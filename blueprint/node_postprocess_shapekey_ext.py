@@ -2035,7 +2035,7 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
             group_var = group_strength_vars[g]
             group_member_vars = [v for v, grp in var_to_group.items() if grp == g]
             if not group_member_vars: continue
-            group_member_vars.sort()
+            group_member_vars.sort(key=lambda v: self._natural_sort_key(v))
             num_members = len(group_member_vars)
             setting = self._find_group_setting(g)
             remark = f" ({setting.remark})" if (setting and setting.remark) else ""
