@@ -445,6 +445,7 @@ class ATP_OT_SplitFramesToShapeKeyMulti(bpy.types.Operator):
         self._play_direction = 1
         self._intermediate_objs = None
         self._current_intermediate_index = 0
+        self._baseline_mesh_names = set(bpy.data.meshes.keys())
         
         if not self._selected_objects:
             self.report({'ERROR'}, "未选择任何网格物体")
@@ -786,7 +787,7 @@ class ATP_OT_SplitFramesToShapeKeyMulti(bpy.types.Operator):
             self._temp_start_obj.hide_render = False
         
         if self._temp_end_obj:
-            bpy.data.objects.remove(self._temp_end_obj, do_unlink=True)
+            self._remove_temp_object_and_mesh(self._temp_end_obj)
             self._temp_end_obj = None
         
         if self._temp_collection and self._temp_collection.name in bpy.data.collections:
@@ -870,7 +871,7 @@ class ATP_OT_SplitFramesToShapeKeyMulti(bpy.types.Operator):
         if not intermediate_obj.data.shape_keys:
             intermediate_obj_name = intermediate_obj.name
             try:
-                bpy.data.objects.remove(intermediate_obj, do_unlink=True)
+                self._remove_temp_object_and_mesh(intermediate_obj)
                 self.report({'INFO'}, f"已删除中间物体 '{intermediate_obj_name}'")
             except Exception as e:
                 self.report({'WARNING'}, f"删除中间物体 '{intermediate_obj_name}' 时出错: {e}")
@@ -882,7 +883,7 @@ class ATP_OT_SplitFramesToShapeKeyMulti(bpy.types.Operator):
                 self.report({'INFO'}, f"成功将 '{intermediate_obj_name}' 的形态键复制到 '{original_obj.name}'")
                 
                 try:
-                    bpy.data.objects.remove(intermediate_obj, do_unlink=True)
+                    self._remove_temp_object_and_mesh(intermediate_obj)
                 except Exception as e:
                     self.report({'WARNING'}, f"删除中间物体 '{intermediate_obj_name}' 时出错: {e}")
             else:
@@ -948,7 +949,7 @@ class ATP_OT_SplitFramesToShapeKeyMulti(bpy.types.Operator):
                             pass
                         continue
                     try:
-                        bpy.data.objects.remove(temp_obj, do_unlink=True)
+                        self._remove_temp_object_and_mesh(temp_obj)
                     except Exception:
                         pass
             if sub_coll.name in bpy.data.collections:
@@ -963,13 +964,54 @@ class ATP_OT_SplitFramesToShapeKeyMulti(bpy.types.Operator):
                         pass
                     continue
                 try:
-                    bpy.data.objects.remove(temp_obj, do_unlink=True)
+                    self._remove_temp_object_and_mesh(temp_obj)
                 except Exception:
                     pass
         
         if temp_collection.name in bpy.data.collections:
             bpy.data.collections.remove(temp_collection)
     
+    @staticmethod
+    def _remove_temp_object_and_mesh(obj):
+        """删除临时物体，并在其 mesh 无引用时一并释放。
+
+        仅调用 bpy.data.objects.remove() 会把网格留在 bpy.data.meshes 成为孤儿
+        （除非显式 meshes.remove 或 orphans purge），导致 Blender 内存随每次
+        运行持续增长、只能重启后释放。
+        """
+        if obj is None:
+            return
+        data = getattr(obj, "data", None)
+        try:
+            bpy.data.objects.remove(obj, do_unlink=True)
+        except Exception:
+            return
+        try:
+            if data is not None and data.users == 0 and data.name in bpy.data.meshes:
+                bpy.data.meshes.remove(data)
+        except Exception:
+            pass
+
+    def _purge_run_orphan_meshes(self):
+        """兜底：释放本次运行期间新建、且已无任何引用（users==0）的 mesh 数据块。
+
+        覆盖异常 / 中途取消等未走到逐物体清理的路径，防止孤儿 mesh 长期驻留内存。
+        """
+        baseline = getattr(self, "_baseline_mesh_names", None)
+        if not baseline:
+            return
+        for name in list(bpy.data.meshes.keys()):
+            if name in baseline:
+                continue
+            mesh = bpy.data.meshes.get(name)
+            if mesh is None:
+                continue
+            try:
+                if mesh.users == 0:
+                    bpy.data.meshes.remove(mesh)
+            except Exception:
+                pass
+
     def finish_processing(self, context):
         """完成处理"""
         props = context.scene.atp_props
@@ -978,6 +1020,7 @@ class ATP_OT_SplitFramesToShapeKeyMulti(bpy.types.Operator):
             context.window_manager.event_timer_remove(self._timer)
             self._timer = None
         
+        self._purge_run_orphan_meshes()
         self.report({'INFO'}, "处理完成！")
     
     def find_intermediate_objects(self, context):
@@ -1020,7 +1063,7 @@ class ATP_OT_SplitFramesToShapeKeyMulti(bpy.types.Operator):
             if frame_number > start_frame:
                 obj_name = intermediate_obj.name
                 try:
-                    bpy.data.objects.remove(intermediate_obj, do_unlink=True)
+                    self._remove_temp_object_and_mesh(intermediate_obj)
                     removed_count += 1
                     print(f"[DEBUG] 清理中间_Base: '{obj_name}'")
                 except Exception as e:
@@ -1053,7 +1096,7 @@ class ATP_OT_SplitFramesToShapeKeyMulti(bpy.types.Operator):
                                         c.objects.unlink(temp_obj)
                                 continue
                             try:
-                                bpy.data.objects.remove(temp_obj, do_unlink=True)
+                                self._remove_temp_object_and_mesh(temp_obj)
                             except Exception:
                                 pass
                     if sub_coll.name in bpy.data.collections:
@@ -1071,7 +1114,7 @@ class ATP_OT_SplitFramesToShapeKeyMulti(bpy.types.Operator):
                                     c.objects.unlink(temp_obj)
                             continue
                         try:
-                            bpy.data.objects.remove(temp_obj, do_unlink=True)
+                            self._remove_temp_object_and_mesh(temp_obj)
                         except Exception:
                             pass
                 
@@ -1111,7 +1154,7 @@ class ATP_OT_SplitFramesToShapeKeyMulti(bpy.types.Operator):
                 if not intermediate_obj.data.shape_keys:
                     intermediate_obj_name = intermediate_obj.name
                     try:
-                        bpy.data.objects.remove(intermediate_obj, do_unlink=True)
+                        self._remove_temp_object_and_mesh(intermediate_obj)
                         self.report({'INFO'}, f"已删除中间物体 '{intermediate_obj_name}'")
                         processed_count += 1
                     except Exception as e:
@@ -1126,7 +1169,7 @@ class ATP_OT_SplitFramesToShapeKeyMulti(bpy.types.Operator):
                     self.report({'INFO'}, f"成功将 '{intermediate_obj_name}' 的形态键复制到 '{original_name}'")
                     
                     try:
-                        bpy.data.objects.remove(intermediate_obj, do_unlink=True)
+                        self._remove_temp_object_and_mesh(intermediate_obj)
                         self.report({'INFO'}, f"已删除中间物体 '{intermediate_obj_name}'")
                         processed_count += 1
                     except Exception as e:
@@ -1234,6 +1277,7 @@ class ATP_OT_SplitFramesToShapeKeyMulti(bpy.types.Operator):
             context.window_manager.event_timer_remove(self._timer)
             self._timer = None
         
+        self._purge_run_orphan_meshes()
         self.report({'WARNING'}, "处理已取消")
         self._is_processing = False
         
