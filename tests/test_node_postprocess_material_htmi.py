@@ -179,6 +179,32 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
         material_node = node_postprocess_material.SSMT_OT_MaterialDetect()
         self.assertIs(material_node._find_result_output(result_output), result_output)
 
+    def test_zzmi_glow_slot_lines_use_explicit_mark_aliases(self):
+        """ZZMI 发光槽位按显式标记写入 GlowMap/WengineFx 别名。"""
+        sys.modules[f"{PKG}.common.global_config"].GlobalConfig.logic_name = "ZZMI"
+        node = node_postprocess_material.SSMTNode_PostProcess_Material()
+        lines = [
+            "ps-t8 = Resource_GlowMap_body",
+            "ps-t9 = ref Resource_WeaponGlow",
+            "ps-t10 = Resource_WengineFx_stocking",
+        ]
+        normalized = node._normalize_zzmi_slot_lines(
+            lines,
+            slot_alias_map={
+                "ps-t8": r"Resource\ZZMI\GlowMap",
+                "ps-t9": r"Resource\ZZMI\GlowMap",
+                "ps-t10": r"Resource\ZZMI\WengineFx",
+            },
+        )
+        self.assertEqual(
+            normalized,
+            [
+                r"Resource\ZZMI\GlowMap = ref Resource_GlowMap_body",
+                r"Resource\ZZMI\GlowMap = ref Resource_WeaponGlow",
+                r"Resource\ZZMI\WengineFx = ref Resource_WengineFx_stocking",
+            ],
+        )
+
     def test_htmi_texture_slots_drive_ps_resources_and_only_fxmap_material_drives_ntemifx(self):
         """测试 HTMI 纹理槽驱动 PS 资源，仅 FXMap 材质驱动 NTEMIFX"""
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -711,7 +711,7 @@ class TT_DDSConversionPanel(bpy.types.Panel):
             info_box = rules_box.box()
             info_box.label(text="当前使用内置贴图类型规则:", icon='INFO')
             info_box.label(text="- DiffuseMap / NormalMap / LightMap / MaterialMap / ORMMap")
-            info_box.label(text="- RampMap / HighLightMap / StockingMap")
+            info_box.label(text="- RampMap / HighLightMap / WengineFX")
             info_box.label(text="- Glowmap / FXMap / RoughnessMap")
             info_box.label(text="- 支持 DiffuseMap_Body 和 Body-DiffuseMap 这两类命名")
             info_box.label(text="- 要改格式，开启上面的规则列表后点“重置默认”即可直接改。")
