@@ -311,6 +311,25 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
                 marker_pending = False
                 if line.strip().lower().startswith("condition =") and guard_expr in line:
                     line = line.replace(guard_expr, "").rstrip()
+                    match = re.match(
+                        r"^(\s*condition\s*=\s*)\((.*)\)\s*$",
+                        line,
+                        re.IGNORECASE | re.DOTALL,
+                    )
+                    if match:
+                        inner = match.group(2)
+                        depth = 0
+                        balanced = True
+                        for char in inner:
+                            if char == "(":
+                                depth += 1
+                            elif char == ")":
+                                depth -= 1
+                                if depth < 0:
+                                    balanced = False
+                                    break
+                        if balanced and depth == 0:
+                            line = f"{match.group(1)}{inner}"
                 new_lines.append(line)
             sections[sec_name] = new_lines
 
@@ -337,7 +356,15 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
                 lines.insert(0, marker)
                 lines.insert(1, f"condition = {guard}")
             elif guard not in lines[condition_index]:
-                lines[condition_index] = f"{lines[condition_index]} && {guard}"
+                condition_match = re.match(
+                    r"^(\s*condition\s*=\s*)(.*)$",
+                    lines[condition_index],
+                    re.IGNORECASE | re.DOTALL,
+                )
+                if condition_match:
+                    lines[condition_index] = (
+                        f"{condition_match.group(1)}({condition_match.group(2)}) && {guard}"
+                    )
 
     # ==========================================
     # UI

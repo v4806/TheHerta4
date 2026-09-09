@@ -192,7 +192,7 @@ class TT_TextureToolsProperties(bpy.types.PropertyGroup):
     lightmap_generate_highlightmap: bpy.props.BoolProperty(name="生成HighLightMap", description="生成HighLightMap材质模板", default=False)
     lightmap_generate_rampmap: bpy.props.BoolProperty(name="生成RampMap", description="生成RampMap材质模板", default=False)
     lightmap_generate_materialmap: bpy.props.BoolProperty(name="生成MaterialMap", description="生成MaterialMap材质模板", default=False)
-    lightmap_generate_stockingmap: bpy.props.BoolProperty(name="生成StockingMap", description="生成StockingMap材质模板", default=False)
+    lightmap_generate_stockingmap: bpy.props.BoolProperty(name="生成WengineFX", description="生成WengineFX材质模板", default=False)
     material_preview_pattern: bpy.props.StringProperty(name="材质名称模式", description="用于匹配材质名称的正则表达式", default=".*")
     material_preview_base_resolution: bpy.props.IntProperty(name="基础分辨率", description="基础分辨率参数（仅存储）", default=1024, min=256, max=8192)
     material_preview_active_index: bpy.props.IntProperty(name="活动索引", description="当前选中的材质预览项索引", default=0)

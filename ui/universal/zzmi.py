@@ -27,7 +27,9 @@ class ZZMITextureMarkName:
     NormalMap = "NormalMap"
     LightMap = "LightMap"
     MaterialMap = "MaterialMap"
-    StockingMap = "StockingMap"
+    WengineFx = "WengineFx"
+    WengineFX = "WengineFX"
+    ZglowMap = "ZglowMap"
 
 
 class ExportZZMI(ExportUnity):
@@ -75,7 +77,9 @@ class ExportZZMI(ExportUnity):
         ZZMITextureMarkName.NormalMap: r"Resource\ZZMI\NormalMap",
         ZZMITextureMarkName.LightMap: r"Resource\ZZMI\LightMap",
         ZZMITextureMarkName.MaterialMap: r"Resource\ZZMI\MaterialMap",
-        ZZMITextureMarkName.StockingMap: r"Resource\ZZMI\WengineFx",
+        ZZMITextureMarkName.WengineFx: r"Resource\ZZMI\WengineFx",
+        ZZMITextureMarkName.WengineFX: r"Resource\ZZMI\WengineFx",
+        ZZMITextureMarkName.ZglowMap: r"Resource\ZZMI\GlowMap",
     }
 
     def __init__(self, blueprint_model):

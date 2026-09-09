@@ -46,7 +46,9 @@ MATERIAL_DETECT_PRESETS = [
     "MaterialMap",
     "RampMap",
     "HighLightMap",
-    "StockingMap",
+    "WengineFX",
+    "WengineFx",
+    "ZglowMap",
 ]
 
 
@@ -2391,6 +2393,80 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
 
         return target_names
 
+    def _collect_section_zzmi_slot_alias_map(self, lines):
+        """汇总一个 TextureOverride 段内各部件槽位对应的 ZZMI 别名。
+
+        SSMT/工作空间的槽位标记（mark_name）才是发光语义的权威来源：
+        WengineFx / WengineFX 表示该 ps-t 槽应通过
+        Resource\\ZZMI\\WengineFx 别名绑定；GlowMap 表示应通过
+        Resource\\ZZMI\\GlowMap 绑定；ZglowMap 表示该贴图专用于 ZZMI 发光，
+        同样通过 Resource\\ZZMI\\GlowMap 绑定，且不应再被当作 RabbitFX 发光
+        重复处理。这里按 mesh 行找到对应物体并读取其工作空间槽位元数据，
+        返回 {ps-tN(小写): 别名} 映射。
+        """
+        if GlobalConfig.logic_name != LogicName.ZZMI:
+            return {}
+        result = {}
+        seen_params = set()
+        for line in lines:
+            mesh_name = self.extract_mesh_name(line)
+            if not mesh_name:
+                continue
+            obj = self.find_object_by_mesh_name(mesh_name)
+            if obj is None:
+                continue
+            try:
+                slots = self._collect_modimp_texture_slots(obj)
+            except Exception:
+                slots = {}
+            for param_name, slot_info in (slots or {}).items():
+                key = str(param_name or "").strip().lower()
+                if not key.startswith("ps-t") or key in seen_params:
+                    continue
+                mark_name = str(slot_info.get("mark_name", "") or "").strip().lower()
+                if mark_name == "wenginefx":
+                    result[key] = r"Resource\ZZMI\WengineFx"
+                    seen_params.add(key)
+                elif mark_name in ("glowmap", "glow", "zglowmap", "zglow"):
+                    result[key] = r"Resource\ZZMI\GlowMap"
+                    seen_params.add(key)
+        return result
+
+    def _normalize_zzmi_slot_lines(self, lines, slot_alias_map=None):
+        """ZZMI 专用：把直接绑定 ps-tN 的发光槽位改写为资源别名。
+
+        直接写 ps-tN = Resource... 会绕过 SlotFix 按 shader 的槽位分配。
+        最终写盘前按 SSMT 标记决定别名：标记为 WengineFx / WengineFX 的槽位
+        写成 Resource\\ZZMI\\WengineFx，标记为 GlowMap / ZglowMap（或资源名含
+        GlowMap / ZglowMap）的槽位写成 Resource\\ZZMI\\GlowMap。
+        """
+        if GlobalConfig.logic_name != LogicName.ZZMI:
+            return lines
+        slot_alias_map = dict(slot_alias_map or {})
+        converted = []
+        for line in lines:
+            stripped = str(line or "")
+            match = re.match(
+                r"^(\s*)ps-t\d+\s*=\s*(?:ref\s+)?(Resource[^\s=;]+?)\s*$",
+                stripped,
+                re.IGNORECASE,
+            )
+            if match:
+                indent = match.group(1)
+                resource_name = match.group(2)
+                param_key = stripped.strip().split("=", 1)[0].strip().lower()
+                alias = slot_alias_map.get(param_key)
+                resource_lower = resource_name.lower()
+                if alias is None:
+                    if "wenginefx" in resource_lower:
+                        alias = r"Resource\ZZMI\WengineFx"
+                    elif "glowmap" in resource_lower:
+                        alias = r"Resource\ZZMI\GlowMap"
+                if alias is not None:
+                    line = f"{indent}{alias} = ref {resource_name}"
+            converted.append(line)
+        return converted
+
     def execute_postprocess(self, mod_export_path, exporter=None):
         from ..utils.log_utils import LOG as _LOG
 
@@ -2438,6 +2514,16 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
                 )
 
             del sections['_config_path']
+
+            for _section_name in list(sections.keys()):
+                if not str(_section_name or "").lower().startswith("[textureoverride"):
+                    continue
+                _section_lines = sections[_section_name]
+                _slot_alias_map = self._collect_section_zzmi_slot_alias_map(_section_lines)
+                sections[_section_name] = self._normalize_zzmi_slot_lines(
+                    _section_lines,
+                    slot_alias_map=_slot_alias_map,
+                )
 
             self.define_swapkeys_in_sections(sections, used_swap_keys)
 

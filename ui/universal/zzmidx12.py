@@ -27,7 +27,9 @@ class ZZMIDX12TextureMarkName:
     NormalMap = "NormalMap"
     LightMap = "LightMap"
     MaterialMap = "MaterialMap"
-    StockingMap = "StockingMap"
+    WengineFx = "WengineFx"
+    WengineFX = "WengineFX"
+    ZglowMap = "ZglowMap"
 
 
 class ExportZZMIDX12(ExportUnity):
@@ -42,7 +44,9 @@ class ExportZZMIDX12(ExportUnity):
         ZZMIDX12TextureMarkName.NormalMap: r"Resource\ZZMI\NormalMap",
         ZZMIDX12TextureMarkName.LightMap: r"Resource\ZZMI\LightMap",
         ZZMIDX12TextureMarkName.MaterialMap: r"Resource\ZZMI\MaterialMap",
-        ZZMIDX12TextureMarkName.StockingMap: r"Resource\ZZMI\WengineFx",
+        ZZMIDX12TextureMarkName.WengineFx: r"Resource\ZZMI\WengineFx",
+        ZZMIDX12TextureMarkName.WengineFX: r"Resource\ZZMI\WengineFx",
+        ZZMIDX12TextureMarkName.ZglowMap: r"Resource\ZZMI\GlowMap",
     }
 
     def get_blend_match_cs(self, drawib_model) -> str:

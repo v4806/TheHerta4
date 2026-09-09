@@ -6,14 +6,14 @@ TEMPLATE_TYPES = (
     ("HighLightMap", "lightmap_generate_highlightmap"),
     ("RampMap", "lightmap_generate_rampmap"),
     ("MaterialMap", "lightmap_generate_materialmap"),
-    ("StockingMap", "lightmap_generate_stockingmap"),
+    ("WengineFX", "lightmap_generate_stockingmap"),
 )
 
 
 class TT_OT_generate_lightmap_template(bpy.types.Operator):
     bl_idname = "toolkit.tt_generate_lightmap_template"
     bl_label = "生成光照模板"
-    bl_description = "为选中的物体创建 LightMap / HighLightMap / RampMap / MaterialMap / StockingMap 材质模板"
+    bl_description = "为选中的物体创建 LightMap / HighLightMap / RampMap / MaterialMap / WengineFX 材质模板"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):

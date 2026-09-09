@@ -40,8 +40,8 @@ DDS_DEFAULT_RULES = [
         "format": "bc7_unorm_srgb",
     },
     {
-        "texture_type": "StockingMap",
-        "pattern": r"(?i)(?:^|[_\-. ])StockingMap(?:[_\-. ]|$)",
+        "texture_type": "WengineFX",
+        "pattern": r"(?i)(?:^|[_\-. ])WengineFx(?:[_\-. ]|$)",
         "format": "bc7_unorm",
     },
     {
@@ -395,7 +395,7 @@ class TT_OT_test_dds_rule(bpy.types.Operator):
             "Body-ORMMap.png",
             "RampMap_Eye.png",
             "HighLightMap_Hair.png",
-            "StockingMap_Leg.bmp",
+            "WengineFX_Leg.bmp",
             "Glowmap_1_Eye.png",
             "FXMap_Body.dds",
             "RoughnessMap_Body.png",
