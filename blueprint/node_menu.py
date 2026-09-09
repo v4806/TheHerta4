@@ -1409,7 +1409,6 @@ class SSMT_MT_NodeMenu_PostProcess_Material(bpy.types.Menu):
         # 原版「材质转资源」已弃用：功能被「材质转资源pro」完全覆盖，旧蓝图会自动迁移。
         _add_node_entry(layout, "材质转资源pro", 'OBJECT_DATA', "SSMTNode_PostProcess_CustomMaterialAssign")
         _add_node_entry(layout, "贴图资源去重", 'PACKAGE', "SSMTNode_PostProcess_ResourceMerge")
-        _add_node_entry(layout, "物体贴图替换与清理", 'TEXTURE', "SSMTNode_PostProcess_ObjectTextureAssign")
         _add_node_entry(layout, "缓冲区清理", 'TRASH', "SSMTNode_PostProcess_BufferCleanup")
         _add_node_entry(layout, "配置文件清理", 'TEXT', "SSMTNode_PostProcess_CommentCleanup")
 
@@ -1441,6 +1440,7 @@ class SSMT_MT_NodeMenu_PostProcess_Creative(bpy.types.Menu):
         _add_node_entry(layout, "形态键扩展配置", 'ACTION', "SSMTNode_PostProcess_ShapeKeyExt")
         _add_node_entry(layout, "物体切换面板", 'SHADERFX', "SSMTNode_PostProcess_SwapPanel")
         _add_node_entry(layout, "贴图切换 V5.1", 'TEXTURE', "SSMTNode_PostProcess_DiffuseSwitch")
+        _add_node_entry(layout, "物体贴图替换与清理", 'TEXTURE', "SSMTNode_PostProcess_ObjectTextureAssign")
         _add_node_entry(layout, "RabbitFX贴图后处理", 'LIGHT', "SSMTNode_PostProcess_Glow")
         _add_node_entry(layout, "PS绑定+IB限定", 'SHADERFX', "SSMTNode_PostProcess_PSBinding")
 
