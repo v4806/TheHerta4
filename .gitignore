@@ -38,3 +38,6 @@ tests/_verify_*.log
 .review_*.diff
 # 复核基线日志（只忽略 .log，保留 review-reports/*.md 留档）
 review-reports/*.log
+
+# 残余清理的离线回滚归档（保留在 review-reports/ 供回滚，明确不入库）
+review-reports/*.zip
