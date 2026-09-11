@@ -32,6 +32,50 @@ class ZZMITextureMarkName:
     ZglowMap = "ZglowMap"
 
 
+# 纯占位 target（子网格全成了占位小三角）的变体 pass 里，写入 SO 前缀的实写行数：
+# target 自己的 deform draw 会被跳过，前缀只剩该 pass 里 carrier 的 3 顶点占位小三角。
+# base_vertex / Redirect Texcoord pad / override_vertex_count 都按它取值，保证
+# "前缀声明行数 == 实际写入行数"（历史事故：浮波柚叶01 base_vertex=6 而实写 3 行
+# → 合并几何整体错位 3 个顶点，游戏内爆炸）。
+ZZMI_STUB_PREFIX_ROWS = 3
+
+# ---------------------------------------------------------------------------
+# 合并骨架 v9：出现次槽位（occurrence slot）+ 每槽守卫
+# ---------------------------------------------------------------------------
+# 背景（用户游戏内实测通过的手改版 K:\...\浮波柚叶\浮波柚叶.ini 为语义基准）：
+# v2 只保存**一份** palette / 骨架 / SO，并用 seen/phase 守卫「组内部件当帧全部
+# 到达」。同一 IB 在场景中被画多次（多实例）时，两个实例的 deform pass 会交错
+# 覆盖同一份 palette → 守卫即使成立也可能重放**半帧拼接**的骨架，表现为运动时
+# 抖动 / 罕见反转帧混淆。v6 尝试「每次 deform 无条件重放」消除交错，结果更差：
+# 第一个部件到达时另一个部件的数据还是上一帧的，那一笔重放本身是错的。
+#
+# v9 保留 v2 已验证的守卫，把单份资源扩成 **2 个槽位**：每个部件的 deform 段按
+# 自己的出现次（occurrence）把当帧 palette / SO 写进 s1 或 s2，attach 也只写
+# 该槽的合并骨架；守卫按槽判定「本组全部部件在该槽都已当帧到达」后才重放。
+# 于是两个实例各占一槽、互不覆盖，任何一槽被消费时组内数据都是同一实例的。
+#
+# 三条硬约束（历次实测踩坑，改动时不得违反）：
+# 1. `run = <CustomShader>` **绝不能在 if 体内**：本 3DMigoto fork 里 if 内的 run
+#    不执行 → 骨架为空 → 模型整体消失。所有 attach run 必须在段顶层无条件执行
+#    （每个 (部件, 槽) 一条）。
+# 2. 出现在 if 条件里的 `$变量` 必须在**顶层**被赋值过：只在 if 体内赋值的变量会被
+#    加载期优化器按初值静态折叠 → 整个守卫 if 被删除 → 重放不发生。因此到达标记
+#    用 `$zz_ms_seen_<i><k> = $zz_ms_seen_<i><k> + ($zz_ms_occ_<i> == <k>)` 这种
+#    顶层算术累加写法，**绝不在 if 体内赋值**。
+# 3. [Present] 只把 occ/seen 清零，**不写任何资源复位**（`ResourceZZRedirectSO_* = null`
+#    等 F8 构造经实测有害，会废掉 [Present] 清场）；也不生成 drawn/ready 之类闩锁变量。
+#
+# 已知限制：
+# - 两个 pass 的实例提交顺序相反时，出现次槽位会配错（与 v6 同源）。
+# - 某部件整帧被剔除时，该槽守卫不闭合 = 可能保持上一帧内容（不会画出半帧拼接，
+#   方向是安全的）；[Present] 的 occ/seen 清零只作跨帧兜底。
+ZZMI_MERGED_SKELETON_SLOTS: tuple[int, ...] = (1, 2)
+# 出现次回绕上限：occ 自增到该值即回绕为槽位起点（1/2 循环）。
+ZZMI_MERGED_SKELETON_OCC_WRAP = len(ZZMI_MERGED_SKELETON_SLOTS) + 1
+# 计数器出现在 if 条件前必须能在顶层解析出的下限（槽位起点）。
+ZZMI_MERGED_SKELETON_OCC_SLOT_BASE = ZZMI_MERGED_SKELETON_SLOTS[0]
+
+
 class ExportZZMI(ExportUnity):
     MERGED_SKELETON_ATTACH_THREADS = 64
 
@@ -114,6 +158,9 @@ class ExportZZMI(ExportUnity):
             # 合并网格自动重定向计划（_build_merged_mesh_redirect_plan 产出，INI 生成时查询）
             self._redirect_carrier_map: dict = {}
             self._redirect_target_map: dict = {}
+            # A-opt1：旧有的 self._unredirected 字段全仓无读取方（_export_impl 用的是
+            # 局部 unredirected / 返回值），已删除；v9 直连回退判据见
+            # _build_merged_mesh_redirect_plan 的返回值。
 
             print(f"[CrossIB ZZMI] 初始化: has_cross_ib={self.has_cross_ib}")
             print(f"[CrossIB ZZMI] cross_ib_info_dict={self._format_cross_ib_info_dict(self.cross_ib_info_dict)}")
@@ -173,6 +220,9 @@ class ExportZZMI(ExportUnity):
           （游戏内不可见的小三角，抑制原版 draw 防止重影）；零引用 = 用户压根
           不想生成 → 保持原样不插桩（该 DrawIB 不进入 mod，游戏内显示原版）。
         无反查数据（json 无 VGMap）的缺席 DrawIB 一律不插桩。
+        - **dedup_excluded 正交**（VGMapDedupExcluded=True）：该部件即使被引用
+          也不生成占位——显式排除优先于 absorbed 判定（对齐 EFMI，用户意图
+          「完全不出现在 mod 里」，游戏保留原版绘制）。
         返回创建的对象名列表（export() 结束后清理）。
         """
         workspace_root = GlobalConfig.path_workspace_folder()
@@ -226,6 +276,12 @@ class ExportZZMI(ExportUnity):
                     continue
 
             for member in stub_members:
+                if self._is_component_dedup_excluded(member):
+                    print(
+                        f"[ZZMI骨骼合并] 部件 {member} 已标记 VGMapDedupExcluded，"
+                        "按用户意图不生成占位（游戏保留原版绘制）"
+                    )
+                    continue
                 obj_name = self._create_stub_object(member)
                 if obj_name:
                     # 必须在任何后续构造步骤之前登记到实例；否则批量创建中途
@@ -330,7 +386,15 @@ class ExportZZMI(ExportUnity):
 
 
     def _create_stub_object(self, bare_unique_str: str) -> str:
-        """创建占位对象：3 顶点 1 三角面（1e-6 尺度），权重全给组 "0"。"""
+        """创建占位对象：3 顶点 1 三角面（1e-6 尺度），权重挂在已注册槽。
+
+        权重组名必须是**已注册槽**（json VGMap 首值，对齐 EFMI
+        efmi.py:_resolve_stub_registered_slot）：ZZZ 合并骨架模式下组名 =
+        全局骨骼 id，占位三角的权重挂 json VGMap 引用槽即落在合法全局槽内，
+        能通过导出侧数字组检查（submesh_model 的 index==name 不变量）——
+        不依赖「0 恒在范围内」的巧合；json 无 VGMap（局部命名空间/无反查数据）
+        保持 "0" 与旧行为一致（无反查数据不插桩语义由 _is_drawib_absorbed 保证）。
+        """
         workspace_unique_str = bare_unique_str
         if not workspace_unique_str.upper().startswith("LOD"):
             workspace_unique_str = "LOD0." + workspace_unique_str
@@ -349,7 +413,8 @@ class ExportZZMI(ExportUnity):
             obj = bpy.data.objects.new(name=workspace_unique_str, object_data=mesh)
             obj["ZZMI_STUB"] = 1
             obj["3DMigoto:WorkspaceUniqueStr"] = workspace_unique_str
-            vertex_group = obj.vertex_groups.new(name="0")
+            slot_group_name = self._resolve_stub_registered_slot(bare_unique_str)
+            vertex_group = obj.vertex_groups.new(name=slot_group_name)
             vertex_group.add([0, 1, 2], 1.0, 'REPLACE')
 
             try:
@@ -366,6 +431,63 @@ class ExportZZMI(ExportUnity):
                 except (AttributeError, RuntimeError):
                     pass
             raise
+
+    def _resolve_stub_registered_slot(self, bare_unique_str: str) -> str:
+        """解析占位三角的权重槽：合并骨架部件取 json VGMap 的第一个非负值。
+
+        缺失部件的 VGMap 引用槽是全局骨骼编号（ZZMI 组基址拼接后的合法全局槽），
+        占位权重组名落在已注册槽内即可通过导出侧数字组检查；json 无 VGMap
+        （局部命名空间/无反查数据）时返回 "0"（与旧行为一致）。
+        搜索顺序：LOD0 目录 -> 工作空间根目录兜底（ZZZ 常规在 LOD0）。
+        """
+        base = GlobalConfig.path_workspace_folder()
+        for root in (os.path.join(base, "LOD0"), base):
+            submesh_dir = os.path.join(root, bare_unique_str)
+            if not os.path.isdir(submesh_dir):
+                continue
+            for type_dir in sorted(os.listdir(submesh_dir)):
+                if not type_dir.startswith("TYPE_"):
+                    continue
+                json_path = os.path.join(submesh_dir, type_dir, bare_unique_str + ".json")
+                if not os.path.isfile(json_path):
+                    continue
+                payload = JsonUtils.LoadFromFile(json_path)
+                vg_map = payload.get("VGMap") or {}
+                for raw in vg_map.values():
+                    try:
+                        slot = int(raw)
+                    except (TypeError, ValueError):
+                        continue
+                    if slot >= 0:
+                        return str(slot)
+                return "0"
+        return "0"
+
+    def _is_component_dedup_excluded(self, bare_unique_str: str) -> bool:
+        """部件是否被用户显式排除（json 标记 VGMapDedupExcluded=True）。
+
+        显式排除 = 用户意图「完全不出现在 mod 里」：跳过占位小三角面生成，游戏侧
+        保留原版绘制。与占位的 `absorbed`（几何被合并进其它对象）语义正交——
+        合并场景下的缺失部件仍须占位抑制重影（absorbed=True 补占位），排除部件
+        则相反（即使被引用也不插桩）。搜索顺序同 _resolve_stub_registered_slot：
+        LOD0 目录 -> 工作空间根目录兜底。
+        """
+        base = GlobalConfig.path_workspace_folder()
+        for root in (os.path.join(base, "LOD0"), base):
+            submesh_dir = os.path.join(root, bare_unique_str)
+            if not os.path.isdir(submesh_dir):
+                continue
+            for type_dir in sorted(os.listdir(submesh_dir)):
+                if not type_dir.startswith("TYPE_"):
+                    continue
+                json_path = os.path.join(submesh_dir, type_dir, bare_unique_str + ".json")
+                if not os.path.isfile(json_path):
+                    continue
+                payload = JsonUtils.LoadFromFile(json_path)
+                if bool(payload.get("VGMapDedupExcluded")):
+                    return True
+                return False
+        return False
 
     def _cleanup_stub_objects(self):
         """导出结束后移除占位对象、mesh 数据和注入蓝图的 DrawCall。"""
@@ -582,40 +704,6 @@ class ExportZZMI(ExportUnity):
                     section.append("endif")
             section.append("")
 
-    def _append_ready_gated_render_draws(
-        self,
-        section,
-        drawcall_list,
-        draw_offset_dict,
-        target_ib: str,
-        base_vertex: int = 0,
-    ) -> None:
-        """Emit carrier render draws only after this frame's SO replay ran.
-
-        RedirectSO is persistent and its carrier hook always writes a small
-        stub prefix.  If a required palette arrives after every compatible
-        deform host, the replay guard cannot run; drawing the SO tail anyway
-        would consume the previous frame or uninitialised data.  Gate only the
-        carrier's render draw, leaving the normal texture/resource setup intact.
-        """
-        ready_var = f"$zz_ms_redirect_drawn_{target_ib}"
-        section.append(f"if {ready_var} == 1")
-        start = len(section.SectionLineList)
-        self._append_drawindexed_with_shader_replace(
-            section,
-            drawcall_list,
-            draw_offset_dict,
-            base_vertex=base_vertex,
-        )
-        # Keep nested generated conditions syntactically inside the readiness
-        # block.  M_IniSection stores raw lines, so indentation is the only
-        # required operation and does not alter the existing draw expressions.
-        for index in range(start, len(section.SectionLineList)):
-            line = section.SectionLineList[index]
-            if line:
-                section.SectionLineList[index] = "    " + line
-        section.append("endif")
-
     @staticmethod
     def _format_name_set(names) -> list[str]:
         return sorted(str(name) for name in (names or []))
@@ -780,6 +868,414 @@ class ExportZZMI(ExportUnity):
 
         return source_drawib_model, None, source_hash, source_first_index
 
+    # ------------------------------------------------------------------
+    # 合并骨架 v9：出现次槽位命名 / 守卫条件
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _merged_skeleton_slots(cls) -> tuple[int, ...]:
+        """出现次槽位号列表（1/2 循环）。改这里即可扩到更多槽位。"""
+        return tuple(ZZMI_MERGED_SKELETON_SLOTS)
+
+    @staticmethod
+    def _merged_occ_var(component_id: int) -> str:
+        """部件出现次计数器（deform 段顶层自增，1/2 循环）。"""
+        return f"$zz_ms_occ_{component_id}"
+
+    @staticmethod
+    def _merged_seen_var(component_id: int, slot: int) -> str:
+        """部件在槽 <slot> 的当帧到达标记（顶层 sticky 累加）。"""
+        return f"$zz_ms_seen_{component_id}{slot}"
+
+    @staticmethod
+    def _merged_palette_name(draw_ib: str, slot: int) -> str:
+        """该部件该槽的 palette 持久副本资源名。"""
+        return f"ResourceZZPalette_{draw_ib}_s{slot}"
+
+    @staticmethod
+    def _merged_skeleton_name(skeleton_group: int, slot: int) -> str:
+        """该组该槽的合并骨架资源名（骨架按槽分份，attach 只写本槽）。"""
+        return f"ResourceZZMergedSkeleton_G{skeleton_group}_s{slot}"
+
+    @staticmethod
+    def _merged_redirect_so_name(slot: int) -> str:
+        """该槽的 SO 重定向资源名（全 target 共享；只有 SO owner 部件捕获）。"""
+        return f"ResourceZZRedirectSO_s{slot}"
+
+    @staticmethod
+    def _merged_attach_name(component_id: int, slot: int) -> str:
+        """(部件, 槽) 的 attach CustomShader 段名。"""
+        return f"CustomShaderZZMIMergedSkeletonAttach_C{component_id}_s{slot}"
+
+    def _merged_group_component_ids(self, skeleton_group: int) -> list[int]:
+        """本骨架组包含的组件号列表（升序；与 merged_skeleton_components 同序）。
+
+        v9：本组**全部**部件的 seen 标记都要参与每个槽守卫的条件——「组内部件
+        当帧全部到达」才允许消费该槽骨架。已知限制：某部件整帧被剔除时该槽
+        守卫不闭合（保持上一帧内容），方向安全，不会画出半帧拼接。
+        """
+        return [
+            int(component_id)
+            for component_id, component in enumerate(self.merged_skeleton_components)
+            if int(component["skeleton_group"]) == int(skeleton_group)
+        ]
+
+    def _merged_group_slot_seen_condition(
+        self, skeleton_group: int, slot: int
+    ) -> str:
+        """该组该槽的守卫条件：组内全部部件的 `seen_<i><k> == 1` 相与。
+
+        这些 `$zz_ms_seen_*` 变量由各部件 deform 段的**顶层** sticky 累加赋值
+        （见 `_append_merged_skeleton_deform_block`）；因此不会被加载期优化器
+        按初值静态折叠，守卫不会被删除。
+        """
+        return " && ".join(
+            f"{self._merged_seen_var(component_id, slot)} == 1"
+            for component_id in self._merged_group_component_ids(skeleton_group)
+        )
+
+    def _append_merged_skeleton_deform_block(
+        self, texture_override_vb_section, drawib_model
+    ) -> None:
+        """向 deform VB 段注入合并骨架 v9 语义（出现次槽位 + 每槽守卫）。
+
+        生成顺序**必须**保持如下（每一条都对应一次游戏内实测失败）：
+        1. `$zz_ms_occ_<i>` 顶层自增 + `>= 3` 回绕为 1（槽位 1/2 循环）；
+        2. `$zz_ms_seen_<i><k>` 顶层 sticky 累加（**绝不能在 if 体内赋值**：
+           只在 if 体内赋值的变量会被加载期优化器按初值静态折叠 → 守卫整段
+           被删除 → 重放不发生）；
+        3. `if $zz_ms_occ_<i> == 1 ... else ... endif` 把当帧 palette 复制进本槽
+           的 palette 资源；SO 捕获**只由 SO owner（载体）部件做**；
+        4. 顶层无条件 `run` 全部 (部件, 槽) attach（**run 绝不能进 if**：本 fork
+           里 if 内的 run 不执行 → 骨架为空 → 模型整体消失）；
+        5. `vs-t0 = <本组 s1 骨架>` 顶层默认换绑；
+        6. `handling = skip` 与载体 3 顶点前缀 stub（`draw = 3, 0`，在守卫之前）；
+        7. 每槽守卫：`if <组内全部部件 seen_<i><k> == 1 相与>`，体内**只允许**
+           绑定与 draw（vs-t0 / so0 = ref / vb2 / vb0 / draw / so0 = null），
+           **不得出现 run、不得给 $变量赋值**。
+        """
+        draw_ib = drawib_model.draw_ib
+        component_id = int(self.merged_skeleton_component_id_dict[draw_ib])
+        component = self.merged_skeleton_components[component_id]
+        skeleton_group = int(component["skeleton_group"])
+        slots = self._merged_skeleton_slots()
+
+        occ_var = self._merged_occ_var(component_id)
+        slot_first = slots[0]
+
+        # 1) 出现次（顶层）
+        texture_override_vb_section.append("; 出现次（顶层）")
+        texture_override_vb_section.append(f"{occ_var} = {occ_var} + 1")
+        texture_override_vb_section.append(f"if {occ_var} >= {ZZMI_MERGED_SKELETON_OCC_WRAP}")
+        texture_override_vb_section.append(f"    {occ_var} = {slot_first}")
+        texture_override_vb_section.append("endif")
+
+        # 2) 到达标记（顶层 sticky 累加；绝不在 if 体内赋值）
+        texture_override_vb_section.append("; 到达标记（顶层 sticky 累加）")
+        for slot in slots:
+            seen_var = self._merged_seen_var(component_id, slot)
+            texture_override_vb_section.append(
+                f"{seen_var} = {seen_var} + ({occ_var} == {slot})"
+            )
+
+        # 3) 按槽捕获 palette（与 SO owner 的 SO 引用）
+        so_owner_target_ibs = self._merged_so_owner_target_ibs(draw_ib)
+        texture_override_vb_section.append("; 按槽捕获 palette 与 SO 引用")
+        for index, slot in enumerate(slots):
+            palette_line = (
+                f"{self._merged_palette_name(draw_ib, slot)} = copy vs-t0 unless_null"
+            )
+            condition = f"if {occ_var} == {slot}" if index == 0 else "else"
+            texture_override_vb_section.append(condition)
+            texture_override_vb_section.append(f"    {palette_line}")
+            for _so_owner_target_ib in so_owner_target_ibs:
+                texture_override_vb_section.append(
+                    f"    {self._merged_redirect_so_name(slot)} = ref so0"
+                )
+        if len(slots) > 1:
+            texture_override_vb_section.append("endif")
+
+        # 4) 顶层无条件 attach（每个 (部件, 槽) 一条 run；run 绝不进 if）
+        texture_override_vb_section.append("; 顶层无条件 attach（run 不进 if）")
+        for slot in slots:
+            for group_component_id in self._merged_group_component_ids(skeleton_group):
+                texture_override_vb_section.append(
+                    f"run = {self._merged_attach_name(group_component_id, slot)}"
+                )
+
+        # 5) 默认换绑本组 s<slot_first> 骨架（守卫按槽覆盖）
+        texture_override_vb_section.append(
+            f"vs-t0 = {self._merged_skeleton_name(skeleton_group, slot_first)}"
+        )
+        texture_override_vb_section.append("handling = skip")
+
+        redirect_carrier = self._redirect_carrier_map.get(draw_ib)
+        group_target = self._merged_group_redirect_target(skeleton_group)
+        group_plan = self._redirect_target_map.get(group_target) if group_target else None
+
+        # 6) 每槽守卫（体内只有绑定与 draw）
+        #
+        # 合并几何的归属（与 `_build_merged_mesh_redirect_plan` 同一口径）：
+        # - 重放宿主（replay host）：由本挂点的每槽守卫重放整段合并几何（绑定
+        #   carrier 的 vb0/vb2）——挂在 target 上，或 target 自身布局不兼容时挂在
+        #   兼容的 carrier 上；
+        # - 纯 carrier（几何被 target 吸收，且 target 挂点能承载重放）：deform
+        #   退化为 3 顶点前缀 stub，写本槽 SO 的前缀行，不发守卫；
+        # - 几何已被吸收、但本轮没有任何挂点能承载重放：不画（没有可见几何，
+        #   也不该画自己的占位 stub）；
+        # - 该组没有可行的重定向：合并几何留在**拥有导出几何的那个部件**自己的
+        #   deform draw 上（直连路径），由本挂点的每槽守卫绘制。
+        #
+        # 无论哪条路径，`run = <CustomShader>` 都已在上面**顶层**无条件执行完毕
+        # （if 内的 run 在本 fork 上不执行）。
+        if group_plan is None:
+            # 该组没有可行的重定向计划（未发生重定向，或计划被判为不可行）：
+            # 合并几何留在承载部件自己的 deform draw 上（直连路径）。
+            self._append_merged_direct_slot_guards(
+                texture_override_vb_section,
+                draw_ib,
+                skeleton_group,
+                slots,
+                fallback_draw_number=int(getattr(drawib_model, "draw_number", 0) or 0),
+            )
+            return
+
+        target_viable = self._merged_target_viable_as_replay_host(
+            group_target, group_plan
+        )
+        if self._merged_component_layout_compatible(draw_ib, group_plan):
+            if target_viable:
+                # v9（用户实测口径）：重定向可行时，**每个布局兼容的组内部件挂点都发
+                # 同一套每槽守卫** —— 守卫的触发时机可能落在组内任意部件的 deform 段
+                # （取决于引擎提交次序，两个实例的 pass 次序甚至可能相反）。只让单一
+                # 挂点持有守卫时，若该挂点先于组内其它部件 deform，守卫永不触发 →
+                # 该槽 SO 只剩 3 顶点前缀 → 合并几何整段消失（重新导出的实测回归）。
+                # 同一槽被多个挂点重复重放是幂等写入（同骨架、同 SO），只多几次 dispatch。
+                if (
+                    group_plan.get("so_owner_ib") == draw_ib
+                    and draw_ib != group_target
+                ):
+                    # SO owner（载体）：先写本槽 SO 的 3 顶点前缀行（渲染用 base_vertex 跳过）
+                    texture_override_vb_section.append("draw = 3, 0")
+                self._append_merged_target_slot_guards(
+                    texture_override_vb_section,
+                    group_target,
+                    skeleton_group,
+                    slots,
+                )
+                return
+            # target 挂点不可行：由兼容 carrier 承载重放（沿用既有行为；此路径渲染不带
+            # base_vertex 偏移，因此不写前缀 stub）。
+            if self._merged_component_can_host_replay(
+                draw_ib, group_plan, group_target, target_viable
+            ):
+                self._append_merged_target_slot_guards(
+                    texture_override_vb_section,
+                    group_target,
+                    skeleton_group,
+                    slots,
+                )
+                return
+
+        if (
+            draw_ib not in self._redirect_carrier_map
+            and self._merged_component_geometry_absorbed(skeleton_group, draw_ib)
+        ):
+            # 几何已被组内其它部件合并走，且本轮已确定由某个挂点重放：本部件没有
+            # 可见几何，不能在这里再画自己的占位 stub（否则重复绘制 / 画出占位
+            # 小三角）。
+            return
+
+        # 其余情况（几何未被吸收的组内部件；或 target 挂点不可行时由兼容 carrier
+        # 兜底）：合并几何必须由本挂点自己画，否则会整体消失。仍用同一套
+        # 「组内部件当帧全部到达」门控。
+        self._append_merged_direct_slot_guards(
+            texture_override_vb_section,
+            draw_ib,
+            skeleton_group,
+            slots,
+            fallback_draw_number=int(getattr(drawib_model, "draw_number", 0) or 0),
+        )
+
+    @staticmethod
+    def _merged_target_viable_as_replay_host(target_ib: str, group_plan: dict) -> bool:
+        """target 挂点本身能否承载整段重放。
+
+        两个否决条件（与 `_build_merged_mesh_redirect_plan` 同源）：
+        - Blend 输入布局不兼容（`compatible_component_ids` 不含 target）；
+        - 必需骨骼依赖到达晚于所有兼容宿主（计划记为 `unredirected`，
+          `$zz_ms_seen_*` 在 target 挂点永远不会全部成立）。
+        """
+        if not target_ib:
+            return False
+        compatible_ids = group_plan.get("compatible_component_ids")
+        if compatible_ids is not None:
+            target_component_id = group_plan.get("target_component_id")
+            if target_component_id is not None and int(target_component_id) not in [
+                int(cid) for cid in compatible_ids
+            ]:
+                return False
+        return bool(group_plan.get("target_viable", True))
+
+    def _merged_component_layout_compatible(self, draw_ib: str, group_plan: dict) -> bool:
+        """本部件挂点的输入布局是否与合并几何兼容（BI4 与 BW16_BI16 不能混用）。
+
+        v9 起：**兼容即发守卫**（不再区分 target / carrier 只留一个挂点）——见调用处
+        注释：守卫的触发时机可能落在组内任意部件的 deform 段上。
+        """
+        component_id = self.merged_skeleton_component_id_dict.get(draw_ib)
+        if component_id is None:
+            return False
+        compatible_ids = group_plan.get("compatible_component_ids")
+        if compatible_ids is None:
+            allowed = [int(cid) for cid in group_plan.get("required_component_ids", [])]
+        else:
+            allowed = [int(cid) for cid in compatible_ids]
+        return int(component_id) in allowed
+
+    def _merged_component_can_host_replay(
+        self, draw_ib: str, group_plan: dict, target_ib: str, target_viable: bool
+    ) -> bool:
+        """本部件挂点能否承载该组的整段重放（BI4 与 BW16_BI16 不能混用）。
+
+        - 本部件就是 target：只要 target 自身可行即可；
+        - 本部件是兼容的 carrier：仅当 target 挂点不可行（布局不兼容 / 依赖到达
+          过晚）时才由它兜底重放，否则合并几何统一由 target 挂点重放一次。
+        """
+        component_id = self.merged_skeleton_component_id_dict.get(draw_ib)
+        if component_id is None:
+            return False
+        compatible_ids = group_plan.get("compatible_component_ids")
+        if compatible_ids is None:
+            allowed = [
+                int(cid) for cid in group_plan.get("required_component_ids", [])
+            ]
+        else:
+            allowed = [int(cid) for cid in compatible_ids]
+        if int(component_id) not in allowed:
+            return False
+        if draw_ib == target_ib:
+            return bool(target_viable)
+        return not target_viable
+
+    def _merged_component_geometry_absorbed(
+        self, skeleton_group: int, draw_ib: str
+    ) -> bool:
+        """本部件引用的骨骼是否包含**组内其它部件**的槽位（= 几何已被吸收）。
+
+        与 `_build_merged_mesh_redirect_plan` 判定 carrier 的口径一致：
+        `(引用的骨骼 id - 本部件 vg_map 值集合) ∩ 本组合法槽位` 非空即被吸收。
+        被吸收的部件没有自己的可见几何（它的行已经写进 target 的对象里），
+        渲染侧不能重复绘制。
+        """
+        component_id = self.merged_skeleton_component_id_dict.get(draw_ib)
+        if component_id is None:
+            return False
+        component = self.merged_skeleton_components[int(component_id)]
+        own = set((component.get("vg_map") or {}).values())
+        legal: set[int] = set()
+        for other_id in self._merged_group_component_ids(skeleton_group):
+            other = self.merged_skeleton_components[other_id]
+            legal.update(
+                range(
+                    int(other["vg_offset"]),
+                    int(other["vg_offset"]) + int(other["vg_count"]),
+                )
+            )
+        absorbed = (self._collect_drawib_referenced_bone_ids(draw_ib) - own) & legal
+        return bool(absorbed)
+
+    def _merged_group_redirect_target(self, skeleton_group: int) -> str | None:
+        """本骨架组被重定向到的 target DrawIB；该组未发生重定向时返回 None。
+
+        一组至多一个 target（= 组内最后一个 deform draw，见
+        `_build_merged_mesh_redirect_plan`）。
+        """
+        group_component_ids = set(self._merged_group_component_ids(skeleton_group))
+        for target_ib, plan in self._redirect_target_map.items():
+            target_component_id = self.merged_skeleton_component_id_dict.get(target_ib)
+            if (
+                target_component_id is not None
+                and int(target_component_id) in group_component_ids
+            ):
+                return target_ib
+        return None
+
+    def _merged_so_owner_target_ibs(self, draw_ib: str) -> list[str]:
+        """本部件作为 SO owner 时要捕获 SO 的 target 列表（升序）。
+
+        - target 有真实几何：由 target **自己**的 deform 段捕获 SO（此时
+          `so_owner_ib == target_ib`，本函数同样返回该 target）；
+        - 纯占位 target：SO 必须由一个真实 carrier 挂点拥有，否则 target 晚到时
+          会把空 SO / BI4 布局的 SO 覆盖掉有效内容。
+        只有 owner 挂点才能写 `ResourceZZRedirectSO_s<k> = ref so0`。
+        """
+        return sorted(
+            target_ib
+            for target_ib, plan in self._redirect_target_map.items()
+            if plan.get("so_owner_ib") == draw_ib
+        )
+
+    def _append_merged_target_slot_guards(
+        self, section, target_ib: str, skeleton_group: int, slots
+    ) -> None:
+        """重放宿主挂点的每槽守卫（绑定 carrier 的 vb0/vb2 + 本槽 SO）。
+
+        调用方已保证本挂点在 `compatible_component_ids` 内（BI4 与 BW16_BI16
+        不能混用；不兼容的挂点不进入本函数）。
+        """
+        plan = self._redirect_target_map[target_ib]
+        for slot in slots:
+            section.append(
+                "; 每槽守卫：本组全部部件在该槽都已当帧到达才重放"
+                "（if 内只有绑定与 draw）"
+            )
+            section.append(f"if {self._merged_group_slot_seen_condition(skeleton_group, slot)}")
+            section.append(
+                f"    vs-t0 = {self._merged_skeleton_name(skeleton_group, slot)}"
+            )
+            section.append(f"    so0 = ref {self._merged_redirect_so_name(slot)}")
+            for vb0_resource, vb2_resource, draw_count in plan.get("deform_draws", []):
+                section.append(f"    vb2 = {vb2_resource}")
+                section.append(f"    vb0 = {vb0_resource}")
+                section.append(f"    draw = {int(draw_count)}, 0")
+            section.append("    so0 = null")
+            section.append("endif")
+
+    def _append_merged_direct_slot_guards(
+        self, section, draw_ib: str, skeleton_group: int, slots, fallback_draw_number: int = 0
+    ) -> None:
+        """直连路径（无 SO 重定向）的每槽守卫：组内全部部件当帧到达才画合并几何。
+
+        vb0/vb2 沿用本部件自己的绑定（合并几何就是从本部件导出的 VB 读的），
+        因此守卫体内只有 `vs-t0` 与 `draw`——同样满足「if 内不得 run / 不得给
+        $变量赋值」。
+
+        draw 顶点数取本 DrawIB 的**导出顶点数**（所有子网格导出顶点之和 =
+        合并网格在本部件 VB 里的实际行数）——不用 draw_number：合并几何是从
+        导出 buffer 读的，超出原部件顶点数的部分正是被合并进来的其它部件几何，
+        按原部件顶点数画会截掉它们。
+        只有导出顶点数为 0 的测试桩/空变体才回退到 `fallback_draw_number`
+        （保持旧行为，避免旧工作空间突然不画）。
+        """
+        draw_count = int(self._drawib_exported_vertex_count(draw_ib) or 0)
+        if draw_count <= 0:
+            draw_count = int(fallback_draw_number or 0)
+        if draw_count <= 0:
+            # 该变体下没有任何可画的合并几何：不发守卫，避免 `draw = 0, 0`。
+            return
+        for slot in slots:
+            section.append(
+                "; 每槽守卫（直连路径）：本组全部部件在该槽都已当帧到达才绘制"
+                "（if 内只有绑定与 draw）"
+            )
+            section.append(f"if {self._merged_group_slot_seen_condition(skeleton_group, slot)}")
+            section.append(
+                f"    vs-t0 = {self._merged_skeleton_name(skeleton_group, slot)}"
+            )
+            section.append(f"    draw = {draw_count}, 0")
+            section.append("endif")
+
     def add_unity_vs_texture_override_vb_sections(self, ini_builder: M_IniBuilder, drawib_model):
         d3d11_game_type = drawib_model.d3d11GameType
         draw_ib = drawib_model.draw_ib
@@ -808,101 +1304,23 @@ class ExportZZMI(ExportUnity):
 
             draw_category_name = d3d11_game_type.CategoryDrawCategoryDict.get("Blend", None)
             if draw_category_name is not None and category_name == draw_category_name:
-                # ZZMI 骨骼合并：deform draw 前把当帧 palette copy 成持久资源，
-                # 立即 attach 到本组骨架，并记录该部件本帧已到达。合并网格的
-                # 可见 draw 由依赖就绪守卫控制，避免目标先到时读取半成品骨架。
-                merged_component = self.merged_skeleton_component_id_dict.get(draw_ib)
-                component = (
-                    self.merged_skeleton_components[merged_component]
-                    if merged_component is not None else None
-                )
-                if component is not None:
-                    component_id = int(merged_component)
-                    skeleton_group = int(component["skeleton_group"])
-                    seen_var = f"$zz_ms_seen_c{component_id}"
-                    texture_override_vb_section.append(
-                        f"ResourceZZPalette_{draw_ib} = copy vs-t0 unless_null"
+                if self.merged_skeleton_component_id_dict.get(draw_ib) is not None:
+                    self._append_merged_skeleton_deform_block(
+                        texture_override_vb_section, drawib_model
                     )
-                    texture_override_vb_section.append(
-                        f"run = CustomShaderZZMIMergedSkeletonAttach_C{component_id}"
-                    )
-                    texture_override_vb_section.append(f"{seen_var} = 1")
-                    texture_override_vb_section.append(
-                        f"vs-t0 = ResourceZZMergedSkeleton_G{skeleton_group}"
-                    )
-                redirect_target_plan = self._redirect_target_map.get(draw_ib)
-                if redirect_target_plan is not None:
-                    # 有真实几何的 target 仍由自身捕获 SO；纯占位 target 则由
-                    # 兼容的 carrier 捕获，避免 target 晚到时把有效 carrier SO
-                    # 覆盖为空或以 BI4 布局执行 BI16 重放。
-                    if redirect_target_plan.get("target_has_real_geometry", True):
-                        texture_override_vb_section.append(
-                            f"ResourceZZRedirectSO_{draw_ib} = ref so0"
-                        )
-                # 纯占位 target 的 SO owner 是第一个 carrier。该赋值必须只在
-                # owner 挂点出现；若 target 晚到，不能再次覆盖已写入的有效 SO。
-                for owner_target_ib, owner_plan in self._redirect_target_map.items():
-                    if (
-                        owner_plan.get("so_owner_ib") == draw_ib
-                        and not owner_plan.get("target_has_real_geometry", True)
-                    ):
-                        texture_override_vb_section.append(
-                            f"ResourceZZRedirectSO_{owner_target_ib} = ref so0"
-                        )
-                texture_override_vb_section.append("handling = skip")
-
-                # 合并网格自动重定向：carrier 的 deform 退化为 3 顶点 stub draw
-                # （保留 copy palette + attach 写当帧骨骼）；target 的 deform 追加
-                # 画重定向的合并网格（绑定 carrier 的 vb0/vb2，SO 按序拼接）。
-                redirect_carrier = self._redirect_carrier_map.get(draw_ib)
-                if redirect_carrier is not None:
-                    texture_override_vb_section.append("draw = 3, 0")
-                elif redirect_target_plan is not None:
-                    pass  # target 自身几何也在 guarded target-SO 重放中统一绘制
                 else:
+                    # B3/C1 回归修复（用户裁决 2026-09-11）：非合并路径必须保留
+                    # 「抑制原 deform draw + 用模组顶点按原顶点数重绘」语义。本次改动
+                    # 曾把下面两行收窄为"仅合并组件才发"，而本方法被 ExportZZMI 整体
+                    # 覆写且不调 super()（基类 unity.py:58-61 兜不住）⇒ 非合并模式
+                    # （未勾合并 / 无合并缓存 / vg_count<=0）少发这两条指令且无等价
+                    # 替代（IB 段的 handling=skip 管渲染 draw，不管 deform draw）。
+                    # 此处按 `git show HEAD:ui/universal/zzmi.py` 809-865 的原始行为
+                    # 无条件恢复同样的两行、同样顺序。
+                    texture_override_vb_section.append("handling = skip")
                     texture_override_vb_section.append(
                         "draw = " + str(drawib_model.draw_number) + ", 0"
                     )
-
-                # 合并网格的可见几何不再固定在 target 的 deform 顺序上：
-                # 所有依赖组件挂点都尝试，但只有依赖 palette 全部当帧 attach 后
-                # 的第一个挂点真正 draw。无论当前是 target 还是 carrier，都把
-                # SO 明确绑回已捕获的 target SO，渲染侧数据源保持不变。
-                deferred_plans = [
-                    (target_ib, plan)
-                    for target_ib, plan in self._redirect_target_map.items()
-                    if merged_component is not None
-                    and int(merged_component) in plan.get("required_component_ids", [])
-                ]
-                for deferred_target_ib, deferred_plan in deferred_plans:
-                    compatible_ids = deferred_plan.get("compatible_component_ids")
-                    if (
-                        compatible_ids is not None
-                        and int(merged_component) not in compatible_ids
-                    ):
-                        continue
-                    required_ids = deferred_plan.get("required_component_ids", [])
-                    all_seen = " && ".join(
-                        f"$zz_ms_seen_c{cid} == 1" for cid in required_ids
-                    )
-                    drawn_var = f"$zz_ms_redirect_drawn_{deferred_target_ib}"
-                    texture_override_vb_section.append(
-                        f"if {all_seen} && {drawn_var} == 0"
-                    )
-                    texture_override_vb_section.append(f"    {drawn_var} = 1")
-                    texture_override_vb_section.append(
-                        f"    so0 = ref ResourceZZRedirectSO_{deferred_target_ib}"
-                    )
-                    for vb0_resource, vb2_resource, draw_count in deferred_plan.get(
-                        "deform_draws", []
-                    ):
-                        texture_override_vb_section.append("    vb2 = " + vb2_resource)
-                        texture_override_vb_section.append("    vb0 = " + vb0_resource)
-                        texture_override_vb_section.append(
-                            "    draw = " + str(draw_count) + ", 0"
-                        )
-                    texture_override_vb_section.append("    so0 = null")
-                    texture_override_vb_section.append("endif")
                 for so0_source_resource_name in so0_source_resource_names:
                     texture_override_vb_section.append(so0_source_resource_name + " = ref so0")
 
@@ -950,6 +1368,30 @@ class ExportZZMI(ExportUnity):
                 vertex_count = carrier_target_plan["so_vertex_count"]
             else:
                 vertex_count = 3
+                # F9 边界（t6 复核保留项）：carrier 的渲染 drawindexed 读本实例 SO
+                # 的「前缀 3 行 + 合并行」，因此要求本实例 SO 容量覆盖
+                # so_vertex_count 行。SO 容量由 **SO owner 部件**的
+                # VertexLimitRaise 声明（纯占位 target 时 owner = 第一个 carrier；
+                # 有真实几何时 owner = target，target 段自带声明）。
+                # 多 carrier 时非 owner 的 carrier 这里只声明自己的 3 行占位容量：
+                # 若游戏按"本 IB 的声明"分配共享 SO，合并几何尾部会被截断。
+                # 该组合当前无实测样本。**仅升级诊断措辞与标注，未改动下面的
+                # 声明行数（vertex_count = 3）**——改声明会改变生成产物、有实机
+                # 风险。F9：待实机确认游戏是否按 SO owner 的声明分配本实例共享 SO。
+                so_owner_ib = str(carrier_target_plan.get("so_owner_ib", "") or "")
+                required_rows = int(carrier_target_plan.get("so_vertex_count", 0) or 0)
+                if required_rows > vertex_count and so_owner_ib not in (
+                    draw_ib,
+                    str(redirect_carrier.get("target", "") or ""),
+                ):
+                    print(
+                        "⚠️ [ZZMI骨骼合并] 需要你确认（F9 / 多 carrier SO 容量）："
+                        f"DrawIB {draw_ib} 的 VertexLimitRaise 只声明 {vertex_count} 行，"
+                        f"但本组合并几何渲染读取 {required_rows} 行（SO owner = {so_owner_ib}）。"
+                        "影响：若游戏按『本 IB 的声明』分配共享 SO，合并几何尾部会被截断"
+                        "（实机现象：模型局部缺失 / 网格错位）。"
+                        "处置：导出不中断；请实机确认 SO 分配口径，若确认截断请回报。"
+                    )
         else:
             vertex_count = redirect_target["so_vertex_count"]
         vertexlimit_section = M_IniSection(M_SectionType.TextureOverrideVertexLimitRaise)
@@ -981,8 +1423,8 @@ class ExportZZMI(ExportUnity):
 
         骨骼 id 取顶点组**名字**（导入约定：组名 = 全局骨骼 id；join 按名合并，
         组名恒为骨骼 id，而索引不保证）。非数字组名跳过（不是骨骼）。
-        占位小三角面对象（ZZMI_STUB，权重挂在组 "0"）跳过——它是不可见标记，
-        不是真实几何，不该触发跨组报警。
+        占位小三角面对象（ZZMI_STUB，权重挂在已注册槽——json VGMap 首值）跳过——它是
+        不可见标记，不是真实几何，不该触发跨组报警。
         """
         used: set[int] = set()
         for drawib_model in self.drawib_model_list:
@@ -1422,19 +1864,45 @@ class ExportZZMI(ExportUnity):
                     }
                 continue
 
-            # target 的 SO 布局：[target 完整导出顶点（含 stub）][carrier1 merged]...
-            base_vertex = target_own_vertices
-            deform_draws = []
-            # 纯占位 target 只需要保留 SO 前缀，不能把它的 BI4/BI8 等输入布局
-            # 带进后续 carrier 的实际重放；carrier 的 3 顶点 stub draw 会占住
-            # 前缀，真实 carrier 几何仍从 base_vertex=3 开始，因此无需 target draw。
-            if target_has_real_geometry and target_own_vertices > 0:
-                deform_draws.append((
-                    f"Resource{target_ib}Position",
-                    f"Resource{target_ib}Blend",
-                    target_own_vertices,
-                ))
-            so_total = target_own_vertices
+            # target 的 SO 布局：**[target 在变体 pass 里实际写入的前缀行][carrier merged]...**
+            #
+            # 关键不变量：base_vertex 必须等于本 pass **实际写进 SO 的行数之和**
+            # （= 本 pass 中所有写 SO 的 draw 顶点数之和）。历史事故：浮波柚叶01
+            # 的 target 两个子网格都成了占位小三角，target 自己那条 deform draw
+            # 被跳过（不能把它的 BI4/BI8 输入布局带进 carrier 重放），prefix 只剩
+            # carrier 的 3 顶点占位 stub —— 而 base_vertex 仍按"设计意图"取
+            # target_own_vertices=6，渲染从 SO[6] 开始读实际只写满 SO[0..2] 的
+            # 缓冲 → 合并几何整体错位 3 个顶点（爆炸）。
+            #
+            # 因此前缀行数改由 _redirect_plan_prefix_rows() 按"本 pass 实写行数"
+            # 计算：纯占位 target 不额外写前缀（用占位 stub 的实写行数），base_vertex
+            # 与 redirect Texcoord pad 同源取值，三者不可能再不一致。
+            prefix_draws = self._build_redirect_plan_prefix_draws(
+                target_ib,
+                target_own_vertices,
+                target_has_real_geometry,
+            )
+            so_prefix_rows = self._redirect_plan_prefix_rows(
+                target_own_vertices,
+                target_has_real_geometry,
+            )
+            # plan_prefix_rows 是"本 pass 前缀实写行数"的不可变快照：
+            # base_vertex 会被下面按 carrier 累加（渲染侧依次读到各 carrier 区段），
+            # 因此自检与 target_map 必须引用这个快照，不能引用被累加后的 base_vertex。
+            #
+            # A1 修复（用户裁决 2026-09-11）：此前 `plan_prefix_rows = so_prefix_rows`
+            # 把两侧赋成同一个值，使下面 L2003 的自检**恒真、护栏实际不存在**
+            # （历史事故：浮波柚叶01 的 base_vertex 按设计意图取 6、实际只写满
+            # SO[0..2] → 合并几何整体错位 3 个顶点、画面爆炸）。现改为**独立重算**
+            # 「实写侧前缀行数」，与 base_vertex 同源取值路径（纯占位 target
+            # 用占位 stub 的实写行数），使自检真正能发现不一致。
+            plan_prefix_rows = self._redirect_plan_prefix_rows(
+                target_own_vertices,
+                target_has_real_geometry,
+            )
+            base_vertex = so_prefix_rows
+            deform_draws = list(prefix_draws)
+            so_total = base_vertex
             # 合并几何真正依赖哪些当帧 palette：至少包括所有 carrier，另外
             # 把 carrier 顶点实际引用的全局骨骼所属部件也纳入守卫。这样 target
             # 先到时不会读取半成品；最后一个依赖部件到达的 deform 挂点负责 draw。
@@ -1514,9 +1982,19 @@ class ExportZZMI(ExportUnity):
             # component arriving after all BI16 hosts).  Then every compatible
             # host has already run before the last dependency arrives, so the
             # emitted guard can never become true in this frame.  Keep the
-            # carrier stub/ready gate so stale RedirectSO data is not rendered,
-            # but publish an explicit diagnostic instead of silently producing
-            # a flickering mesh.
+            # carrier stub so stale RedirectSO data is not rendered as real
+            # geometry, and publish an explicit diagnostic instead of silently
+            # producing a flickering mesh (the merged draw stays undrawn because
+            # the replay never ran; 2026-09 v2 has no frame latch, so the next
+            # instance/frame re-evaluates the same guard).
+            #
+            # N3/F9：取消帧闩锁后 carrier 的渲染 drawindexed 是**无条件**的
+            # （不再包 `if drawn == 1`），所以上述"重放永不成立"的变体下，渲染
+            # 可能读到上一帧 SO 的尾部。取舍固定：恢复帧闩锁会在多实例下再次
+            # 吞掉后续实例（用户实测已证伪该方向），因此保持无闩锁 + 导出期
+            # 大声诊断，由用户换帧重抓或改名修复；SO 容量侧的不变量说明见
+            # add_unity_vs_texture_override_vlr_section（非 SO owner 的 carrier 会
+            # 打印显式诊断）。
             if required_component_ids:
                 required_draws = [
                     int(
@@ -1543,15 +2021,37 @@ class ExportZZMI(ExportUnity):
                             "target": last.get("unique_str") or "",
                         }
 
+            # 离线自检（无副作用诊断）：声明侧 base_vertex 与实写侧前缀行数
+            # 必须同源。prefix_write_rows = 本变体 pass 里真正会写 SO 前缀的行数：
+            #   target 自身 deform draw 的行数（有真实几何）+ 占位 stub 的行数
+            #   （纯占位 target，由该 pass 里 carrier 的 stub draw 实写）。
+            # 二者不一致时导出仍然继续（fixtures/骨架未就绪的旧工作空间不误伤），
+            # 但会大声打印，便于离线自检脚本与用户第一时间发现错位。
+            if int(plan_prefix_rows or 0) != int(so_prefix_rows or 0):
+                print(
+                    f"[ZZMI骨骼合并] !!! SO 前缀不一致: base_vertex="
+                    f"{int(so_prefix_rows or 0)} 但本变体 pass 实写前缀 "
+                    f"{int(plan_prefix_rows or 0)} 行（DrawIB {target_ib}）——"
+                    "合并几何会整体位移；请检查 base_vertex 与实写前缀是否同源。"
+                )
+
             target_map[target_ib] = {
                 "target_ib": target_ib,
+                "target_component_id": component_id_by_draw_ib.get(target_ib),
                 "deform_draws": deform_draws,
                 "so_vertex_count": so_total,
                 "target_own_vertices": target_own_vertices,
+                "so_prefix_rows": int(plan_prefix_rows or 0),
                 "target_has_real_geometry": target_has_real_geometry,
                 "so_owner_ib": so_owner_ib,
                 "required_component_ids": sorted(required_component_ids),
                 "compatible_component_ids": compatible_component_ids,
+                # 该组最后一个 deform 挂点自己能否承载重放：布局兼容且必需依赖
+                # 不会晚于所有兼容宿主（后者由下方 unredirected 判定）。
+                "target_viable": (
+                    target_ib not in unredirected
+                    and target_component_id in compatible_component_ids
+                ),
                 "so_stride": next(
                     (
                         int(
@@ -1576,6 +2076,49 @@ class ExportZZMI(ExportUnity):
         return carrier_map, target_map, unredirected
 
     @staticmethod
+    def _redirect_plan_prefix_rows(
+        target_own_vertices: int,
+        target_has_real_geometry: bool,
+    ) -> int:
+        """本变体 pass 里写入 SO 前缀的行数（= base_vertex 的唯一来源）。
+
+        - target 有真实几何：target 自己的 deform draw 写满 target_own_vertices 行；
+        - 纯占位 target：target 自己的 draw 被跳过，前缀只剩该 pass 里 carrier 的
+          占位 stub draw（3 顶点小三角）——前缀行数必须按"实写行数"取，不能按
+          target 的声明顶点数取，否则渲染会从没写过的行开始读（浮波柚叶01 爆炸）。
+        """
+        if target_has_real_geometry:
+            return int(target_own_vertices or 0)
+        return int(ZZMI_STUB_PREFIX_ROWS)
+
+    def _build_redirect_plan_prefix_draws(
+        self,
+        target_ib: str,
+        target_own_vertices: int,
+        target_has_real_geometry: bool,
+    ) -> list[tuple[str, str, int]]:
+        """构造变体 pass 里**写入 SO 前缀**的 target 自身 draw 序列。
+
+        返回 ``[(vb0 资源名, vb2 资源名, 顶点数), ...]``，按写入顺序排列。
+        - target 有真实几何：target 自己的 deform draw 承担 target_own_vertices 行；
+        - 纯占位 target：target 自己的 draw 被跳过，前缀由该 pass 里 carrier 的
+          占位 stub draw 实写（见 ``_redirect_plan_prefix_rows``），这里不再产生
+          draw（避免把 target 的输入布局带进 carrier 重放）。
+        """
+        prefix_draws: list[tuple[str, str, int]] = []
+        if not target_has_real_geometry:
+            return prefix_draws
+        prefix_rows = int(target_own_vertices or 0)
+        if prefix_rows <= 0:
+            return prefix_draws
+        prefix_draws.append((
+            f"Resource{target_ib}Position",
+            f"Resource{target_ib}Blend",
+            prefix_rows,
+        ))
+        return prefix_draws
+
+    @staticmethod
     def _redirect_texcoord_resource_name(target_ib: str, carrier_ib: str, base_vertex: int) -> str:
         """返回合并网格 carrier 专用的、已按 base_vertex 对齐的 Texcoord 资源名。"""
         return (
@@ -1589,10 +2132,11 @@ class ExportZZMI(ExportUnity):
     def _build_redirect_texcoord_payload(self, carrier_ib: str, carrier_info: dict) -> tuple[bytes, int]:
         """为 carrier 的 vb1 生成与 RedirectSO 相同顶点偏移的缓冲。
 
-        D3D11 的 ``base_vertex`` 会同时作用于所有顶点输入槽。合并重定向只把
-        ``vb0`` 换成 target 的 RedirectSO，而 carrier 原本的 vb1 从第 0 行开始，
-        因而会在每个索引上错读 ``base_vertex`` 行。这里在 Texcoord 前补齐同样
-        数量的空行，使 ``vb1[index + base_vertex]`` 仍命中 carrier 的 UV 行。
+        D3D11 的 ``base_vertex`` 会同时作用于所有顶点输入槽。合并重定向把本实例
+        deform 的合并行写进本实例 SO（渲染段沿用游戏原生 vb0，不再覆写），而
+        carrier 原本的 vb1 从第 0 行开始，因而会在每个索引上错读 ``base_vertex``
+        行。这里在 Texcoord 前补齐同样数量的空行，使 ``vb1[index + base_vertex]``
+        仍命中 carrier 的 UV 行。
         """
         drawib_model = next(
             (
@@ -1662,31 +2206,40 @@ class ExportZZMI(ExportUnity):
         return resource_definitions
 
     def add_merged_skeleton_sections(self, ini_builder: M_IniBuilder):
-        """生成 ZZMI 合并骨架段（组内统一骨架版：全局骨骼编号 + 逐 pass attach）。
+        """生成 ZZMI 合并骨架段（组内统一骨架 + 出现次槽位 v9 版）。
 
-        架构（2026-08-24 用户拍板分组；2026-08-25 用户拍板**移除 CB1 校准**；
-        2026-08-26 增加合并可见 draw 的依赖就绪守卫，详见计划书）：
+        架构（2026-08-24 用户拍板分组；2026-08-25 移除 CB1 校准；2026-08-26 增加
+        依赖就绪守卫；2026-09 v9 出现次槽位，用户游戏内实测通过）：
         - 骨骼 id = 全局编号（组基址拼接组内槽位）；Blender 侧组内 join 无歧义。
-        - 每组一套**全宽**合并骨架 `ResourceZZMergedSkeleton_G<N>`（array = 全局
-          max(vg_offset+vg_count)）：**只写本组骨骼**（无任何校准乘）。
+        - 骨架**按槽分份**：每组每槽一份 `ResourceZZMergedSkeleton_G<N>_s<k>`
+          （array 同现状 = 全局 max(vg_offset+vg_count)）。deform 段按出现次把
+          当帧 palette 写进 s<k>，attach 也只写该槽 → 多实例各占一槽、互不覆盖。
         - **禁止跨组别骨骼合并**：各组骨架只含本组骨骼；跨组别引用在导出时大声
           报警（`_warn_cross_group_bone_references`，无校准的运行时这些槽位
           永远不会被写入 = 原点塌陷）。
-        - **逐 pass attach + 依赖就绪 draw**：deform 段 copy 当帧 palette →
-          立即 run attach CS → 换绑本组骨架。自动重定向的合并可见几何不固定
-          绑在某一个 target 顺序上，而是在 carrier/target 挂点中等待其依赖的
-          palette 全部当帧到达后只 draw 一次；因此目标先到也不会读取半成品。
-          [Present] 只清理本帧到达/绘制标记，不重放持久 palette。
+        - **顶层无条件 attach + 每槽守卫**：所有 `run` 都在段顶层（本 fork 里
+          if 内的 run 不执行）；到达标记 seen 全部顶层 sticky 累加（if 体内赋值
+          会被优化器静态折叠）；守卫体内只有资源绑定与 draw。
+        - `[Constants]` 只声明 occ/seen；`[Present]` 只把 occ/seen 清零。
+          不生成 drawn/ready 之类闩锁变量，**不在 [Present] 里写任何资源复位**
+          （`ResourceZZRedirectSO_* = null` 的 F8 构造经实测有害，会废掉
+          [Present] 清场）。
         - 未生成组件无需任何延迟机制，继续走游戏原渲染（当帧 palette）。
         """
         section = M_IniSection(M_SectionType.MergedSkeleton)
         constants_section = M_IniSection(M_SectionType.Constants)
         constants_section.SectionName = "Constants"
         groups = self._merged_skeleton_groups()
+        slots = self._merged_skeleton_slots()
+
+        # [Constants] 只声明出现次与到达标记；每帧由 [Present] 清零。
+        constants_section.append("; [v9 出现次槽位 + 每槽守卫]")
         for component_id in range(len(self.merged_skeleton_components)):
-            constants_section.append(f"global $zz_ms_seen_c{component_id} = 0")
-        for target_ib in sorted(self._redirect_target_map):
-            constants_section.append(f"global $zz_ms_redirect_drawn_{target_ib} = 0")
+            constants_section.append(f"global {self._merged_occ_var(component_id)} = 0")
+            for slot in slots:
+                constants_section.append(
+                    f"global {self._merged_seen_var(component_id, slot)} = 0"
+                )
         constants_section.new_line()
 
         # 全宽口径：全局骨骼编号空间的大小 = 全部组件 max(vg_offset+vg_count)
@@ -1694,16 +2247,19 @@ class ExportZZMI(ExportUnity):
         # 同组 3 部件 0~10/11~30/31~50 且中间缺席时 sum=31 但 max=51，按 max 声明）。
         bones_count = max(c["vg_offset"] + c["vg_count"] for c in self.merged_skeleton_components)
 
-        # 每部件 palette 持久副本资源声明（deform VB 段里 copy vs-t0 写入当帧内容）。
-        # type=stride 必须显式声明：副本要作为 CS 的 cs-t0（SRV）按
+        # 每部件每槽 palette 持久副本资源声明（deform VB 段里 copy vs-t0 写入当帧
+        # 内容）。type=stride 必须显式声明：副本要作为 CS 的 cs-t0（SRV）按
         # StructuredBuffer<ZZBone3x4>（48 字节/骨骼）读取，空声明的 SRV 视图格式
         # 不受控，会读出垃圾矩阵（蒙皮每帧乱跳）。
         for component in self.merged_skeleton_components:
-            section.append(f"[ResourceZZPalette_{component['draw_ib']}]")
-            section.append("type = Buffer")
-            section.append("stride = 48")
-            section.append(f"array = {component['vg_count']}")
-            section.new_line()
+            for slot in slots:
+                section.append(
+                    f"[{self._merged_palette_name(component['draw_ib'], slot)}]"
+                )
+                section.append("type = Buffer")
+                section.append("stride = 48")
+                section.append(f"array = {component['vg_count']}")
+                section.new_line()
 
         # 每部件 vg_map 表（局部骨骼 id -> 合并骨架全局槽位）：attach CS 的 cs-t1
         # 按此写槽位——本部件引用的共享 canonical 槽位当帧覆盖，后续 deform 的
@@ -1733,13 +2289,18 @@ class ExportZZMI(ExportUnity):
                 payload,
             )
 
-        # 自动重定向 target 的真实 SO 资源引用。target 先到时先捕获 so0；
-        # 依赖齐全后可在任意后续组件挂点把合并 draw 回写到同一 target SO。
+        # 每槽一份 SO 重定向资源（全 target 共享）。只有 SO owner（载体）部件的
+        # deform 段捕获 `ref so0`；target 先到时由自身捕获，纯占位 target 则由
+        # 兼容的 carrier 捕获，避免 target 晚到时把有效 SO 覆盖为空。
+        so_stride_by_slot: dict[int, int] = {}
         for target_ib in sorted(self._redirect_target_map):
             plan = self._redirect_target_map[target_ib]
-            section.append(f"[ResourceZZRedirectSO_{target_ib}]")
+            for slot in slots:
+                so_stride_by_slot.setdefault(slot, int(plan.get("so_stride", 40)))
+        for slot in slots:
+            section.append(f"[{self._merged_redirect_so_name(slot)}]")
             section.append("type = Buffer")
-            section.append(f"stride = {int(plan.get('so_stride', 40))}")
+            section.append(f"stride = {int(so_stride_by_slot.get(slot, 40))}")
             section.new_line()
 
         # RedirectSO 使用 DrawIndexed 的 base_vertex 读取合并 Position；D3D11 会
@@ -1747,45 +2308,62 @@ class ExportZZMI(ExportUnity):
         # 同样数量的顶点行。否则位置与 UV 会错位，表现为 UV 整体乱跳/串块。
         redirect_texcoord_resources = self._write_redirect_texcoord_resources()
 
-        # 每组一套合并骨架（组内统一：只直拷本组骨骼，跨组别禁止合并）。
+        # 每组每槽一份合并骨架（组内统一：只直拷本组骨骼，跨组别禁止合并）。
         for skeleton_group in groups:
-            section.append(f"[ResourceZZMergedSkeleton_G{skeleton_group}]")
-            section.append("type = RWStructuredBuffer")
-            section.append("stride = 48")
-            section.append("array = " + str(bones_count))
-            section.new_line()
+            for slot in slots:
+                section.append(
+                    f"[{self._merged_skeleton_name(skeleton_group, slot)}]"
+                )
+                section.append("type = RWStructuredBuffer")
+                section.append("stride = 48")
+                section.append("array = " + str(bones_count))
+                section.new_line()
 
-        # 逐部件 attach 段（y1 = vg_count；仅由 deform VB 段调用）。
+        # 逐 (部件, 槽) attach 段（y1 = vg_count；仅由 deform VB 段顶层调用）。
         # Dispatch 按 HLSL numthreads(64,1,1) 动态取整，避免 palette > 512 时
         # 固定 8 组漏掉尾部骨骼。
-        for component_id, component in enumerate(self.merged_skeleton_components):
-            vg_count = int(component["vg_count"])
-            dispatch_count = max(
-                1,
-                (vg_count + self.MERGED_SKELETON_ATTACH_THREADS - 1)
-                // self.MERGED_SKELETON_ATTACH_THREADS,
-            )
-            section.append(f"[CustomShaderZZMIMergedSkeletonAttach_C{component_id}]")
-            section.append("flags = optimization_level3 all_resources_bound skip_validation")
-            section.append("cs = ./res/zzmi_merged_skeleton_attach.hlsl")
-            section.append("x1 = 0")
-            section.append(f"y1 = {vg_count}")
-            section.append(f"cs-t0 = ref ResourceZZPalette_{component['draw_ib']}")
-            section.append(f"cs-t1 = ref ResourceZZVgMap_{component['draw_ib']}")
-            section.append(
-                f"cs-u0 = ref ResourceZZMergedSkeleton_G{component['skeleton_group']}"
-            )
-            section.append(f"Dispatch = {dispatch_count}, 1, 1")
-            section.append("cs-u0 = null")
-            section.new_line()
+        for slot in slots:
+            for component_id, component in enumerate(self.merged_skeleton_components):
+                vg_count = int(component["vg_count"])
+                dispatch_count = max(
+                    1,
+                    (vg_count + self.MERGED_SKELETON_ATTACH_THREADS - 1)
+                    // self.MERGED_SKELETON_ATTACH_THREADS,
+                )
+                section.append(f"[{self._merged_attach_name(component_id, slot)}]")
+                section.append("flags = optimization_level3 all_resources_bound skip_validation")
+                section.append("cs = ./res/zzmi_merged_skeleton_attach.hlsl")
+                section.append("x1 = 0")
+                section.append(f"y1 = {vg_count}")
+                section.append(
+                    f"cs-t0 = ref {self._merged_palette_name(component['draw_ib'], slot)}"
+                )
+                section.append(f"cs-t1 = ref ResourceZZVgMap_{component['draw_ib']}")
+                section.append(
+                    "cs-u0 = ref "
+                    + self._merged_skeleton_name(
+                        int(component["skeleton_group"]), slot
+                    )
+                )
+                section.append(f"Dispatch = {dispatch_count}, 1, 1")
+                section.append("cs-u0 = null")
+                section.new_line()
 
-        # [Present] 只清理本帧到达/绘制标记，不再重放可能跨帧/跨对象的 palette 副本。
+        # [Present] 只把 occ/seen 清零（跨帧兜底）。
+        # 教训（2026-09 实测回归）：不要在 [Present] 里写 RedirectSO 资源复位
+        # （ResourceZZRedirectSO_<ib> = null，即原 F8 防御性构造）。该语句会
+        # 废掉 [Present] 段的正常执行，使 occ/seen 的跨帧清场失效 → 第二实例
+        # 加入/被剔除的过渡帧残留半组状态，随后错槽重放，表现为后加入实例
+        # 闪烁直至卡死无动画。RedirectSO 只在同槽「deform 捕获 → 守卫重放」
+        # 窗口内使用，渲染段不引用，无需帧末复位。
         present_section = M_IniSection(M_SectionType.Present)
         present_section.SectionName = "Present"
         for component_id in range(len(self.merged_skeleton_components)):
-            present_section.append(f"$zz_ms_seen_c{component_id} = 0")
-        for target_ib in sorted(self._redirect_target_map):
-            present_section.append(f"$zz_ms_redirect_drawn_{target_ib} = 0")
+            present_section.append(f"{self._merged_occ_var(component_id)} = 0")
+            for slot in slots:
+                present_section.append(
+                    f"{self._merged_seen_var(component_id, slot)} = 0"
+                )
         present_section.new_line()
 
         ini_builder.append_section(section)
@@ -1903,9 +2481,10 @@ class ExportZZMI(ExportUnity):
             # 一个运行时匹配键下：纹理、透明、shader replace 和 mesh 备注互相
             # 覆盖；target 的占位段还会用 ib=null 把对应物体整个跳过。
             #
-            # 现在每个段始终使用自己的 hash/first_index。carrier 若需读取合并
-            # 后的 SO，显式绑定 RedirectSO；target/缺失部件的占位 IB 保持可见
-            # （几何尺寸为 1e-6），不再使用 ib=null 作为“跳过”手段。
+            # 现在每个段始终使用自己的 hash/first_index。carrier 的合并行由**本实例**
+            # 的 deform 段重放写入本实例 SO，渲染段沿用游戏原生 vb0（不再覆写
+            # RedirectSO）；target/缺失部件的占位 IB 保持可见（几何尺寸为 1e-6），
+            # 不再使用 ib=null 作为“跳过”手段。
             redirect_carrier_info = self._redirect_carrier_map.get(draw_ib)
             override_hash = draw_ib
             override_first_index = submesh_model.match_first_index
@@ -1914,13 +2493,13 @@ class ExportZZMI(ExportUnity):
             texture_override_ib_section.append("hash = " + override_hash)
             texture_override_ib_section.append("match_first_index = " + str(override_first_index))
 
-            if redirect_carrier_info is not None:
-                # carrier 的索引仍属于 carrier，但顶点来自 target 的合并 SO。
-                # 显式换绑 vb0 后，渲染匹配键仍保持 carrier hash，不会与 target
-                # 或同 DrawIB 的其它子网格串台。
-                texture_override_ib_section.append(
-                    "vb0 = ResourceZZRedirectSO_" + redirect_carrier_info["target"]
-                )
+            # 2026-09 多实例分离 v2（用户实测通过）：carrier 的渲染 draw
+            # **不再覆写 vb0**。旧实现 `vb0 = ResourceZZRedirectSO_<target>` 把该
+            # IB 的所有实例都钉到同一个 SO 资源变量上（后到实例的捕获会改指向，
+            # 先到实例的渲染因此读到别的实例的蒙皮结果）。游戏渲染 draw 的 vb0
+            # 天然是本实例 deform 的 SO（so0=vb0 指针族严格分实例），重放已把
+            # 本实例的合并行写进去；索引仍属于 carrier，渲染匹配键仍保持
+            # carrier hash，不会与 target 或同 DrawIB 的其它子网格串台。
 
             ib_buf = drawib_model.submesh_ib_dict.get(submesh_model.unique_str, None)
             if ib_buf is None or len(ib_buf) == 0:
@@ -2004,14 +2583,19 @@ class ExportZZMI(ExportUnity):
             else:
                 print(f"[CrossIB ZZMI] 非源块绘制物体: {len(submesh_model.drawcall_model_list)} 个")
                 if redirect_carrier_info is not None:
-                    # 合并网格重定向：drawindexed 带 base_vertex——从 target 的 SO
-                    # 中读本合并网格的区段（offset 保持本 submesh 的索引偏移）
+                    # 合并网格重定向：drawindexed 带 base_vertex——从**本实例**的
+                    # SO 中读本合并网格的区段（offset 保持本 submesh 的索引偏移）。
+                    # 2026-09 多实例分离 v2（用户实测通过）：不再覆写 vb0、也不再包
+                    # `if $zz_ms_redirect_drawn_<target> == 1` 帧闩锁——旧写法把两个
+                    # 实例钉到同一个 SO 资源变量上，并让同一帧的后续实例等不到重放。
+                    # 游戏渲染 draw 的 vb0 本来就是本实例自己的 deform SO（so0=vb0
+                    # 指针族严格分实例），重放已把本实例的蒙皮结果写进去，因此这里
+                    # 无条件发 drawindexed，每个实例各画一次。
                     base_vertex = redirect_carrier_info["base_vertex"]
-                    self._append_ready_gated_render_draws(
+                    self._append_drawindexed_with_shader_replace(
                         texture_override_ib_section,
                         submesh_model.drawcall_model_list,
                         drawib_model.obj_name_draw_offset,
-                        redirect_carrier_info["target"],
                         base_vertex=base_vertex,
                     )
                 else:
