@@ -8,6 +8,11 @@ from ..utils.log_utils import LOG
 
 from ..common.global_config import GlobalConfig
 from ..common.global_key_count_helper import GlobalKeyCountHelper
+from ..common.config_table_backup import (
+    backup_config_tables,
+    find_config_table_files,
+    restore_config_tables,
+)
 
 from ..blueprint.model import BluePrintModel
 from ..blueprint.direct_export import execute_direct_export, has_direct_export_mode
@@ -42,6 +47,17 @@ class SSMTGenerateModBlueprint(bpy.types.Operator):
         options={'SKIP_SAVE'},
     ) # type: ignore
 
+    overwrite_config: bpy.props.EnumProperty(
+        name="配置表覆盖",
+        description="导出目录中已存在配置表（*.ini），选择是否覆盖",
+        items=[
+            ('YES', "是", "将旧配置表改名并移动至备份，然后正常导出并生成新的配置表"),
+            ('NO', "否", "将旧配置表改名并移动至备份，导出完成后恢复旧配置表"),
+        ],
+        default='YES',
+        options={'SKIP_SAVE'},
+    ) # type: ignore
+
     def _resolve_target_tree(self, context):
         """解析目标蓝图节点树"""
         requested_tree_name = str(getattr(self, "blueprint_name", "") or "").strip()
@@ -60,7 +76,7 @@ class SSMTGenerateModBlueprint(bpy.types.Operator):
         return tree
 
     def invoke(self, context, event):
-        """弹窗确认导出目录是否为空（含后处理节点时）"""
+        """弹窗确认导出目录中的配置表是否覆盖（含后处理节点时）"""
         tree = self._resolve_target_tree(context)
         if not tree:
             return self.execute(context)
@@ -70,21 +86,30 @@ class SSMTGenerateModBlueprint(bpy.types.Operator):
         if has_postprocess:
             mod_export_path = GlobalConfig.path_generate_mod_folder()
             if mod_export_path and os.path.exists(mod_export_path):
-                if os.listdir(mod_export_path):
+                config_table_paths = find_config_table_files(mod_export_path)
+                if config_table_paths:
                     self._export_path = mod_export_path
-                    return context.window_manager.invoke_props_dialog(self, width=400)
+                    self._config_table_paths = config_table_paths
+                    self._backup_pending = True
+                    return context.window_manager.invoke_props_dialog(self, width=460)
 
         return self.execute(context)
 
     def draw(self, context):
         """绘制确认对话框"""
         layout = self.layout
-        layout.label(text="⚠️ 导出目录不为空！", icon='ERROR')
+        layout.label(text="⚠️ 导出目录中存在配置表！", icon='ERROR')
         layout.separator()
         layout.label(text=f"路径: {getattr(self, '_export_path', '未知')}")
-        layout.label(text="检测到后处理节点，继续导出可能会覆盖现有文件。")
+        for config_path in getattr(self, '_config_table_paths', []) or []:
+            layout.label(text=f"   • {os.path.basename(config_path)}")
         layout.separator()
-        layout.label(text="是否继续导出？")
+        layout.label(text="是否覆盖配置表？")
+        layout.prop(self, "overwrite_config", expand=True)
+        if self.overwrite_config == 'YES':
+            layout.label(text="旧配置表将改名并移动至备份，导出后生成新的配置表。", icon='INFO')
+        else:
+            layout.label(text="旧配置表将改名并移动至备份，导出完成后自动恢复旧配置表。", icon='INFO')
 
     def _has_postprocess_nodes(self, tree) -> bool:
         """检查蓝图中是否包含后处理节点"""
@@ -134,6 +159,22 @@ class SSMTGenerateModBlueprint(bpy.types.Operator):
                 )
             return {'CANCELLED'}
 
+        # 配置表备份：弹窗确认后，将旧配置表改名并移动至备份目录
+        self._backup_entries = []
+        if getattr(self, "_backup_pending", False):
+            mod_export_path = GlobalConfig.path_generate_mod_folder()
+            self._backup_entries = backup_config_tables(
+                mod_export_path,
+                getattr(self, "_config_table_paths", []) or [],
+            )
+            self._backup_pending = False
+            if self._backup_entries:
+                backup_root = os.path.dirname(self._backup_entries[0][1])
+                if self.overwrite_config == 'YES':
+                    LOG.info(f"💾 旧配置表已备份至: {backup_root}，导出后将生成新的配置表")
+                else:
+                    LOG.info(f"💾 旧配置表已备份至: {backup_root}，导出完成后将恢复旧配置表")
+
         BlueprintExportHelper.set_runtime_blueprint_tree(tree)
         BlueprintExportHelper.reset_direct_export_runtime_state(clear_postprocess_caches=True)
         TimerUtils.end_stage("蓝图验证")
@@ -161,6 +202,10 @@ class SSMTGenerateModBlueprint(bpy.types.Operator):
                 print(f"❌ 直出过程中发生错误: {e}")
                 LOG.exception(e)
                 PreProcessHelper.cleanup_copies(silent=True)
+
+            # 选择「否」时：导出完成后把备份的旧配置表覆盖回原位；「是」则保留新配置表
+            if self.overwrite_config == 'NO':
+                restore_config_tables(self._backup_entries)
 
             LOG.info("")
             LOG.info("📍 清理阶段")
@@ -330,6 +375,10 @@ class SSMTGenerateModBlueprint(bpy.types.Operator):
             LOG.exception(e)
 
             PreProcessHelper.cleanup_copies(silent=True)
+
+        # 选择「否」时：导出完成后把备份的旧配置表覆盖回原位；「是」则保留新配置表
+        if self.overwrite_config == 'NO':
+            restore_config_tables(self._backup_entries)
 
         LOG.info("")
         LOG.info("📍 清理阶段")
