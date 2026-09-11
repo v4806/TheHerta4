@@ -402,6 +402,7 @@ class ATP_PT_AnimationFrameSplit(bpy.types.Panel):
 
         box.separator()
         box.prop(props, "anim_split_set_linear")
+        box.prop(props, "anim_split_keep_frame_origin")
         
         op_row = box.row()
         op_row.enabled = has_selection

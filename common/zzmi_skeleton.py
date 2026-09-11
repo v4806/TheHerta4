@@ -476,6 +476,7 @@ class ZZMIBoneMapBuilder:
         part_palettes: dict[str, numpy.ndarray],
         part_signatures: dict[str, dict] | None = None,
         rigid_centroid_tolerance: float = 0.05,
+        dedup_excluded: set[str] | None = None,
     ) -> tuple[dict[str, dict], dict[str, int], int]:
         """跨部件按矩阵 bitwise 判等去重（刚性部件加权质心门控），构建 vg_map / vg_offset / 总槽位。
 
@@ -484,7 +485,13 @@ class ZZMIBoneMapBuilder:
               part_signatures: part_key -> {local: 驱动签名}（EFMIBoneMapBuilder.
               compute_driven_signatures 产出，仅用其 centroid 字段）；不传则退化为
               纯 bitwise 旧行为；
-              rigid_centroid_tolerance: 刚性部件命中对的质心确认阈值（默认 0.05 米）。
+              rigid_centroid_tolerance: 刚性部件命中对的质心确认阈值（默认 0.05 米）；
+              dedup_excluded: 部件级「排除去重」集合（part_key 集合，对齐 EFMI
+              efmi_skeleton.build_vg_maps）。集合内部件的每根骨骼**不参与任何去重合并**：
+              其 VGMap 恒为恒等映射（local -> offset + local，独占自己声明段内的
+              **组内**槽位，外部拼接组基址后即全局 vg_offset + local），且不注册进
+              owners——其它部件也查不到其槽位、无法并入。排除不改变其它部件的
+              offset 布局。对应子网格 json 标记键：``VGMapDedupExcluded=True``。
         返回:
             vg_maps: part_key -> {local_vg_id(int): global_vg_id(int)}
             vg_offsets: part_key -> 该部件在合并骨架中的起始槽位
@@ -511,6 +518,7 @@ class ZZMIBoneMapBuilder:
         vg_maps: dict[str, dict] = {}
         vg_offsets: dict[str, int] = {}
         offset = 0
+        excluded_set: set[str] = set(dedup_excluded or ())
 
         def _centroid_of(part_key: str, local_id: int):
             if part_signatures is None:
@@ -536,6 +544,16 @@ class ZZMIBoneMapBuilder:
             part_rigid = len(palette) == 1
             vg_offsets[part_key] = offset
             vg_map = {}
+            if part_key in excluded_set:
+                # 排除去重（对齐 EFMI efmi_skeleton.py:2377-2398）：被排除部件的
+                # 每根骨骼恒等映射 local -> offset + local（组内 offset 语义，
+                # 外部拼组基址后即全局 vg_offset + local），独占自己声明段；
+                # 不注册进 owners —— 其它部件查不到其槽位，无法把骨骼并入。
+                for local_id in range(len(palette)):
+                    vg_map[local_id] = offset + local_id
+                vg_maps[part_key] = vg_map
+                offset += len(palette)
+                continue
             for local_id in range(len(palette)):
                 bone_key = palette[local_id].tobytes()
                 hitter_centroid = _centroid_of(part_key, local_id)
@@ -956,10 +974,17 @@ class ZZMISkeletonMergeHelper:
                     "cb1_cache_valid": False,
                     "skip_reason": "",
                     "representative": unique_str,
+                    # 组件级「排除去重」（json 标记 VGMapDedupExcluded=True）：任一成员
+                    # 声名排除即整 DrawIB 退出合并（palette 按 DrawIB 共享），去重阶段
+                    # 恒等映射独占声明段；缺件占位侧同键跳过（ui/universal/zzmi.py）。
+                    # 时效性对齐 EFMI：只在**重建**时生效，幂等快路径命中即跳过重算。
+                    "dedup_excluded": False,
                 }
                 groups[draw_ib] = group
             group["members"].append(unique_str)
             group["json_paths"][unique_str] = json_path
+            if bool(submesh_json.get("VGMapDedupExcluded")):
+                group["dedup_excluded"] = True
 
             cache_intact = cls._zzmi_cache_intact(
                 submesh_json, json_path, unique_str
@@ -1385,6 +1410,10 @@ class ZZMISkeletonMergeHelper:
             gm, go, total = ZZMIBoneMapBuilder.build_vg_maps(
                 {draw_ib: ready_groups[draw_ib]["palette"] for draw_ib in members},
                 {draw_ib: ready_groups[draw_ib]["signatures"] for draw_ib in members},
+                dedup_excluded={
+                    draw_ib for draw_ib in members
+                    if ready_groups[draw_ib].get("dedup_excluded")
+                },
             )
             local_maps.update(gm)
             local_offsets.update(go)

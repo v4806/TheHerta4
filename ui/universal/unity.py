@@ -327,6 +327,14 @@ class ExportUnity(DrawIBExportBase):
         ini_builder.append_section(resource_vertex_limit_section)
 
     def add_unity_cs_vertex_shader_check(self, ini_builder: M_IniBuilder):
+        # t45：$costume_mods 引用前必须声明（否则加载期 Unrecognised entry +
+        # endif missing if——实机截图 Mods\??????.ini）；默认 0 = 无 costume mods
+        # 时 checktextureoverride 恒跳过，与有 costume 系统的 mod 共享变量值
+        constants_section = M_IniSection(M_SectionType.Constants)
+        constants_section.SectionName = "Constants"
+        constants_section.append("global $costume_mods = 0")
+        ini_builder.append_section(constants_section)
+
         vscheck_section = M_IniSection(M_SectionType.VertexShaderCheck)
         vs_hash_set = set()
         for drawib_model in self.drawib_model_list:

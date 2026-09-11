@@ -309,9 +309,12 @@ class ATP_OT_SplitAnimation(bpy.types.Operator):
         bm.to_mesh(new_mesh)
         bm.free()
 
-        new_mesh.transform(eval_obj.matrix_world)
-
-        new_obj = bpy.data.objects.new(new_obj_name, new_mesh)
+        if props.anim_split_keep_frame_origin:
+            new_obj = bpy.data.objects.new(new_obj_name, new_mesh)
+            new_obj.matrix_world = eval_obj.matrix_world
+        else:
+            new_mesh.transform(eval_obj.matrix_world)
+            new_obj = bpy.data.objects.new(new_obj_name, new_mesh)
         for slot in obj.material_slots:
             new_obj.data.materials.append(slot.material)
 
@@ -460,9 +463,12 @@ class ATP_OT_SplitAnimation(bpy.types.Operator):
                             eval_obj = obj.evaluated_get(depsgraph)
                             mesh_data = bpy.data.meshes.new_from_object(eval_obj)
                             matrix = eval_obj.matrix_world.copy()
-                            mesh_data.transform(matrix)
                             obj_name = f"{props.be_object_prefix}{obj.name}_{frame:03d}"
                             new_obj = bpy.data.objects.new(obj_name, mesh_data)
+                            if props.anim_split_keep_frame_origin:
+                                new_obj.matrix_world = matrix
+                            else:
+                                mesh_data.transform(matrix)
                             for slot in obj.material_slots:
                                 if slot.material:
                                     new_obj.data.materials.append(slot.material)

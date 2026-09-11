@@ -32,7 +32,11 @@ _switch_sync_guard = False
 
 
 def _sync_switch_variable_fields(group, context):
-    """同一切换变量的启用状态与备注保持完全一致（限定在所属蓝图内）。"""
+    """同一切换变量的启用状态、备注与按键保持完全一致（限定在所属蓝图内）。
+
+    一个切换变量在 UI 上只有一套控件、在 INI 里也只有一段 ``[KeySwap_Diffuse_*]``，
+    所以这三项必须同变量同值；否则生成侧会被"最后一个组"的值覆盖。
+    """
     global _switch_sync_guard
     if _switch_sync_guard:
         return
@@ -48,6 +52,7 @@ def _sync_switch_variable_fields(group, context):
     try:
         enabled = bool(getattr(group, "enabled", True))
         comment = str(getattr(group, "comment", "") or "")
+        hotkey = str(getattr(group, "key", "") or "")
         trees = [owner_tree] if owner_tree is not None else list(bpy.data.node_groups)
         for tree in trees:
             for node in getattr(tree, "nodes", []) or []:
@@ -65,8 +70,56 @@ def _sync_switch_variable_fields(group, context):
                                 continue
                             candidate.enabled = enabled
                             candidate.comment = comment
+                            candidate.key = hotkey
     finally:
         _switch_sync_guard = False
+
+
+def _pick_variable_control_group(groups):
+    """同一变量下的"控制组"：第一个填了按键的组，都没填则取第一个组。
+
+    与 UI 控件组（``_draw_global_switch_panel`` 取 ``entries[0]``）和贴图切换
+    面板取其第一个非空 hotkey 的既有口径一致；用户在一个共享框里填的键必须
+    落到整个变量上。
+    """
+    fallback = None
+    for group in groups:
+        if fallback is None:
+            fallback = group
+        if str(getattr(group, "key", "") or "").strip():
+            return group
+    return fallback
+
+
+def _normalize_switch_variable_metadata(collections):
+    """把同一变量的 备注/按键/启用 归一为该变量控制组的值。
+
+    扫描重建后每个部件组各自带着旧值，同伴可能停在默认 ``N``；归一后
+    "看到的控件 = 实际生成的 KeySwap 段"，也不会在下一次导出时回退。
+    返回每个变量的控制组，供调用方做一次显式跨节点同步。
+    """
+    ordered = []
+    for collection in collections:
+        ordered.extend(collection)
+    by_variable = OrderedDict()
+    for group in ordered:
+        variable = str(getattr(group, "switch_variable", "") or "").strip()
+        if variable:
+            by_variable.setdefault(variable, []).append(group)
+    controls = []
+    for groups in by_variable.values():
+        control = _pick_variable_control_group(groups)
+        if control is None:
+            continue
+        key = str(getattr(control, "key", "") or "")
+        comment = str(getattr(control, "comment", "") or "")
+        enabled = bool(getattr(control, "enabled", True))
+        for group in groups:
+            group.key = key
+            group.comment = comment
+            group.enabled = enabled
+        controls.append(control)
+    return controls
 
 
 def _mesh_object_poll(self, obj):
@@ -89,8 +142,9 @@ class SSMT_CustomMaterialAssignSwitchGroup(bpy.types.PropertyGroup):
     )
     key: bpy.props.StringProperty(
         name="切换按键",
-        description="控制该部件多套贴图切换的按键",
+        description="控制该部件多套贴图切换的按键；同一切换变量下的部件共享此按键",
         default="N",
+        update=_sync_switch_variable_fields,
     )
     state_count: bpy.props.IntProperty(
         name="切换档数",
@@ -740,17 +794,32 @@ class SSMT_OT_CustomMaterialScanSwitches(bpy.types.Operator):
     node_name: bpy.props.StringProperty()
 
     @staticmethod
-    def _group_shape(group):
+    def _binding_signature(binding_lists):
+        """切换身份 = 这一组材质名清单本身（与顺序无关）。
+
+        对齐原版「材质转资源」的判定：它用 ``tuple(sorted(mat.name ...))`` 作
+        ``material_group_to_swapkey`` 的 key，只有**同一套材质**才复用同一个
+        ``$swapkeyN``，材质不同就各领新号。套数相同但贴图不同（例如脸部 2 套、
+        身体 2 套）必须各自成组 —— 18ab9ba 曾把身份换成"套数形状"
+        （``_group_shape``），导致不同贴图因档数相同被并成一组。
+        """
+        return tuple(sorted(tuple(sorted(names)) for names in binding_lists))
+
+    @classmethod
+    def _group_signature(cls, group):
         try:
             bindings = json.loads(str(getattr(group, "bindings", "") or "[]"))
         except Exception:
             bindings = []
-        lengths = tuple(sorted(len(item) for item in bindings if isinstance(item, (list, tuple))))
-        return (int(getattr(group, "state_count", 0) or 0), lengths)
+        if not isinstance(bindings, list):
+            bindings = []
+        return cls._binding_signature(
+            [names for names in bindings if isinstance(names, (list, tuple))]
+        )
 
-    @staticmethod
-    def _material_group_shape(groups):
-        return (max(len(names) for names in groups.values()), tuple(sorted(len(names) for names in groups.values())))
+    @classmethod
+    def _material_group_signature(cls, groups):
+        return cls._binding_signature(list(groups.values()))
 
     def execute(self, context):
         node = _find_node(context, self.node_name)
@@ -787,11 +856,26 @@ class SSMT_OT_CustomMaterialScanSwitches(bpy.types.Operator):
                     "未在链接到 Mod 输出的蓝图链路中找到任何部件，已忽略未连接部件",
                 )
                 return {"CANCELLED"}
-            old_global = {
-                (group.object_name, group.switch_variable): group
-                for group in node.global_switch_groups
-                if group.switch_variable
-            }
+            # 必须先快照纯数据、再清空集合：PropertyGroup 项从集合里移除后，残留的
+            # Python 引用不会抛 ReferenceError，而是静默读回属性默认值
+            # （state_count→2、bindings/comment/object_name→""、key→"N"、
+            # enabled→True；若随后 add 了新项，旧引用还会附身到新项内存上）。
+            # 旧实现先 clear 再读字段，导致第二次扫描时每个旧组身份退化成空：
+            # 同材质合并与旧变量沿用全部失效（分组结果与首次不同），用户设置的
+            # 备注/按键/停用状态也被抹成默认值。
+            old_global = {}
+            for group in node.global_switch_groups:
+                variable = str(getattr(group, "switch_variable", "") or "").strip()
+                if not variable:
+                    continue
+                object_name = str(getattr(group, "object_name", "") or "")
+                old_global[(object_name, variable)] = {
+                    "variable": variable,
+                    "signature": self._group_signature(group),
+                    "comment": str(group.comment),
+                    "key": str(group.key),
+                    "enabled": bool(group.enabled),
+                }
             node.global_switch_groups.clear()
         else:
             scan_objects = [
@@ -799,22 +883,19 @@ class SSMT_OT_CustomMaterialScanSwitches(bpy.types.Operator):
                 for item in node.target_items
             ]
 
-        # 先保存旧组的纯数据，随后清空并按当前材质重建，避免集合引用失效。
+        # 汇总旧组纯数据（全局分支已在清空前取好，非全局分支在上面的循环里取）。
         old_by_object = {}
         old_by_variable = {}
         if global_mode:
-            for (object_name, variable), group in old_global.items():
-                old_by_object[object_name] = {
-                    "variable": variable, "shape": self._group_shape(group),
-                    "comment": str(group.comment), "key": str(group.key), "enabled": bool(group.enabled),
-                }
-                old_by_variable.setdefault(variable, old_by_object[object_name])
+            for (object_name, variable), snapshot in old_global.items():
+                old_by_object[object_name] = snapshot
+                old_by_variable.setdefault(variable, snapshot)
         else:
             for item in node.target_items:
                 for old_group in item.switch_groups:
                     if old_group.switch_variable:
                         snapshot = {
-                            "variable": str(old_group.switch_variable), "shape": self._group_shape(old_group),
+                            "variable": str(old_group.switch_variable), "signature": self._group_signature(old_group),
                             "comment": str(old_group.comment), "key": str(old_group.key), "enabled": bool(old_group.enabled),
                         }
                         old_by_object[item.target_object.name if item.target_object else ""] = snapshot
@@ -823,67 +904,114 @@ class SSMT_OT_CustomMaterialScanSwitches(bpy.types.Operator):
             for item in node.target_items:
                 item.switch_groups.clear()
 
-        variable_shapes = {variable: data["shape"] for variable, data in old_by_variable.items()}
-        shape_variables = {}
-        for variable, shape in variable_shapes.items():
-            shape_variables.setdefault(shape, variable)
+        # signature -> variable：同材质集合的部件共用一个切换变量
+        # variable -> signature：一个变量只归属一种材质集合（拆分历史误合并）
+        signature_variables = {}
+        variable_signatures = {}
+        for variable, data in old_by_variable.items():
+            signature_variables.setdefault(data["signature"], variable)
 
-        for obj in scan_objects:
-            if obj is None or getattr(obj, "type", "") != "MESH":
-                continue
-            groups = _collect_switch_prefix_groups(obj)
-            if not groups:
-                continue
-
-            shape = self._material_group_shape(groups)
-            old_data = old_by_object.get(obj.name)
-            if old_data is not None and old_data["shape"] == shape:
-                variable = old_data["variable"]
-            elif old_data is None and shape in shape_variables:
-                variable = shape_variables[shape]
-            else:
-                variable = f"{prefix}{next_number}"
-                next_number += 1
-                shape_variables.setdefault(shape, variable)
-
-            if global_mode:
-                container = node.global_switch_groups
-            else:
-                item = next(
-                    (candidate for candidate in node.target_items if candidate.target_object == obj),
-                    None,
-                )
-                if item is None:
-                    continue
-                container = item.switch_groups
-
-            total_parts += 1
-            group = container.add()
-            group.object_name = obj.name
-            group.switch_variable = variable
-            group.merge_group_id = variable
-            group.state_count = max(len(names) for names in groups.values())
-            group.bindings = json.dumps(
-                [sorted(names) for names in groups.values()],
-                ensure_ascii=False,
+        # 旧变量会被沿用，新变量必须从“已占用的最大号 + 1”开始分配：否则链路里
+        # 新增 / 改名 / 换贴图套数的部件会领到旧组已占用的号，被错并进同一个切换
+        # 变量（KeySwap 段只有一份档数，两个部件会一起切且档数不符）。
+        _used_numbers = [
+            int(match.group(2))
+            for match in (
+                re.match(r"^\$?(\w+?)(\d+)$", str(variable))
+                for variable in old_by_variable
             )
-            metadata = old_data or old_by_variable.get(variable)
-            if metadata is not None:
-                group.comment = metadata["comment"]
-                group.key = metadata["key"]
-                group.enabled = metadata["enabled"]
-            else:
-                group.comment = ""
-                group.key = "N"
-                group.enabled = True
-            total_groups += 1
+            if match and f"${match.group(1)}" == prefix
+        ]
+        if _used_numbers:
+            next_number = max(next_number, max(_used_numbers) + 1)
 
-            counts = {len(names) for names in groups.values()}
-            if len(counts) > 1:
-                self.report(
-                    {"WARNING"},
-                    f"{obj.name} 各前缀贴图档数不一致，按键可能无法完整切换所有贴图",
+        # 重建期间关掉同变量同步回调：批量重建时每个部件组都要先按自己的旧值落位，
+        # 否则同伴默认值（N / 空备注）会在写入瞬间通过 update 回调把用户的键顶掉。
+        # 重建完成后由下面的归一 + 一次显式同步统一该变量。
+        global _switch_sync_guard
+        previous_guard = _switch_sync_guard
+        _switch_sync_guard = True
+        control_groups = []
+        try:
+            for obj in scan_objects:
+                if obj is None or getattr(obj, "type", "") != "MESH":
+                    continue
+                groups = _collect_switch_prefix_groups(obj)
+                if not groups:
+                    continue
+
+                signature = self._material_group_signature(groups)
+                old_data = old_by_object.get(obj.name)
+                variable = ""
+                # 沿用旧变量：材质没变才沿用；且该变量不能被别的材质集合占用
+                # （历史版本按"档数形状"合并过，会出现脸部和身体共用 $swapkey150）。
+                if old_data is not None and old_data["signature"] == signature:
+                    candidate = old_data["variable"]
+                    if variable_signatures.get(candidate, signature) == signature:
+                        variable = candidate
+                if not variable:
+                    variable = signature_variables.get(signature, "")
+                if not variable:
+                    variable = f"{prefix}{next_number}"
+                    next_number += 1
+                signature_variables.setdefault(signature, variable)
+                variable_signatures.setdefault(variable, signature)
+
+                if global_mode:
+                    container = node.global_switch_groups
+                else:
+                    item = next(
+                        (candidate for candidate in node.target_items if candidate.target_object == obj),
+                        None,
+                    )
+                    if item is None:
+                        continue
+                    container = item.switch_groups
+
+                total_parts += 1
+                group = container.add()
+                group.object_name = obj.name
+                group.switch_variable = variable
+                group.merge_group_id = variable
+                group.state_count = max(len(names) for names in groups.values())
+                group.bindings = json.dumps(
+                    [sorted(names) for names in groups.values()],
+                    ensure_ascii=False,
                 )
+                metadata = old_data or old_by_variable.get(variable)
+                if metadata is not None:
+                    group.comment = metadata["comment"]
+                    group.key = metadata["key"]
+                    group.enabled = metadata["enabled"]
+                else:
+                    group.comment = ""
+                    group.key = "N"
+                    group.enabled = True
+                total_groups += 1
+
+                counts = {len(names) for names in groups.values()}
+                if len(counts) > 1:
+                    self.report(
+                        {"WARNING"},
+                        f"{obj.name} 各前缀贴图档数不一致，按键可能无法完整切换所有贴图",
+                    )
+
+            # 同一变量的 备注/按键/启用 归一：一个变量在 UI 上只有一套控件、在 INI 里
+            # 只有一段 KeySwap，同伴若停在默认 N，导出时会把用户填的键覆盖掉。
+            if global_mode:
+                control_groups = _normalize_switch_variable_metadata(
+                    [node.global_switch_groups]
+                )
+            else:
+                control_groups = _normalize_switch_variable_metadata(
+                    [item.switch_groups for item in node.target_items]
+                )
+        finally:
+            _switch_sync_guard = previous_guard
+
+        # 归一结果同步给同变量的其它节点（本节点各组已直接写好）。
+        for control in control_groups:
+            _sync_switch_variable_fields(control, None)
 
         if total_groups:
             self.report(
@@ -1197,6 +1325,10 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
         self._strip_stale_keyswap_blocks(sections)
         super().define_swapkeys_in_sections(sections, keys_to_define)
         used_keys = set(keys_to_define or [])
+        # 一个变量只写一段 [KeySwap_Diffuse_<var>]：同变量的每个部件组都会写出
+        # 同名 section，后写覆盖先写，同伴停在默认 N 时会把用户的按键顶掉。
+        # 取该变量里第一个填过按键的组为准（与 UI 控件组/贴图面板口径一致）。
+        chosen = OrderedDict()
         for spec in self._iter_switch_group_defs():
             if not spec["enabled"]:
                 continue
@@ -1204,6 +1336,8 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
                 continue
             if not spec["key"]:
                 continue
+            chosen.setdefault(spec["variable"], spec)
+        for spec in chosen.values():
             self._write_keyswap_section(sections, spec)
 
     def _section_custom_mesh_names(self, lines):

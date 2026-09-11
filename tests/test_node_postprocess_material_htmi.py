@@ -1296,6 +1296,72 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             self.assertIn("[TextureOverrideGenericMesh_2]", sections)
             self.assertNotIn("[TextureOverride_Generic]", sections)
 
+    def test_ttl_default_brightness_written_outside_if_block(self):
+        r"""TTL：提亮默认值 $\TTL\V = 1.5 写在 if 条件块之外（回归：写进 if 内会爆炸）"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            BS = chr(92)
+            mesh_name = "LOD0.241deac5-56376-0.中文中文_copy"
+            ttl_path = os.path.join(temp_dir, "ttl.png")
+            with open(ttl_path, "wb") as file_obj:
+                file_obj.write(b"ttl")
+            obj = _FakeObject(mesh_name, {}, [("TTLMap_遮罩", ttl_path)])
+            _fake_bpy.data.objects[obj.name] = obj
+
+            sections = OrderedDict([
+                ("[TextureOverride_LOD0.241deac5_56376_0]", [
+                    "hash = 241deac5",
+                    "match_first_index = 0",
+                    "ib = Resource_LOD0.241deac5_56376_0_Index",
+                    "run = CommandListSkinTexture",
+                    "if $swapkey0 == 0",
+                    "  ; [mesh:LOD0.241deac5-56376-0.中文中文_copy] [vertex_count:15618]",
+                    "  drawindexed = 56376,0,3",
+                    "endif",
+                ]),
+                ("_config_path", temp_dir),
+            ])
+
+            node = node_postprocess_material.SSMTNode_PostProcess_Material()
+            node.name = "MaterialNode"
+            node.material_to_resource_switch = False
+            node.material_to_resource_override = False
+            node.material_switch_var = "$swapkey150"
+
+            node.process_texture_override_section(
+                "[TextureOverride_LOD0.241deac5_56376_0]",
+                sections,
+                material_group_to_swapkey={},
+                swap_key_prefix="$swapkey",
+                next_swap_key_num=150,
+                used_swap_keys=set(),
+                transparency_sections_to_add=OrderedDict(),
+            )
+
+            ttl_keys = [k for k in sections if k.startswith("[TextureOverride")]
+            self.assertTrue(ttl_keys, "no TTL section generated")
+            new_lines = sections[ttl_keys[0]]
+            brightness_line = "$" + BS + "TTL" + BS + "V = 1.5"
+            if_line = "if $swapkey0 == 0"
+            alpha_line = "$" + BS + "TTL" + BS + "alpha = $TTLAlpha1_0"
+
+            # 1) 默认生成
+            self.assertIn(brightness_line, new_lines)
+            # 2) 与 if 同级：第 0 列，不受条件块缩进影响
+            self.assertEqual(
+                [line for line in new_lines if line.strip() == brightness_line],
+                [brightness_line],
+            )
+            # 3) 位置在 alpha 之后、if 之前 —— 即条件块之外
+            self.assertLess(new_lines.index(alpha_line), new_lines.index(brightness_line))
+            self.assertLess(new_lines.index(brightness_line), new_lines.index(if_line))
+            # 4) 条件块本身仍完整
+            self.assertIn("    $" + BS + "TTL" + BS + "_1 = 56376", new_lines)
+            self.assertIn("    $" + BS + "TTL" + BS + "_2 = 0", new_lines)
+            self.assertIn("    $" + BS + "TTL" + BS + "_3 = 3", new_lines)
+            self.assertIn("    run = CommandList" + BS + "TTL" + BS + "Draw", new_lines)
+            self.assertEqual(new_lines[-1], "endif")
+
+
     def test_ttl_multiple_fxmap_materials_use_switch_branches(self):
         """TTL：同一物体多个 TTLMap 材质生成 $swapkey 分支"""
         with tempfile.TemporaryDirectory() as temp_dir:

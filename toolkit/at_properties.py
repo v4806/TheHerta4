@@ -105,6 +105,11 @@ class ATP_Properties(bpy.types.PropertyGroup):
                                                          description="判断顶点是否为静态的位置变化容差")
     anim_split_set_linear: bpy.props.BoolProperty(name="设为线性插值", default=False,
                                                   description="在拆分前，将选中对象所有关键帧的插值模式设为线性")
+    anim_split_keep_frame_origin: bpy.props.BoolProperty(
+        name="保留当前帧原点",
+        default=False,
+        description="勾选后拆分物体的原点保留在当前帧时源物体原点的世界位置；默认不勾选时原点在世界中心(保持现状)",
+    )
 
     be_start_frame: bpy.props.IntProperty(name="起始帧", default=1, min=1, description="自动化流程从指定的帧数开始执行")
     be_loop_count: bpy.props.IntProperty(name="结束帧", default=15, min=1, description="自动化流程执行的总次数 (作为结束帧)")

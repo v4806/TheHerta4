@@ -15,6 +15,10 @@ _reverse_name_mapping_cache = {}
 # 资源缓存按“材质内容签名”去重，避免同一套贴图被重复复制/重复生成 Resource。
 _material_resource_cache = {}
 _TTL_MASK_INVERT_PREFIX = "${}TTL{}mask_invert".format(chr(92), chr(92)).casefold()
+# TTL 合成亮度默认值（TTLib 的 $\TTL\V，即 HSV 的 Value）。
+# 必须写在 if 条件块之外：TTLib 的 CommandListFrameReset 每帧把 $V 重置为 1.0，
+# 只有绘制前重新赋值才生效；不需要提亮的段落手动删掉这一行即可。
+_TTL_DEFAULT_BRIGHTNESS = "1.5"
 # 拖拽物体显隐 flag 行（注入在绘制分支内；TTL 块重建必须原样保留，否则隐藏判定失效）
 _DRAG_OBJVIS_LINE_RE = re.compile(r'^\s*\$ssmtdrag_objvis_[\w]*\s*=\s*1\s*$')
 
@@ -1949,6 +1953,8 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
             alpha_value = transparency_value if transparency_value else "1.0"
             alpha_var = self._ttl_ensure_alpha_variable(alpha_value, all_sections)
             new_lines.append("${}TTL{}alpha = {}".format(chr(92), chr(92), alpha_var))
+            # 提亮默认写在条件块之外（此时 if 块尚未拼接），否则进 if 内会失效/爆炸。
+            new_lines.append("${}TTL{}V = {}".format(chr(92), chr(92), _TTL_DEFAULT_BRIGHTNESS))
 
             if cond_if_indexes:
                 cond_block = []

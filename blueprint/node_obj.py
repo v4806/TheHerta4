@@ -417,6 +417,9 @@ class SSMTNode_Result_Output(SSMTNodeBase):
         layout.prop(context.scene.global_properties, 
                     "forbid_auto_texture_ini",text="禁止自动贴图流程")
 
+        layout.prop(context.scene.global_properties,
+                    "recalculate_tangent_basis",text="重新计算标准切线(TBN)")
+
         if GlobalConfig.logic_name != LogicName.GF2:
             layout.prop(context.scene.global_properties,
                         "recalculate_tangent",text="向量归一化法线存入TANGENT(全局)")

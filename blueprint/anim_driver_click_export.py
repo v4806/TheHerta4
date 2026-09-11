@@ -282,6 +282,15 @@ class SSMTNode_AnimDriver_ClickExport(SSMTNode_AnimDriver_Base):
             ns = drag_node._resolve_namespace("")
         except Exception:
             ns = DEFAULT_MOD_NAMESPACE
+        # EFMI 分支跨节点契约（研究② §3.2）：经拖拽节点 _click_export_names 取
+        # 前缀资源/变量（EFMI 模式 → EFMI 前缀）；旧节点/测试桩回退 zzmi 前缀
+        names_fn = getattr(drag_node, "_click_export_names", None)
+        if callable(names_fn):
+            click_f_resource, booted_var, seed_pending_var = names_fn(ns)
+        else:
+            click_f_resource = f"ResourceDragShapeKeyClickCountF_{ns}"
+            booted_var = f"$ssmtdrag_booted_{ns}"
+            seed_pending_var = f"$ssmtdrag_seed_pending_{ns}"
         try:
             zone = int(getattr(self, "click_zone_id", 0) or 0)
         except (TypeError, ValueError):
@@ -299,7 +308,7 @@ class SSMTNode_AnimDriver_ClickExport(SSMTNode_AnimDriver_Base):
             "; 点击计数导出（值仲裁、变量为主）：变量变化时经 seed_pending 触发播种",
             "; 把变量值推回点击计数缓冲（下一帧点击从新值继续推进）；变量未变时",
             "; 每帧拉取缓冲值（点击推进）；热键改动绝不被回读顶掉。",
-            f"if $ssmtdrag_booted_{ns} == 1 && $ssmtdrag_seed_pending_{ns} == 0",
+            f"if {booted_var} == 1 && {seed_pending_var} == 0",
         ]
         prev_names = []
         for var in target_vars:
@@ -309,9 +318,9 @@ class SSMTNode_AnimDriver_ClickExport(SSMTNode_AnimDriver_Base):
             block_lines.extend([
                 f"\tif {var} != {prev}",
                 f"\t\t{prev} = {var}",
-                f"\t\t$ssmtdrag_seed_pending_{ns} = 1",
+                f"\t\t{seed_pending_var} = 1",
                 "\telse",
-                f"\t\tstore = {var}, ResourceDragShapeKeyClickCountF_{ns}, {zone}",
+                f"\t\tstore = {var}, {click_f_resource}, {zone}",
                 f"\t\t{prev} = {var}",
                 "\tendif",
             ])

@@ -29,7 +29,8 @@ class TT_OT_generate_lightmap_template(bpy.types.Operator):
             self.report({'ERROR'}, "请确保活动物体是网格物体")
             return {'CANCELLED'}
 
-        mat_prefix = active_obj.name
+        custom_name = (getattr(props, "lightmap_custom_name", "") or "").strip()
+        name_suffix = custom_name or active_obj.name
         selected_template_types = [
             template_type
             for template_type, prop_name in TEMPLATE_TYPES
@@ -46,7 +47,7 @@ class TT_OT_generate_lightmap_template(bpy.types.Operator):
 
         generated_types = []
         for template_type in selected_template_types:
-            template_material = self._create_template_material(template_type, mat_prefix)
+            template_material = self._create_template_material(template_type, name_suffix)
             for obj in selected_objects:
                 obj.data.materials.append(template_material)
             generated_types.append(template_material.name)
@@ -54,8 +55,8 @@ class TT_OT_generate_lightmap_template(bpy.types.Operator):
         self.report({'INFO'}, f"已为 {len(selected_objects)} 个物体生成共享材质: {', '.join(generated_types)}")
         return {'FINISHED'}
 
-    def _create_template_material(self, template_type, obj_name):
-        mat_name = f"{template_type}_{obj_name}"
+    def _create_template_material(self, template_type, name_suffix):
+        mat_name = f"{template_type}_{name_suffix}"
         existing = bpy.data.materials.get(mat_name)
         if existing:
             return existing

@@ -21,6 +21,7 @@ from ..common.mod_path_compat import (
     ensure_resource_alias_section,
     iter_position_buffer_candidates,
 )
+from ..common.logic_name import LogicName
 from ..utils.export_space import position_export_matrix
 
 try:
@@ -733,6 +734,14 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         description="生成 viewport 探针系统（角色查看器等子区域渲染时校正光标映射，否则检测射线打偏、命中为零。原作必备）",
     )
 
+    # ---- EFMI 分支专属（仅 GlobalConfig.logic_name == EFMI 时经
+    #      node_postprocess_draginteraction_efmi.py 消费；zzmi 分支不使用）----
+    efmi_probe_pass_hash: bpy.props.StringProperty(
+        name="EFMI 主色 Pass Hash",
+        description="【已废弃】门控改用 NumViews == 1（Zmd 构建不支持 ps hash 表达式门控）；保留属性以兼容已存工程，值不再生效——导出时如有旧值会告警清理，请清空",
+        default="",
+    )
+
     # ---- 全局物理档案（IniParams 70/71 字面量）----
     # 注：phys_release_kick / phys_target_follow 的键名是历史错位——
     # phys_release_kick 实际写 w71（原作“目标跟随”槽，默认 0.12），
@@ -874,6 +883,17 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         super().init(context)
         self.drag_system_mode_default = 2 if self.drag_enabled_default else 1
         self.drag_mode_initialized = True
+        # EFMI 权重预览注册（t28：不依赖导出——节点创建即尝试注册，幂等；
+        # 逻辑门控保证非 EFMI 环境零副作用；draw_buttons 另有一处自愈入口）。
+        try:
+            from ..common.global_config import GlobalConfig
+            if str(getattr(GlobalConfig, "logic_name", "") or "") == LogicName.EFMI:
+                from .node_postprocess_draginteraction_efmi import (
+                    _ensure_efmi_preview_running,
+                )
+                _ensure_efmi_preview_running(self)
+        except Exception:
+            pass
 
     def _default_drag_system_mode(self):
         if not getattr(self, "drag_mode_initialized", False):
@@ -904,15 +924,55 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
     # =======================================================================
 
     def draw_buttons(self, context, layout):
+        try:
+            from ..common.global_config import GlobalConfig
+            current_logic = str(getattr(GlobalConfig, "logic_name", "") or "")
+        except Exception:
+            current_logic = ""
+        is_efmi = current_logic == LogicName.EFMI
+
+        if is_efmi:
+            # ---- EFMI 分支专属（t25 全面 zzmi 化：参数完全跟随全局，仅提示）----
+            efmi_box = layout.box()
+            efmi_box.label(text="EFMI 分支（Endfield 256 区高斯球场，独立运行时）", icon='INFO')
+            efmi_box.label(
+                text="权重/物理完全跟随全局：区域空物体（高斯画刷参数）+ 全局物理档案与"
+                "倍率；ps hash 见下方「目标哈希值」旁的附加输入",
+                icon='INFO',
+            )
+            layout.label(
+                text="碰撞检测/视口探针在 EFMI 模式不可用（本期未迁移，不生成对应段族）；"
+                "手型光标已支持（独立实现）；权重预览已支持（zzmi 式语义）",
+                icon='INFO',
+            )
+
         layout.prop(self, "hash_values")
+        if is_efmi:
+            # ---- 门控定案（NumViews == 1）：颜色 pass NumViews=1 / 深度阴影
+            #      NumViews=0 / 多 RT 2/5/8——跨 mod 通用、无状态维护；ps hash
+            #      表达式门控废弃（Zmd 构建不可用）----
+            layout.label(
+                text="主色 pass 自动门控（NumViews == 1）：探针/检测只在绘制到主色 "
+                "RT（视图数=1）的 pass 运行——深度/阴影 pass（NumViews=0）自动排除，"
+                "无需手动填哈希",
+                icon='INFO',
+            )
+            # t49 F3：旧属性迁移提示（efmi_probe_pass_hash 已废弃）
+            layout.label(
+                text="旧属性「主色 Pass Hash」（efmi_probe_pass_hash）已废弃："
+                "如节点曾填写（如 1718.1）请清空——该值不再生效，导出时会有清理告警",
+                icon='ERROR',
+            )
         layout.prop(self, "mod_namespace")
         row = layout.row(align=True)
         row.prop(self, "grab_key")
-        row.prop(self, "grab_gesture")
+        gesture_row = row.row(align=True)
+        gesture_row.enabled = not is_efmi
+        gesture_row.prop(self, "grab_gesture")
         row = layout.row(align=True)
         row.prop(self, "enable_poke")
         poke_row = row.row(align=True)
-        poke_row.enabled = self.enable_poke
+        poke_row.enabled = self.enable_poke and not is_efmi
         poke_row.prop(self, "poke_gesture")
         layout.prop(self, "enable_hand_cursor")
 
@@ -926,7 +986,9 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         if not self._feature_skd():
             feature_box.label(text="变量联动依赖形态键联动缓冲，形态键联动关闭时自动一并关闭", icon='INFO')
         feature_box.prop(self, "feature_panel_link", text="启用面板联动")
-        feature_box.prop(self, "collision_enabled", text="启用碰撞检测（未完善）")
+        collision_row = feature_box.row()
+        collision_row.enabled = not is_efmi
+        collision_row.prop(self, "collision_enabled", text="启用碰撞检测（未完善）")
 
         # ---- 形态键驱动输出（开关已并入上方「功能开关·启用形态键联动」，此 box 仅余输出配置）----
         drive_box = layout.box()
@@ -1077,13 +1139,35 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         col.prop(self, "preview_weights")
         col.prop(self, "preview_target")
         col.prop(self, "preview_collection")
-        if self.preview_weights:
-            preview_count = len(_preview_targets(self))
-            if preview_count == 0:
-                col.label(text="请选择预览网格或包含网格的集合", icon='INFO')
-            else:
-                col.label(text=f"正在预览 {preview_count} 个网格", icon='INFO')
-        _ensure_preview_running()
+        if is_efmi:
+            # EFMI 权重预览（t25 恢复，t28 注册时机修复）：与 zzmi 同语义——
+            # 选中区域空物体在预览网格上显示高斯球权重场（depsgraph evaluated
+            # 网格，世界坐标点绘制）；注册不依赖导出（draw_buttons/init 即注册，
+            # 幂等，见 _ensure_efmi_preview_running）。
+            if self.preview_weights:
+                preview_count = len(_preview_targets(self))
+                if preview_count == 0:
+                    col.label(text="请选择预览网格或包含网格的集合", icon='INFO')
+                else:
+                    col.label(
+                        text=f"正在预览 {preview_count} 个网格（选中区域空物体显示权重场）",
+                        icon='INFO',
+                    )
+            try:
+                from .node_postprocess_draginteraction_efmi import (
+                    _ensure_efmi_preview_running,
+                )
+                _ensure_efmi_preview_running(self)
+            except Exception:
+                pass
+        else:
+            if self.preview_weights:
+                preview_count = len(_preview_targets(self))
+                if preview_count == 0:
+                    col.label(text="请选择预览网格或包含网格的集合", icon='INFO')
+                else:
+                    col.label(text=f"正在预览 {preview_count} 个网格", icon='INFO')
+            _ensure_preview_running()
 
         if not NUMPY_AVAILABLE:
             layout.label(text="警告: 未安装 numpy，烘焙不可用", icon='ERROR')
@@ -1470,6 +1554,34 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
     # =======================================================================
 
     def execute_postprocess(self, mod_export_path):
+        # ---- 游戏类型路由（集中入口）----
+        # EFMI → 独立分支（node_postprocess_draginteraction_efmi.py，不共用着色器/函数）；
+        # zzmi 家族（ZZMI/ZZMIDX12）→ 原分支（行为不变）；
+        # 其他已加载游戏类型 → 跳过并明确警告；逻辑名未加载（旧工程/测试）→ 原分支兼容。
+        try:
+            from ..common.global_config import GlobalConfig
+            current_logic = str(getattr(GlobalConfig, "logic_name", "") or "")
+        except Exception:
+            current_logic = ""
+        if current_logic == LogicName.EFMI:
+            from .node_postprocess_draginteraction_efmi import (
+                DragInteractionEFMIExporter,
+                _ensure_efmi_preview_running,
+            )
+            DragInteractionEFMIExporter(self).execute(mod_export_path)
+            # t25：EFMI 权重预览（zzmi 式语义独立实现；幂等注册，选中区域
+            # 空物体才显示）
+            try:
+                _ensure_efmi_preview_running(self)
+            except Exception:
+                pass
+            return
+        if current_logic and not LogicName.is_zzmi_family(current_logic):
+            print(
+                f"[DragInteraction][WARNING] 当前游戏类型 '{current_logic}' 暂不支持拖拽交互"
+                "（仅支持 EFMI 与 ZZMI 家族），已跳过"
+            )
+            return
         print(f"[DragInteraction] 开始执行, 输出路径: {mod_export_path}")
         if not NUMPY_AVAILABLE:
             print("[DragInteraction][ERROR] 需要 numpy，已跳过")
@@ -3094,10 +3206,46 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 "变量联动随之后台降级（其缓冲族依赖形态键联动）"
             )
 
+    def _is_efmi_mode(self):
+        """当前游戏类型是否为 EFMI（路由与消费方契约共用判定）。"""
+        try:
+            from ..common.global_config import GlobalConfig
+            return str(getattr(GlobalConfig, "logic_name", "") or "") == LogicName.EFMI
+        except Exception:
+            return False
+
+    def _drag_shapekey_resource_prefix(self):
+        """形态键驱动资源前缀（跨节点契约，研究② §9）：EFMI 模式 → EFMI 独立前缀
+        （ResourceEFMIDragShapeKey）；zzmi 家族 → 原前缀（ResourceDragShapeKey）。
+        形态键节点经 _drag_shapekey_drive_resource_name 反扫推导资源名。"""
+        if self._is_efmi_mode():
+            return "ResourceEFMIDragShapeKey"
+        return "ResourceDragShapeKey"
+
+    def _click_export_names(self, ns):
+        """点击计数导出（ClickExport）跨节点引用（研究② §3.2）：EFMI 模式 →
+        EFMI 前缀资源/变量；zzmi 家族 → 原前缀。
+        返回 (click_count_f_resource, booted_var, seed_pending_var)。"""
+        if self._is_efmi_mode():
+            return (
+                f"ResourceEFMIDragShapeKeyClickCountF_{ns}",
+                f"$ssmtdrag_efmi_booted_{ns}",
+                f"$ssmtdrag_efmi_seed_pending_{ns}",
+            )
+        return (
+            f"ResourceDragShapeKeyClickCountF_{ns}",
+            f"$ssmtdrag_booted_{ns}",
+            f"$ssmtdrag_seed_pending_{ns}",
+        )
+
     def _drag_drive_zone_stage_counts(self):
         """按区域统计点击档位数：扫描同树所有开启拖拽驱动的形态键节点，
         每个区域取该区域无方向形态键 drag_click_stage 最大值（方向形态键忽略档位），最少 1。
-        返回 {zone_id: stage_count}，只含被形态键引用的区域。"""
+        返回 {zone_id: stage_count}，只含被形态键引用的区域。
+        EFMI 模式委托 EFMI 分支等价实现（独立代码，语义一致）。"""
+        if self._is_efmi_mode():
+            from .node_postprocess_draginteraction_efmi import DragInteractionEFMIExporter
+            return DragInteractionEFMIExporter(self)._drag_drive_zone_stage_counts()
         tree = getattr(self, "id_data", None)
         counts = {}
         if tree is None:
@@ -3135,7 +3283,11 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         """按区域独立档位计算驱动缓冲布局。
         返回 (total_slots, zone_bases, zone_stage_counts)：
         每个区域段 = 4 方向槽 + 该区域档位数 N 个无方向槽；
-        zone_bases[z] = 区域 z 段在缓冲中的起始槽位；total_slots = 所有区域段长之和。"""
+        zone_bases[z] = 区域 z 段在缓冲中的起始槽位；total_slots = 所有区域段长之和。
+        EFMI 模式委托 EFMI 分支等价实现（恒双区语义，独立代码）。"""
+        if self._is_efmi_mode():
+            from .node_postprocess_draginteraction_efmi import DragInteractionEFMIExporter
+            return DragInteractionEFMIExporter(self)._drag_drive_buffer_layout()
         capacity = self._zone_capacity(self._collect_enabled_zone_entries())
         export_entries = self._collect_click_export_drivers()
         if export_entries:
@@ -6047,6 +6199,13 @@ def register():
 
 def unregister():
     _preview_cleanup()
+    # t30：EFMI 权重预览 handler 生命周期——插件注销时一并拆卸（非 EFMI 环境
+    # 该模块未导入/无 handler，guarded 幂等）
+    try:
+        from .node_postprocess_draginteraction_efmi import _efmi_preview_cleanup
+        _efmi_preview_cleanup()
+    except Exception:
+        pass
     del bpy.types.Object.ssmt_drag_zone
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)

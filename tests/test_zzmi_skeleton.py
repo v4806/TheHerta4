@@ -772,6 +772,96 @@ def _make_zzmi_dump_and_workspace(root: Path):
     return dump, ws, unique_strs
 
 
+def _make_zzmi_dump_and_workspace_pair(root: Path):
+    """构造最小 ZZMI dump + 工作空间：两个部件共享同一对象变换 CB，各 2 根骨骼。
+
+    与 _make_zzmi_dump_and_workspace 的区别：双方 palette 各 2 根骨骼且逐位全同
+    （多骨骼对不加刚性门控）——无排除时两部件跨部件合并到同一槽位；标记
+    VGMapDedupExcluded 后重建才能验证「恒等映射独占声明段」确实改变合并结果。
+    返回 (dump_dir, workspace_dir, unique_strs)。
+    """
+    dump = root / "dump"
+    (dump / "deduped").mkdir(parents=True, exist_ok=True)
+    deduped_abs = (dump / "deduped").resolve()
+
+    palette = numpy.array([
+        [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.1, 0.2, 0.3],
+        [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 4.0, 5.0, 6.0],
+    ], dtype=numpy.float32)
+
+    # 两个部件各自的 deform pass（palette 各 2 根骨骼，逐位全同）
+    parts = [
+        ("000001", "11111111", "22222222", "33333333", "pal1.buf"),
+        ("000002", "44444444", "55555555", "66666666", "pal2.buf"),
+    ]
+    for draw_index, _vb0, _so, _t0, pal_file in parts:
+        (dump / "deduped" / pal_file).write_bytes(palette.tobytes())
+
+    # 共享对象变换 CB（identity，64 字节 <= 512 逐部件块上限）
+    cb = numpy.zeros((16,), dtype=numpy.float32)
+    cb[[0, 5, 10, 15]] = 1.0
+    (dump / "deduped" / "shared_cb1.buf").write_bytes(cb.tobytes())
+
+    lines = []
+    for draw_index, vb0, so, t0, pal_file in parts:
+        lines += [
+            f"{draw_index} IASetVertexBuffers(StartSlot:0, NumBuffers:3,",
+            f"0: resource=0x00000000 hash={vb0}",
+            f"{draw_index} SOSetTargets(NumBuffers:1,",
+            f"0: resource=0x00000000 hash={so}",
+            f"{draw_index} VSSetShaderResources(StartSlot:0, NumViews:1,",
+            f"0: view=0x00000000 resource=0x00000000 hash={t0}",
+            f"{draw_index} Draw(VertexCount:1, StartVertexLocation:0)",
+            f"{draw_index} 3DMigoto Dumping Buffer {draw_index}-vs-t0={t0}.buf "
+            f"-> {deduped_abs / pal_file}",
+        ]
+    for render_draw, render_ib in (("000010", "aaaa1111"), ("000020", "bbbb2222")):
+        lines += [
+            f"{render_draw} IASetIndexBuffer(format:R32_UINT, offset:0) hash={render_ib}",
+            f"{render_draw} DrawIndexedInstanced(IndexCountPerInstance:3, InstanceCount:1, "
+            "StartIndexLocation:0, BaseVertexLocation:0, StartInstanceLocation:0)",
+            f"{render_draw} 3DMigoto Dumping Buffer "
+            f"{render_draw}-vs-cb1=77777777-vs=aaaaaaaaaaaaaaaa.buf "
+            f"-> {deduped_abs / 'shared_cb1.buf'}",
+        ]
+    (dump / "log.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    ws = root / "ws"
+    (ws / "Config").mkdir(parents=True, exist_ok=True)
+    (ws / "Config" / "FrameAnalysisPath.json").write_text(
+        json.dumps({"frameAnalysisFolderPath": str(dump)}), encoding="utf-8"
+    )
+    gametype = "GPU_P12_"
+    unique_strs = []
+    component_map = {}
+    import_map = {}
+    for bare, position_hash, render_draw in (
+        ("aaaa1111-100-0", "11111111", "000010"),
+        ("bbbb2222-200-0", "44444444", "000020"),
+    ):
+        type_dir = ws / "LOD0" / bare / ("TYPE_" + gametype)
+        type_dir.mkdir(parents=True, exist_ok=True)
+        (type_dir / f"{bare}.json").write_text(json.dumps({
+            "CategoryHash": {"Position": position_hash},
+            "CategoryBufferList": [{"D3D11ElementList": [
+                {"Category": "Blend", "SemanticName": "BLENDINDICES",
+                 "Format": "R32_UINT", "ByteWidth": 4},
+            ]}],
+        }), encoding="utf-8")
+        # 2 根骨骼：BLENDINDICES 有效通道最大索引 + 1 = 2
+        indices = numpy.array([0, 1], dtype=numpy.uint32)
+        (type_dir / f"{bare}-Blend.buf").write_bytes(indices.tobytes())
+        component_map[bare] = [render_draw]
+        unique_str = f"LOD0.{bare}"
+        unique_strs.append(unique_str)
+        import_map[unique_str] = gametype
+    (ws / "Import.json").write_text(json.dumps(import_map), encoding="utf-8")
+    (ws / "LOD0" / "ComponentName_DrawCallIndexList.json").write_text(
+        json.dumps(component_map), encoding="utf-8"
+    )
+    return dump, ws, unique_strs
+
+
 def _read_zzmi_json(ws: Path, bare: str) -> dict:
     for type_dir in (ws / "LOD0" / bare).iterdir():
         if type_dir.is_dir() and type_dir.name.startswith("TYPE_"):
@@ -1315,6 +1405,82 @@ class ZZMIWorkspaceCacheOnlyTests(unittest.TestCase):
         self.assertTrue(ok2, message2)
         self.assertIn("个子网格生成", message2)
         self.assertGreaterEqual(cache_path.stat().st_size, 48)
+
+
+class ZZMIDedupExcludedTests(unittest.TestCase):
+    """组件级排除去重（VGMapDedupExcluded）端到端：ensure_skeleton_data 收集 json
+    标记 -> 去重阶段恒等映射独占声明段；快路径命中时排除不生效（对齐 EFMI 时效语义）。"""
+
+    def test_dedup_excluded_rebuild_only_identity_slots(self):
+        with tempfile.TemporaryDirectory(prefix="zzmi_dedup_excl_") as tmp:
+            root = Path(tmp)
+            _dump, ws, unique_strs = _make_zzmi_dump_and_workspace_pair(root)
+
+            # 基线：无排除时两部件 2 根 bitwise 全同骨骼合并到同一槽位
+            ok, message = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+                workspace_root=str(ws), unique_str_list=unique_strs
+            )
+            self.assertTrue(ok, message)
+            base = {
+                bare: _read_zzmi_json(ws, bare)
+                for bare in ("aaaa1111-100-0", "bbbb2222-200-0")
+            }
+            self.assertEqual(
+                base["aaaa1111-100-0"]["VGMap"]["0"],
+                base["bbbb2222-200-0"]["VGMap"]["0"],
+            )
+            self.assertEqual(
+                base["aaaa1111-100-0"]["VGMap"]["1"],
+                base["bbbb2222-200-0"]["VGMap"]["1"],
+            )
+
+            # 标记排除后不 force：幂等快路径命中，排除不生效（EFMI 同口径：
+            # 缓存完整性校验不看 VGMapDedupExcluded，重建才重新计算）
+            payload = _read_zzmi_json(ws, "bbbb2222-200-0")
+            payload["VGMapDedupExcluded"] = True
+            _write_zzmi_json(ws, "bbbb2222-200-0", payload)
+            ok_skip, message_skip = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+                workspace_root=str(ws), unique_str_list=unique_strs
+            )
+            self.assertTrue(ok_skip, message_skip)
+            self.assertIn("幂等跳过", message_skip)
+            skipped = _read_zzmi_json(ws, "bbbb2222-200-0")
+            self.assertEqual(skipped["VGMap"], base["bbbb2222-200-0"]["VGMap"])
+
+            # force 重建：排除生效——恒等映射独占声明段，不再与 aaaa1111 合并
+            ok_force, message_force = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+                workspace_root=str(ws), unique_str_list=unique_strs, force=True
+            )
+            self.assertTrue(ok_force, message_force)
+            after = {
+                bare: _read_zzmi_json(ws, bare)
+                for bare in ("aaaa1111-100-0", "bbbb2222-200-0")
+            }
+            self.assertEqual(
+                after["bbbb2222-200-0"]["VGMap"]["0"],
+                after["bbbb2222-200-0"]["VGOffset"] + 0,
+            )
+            self.assertEqual(
+                after["bbbb2222-200-0"]["VGMap"]["1"],
+                after["bbbb2222-200-0"]["VGOffset"] + 1,
+            )
+            self.assertNotEqual(
+                after["bbbb2222-200-0"]["VGMap"]["0"],
+                after["aaaa1111-100-0"]["VGMap"]["0"],
+            )
+            # 排除不改变其它部件的 offset 布局（组内 offset 口径 + 组基址拼接）
+            self.assertEqual(
+                after["aaaa1111-100-0"]["VGOffset"],
+                base["aaaa1111-100-0"]["VGOffset"],
+            )
+            self.assertEqual(
+                after["bbbb2222-200-0"]["VGOffset"],
+                base["bbbb2222-200-0"]["VGOffset"],
+            )
+            # json 标记键原样保留（LoadFromFile -> 修改 -> 保存）
+            self.assertTrue(
+                _read_zzmi_json(ws, "bbbb2222-200-0").get("VGMapDedupExcluded")
+            )
 
 
 class ZZMISiblingCacheTests(unittest.TestCase):

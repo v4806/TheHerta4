@@ -416,7 +416,10 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
         return bool(getattr(node, "enable_shapekey_drive", False))
 
     def _drag_shapekey_drive_resource_name(self, ini_path=None):
-        """自动从同一节点树中的拖拽交互节点推导 ShapeKeyDrive 资源名。"""
+        """自动从同一节点树中的拖拽交互节点推导 ShapeKeyDrive 资源名。
+
+        EFMI 模式（拖拽节点 _drag_shapekey_resource_prefix 返回 EFMI 前缀）推导
+        EFMI 独立前缀资源名；否则保持原 zzmi 前缀（跨节点契约，研究② §9）。"""
         node = self._find_drag_drive_node()
         if node is None:
             return None
@@ -424,10 +427,12 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
             ns = node._resolve_namespace(ini_path or "")
         except Exception:
             ns = ""
-        return f"ResourceDragShapeKeyDrive_{ns}"
+        prefix_fn = getattr(node, "_drag_shapekey_resource_prefix", None)
+        base = prefix_fn() if callable(prefix_fn) else "ResourceDragShapeKey"
+        return f"{base}Drive_{ns}"
 
     def _drag_shapekey_click_count_resource_name(self, ini_path=None):
-        """自动从同一节点树中的拖拽交互节点推导点击计数资源名。"""
+        """自动从同一节点树中的拖拽交互节点推导点击计数资源名（前缀同驱动资源）。"""
         node = self._find_drag_drive_node()
         if node is None:
             return None
@@ -435,7 +440,9 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
             ns = node._resolve_namespace(ini_path or "")
         except Exception:
             ns = ""
-        return f"ResourceDragShapeKeyClickCount_{ns}"
+        prefix_fn = getattr(node, "_drag_shapekey_resource_prefix", None)
+        base = prefix_fn() if callable(prefix_fn) else "ResourceDragShapeKey"
+        return f"{base}ClickCount_{ns}"
 
     def _drag_drive_stage_count(self):
         """兼容入口：返回各区域档位数之和对应的段槽数中的最大档位（已废弃，仅测试/回退用）。

@@ -985,6 +985,36 @@ class TT_LightmapPanel(bpy.types.Panel):
         row = box.row(align=True)
         row.prop(props, "lightmap_generate_stockingmap")
         
+        name_box = layout.box()
+        name_box.label(text="材质名称", icon='FONT_DATA')
+        name_box.prop(props, "lightmap_custom_name", text="名称")
+        
+        from .tt_lightmap import TEMPLATE_TYPES
+        custom_name = (props.lightmap_custom_name or "").strip()
+        active_obj = context.active_object
+        if custom_name:
+            name_suffix = custom_name
+        elif active_obj is not None:
+            name_suffix = active_obj.name
+        else:
+            name_suffix = "活动物体名"
+        
+        checked_types = [
+            template_type
+            for template_type, prop_name in TEMPLATE_TYPES
+            if getattr(props, prop_name, False)
+        ]
+        
+        preview_col = name_box.column(align=True)
+        if not custom_name:
+            preview_col.label(text="(留空时使用活动物体名)", icon='INFO')
+        if checked_types:
+            preview_col.label(text="将生成:")
+            for template_type in checked_types:
+                preview_col.label(text=f"{template_type}_{name_suffix}")
+        else:
+            preview_col.label(text="未选择生成类型", icon='ERROR')
+        
         box2 = layout.box()
         box2.label(text="应用模式", icon='SETTINGS')
         box2.prop(props, "lightmap_mode", expand=True)

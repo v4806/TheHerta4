@@ -999,8 +999,15 @@ def _build_session_from_objects(sid, root, balls, context):
     """从带 GB 标记的场景物体重建一个会话（undo 回退/文件加载后恢复）。
 
     依据 root 上的持久属性（gb_mode/gb_vg_name/gb_debug_parent/
-    gb_use_evaluated/gb_direction）+ 球的 gb_vg_name/gb_ball 参数；
-    目标集合按调试父重新解析，源点云重读失败则禁用采样场（解析高斯仍可用）。
+    gb_use_evaluated/gb_direction/gb_create_missing）+ 球的
+    gb_vg_name/gb_ball 参数；接收侧集合按 gb_direction 重新解析
+    （forward→同源目标集合、self→目标自身、reverse→源侧物体/源合集），
+    源点云重读失败则禁用采样场（解析高斯仍可用）。
+
+    方向语义（关键）：session.targets 必须是**权重接收侧**。REVERSE 会话的
+    mode 为 "target" 但接收侧是源侧物体（原物体/源合集），因此这里不能按
+    mode 判定——按 mode 会让恢复后的反向会话把接收侧解析成目标物体，
+    导致热力图/写入方向整体反转。
 
     Returns:
         _GBSession 或 None（无法重建：无目标/缺关键属性）。
@@ -1021,6 +1028,11 @@ def _build_session_from_objects(sid, root, balls, context):
         gb_resolve.DIRECTION_FORWARD if mode == "source"
         else gb_resolve.DIRECTION_SELF)
     session.use_evaluated = use_evaluated
+    # 显式创建缺失组状态随 root 持久化恢复：反向会话（接收侧=源侧用户数据）
+    # 的建组开关若不恢复，undo/加载后写源侧缺组会被静默跳过（与创建时会话
+    # 语义不一致）。旧 .blend 无该属性 → 保持 _GBSession 默认 False（与
+    # start_create_missing 默认值一致，不改变既有行为）。
+    session.create_missing = bool(root.get("gb_create_missing", False))
     session.debug_parent_name = parent_name if parent is not None else ""
     # 球的清单：排除根（根也带 gb_vg_name 持久属性，但不是球）
     session.ball_names = [
@@ -1031,7 +1043,6 @@ def _build_session_from_objects(sid, root, balls, context):
     session.session_root_name = root.name
 
     if parent is not None:
-        session.source_key = frozenset(_source_names_for(parent))
         pos, weights, desc = _read_source_weights(
             parent, vg_name, use_evaluated=use_evaluated, context=context)
         if weights is not None:
@@ -1040,19 +1051,38 @@ def _build_session_from_objects(sid, root, balls, context):
             session.source_weights = np.asarray(weights, dtype=np.float64)[mask]
             session.source_info = desc
 
-    # 目标集合：正向/自身用既有解析；父缺失时回退 vgtp_target_name
-    if parent is not None and mode == "source":
-        target_names = _resolve_target_names(parent)
-    elif parent is not None:
-        target_names = [parent.get("vgtp_target_name", "")]
-    else:
+    # 目标集合（= 权重接收侧）：必须按 direction 分派，而不是按 mode——
+    # REVERSE 会话的 mode 是 "target"，但它的接收侧是**源侧物体**（原物体/
+    # 源合集），只有 SELF 的接收侧才是 vgtp_target_name 记录的自身。
+    # 若只看 mode，反向会话 undo/加载恢复后接收侧会被解析成目标物体：
+    # 热力图从原物体消失、落到目标物体且场恒 0，确认写入也会写错侧
+    # （违反「热力图只画在 session.targets」与「预览/写入同一接收侧」）。
+    own_target_name = parent.get("vgtp_target_name", "") if parent is not None else ""
+    if parent is None:
         target_names = []
+        session.source_key = frozenset()
+    elif session.direction == gb_resolve.DIRECTION_REVERSE:
+        # 反向：接收侧 = 源侧物体（与 GB_OT_StartFromDebug 反向分支同语义，
+        # 排除 vgtp_runtime_source_object 临时合并物体——它不是用户原物体）
+        reverse = _resolve_reverse_targets(parent)
+        target_names = [o.name for o in reverse["objects"]]
+        session.source_key = frozenset(target_names)
+    elif mode == "source":
+        # 正向：接收侧 = 同源目标集合（_resolve_target_names 已排除源侧物体）
+        target_names = _resolve_target_names(parent)
+        session.source_key = frozenset(_source_names_for(parent))
+    else:
+        # 目标自身：来源侧 == 接收侧，接收侧就是 own_target
+        target_names = [own_target_name]
+        session.source_key = frozenset(_source_names_for(parent))
     targets = []
     for name in target_names:
         t = bpy.data.objects.get(name)
         if t is not None and t.type == "MESH":
             targets.append(t)
     if not targets:
+        # 接收侧解析失败（源侧缺失/合集为空/目标已删除）时跳过重建，
+        # 绝不回退成“另一侧”物体——那是方向反转的根源
         LOG.warning(f"[GB] 孤儿会话 sid={sid} 无可用目标，跳过重建")
         return None
 
@@ -1491,6 +1521,14 @@ class GB_OT_StartFromDebug(bpy.types.Operator):
             if anchor is not None:
                 params["location"] = np.asarray(anchor, dtype=np.float64).reshape(3)
                 params["center"] = params["location"]
+            else:
+                # 接收侧无法解析锚点（接收物体顶点为空）：保持既有回退位置
+                # （来源侧调试物体），但必须显式可观测，不得静默错位。
+                LOG.warning(
+                    f"[GB] 接收侧无可用顶点，球保持回退位置 "
+                    f"{tuple(round(float(v), 4) for v in params['location'])}"
+                    f"（接收侧 {'、'.join(t.name for t in targets)} "
+                    "无顶点可着色）")
 
         session = _GBSession(_next_session_id)
         _next_session_id += 1
@@ -1506,6 +1544,9 @@ class GB_OT_StartFromDebug(bpy.types.Operator):
         root["gb_debug_parent"] = parent.name
         root["gb_use_evaluated"] = use_evaluated
         root["gb_direction"] = direction
+        # 显式创建缺失组随会话持久化：反向会话（写源侧用户数据）恢复后必须
+        # 保持同一建组开关，否则 undo/加载后写源侧缺组会被静默跳过
+        root["gb_create_missing"] = create_missing
         context.scene.collection.objects.link(root)
 
         ball = bpy.data.objects.new(f"GB_{vg_name}_001", None)

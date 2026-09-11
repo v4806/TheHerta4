@@ -176,6 +176,51 @@ class RigidCentroidGateTests(unittest.TestCase):
         vg_maps, _, _ = ZZMIBoneMapBuilder.build_vg_maps(palettes, {})
         self.assertNotEqual(vg_maps["aa_multi"][0], vg_maps["aa_multi"][1])
 
+    def test_dedup_excluded_component_keeps_identity_slots(self):
+        """VGMapDedupExcluded 部件不参与去重：恒等映射（local -> vg_offset+local，
+        组内 offset 口径，外部拼组基址后即全局 vg_offset+local），独占自己声明段；
+        其余部件之间照常合并，且排除不改变槽位布局（对齐
+        test_efmi_skeleton_dedup.py::test_dedup_excluded_component_keeps_identity_slots）。"""
+        palettes = {
+            "aa_part": _palette(_bone(0.1, 0.2, 0.3), _bone(1.0, 1.0, 1.0)),
+            "bb_part": _palette(_bone(0.1, 0.2, 0.3)),
+            "cc_part": _palette(_bone(0.1, 0.2, 0.3), _bone(5.0, 5.0, 5.0)),
+        }
+        # 无排除：三部件相同的 (0.1,0.2,0.3) 合并到同一 canonical 槽
+        maps, offsets, total = ZZMIBoneMapBuilder.build_vg_maps(palettes)
+        self.assertEqual(maps["aa_part"][0], maps["bb_part"][0])
+        self.assertEqual(maps["aa_part"][0], maps["cc_part"][0])
+
+        # 排除 cc：cc 必须恒等映射（组内 offset 口径），其它组件照常合并
+        maps2, offsets2, total2 = ZZMIBoneMapBuilder.build_vg_maps(
+            palettes, dedup_excluded={"cc_part"}
+        )
+        self.assertEqual(maps2["cc_part"][0], offsets2["cc_part"] + 0)
+        self.assertEqual(maps2["cc_part"][1], offsets2["cc_part"] + 1)
+        self.assertEqual(maps2["aa_part"][0], maps2["bb_part"][0])
+        # cc 的槽位不得与任何合并组重叠
+        self.assertNotEqual(maps2["cc_part"][0], maps2["aa_part"][0])
+        self.assertNotEqual(maps2["cc_part"][0], maps2["aa_part"][1])
+        # 排除不改变其它部件的 offset 布局 / 总槽位
+        self.assertEqual(offsets, offsets2)
+        self.assertEqual(total, total2)
+
+    def test_dedup_excluded_part_never_receives_merges(self):
+        """被排除部件先于他人处理时也不注册 owners：后续部件查不到其槽位，
+        无法把骨骼并入被排除部件的声明段（双向不合并）。"""
+        palettes = {
+            "aa_excluded": _palette(_bone(0.1, 0.2, 0.3)),
+            "bb_part": _palette(_bone(0.1, 0.2, 0.3)),
+        }
+        maps, offsets, _ = ZZMIBoneMapBuilder.build_vg_maps(
+            palettes, dedup_excluded={"aa_excluded"}
+        )
+        # aa 排序在前仍恒等映射；bb 的相同骨骼并入 aa 的槽（禁止）
+        self.assertEqual(maps["aa_excluded"][0], offsets["aa_excluded"] + 0)
+        self.assertNotEqual(maps["bb_part"][0], maps["aa_excluded"][0])
+        # bb 独立成槽（其声明段内），布局不受排除影响
+        self.assertEqual(maps["bb_part"][0], offsets["bb_part"] + 0)
+
 
 if __name__ == "__main__":
     unittest.main()

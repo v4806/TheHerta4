@@ -77,8 +77,11 @@ class BE_FrameSplitter:
                 matrix = evaluated_obj.matrix_world.copy()
                 obj_name = f"{self.props.be_object_prefix}{original_obj.name}_{frame:03d}"
                 new_obj = bpy.data.objects.new(obj_name, mesh_data)
-                mesh_data.transform(matrix)
-                new_obj.matrix_world = mathutils.Matrix.Identity(4)
+                if self.props.anim_split_keep_frame_origin:
+                    new_obj.matrix_world = matrix
+                else:
+                    mesh_data.transform(matrix)
+                    new_obj.matrix_world = mathutils.Matrix.Identity(4)
                 return new_obj
             else:
                 new_obj = original_obj.copy()
