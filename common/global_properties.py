@@ -122,7 +122,21 @@ class GlobalProterties(bpy.types.PropertyGroup):
 
     recalculate_tangent: bpy.props.BoolProperty(
         name="向量归一化法线存入TANGENT(全局)",
-        description="使用向量相加归一化重计算所有模型的TANGENT值，勾选此项后无法精细控制具体某个模型是否计算，是偷懒选项,在不勾选时默认使用右键菜单中标记的选项。\n用途:\n1.一般用于修复GI角色,HI3 1.0角色,HSR角色轮廓线。\n2.用于修复模型由于TANGENT不正确导致的黑色色块儿问题，比如HSR的薄裙子可能会出现此问题。",
+        description="轮廓线专用：将平滑法线写入 TANGENT，而不是生成标准切线空间。使用法线贴图或标准 TBN 光照时不要开启；“重新计算标准切线(TBN)”启用时本选项不会生效。",
+        default=False,
+    ) # type: ignore
+
+    # ARCH-06（描述收窄）：原描述承诺"导出时使用 TEXCOORD.xy（不存在时使用活动 UV）
+    # 重新计算 Blender 标准切线，并忽略导入时保存的旧 TANGENT"——该承诺在代码里
+    # **没有对应实现**：标准 TBN 本来就是导出默认路径（utils/export_utils.py:102 每次
+    # 导出前无条件 mesh.calc_tangents(uvmap=uvmap_name)），而"导入时保存的旧
+    # TANGENT"在导入侧就被丢弃（common/mesh_create_helper.py:188-189 TANGENT →
+    # pass，不写入 mesh）。本开关的**唯一**作用是两处 early-return
+    # （common/obj_buffer_helper.py:988 / :1059 average_normal_tangent_xxmi）：
+    # 抑制"把平滑法线覆盖进 TANGENT"的轮廓线修复路径。描述已按真实行为收窄。
+    recalculate_tangent_basis: bpy.props.BoolProperty(
+        name="重新计算标准切线(TBN)",
+        description="保留 Blender 标准切线空间：抑制“向量归一化法线存入TANGENT”的轮廓线覆盖，导出沿用每次导出重建的标准切线（不使用导入数据里的旧 TANGENT）。使用法线贴图或标准 TBN 光照时开启；仅在同时勾选了“向量归一化法线存入TANGENT”或物体级重算标记时才产生差异。",
         default=False,
     ) # type: ignore
 
@@ -411,6 +425,10 @@ class GlobalProterties(bpy.types.PropertyGroup):
     @classmethod
     def recalculate_tangent(cls):
         return cls._instance().recalculate_tangent
+
+    @classmethod
+    def recalculate_tangent_basis(cls):
+        return cls._instance().recalculate_tangent_basis
 
     @classmethod
     def recalculate_color(cls):

@@ -52,6 +52,12 @@ class ExportEFMI:
         # 极限小三角面占位对象（对齐 ZZMI 机制；必须在组装 SubMeshModel 之前注入，
         # 占位部件才能照常进合并骨架：EntryPoint 照常触发、只画不可见小三角）
         self._efmi_stub_object_names = []
+        # t9/A3：占位 DrawCall 登记表。占位 DrawCall 被 append 进
+        # blueprint_model.ordered_draw_obj_data_model_list，导出结束必须随对象/mesh
+        # 一起摘除，否则同一 BluePrintModel 二次/多轮导出会残留指向**已删除对象**的
+        # 占位绘制（下游 _collect_used_group_ids_by_lod 读到 None、段生成引用消失的
+        # 网格名）。对照 zzmi（zzmi.py:_cleanup_stub_objects 的 _zzmi_stub_draw_calls）。
+        self._efmi_stub_draw_calls = []
         if GlobalProterties.import_merged_vgmap():
             try:
                 self._efmi_stub_object_names = self._ensure_stub_objects_for_missing_parts()
@@ -95,18 +101,29 @@ class ExportEFMI:
     def _ensure_stub_objects_for_missing_parts(self) -> list[str]:
         """为「需要生成但没有对象」的部件创建极限小三角面占位对象。
 
-        合并骨架模式下用户可自由 join/删改。占位规则（用户裁决 2026-11
-        修正，与域前置同口径）：
+        合并骨架模式下用户可自由 join/删改。占位规则（t37 用户裁决，与 zzmi
+        同口径）：
         - **部分缺失的 DrawIB**：缺失组件直接补占位（其几何显然被同 DrawIB 的
           幸存对象接管）；
-        - **整个 DrawIB 缺席**：按**统一顶点组（未去重）注册域**判定是否被
-          并入保存对象——吸收证据只认「真·未注册槽」：现存对象实际使用
-          （权重>0）的槽中，扣除**全工作区所有部件 json VGMap 的已注册槽并集**
-          后剩下的槽，才可能是从被并入部件搬来的骨骼。统一骨架下任一组件
-          引用另一组件的已注册槽是设计内合法状态（域前置放行域同口径），
-          A 用它只是跨组件引用，不是吸收 B 的证据 → B 缺席时不生成占位
-          （该 DrawIB 不进 mod，游戏内显示原版）。零引用同样不插桩。
+        - **整个 DrawIB 缺席**：按 zzmi 同口径判定是否被并入现存对象——吸收证据
+          = 该 DrawIB VGMap 的全局骨骼 id 与现存对象**实际使用**（权重>0）的槽
+          有交集（`used ∩ vg_values` 非空；见 `_is_drawib_absorbed`，实现恒为
+          `bool(set(used_group_ids) & vg_values)`）。被任何现存对象引用即判吸收
+          → 全组件补占位小三角（游戏内不可见，抑制原版 draw 防重影）；
+          零引用 = 用户没想生成该 DrawIB → 保持原样不插桩（该 DrawIB 不进 mod，
+          游戏内显示原版）。
+        - **显式排除正交**：部件 json 标记 `VGMapDedupExcluded=True` 时，即使其槽
+          被引用也不补占位（见 `_is_component_dedup_excluded`）。
         无反查数据（json 无 VGMap）的缺席 DrawIB 一律不插桩。
+
+        历史时间线（勿回收紧版）：
+        - 43d5f62（2026-09-04，用户裁决 2026-11）曾收紧为「真·未注册槽」才判吸收
+          （现存对象使用槽先扣掉全工作区 json VGMap 已注册槽并集，只剩未注册槽
+          才算证据），理由是 GDZGF a4bb34f9 的 267 槽全在工作区 621 注册域内仍
+          误判吸收了 ddc92b8b；
+        - t37（实机反馈）确认该收紧导致合并骨骼场景「被合并 IB 不再生成占位」
+          （游戏侧部件缺失/绘制异常、合并骨骼被修坏）——裁决撤销收紧，恢复本
+          函数现在的 used∩vg_values 口径。
 
         多 LOD 语义（2026-08 实测定案）：LOD0 / LOD1 相互独立——每个 LOD 目录
         （LOD0/LOD1/...）有自己的 DrawIB-Component.json，各自按上述规则独立
@@ -196,18 +213,17 @@ class ExportEFMI:
                     # 部分缺失：缺失组件补占位
                     stub_members = [member for member in members if member not in present]
                 else:
-                    # 整个 DrawIB 缺席：判定「几何被并入现存对象」必须以
-                    # **统一顶点组（未去重）注册域**为基线（用户裁决 2026-11）：
-                    # 骨骼合并后全场共用一副骨架，任一组件引用另一组件的
-                    # **已注册槽**是设计内合法状态（域前置放行域 =
-                    # submesh_model._dualset_registered_slots_union 的
-                    # 全工作区并集，注释同口径）。因此吸收证据只认「真·未注册槽」
-                    # —— 现存对象 A 实际使用（权重>0）的槽中，扣除全工作区
-                    # 全部 json VGMap 已注册槽后剩下的槽，才可能是从被并入
-                    # 部件搬来的骨骼；矩阵相同的共享槽（A local 10 与 B local 20
-                    # 去重合并到同一 canonical）必然同时注册在全工作区 json 里，
-                    # A 用它只是「跨组件引用已注册槽」，不是吸收 B 的证据，
-                    # B 缺席时不应为其生成占位（游戏保留原版）。
+                    # 整个 DrawIB 缺席：按 zzmi 同口径判定「几何被并入现存对象」
+                    # （t37 用户裁决恢复：合并骨骼场景被合并 IB 必须生成占位绘制）。
+                    # 吸收证据 = 该 DrawIB VGMap 的全局骨骼 id 与现存对象实际使用
+                    # （权重>0）的槽有交集（used ∩ vg_values 非空）——只要有任一
+                    # 现存对象引用了它的槽，就认定几何已被合并，全组件补占位抑制
+                    # 重影；零引用 = 用户没想生成，保持原样不插桩（游戏显示原版）。
+                    # 注意：**不要**再收回「真·未注册槽」的收紧版（43d5f62 曾在
+                    # 2026-11 按此收紧，t37 实机确认它会让被合并 IB 不再生成占位、
+                    # 修坏合并骨骼；已撤销，详见 _is_drawib_absorbed 的历史时间线）。
+                    # 用户显式排除（VGMapDedupExcluded）仍不生成（正交语义，见
+                    # _is_component_dedup_excluded）。
                     absorbed = self._is_drawib_absorbed(
                         draw_ib,
                         search_dir,
@@ -237,7 +253,17 @@ class ExportEFMI:
                         continue
                     obj_name = self._create_stub_object(member, lod_name)
                     if obj_name:
-                        ordered.append(DrawCallModel(obj_name=obj_name))
+                        # 对齐 zzmi（L233-238）：显式填入占位几何的导出计数，
+                        # 避免默认的 0 让占位段退化成 drawindexed = 0；
+                        # SubMeshModel 后续仍会用真实 mesh 再校准一次。
+                        stub_draw_call = DrawCallModel(obj_name=obj_name)
+                        stub_draw_call.vertex_count = 3
+                        stub_draw_call.index_count = 3
+                        stub_draw_call.index_offset = 0
+                        stub_draw_call.zzmi_stub = True
+                        ordered.append(stub_draw_call)
+                        # t9/A3：登记，供 _cleanup_stub_objects 从 ordered 摘除。
+                        self._efmi_stub_draw_calls.append(stub_draw_call)
                         created.append(obj_name)
                         print(
                             f"[EFMI骨骼合并] 部件 {member}（{lod_label}）没有对应对象，"
@@ -281,19 +307,26 @@ class ExportEFMI:
         used_group_ids: set[int],
         declared_vg_ids: set[int],
     ) -> bool:
-        """按「统一顶点组（未去重）注册域」基线判定整个缺席的 DrawIB 是否已并入现存对象。
+        """按 zzmi 同口径判定整个缺席的 DrawIB 是否已并入现存对象（t37 用户裁决
+        恢复：合并骨骼场景被合并 IB 必须生成占位绘制）。
 
-        吸收的证据 = 现存对象实际使用的槽中，存在**未由全工作区任何组件 json
-        VGMap 声明**的槽（真·未注册槽——统一骨架下必然不是合法跨组件引用，
-        只能来自被并入的部件）；该未注册槽落在缺席 DrawIB 的 VGMap 值域内
-        即判定吸收。矩阵相同的共享槽（去重合并到同一 canonical）必然同时注册
-        在全工作区 json 里，跨组件引用已注册槽是设计内合法状态，不计入吸收证据。
+        吸收证据 = 缺席 DrawIB 的 VGMap 值域与现存对象实际使用槽有交集
+        （used ∩ vg_values 非空）——与 zzmi「骨骼被现存对象引用即生成 stub」
+        同口径。
+
+        历史时间线：
+        - 43d5f62（2026-09-04，用户裁决 2026-11）曾收紧为「真·未注册槽」才判
+          吸收（GDZGF a4bb34f9 267 槽全在工作区 621 注册域内仍误判 ddc92b8b）；
+        - t37（实机反馈）确认该收紧导致合并骨骼场景被合并 IB 不再生成 stub
+          （游戏侧部件缺失/绘制异常、合并骨骼被修坏）——裁决撤销收紧，恢复
+          zzmi 同口径；
+        - 用户显式 DedupExcluded 排除仍不生成（正交语义，见
+          _is_component_dedup_excluded）。
         """
         vg_values = self._load_drawib_vg_values(draw_ib, search_dir)
         if not vg_values:
             return False
-        foreign_used = set(used_group_ids) - set(declared_vg_ids)
-        return bool(vg_values & foreign_used)
+        return bool(set(used_group_ids) & vg_values)
 
     def _collect_declared_vg_ids_by_lod(self, ordered=None) -> dict[str, set[int]]:
         """收集全工作区各部件的 json VGMap 已注册槽并集，按 LOD 分组。
@@ -507,8 +540,43 @@ class ExportEFMI:
         return "0"
 
     def _cleanup_stub_objects(self):
-        """导出结束后移除占位对象（含 mesh 数据）。"""
-        for obj_name in self._efmi_stub_object_names:
+        """导出结束后移除占位对象（含 mesh 数据）与注入蓝图的占位 DrawCall。
+
+        t9/A3：占位 DrawCall 必须同时从
+        ``blueprint_model.ordered_draw_obj_data_model_list`` 摘除——它指向的
+        Blender 对象在本方法里刚被删除，残留会让同一 BluePrintModel 的下一轮导出
+        引用不存在的物体（zzmi 同款处理见 zzmi.py:_cleanup_stub_objects）。
+        登记表缺失（旧实例/异常路径）时退化为按 ``zzmi_stub`` 标记过滤。
+        """
+        tracked_draw_calls = list(getattr(self, "_efmi_stub_draw_calls", []) or [])
+        tracked_ids = {id(draw_call) for draw_call in tracked_draw_calls}
+
+        ordered = getattr(
+            getattr(self, "blueprint_model", None),
+            "ordered_draw_obj_data_model_list",
+            None,
+        )
+        if ordered is not None:
+            # 命中登记表**且**带占位标记才摘除：只删本模块注入的占位，
+            # 绝不误伤用户/上游放进去的真实 DrawCall。
+            ordered[:] = [
+                draw_call
+                for draw_call in ordered
+                if not (
+                    getattr(draw_call, "zzmi_stub", False)
+                    and id(draw_call) in tracked_ids
+                )
+            ]
+
+        # 对象名来源：登记表优先（其 obj_name 即占位对象名），并保留旧字段兜底。
+        object_names = {
+            str(getattr(draw_call, "obj_name", "") or "")
+            for draw_call in tracked_draw_calls
+        }
+        object_names.update(self._efmi_stub_object_names or [])
+        object_names.discard("")
+
+        for obj_name in sorted(object_names):
             obj = bpy.data.objects.get(obj_name)
             if obj is None:
                 continue
@@ -516,9 +584,10 @@ class ExportEFMI:
             bpy.data.objects.remove(obj, do_unlink=True)
             if mesh is not None and mesh.users == 0:
                 bpy.data.meshes.remove(mesh)
-        if self._efmi_stub_object_names:
-            print(f"[EFMI骨骼合并] 已清理 {len(self._efmi_stub_object_names)} 个占位小三角面对象")
+        if object_names:
+            print(f"[EFMI骨骼合并] 已清理 {len(object_names)} 个占位小三角面对象")
         self._efmi_stub_object_names = []
+        self._efmi_stub_draw_calls = []
 
     def generate_buffer_files(self):
         # 合并骨架部件（含 same-IB 槽位重定向）必须在本方法开始时已收集：
@@ -2772,6 +2841,21 @@ class ExportEFMI:
                 # 矩阵归属已由独立 component 槽位段（段平移互不相交）保证，运行时
                 # $\EFMIv1\lod_level 恒为框架默认 0 即可，无需逐入口传递。
                 texture_override_ib_section.append("$\\EFMIv1\\gpu_posed = 1")
+                # align-t3（efmi-zzmi-drag-align）：拖拽交互区域 include_objects
+                # 包含过滤的数据源——记录本 EntryPoint 覆盖的网格物体名集合
+                # （拖拽后处理导出器 blueprint/node_postprocess_draginteraction_efmi.py
+                # 的 _locate_component 解析 `; [mesh:...]` 注释，把区域包含列表
+                # 映射到组件；分号注释对 3Dmigoto 运行时零影响，等价既有
+                # `; [mesh:..] [vertex_count:..]` 注释惯例）。
+                _ep_mesh_names = sorted({
+                    str(getattr(dc, 'obj_name', '') or '')
+                    for dc in (getattr(submesh_model, 'drawcall_model_list', None) or [])
+                    if str(getattr(dc, 'obj_name', '') or '')
+                })
+                if _ep_mesh_names:
+                    texture_override_ib_section.append(
+                        "; [mesh:" + ",".join(_ep_mesh_names) + "]"
+                    )
                 texture_override_ib_section.append(
                     "CommandList\\EFMIv1\\Callback_Component_DrawCustom = ref " + draw_command_name
                 )

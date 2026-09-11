@@ -978,10 +978,22 @@ class ObjBufferHelper:
         Nico: 米游所有游戏都能用到这个，还有曾经的GPU-PreSkinning的GF2也会用到这个，崩坏三2.0新角色除外。
         尽管这个可以起到相似的效果，但是仍然无法完美获取模型本身的TANGENT数据，只能做到身体轮廓线99%近似。
         经过测试，头发轮廓线部分并不是简单的向量归一化，也不是算术平均归一化。
+
+        ⚠️ ARCH-06 现状标注：**全仓已无调用方**（`git grep average_normal_tangent`
+        仅命中定义处与本文件 `average_normal_tangent_xxmi` 的名称前缀；在用的是
+        `:1050 average_normal_tangent_xxmi`，被 utils/export_utils.py:563 与
+        本文件 :1184 / :1396 调用）。按"先证无调用方再删，否则保留 + 加提示"的
+        纪律：**保留**（它是轮廓线修复的算法参照实现，删掉会丢失口径对照），
+        并在此标注"当前无调用方"——包括其内部 `recalculate_tangent_basis()`
+        early-return 目前是死分支。若后续确认不再需要该参照，可整段删除。
         '''
         # TimerUtils.Start("Recalculate TANGENT")
 
         if "TANGENT" not in d3d11GameType.OrderedFullElementList:
+            return indexed_vertices
+        # 标准切线(TBN)导出与轮廓线写入 TANGENT 互斥：勾选「重新计算标准切线」时
+        # 保持标准 TBN，不再把平滑法线覆盖进 TANGENT。
+        if GlobalProterties.recalculate_tangent_basis():
             return indexed_vertices
         allow_calc = False
         if GlobalProterties.recalculate_tangent():
@@ -1049,6 +1061,10 @@ class ObjBufferHelper:
         这里只替换 xyz，w 仍保持当前导出路径的处理习惯。
         '''
         if "TANGENT" not in d3d11GameType.OrderedFullElementList:
+            return indexed_vertices
+        # 标准切线(TBN)导出与轮廓线写入 TANGENT 互斥：勾选「重新计算标准切线」时
+        # 保持标准 TBN，不再把平滑法线覆盖进 TANGENT。
+        if GlobalProterties.recalculate_tangent_basis():
             return indexed_vertices
 
         allow_calc = False

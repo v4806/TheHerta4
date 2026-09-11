@@ -338,46 +338,44 @@ class EFMIStubLodTests(unittest.TestCase):
         self.assertEqual(stub.vertex_groups[0].name, "371")
         exporter._cleanup_stub_objects()
 
-    def test_absent_drawib_registered_slot_referenced_is_not_absorbed(self):
-        """LOD1 整个 DrawIB 缺席，其独有槽被现存对象实际使用——但该槽已在
-        全工作区 json 注册（缺部件自己的 json 声明了 7）：统一顶点组模式下
-        跨组件引用已注册槽是设计内合法状态（用户裁决 2026-11，基线改为
-        全工作区注册域），不判吸收 -> 不插桩（游戏保留原版）。"""
+    def test_absent_drawib_registered_slot_referenced_is_absorbed(self):
+        """LOD1 整个 DrawIB 缺席，其槽被现存对象实际使用（t37 恢复 zzmi 同口径：
+        43d5f62 的「真·未注册槽」收紧导致合并骨骼场景被合并 IB 不再生成 stub，
+        实机确认修坏——被引用即判吸收 -> 插桩占位小三角）。"""
         self._write_component_map("LOD1", {"26ab840d": {"0": "26ab840d-24570-0"}})
         self._write_vgmap_json("LOD1", "26ab840d-24570-0", 7)
         self._write_vgmap_json("LOD1", "ed6d1655-816-0", 3)  # 现存对象声明槽 3
-        self._register_object_with_groups("LOD1.ed6d1655-816-0", [7])  # 实际却用了 7（已注册）
+        self._register_object_with_groups("LOD1.ed6d1655-816-0", [7])  # 实际用了 7
         ordered = [DrawCallModel(obj_name="LOD1.ed6d1655-816-0")]
         exporter = _make_exporter(ordered)
 
         names = self._workspace_unique_strs(ordered)
-        self.assertNotIn("LOD1.26ab840d-24570-0", names)
-        self.assertEqual(exporter._efmi_stub_object_names, [])
+        self.assertIn("LOD1.26ab840d-24570-0", names)
+        self.assertEqual(len(exporter._efmi_stub_object_names), 1)
         exporter._cleanup_stub_objects()
 
-    def test_absent_drawib_every_reference_is_registered_never_absorbed(self):
-        """整 DrawIB 缺席：declared = 全工作区注册域，缺部件自身的 json VGMap
-        值必然 ⊆ 注册域 -> vg_values ∩ (used − declared) 恒为空 -> absorbed
-        恒 False（用户裁决：几何未并入时槽位引用不算吸收证据；占位只由
-        「部分缺失」分支承担）。未注册槽（如 999）不属于任何 json 值域，
-        同样无法命中 vg_values，故正常数据下整缺席分支不再插桩。"""
+    def test_absent_drawib_referenced_is_absorbed(self):
+        """整 DrawIB 缺席：used ∩ vg_values 非空即吸收（zzmi 同口径）——
+        used 含缺部件声明槽 7 → 插桩；999 未注册也不属任何值域 → 不影响
+        判定（交集由 7 提供）。"""
         self._write_component_map("LOD0", {"b20f90ea": {"0": "b20f90ea-19182-0"}})
         self._write_vgmap_json("LOD0", "b20f90ea-19182-0", 7)
         self._register_object_with_groups(
             "LOD0.84618ee0-22296-0",
-            [7, 999],  # 7 已注册（缺部件声明）；999 未注册（也不属任何值域）
+            [7, 999],  # 7 命中缺部件值域 → 吸收
         )
         ordered = [DrawCallModel(obj_name="LOD0.84618ee0-22296-0")]
         exporter = _make_exporter(ordered)
 
         names = self._workspace_unique_strs(ordered)
-        self.assertNotIn("LOD0.b20f90ea-19182-0", names)
-        self.assertEqual(exporter._efmi_stub_object_names, [])
+        self.assertIn("LOD0.b20f90ea-19182-0", names)
+        self.assertEqual(len(exporter._efmi_stub_object_names), 1)
         exporter._cleanup_stub_objects()
 
-    def test_shared_slot_from_matrix_dedup_does_not_absorb_missing_drawib(self):
-        """用户裁决：矩阵去重的共享槽（A 自己经 VGMap 声明了同槽）不算吸收证据——
-        A 用 X 是用自己的骨骼，B 缺席时不应补占位（游戏保留原版）。"""
+    def test_shared_slot_from_matrix_dedup_reference_absorbs_missing_drawib(self):
+        """t37 恢复：矩阵去重的共享槽（A 自己声明同槽 7）被 A 实际使用——
+        zzmi 同口径 used ∩ vg 非空即吸收 -> B 缺席补占位（43d5f62 曾
+        因「A 用 X 是用自己的骨骼」判不吸收——实机确认该收紧修坏合并场景）。"""
         self._write_component_map("LOD1", {"26ab840d": {"0": "26ab840d-24570-0"}})
         self._write_vgmap_json("LOD1", "26ab840d-24570-0", 7)  # B: local0 -> 槽 7
         self._write_vgmap_json("LOD1", "ed6d1655-816-0", 7)    # A: local0 -> 亦声明槽 7（共享）
@@ -386,28 +384,13 @@ class EFMIStubLodTests(unittest.TestCase):
         exporter = _make_exporter(ordered)
 
         names = self._workspace_unique_strs(ordered)
-        self.assertNotIn("LOD1.26ab840d-24570-0", names)
-        self.assertEqual(exporter._efmi_stub_object_names, [])
+        self.assertIn("LOD1.26ab840d-24570-0", names)
+        self.assertEqual(len(exporter._efmi_stub_object_names), 1)
         exporter._cleanup_stub_objects()
 
-    def test_dedup_excluded_missing_component_skips_stub(self):
-        """VGMapDedupExcluded=True 的缺失部件：即使槽被引用，也按用户意图不生成占位。"""
-        self._write_component_map("LOD1", {"26ab840d": {"0": "26ab840d-24570-0"}})
-        self._write_vgmap_json("LOD1", "26ab840d-24570-0", 7, excluded=True)
-        self._register_object_with_groups("LOD1.ed6d1655-816-0", [7])
-        ordered = [DrawCallModel(obj_name="LOD1.ed6d1655-816-0")]
-        exporter = _make_exporter(ordered)
-
-        names = self._workspace_unique_strs(ordered)
-        self.assertNotIn("LOD1.26ab840d-24570-0", names)
-        self.assertEqual(exporter._efmi_stub_object_names, [])
-        exporter._cleanup_stub_objects()
-
-    def test_replacement_model_registered_slot_reference_is_not_absorbed(self):
+    def test_replacement_model_referenced_slot_is_absorbed(self):
         """替换模型即使几何不同且组下标被压缩，也按数字组名识别统一骨骼；
-        但被引用的槽 7 已由缺席部件自己的 json 注册（全工作区注册域）——
-        跨组件引用已注册槽是合法状态（用户裁决 2026-11）-> 不插桩，
-        游戏保留原版绘制。"""
+        被引用的槽 7 命中缺部件值域（t37 zzmi 同口径）-> 插桩占位。"""
         self._write_component_map("LOD0", {
             "b20f90ea": {"0": "b20f90ea-19182-0"},
         })
@@ -426,8 +409,8 @@ class EFMIStubLodTests(unittest.TestCase):
         exporter = _make_exporter(ordered)
 
         names = self._workspace_unique_strs(ordered)
-        self.assertNotIn("LOD0.b20f90ea-19182-0", names)
-        self.assertEqual(exporter._efmi_stub_object_names, [])
+        self.assertIn("LOD0.b20f90ea-19182-0", names)
+        self.assertEqual(len(exporter._efmi_stub_object_names), 1)
         exporter._cleanup_stub_objects()
 
     def test_geometry_overlap_without_vgmap_relation_does_not_create_stub(self):
@@ -500,10 +483,9 @@ class EFMIStubLodTests(unittest.TestCase):
         self.assertNotIn("LOD1.26ab840d-24570-0", names)
         self.assertEqual(exporter._efmi_stub_object_names, [])
 
-    def test_lod0_registered_slot_referenced_is_not_absorbed(self):
-        """LOD0 新语义不回退：LOD0 缺席 DrawIB 的已注册槽被 LOD0 对象引用
-        （槽 3 由缺部件 json 注册在全工作区）-> 跨组件引用已注册槽合法，
-        不判吸收 -> 不插桩（用户裁决 2026-11，基线=全工作区注册域）。"""
+    def test_lod0_referenced_slot_is_absorbed(self):
+        """LOD0 缺席 DrawIB 的槽被 LOD0 对象引用（槽 3 命中缺部件值域，
+        t37 zzmi 同口径）-> 判吸收 -> 插桩占位（LOD 独立性保持）。"""
         self._write_component_map("LOD0", {"b20f90ea": {"0": "b20f90ea-19182-0"}})
         self._write_vgmap_json("LOD0", "b20f90ea-19182-0", 3)
         self._register_object_with_groups("LOD0.84618ee0-22296-0", [3])
@@ -511,9 +493,99 @@ class EFMIStubLodTests(unittest.TestCase):
         exporter = _make_exporter(ordered)
 
         names = self._workspace_unique_strs(ordered)
-        self.assertNotIn("LOD0.b20f90ea-19182-0", names)
+        self.assertIn("LOD0.b20f90ea-19182-0", names)
+        self.assertEqual(len(exporter._efmi_stub_object_names), 1)
+        exporter._cleanup_stub_objects()
+
+    def test_stub_draw_call_explicit_three_vertex_markers(self):
+        """t37：stub draw call 显式填入 3 顶点占位几何标记（对齐 zzmi L233-238：
+        vertex_count=3/index_count=3/index_offset=0/zzmi_stub=True）——防止默认
+        0 计数让占位段退化成 drawindexed = 0（IB override 阶段先于 SubMeshModel
+        校准）。"""
+        self._write_component_map("LOD1", {"26ab840d": {"0": "26ab840d-24570-0"}})
+        self._write_vgmap_json("LOD1", "26ab840d-24570-0", 7)
+        self._register_object_with_groups("LOD1.ed6d1655-816-0", [7])
+        ordered = [DrawCallModel(obj_name="LOD1.ed6d1655-816-0")]
+        exporter = _make_exporter(ordered)
+
+        stub_draws = [
+            dc for dc in ordered
+            if dc.obj_name == "LOD1.26ab840d-24570-0"
+        ]
+        self.assertEqual(len(stub_draws), 1)
+        stub = stub_draws[0]
+        self.assertEqual(stub.vertex_count, 3)
+        self.assertEqual(stub.index_count, 3)
+        self.assertEqual(stub.index_offset, 0)
+        self.assertTrue(getattr(stub, "zzmi_stub", False))
+        exporter._cleanup_stub_objects()
+
+    def test_dedup_excluded_missing_component_still_skips_stub(self):
+        """t37 保留正交语义：VGMapDedupExcluded=True 的缺失部件即使槽被引用
+        也按用户意图不生成占位（显式排除优先于吸收判定）。"""
+        self._write_component_map("LOD1", {"26ab840d": {"0": "26ab840d-24570-0"}})
+        self._write_vgmap_json("LOD1", "26ab840d-24570-0", 7, excluded=True)
+        self._register_object_with_groups("LOD1.ed6d1655-816-0", [7])
+        ordered = [DrawCallModel(obj_name="LOD1.ed6d1655-816-0")]
+        exporter = _make_exporter(ordered)
+
+        names = self._workspace_unique_strs(ordered)
+        self.assertNotIn("LOD1.26ab840d-24570-0", names)
         self.assertEqual(exporter._efmi_stub_object_names, [])
         exporter._cleanup_stub_objects()
+
+    def test_cleanup_removes_stub_draw_call_from_ordered(self):
+        """t9/A3：导出结束（_cleanup_stub_objects）必须把占位 DrawCall 从
+        blueprint_model.ordered_draw_obj_data_model_list 摘除，否则同一
+        BluePrintModel 二次/多轮导出会残留指向**已删除对象**的占位绘制
+        （下游 _collect_used_group_ids_by_lod 读到 None、段生成引用消失的网格名）。
+        """
+        self._write_component_map("LOD1", {"26ab840d": {"0": "26ab840d-24570-0"}})
+        self._write_vgmap_json("LOD1", "26ab840d-24570-0", 7)
+        self._register_object_with_groups("LOD1.ed6d1655-816-0", [7])
+        ordered = [DrawCallModel(obj_name="LOD1.ed6d1655-816-0")]
+        # 注意：基线长度必须在 _make_exporter **之前**取——构造期就会注入占位。
+        base_length = len(ordered)
+        exporter = _make_exporter(ordered)
+
+        stub_names = [n for n in self._workspace_unique_strs(ordered)
+                      if n == "LOD1.26ab840d-24570-0"]
+        self.assertEqual(len(stub_names), 1, "前置：占位 DrawCall 应已注入 ordered")
+        self.assertEqual(len(exporter._efmi_stub_draw_calls), 1, "t9：占位须登记")
+
+        exporter._cleanup_stub_objects()
+
+        after_names = self._workspace_unique_strs(ordered)
+        self.assertNotIn("LOD1.26ab840d-24570-0", after_names,
+                         "cleanup 后 ordered 不得残留占位 DrawCall")
+        self.assertEqual(len(ordered), base_length, "cleanup 后 ordered 长度应还原")
+        self.assertEqual(exporter._efmi_stub_draw_calls, [], "登记表应清空")
+        self.assertEqual(len([dc for dc in ordered
+                              if getattr(dc, "zzmi_stub", False)]), 0)
+        # 对象与 mesh 也已删除
+        self.assertIsNone(_fake_bpy_data.objects.get("LOD1.26ab840d-24570-0"))
+        # 幂等：再次 cleanup 不应改变 ordered
+        exporter._cleanup_stub_objects()
+        self.assertEqual(len(ordered), base_length)
+        self.assertEqual(self._workspace_unique_strs(ordered), after_names)
+
+    def test_cleanup_keeps_real_draw_calls_even_if_marked(self):
+        """t9/A3 边界：只摘除「本模块登记过 **且** 带 zzmi_stub 标记」的项，
+        不误伤上游/用户放进 ordered 的真实 DrawCall（哪怕它带同名字段）。"""
+        self._write_component_map("LOD1", {"26ab840d": {"0": "26ab840d-24570-0"}})
+        self._write_vgmap_json("LOD1", "26ab840d-24570-0", 7)
+        self._register_object_with_groups("LOD1.ed6d1655-816-0", [7])
+        real = DrawCallModel(obj_name="LOD1.ed6d1655-816-0")
+        stray = DrawCallModel(obj_name="LOD1.ffffffff-1-0")
+        stray.zzmi_stub = True  # 未登记的异物
+        ordered = [real, stray]
+        exporter = _make_exporter(ordered)
+
+        exporter._cleanup_stub_objects()
+
+        names = self._workspace_unique_strs(ordered)
+        self.assertIn("LOD1.ed6d1655-816-0", names, "真实 DrawCall 必须保留")
+        self.assertIn("LOD1.ffffffff-1-0", names, "未登记项不得被误删")
 
 
 if __name__ == "__main__":

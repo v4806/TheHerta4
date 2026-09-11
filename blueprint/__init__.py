@@ -90,6 +90,11 @@ _MODULE_REGISTRY = [
     {"name": "direct_export", "required": False},
     {"name": "node_postprocess_multifile", "required": False},
     {"name": "node_postprocess_draginteraction", "required": False},
+    # ARCH-09：EFMI 拖拽交互独立分支（执行器/烘焙/预览库模块，无自己的 Blender
+    # 类，register()/unregister() 为空钩子）。登记进清单只为让"模块清单/可选加载"
+    # 语义完整、后续模块级审计不漏项；此前它只靠 node_postprocess_draginteraction
+    # 的 6 处惰性 import 加载（功能一直可用）。required=False：缺失不阻塞加载。
+    {"name": "node_postprocess_draginteraction_efmi", "required": False},
     {"name": "anim_driver_base", "required": False},
     {"name": "anim_driver_collector", "required": False},
     {"name": "anim_driver_runtime", "required": False},
