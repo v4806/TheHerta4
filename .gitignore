@@ -20,3 +20,21 @@ test/
 theherta4_updater/
 scan_*.py
 audit_drawindexed.py
+TheHerta4V146.zip
+
+# ---- ARCH-11：备份/临时残余兜底（防止 git add -A 误提交开发期备份）----
+# 编辑器/VCS 手工备份后缀（如 efmi_deform.hlsl.bak-freeze-20260911-070026、
+# node_postprocess_draginteraction_efmi.py.bak-t51-20260911-093407、*.GOOD-*）
+*.bak
+*.bak-*
+*.bak.*
+*.GOOD-*
+*.orig
+*.rej
+*~
+# 验证/诊断日志（如 tests/_verify_efmi_contract.log，全仓零引用）
+tests/_verify_*.log
+# review 期间产出的临时 diff（如 .review_t1_zzmi.diff）
+.review_*.diff
+# 复核基线日志（只忽略 .log，保留 review-reports/*.md 留档）
+review-reports/*.log

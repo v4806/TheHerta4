@@ -46,6 +46,9 @@ jobs:
             --exclude='__pycache__' \
             --exclude='*.pyc' \
             --exclude='*.pyo' \
+            --exclude='*.bak-*' \
+            --exclude='*.GOOD-*' \
+            --exclude='*.log' \
             --exclude='*.md' \
             --exclude='docs' \
             --exclude='dist' \
