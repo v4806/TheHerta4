@@ -496,10 +496,13 @@ class PanelBasicInformation(bpy.types.Panel):
             emboss=False,
         )
 
-        if global_properties.expand_import_quick_tools:
-            velo_row = layout.row()
+        # Velo 工作空间入口固定显示；未切换到 Velo 时保持禁用。
+        if hasattr(bpy.types, 'SSMT_OT_import_current_velo_workspace'):
+            velo_row = layout.row(align=True)
             velo_row.enabled = global_properties.workspace_source_mode == 'VELO'
             velo_row.operator('ssmt.import_current_velo_workspace', text='导入当前velo工作空间', icon='IMPORT')
+
+        if global_properties.expand_import_quick_tools:
             import_box = layout.box()
             import_box.operator("import_mesh.migoto_raw_buffers_mmt", text="导入FMT格式模型", icon='IMPORT')
             import_box.operator(SSMT4ImportRaw.bl_idname, text="导入SSMT格式模型", icon='IMPORT')

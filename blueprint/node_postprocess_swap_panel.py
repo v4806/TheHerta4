@@ -50,6 +50,14 @@ except ImportError:
     PIL_AVAILABLE = False
 
 
+def _is_efmi_ini_sections(sections):
+    return any(
+        '\\efmiv1\\' in line.casefold()
+        for section_lines in sections.values()
+        for line in section_lines
+    )
+
+
 class SSMT_SwapPanelEntry(bpy.types.PropertyGroup):
     """面板中一个物体切换按钮的条目信息（仅用于节点 UI 预览）。"""
     variable_name: bpy.props.StringProperty(name="变量名", default="")   # 如 $swapkey6
@@ -742,7 +750,12 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
                 stripped_line = line.strip()
                 if stripped_line.startswith('[') and stripped_line.endswith(']') and len(stripped_line) > 2:
                     current_section = stripped_line
-                    sections[current_section] = []
+                    # EFMI 会追加同名 Constants/Present 段，按原顺序合并保留。
+                    current_section = next(
+                        (key for key in sections if key.casefold() == current_section.casefold()),
+                        current_section,
+                    )
+                    sections.setdefault(current_section, [])
                 elif current_section is not None:
                     sections[current_section].append(line.rstrip())
         except FileNotFoundError:
@@ -1179,6 +1192,8 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
             return False
         sections, preserved_tail_content, preserved_driver_content = result
 
+        is_efmi = _is_efmi_ini_sections(sections)
+
         # 刷新模式：先按专有标识移除本面板旧配置，再原地重新生成
         if _in_place:
             self._remove_owned_config(sections, ns)
@@ -1293,7 +1308,7 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
             detect_lines.append(f"match_index_count = {detect_index_count_val}")
             has_any_check = True
         detect_lines.append(f"${ns}_ui_active = 1")
-        if has_any_check:
+        if has_any_check and not is_efmi:
             other_sections[f"[TextureOverrideCheckHash_{ns}]"] = detect_lines
 
         other_sections[f"[ResourceImageToRender0_{ns}]"] = [f"filename = ./res/swpbg_{ns}.png"]
@@ -1347,6 +1362,9 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
             other_sections[f"[CommandListSwap{i}_{ns}]"] = command_lines
 
         # ---- Present 逻辑（全部使用命名空间变量，与其它面板隔离）----
+        if is_efmi:
+            # EFMI 已负责对象检测；复用其状态，避免第二个 hash override 竞争入口。
+            present_additions.append(f"${ns}_ui_active = $object_detected && $mod_enabled")
         present_additions.append(f"post ${ns}_ui_active = 0")
         present_additions.append(f"if ${ns}_help == 1 && ${ns}_ui_active == 1")
         present_additions.append("    ; --- 1. 尺寸计算 ---")
