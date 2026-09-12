@@ -343,9 +343,16 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
         guard = f"${ns}_gui_only == 0"
         marker = self.GUI_GUARD_MARKER.format(ns=ns)
         for sec_name, lines in sections.items():
-            if not re.match(r"^\[KeySwap_[^\]]+\]$", sec_name.strip()):
+            # Velo/EFMI emits [KeySwapSwapkeyN], while WWMI and older
+            # generators commonly emit [KeySwap_SwapkeyN]. Both are original
+            # keyboard controls and must be gated in GUI-only mode.
+            if not re.match(r"^\[KeySwap(?:_|[^\]])[^\]]*\]$", sec_name.strip(), re.IGNORECASE):
                 continue
-            if not any(re.match(rf"^\s*{re.escape(var)}\s*=", line) for var in variables for line in lines):
+            if not any(
+                re.match(rf"^\s*{re.escape(var)}\s*=", line, re.IGNORECASE)
+                for var in variables
+                for line in lines
+            ):
                 continue
             condition_index = next(
                 (index for index, line in enumerate(lines)
@@ -742,7 +749,12 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
                 stripped_line = line.strip()
                 if stripped_line.startswith('[') and stripped_line.endswith(']') and len(stripped_line) > 2:
                     current_section = stripped_line
-                    sections[current_section] = []
+                    # EFMI 会追加同名 Constants/Present 段，按原顺序合并保留。
+                    current_section = next(
+                        (key for key in sections if key.casefold() == current_section.casefold()),
+                        current_section,
+                    )
+                    sections.setdefault(current_section, [])
                 elif current_section is not None:
                     sections[current_section].append(line.rstrip())
         except FileNotFoundError:
@@ -779,9 +791,9 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
 
         swaps = []
         for order, (section_name, lines) in enumerate(sections.items()):
-            numeric_match = re.match(r'^\[KeySwap_(\d+)\]$', section_name.strip())
-            diffuse_match = re.match(r'^\[KeySwap_Diffuse_[^\]]+\]$', section_name.strip())
-            if not numeric_match and not diffuse_match:
+            numeric_match = re.match(r'^\[KeySwap_(\d+)\]$', section_name.strip(), re.IGNORECASE)
+            named_match = re.match(r'^\[KeySwap[^\]]+\]$', section_name.strip(), re.IGNORECASE)
+            if not named_match:
                 continue
             index = int(numeric_match.group(1)) if numeric_match else 1000000 + order
             entry = {"index": index, "var_name": "", "comment": "", "key": "", "option_count": 2}
@@ -1063,6 +1075,28 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
             print(f"[物体切换面板] 生成背景图失败: {e}")
             return None
 
+    def _is_velo_efmi_export(self, _in_place=False):
+        """本次后处理是否运行在 Velo / EFMI-Tools 后端上。
+
+        Velo 桥接是独立的输出节点，导出期间由它显式写入运行时标记；这里只读那个标记，
+        不做 ini 文本嗅探——TheHerta4 自身的 EFMI 导出同样会写 ``\\EFMIv1\\`` 命名空间，
+        用文本特征判断会把原生 EFMI 导出误判成 Velo 导出（进而跳过本面板自己的检测段）。
+
+        「原地刷新」没有导出上下文，回落到蓝图树 / 桥接节点上的持久标记。
+        """
+        try:
+            from .export_helper import BlueprintExportHelper
+        except Exception:
+            return False
+        try:
+            game = BlueprintExportHelper.get_velo_bridge_game(
+                tree=getattr(self, "id_data", None),
+                use_blueprint_marker=bool(_in_place),
+            )
+        except Exception:
+            return False
+        return game == 'ENDFIELD'
+
     def execute_postprocess(self, mod_export_path, _in_place=False, _ini_path=None):
         """生成 / 原地刷新物体切换面板配置。
 
@@ -1179,6 +1213,8 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
             return False
         sections, preserved_tail_content, preserved_driver_content = result
 
+        is_efmi = self._is_velo_efmi_export(_in_place)
+
         # 刷新模式：先按专有标识移除本面板旧配置，再原地重新生成
         if _in_place:
             self._remove_owned_config(sections, ns)
@@ -1293,7 +1329,7 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
             detect_lines.append(f"match_index_count = {detect_index_count_val}")
             has_any_check = True
         detect_lines.append(f"${ns}_ui_active = 1")
-        if has_any_check:
+        if has_any_check and not is_efmi:
             other_sections[f"[TextureOverrideCheckHash_{ns}]"] = detect_lines
 
         other_sections[f"[ResourceImageToRender0_{ns}]"] = [f"filename = ./res/swpbg_{ns}.png"]
@@ -1347,6 +1383,9 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
             other_sections[f"[CommandListSwap{i}_{ns}]"] = command_lines
 
         # ---- Present 逻辑（全部使用命名空间变量，与其它面板隔离）----
+        if is_efmi:
+            # EFMI 已负责对象检测；复用其状态，避免第二个 hash override 竞争入口。
+            present_additions.append(f"${ns}_ui_active = $object_detected && $mod_enabled")
         present_additions.append(f"post ${ns}_ui_active = 0")
         present_additions.append(f"if ${ns}_help == 1 && ${ns}_ui_active == 1")
         present_additions.append("    ; --- 1. 尺寸计算 ---")

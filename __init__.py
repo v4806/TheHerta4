@@ -175,6 +175,15 @@ class HertaUpdatePreference(bpy.types.AddonPreferences):
         layout.prop(self, "自动检查更新")
         addon_updater_ops.update_settings_ui(self, context)
 
+def _import_velo_bridge():
+    """按安装布局导入 Velo 桥接模块。"""
+    try:
+        import TheHerta4_Velo_Bridge  # type: ignore
+    except ImportError:
+        from . import TheHerta4_Velo_Bridge  # type: ignore
+    return TheHerta4_Velo_Bridge
+
+
 def register():
     """插件注册入口 - 注册所有属性、面板、操作符和蓝图系统"""
     global_properties.register()
@@ -197,10 +206,9 @@ def register():
     blueprint.register()
     # Velo 桥接支持两种安装布局：作为 TheHerta4 包内子包，或独立复制到 addons 目录。
     try:
-        import TheHerta4_Velo_Bridge
-    except ImportError:
-        from . import TheHerta4_Velo_Bridge
-    TheHerta4_Velo_Bridge.register()
+        _import_velo_bridge().register()
+    except Exception as bridge_error:
+        print(f"[TheHerta4] Velo 桥接注册已跳过: {bridge_error!r}")
     _schedule_blueprint_node_color_refresh()
     ui_prefix_quick_ops.register()
     ui_panel_basic.register()
@@ -236,10 +244,9 @@ def unregister():
     ui_panel_basic.unregister()
     ui_prefix_quick_ops.unregister()
     try:
-        import TheHerta4_Velo_Bridge
-    except ImportError:
-        from . import TheHerta4_Velo_Bridge
-    TheHerta4_Velo_Bridge.unregister()
+        _import_velo_bridge().unregister()
+    except Exception as bridge_error:
+        print(f"[TheHerta4] Velo 桥接注销已跳过: {bridge_error!r}")
     blueprint.unregister()
 
     bpy.utils.unregister_class(HertaUpdatePreference)
