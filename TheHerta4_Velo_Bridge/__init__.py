@@ -1,4 +1,4 @@
-bl_info = {'name': 'TheHerta4 Velo Bridge', 'version': (0, 3, 1), 'blender': (4, 4, 0), 'category': 'Node'}
+bl_info = {'name': 'TheHerta4 Velo Bridge', 'version': (0, 3, 2), 'blender': (4, 4, 0), 'category': 'Node'}
 import bpy
 import importlib.util
 import re
@@ -8,8 +8,12 @@ from pathlib import Path
 from bpy.props import StringProperty
 
 NODE_ID = 'SSMTNode_VeloExportBridge'
-BRIDGE_VERSION = '0.3.1'
+BRIDGE_VERSION = '0.3.2'
 LOG_PREFIX = '[TheHerta4][VeloBridge][Experimental] '
+VELO_FORMATTER_MODULES = {
+    'WUTHERING': 'velo_tools.games.wuthering_waves._wwmi_core.blender_export.text_formatter',
+    'ENDFIELD': 'velo_tools.games.arknights_endfield._efmi_core.blender_export.text_formatter',
+}
 
 # 前置插件检测：未安装 Velo Tools 时节点仍可创建（便于搭建蓝图），
 # 但导入/导出操作在执行时会直接失败并给出明确提示（参考 NTMI 的依赖检测模式）。
@@ -58,6 +62,13 @@ def workspace(scene):
     from velo_tools.games.registry import get_active_descriptor
     desc = get_active_descriptor(scene)
     return desc, desc.settings(scene) if desc else None
+
+
+def _velo_text_formatter(game_value):
+    module_name = VELO_FORMATTER_MODULES.get(game_value)
+    if module_name is None:
+        raise ValueError('TheHerta4 Velo Bridge 不支持此游戏: ' + str(game_value))
+    return importlib.import_module(module_name).TextFormatter()
 
 def linked_objects(node):
     result, seen, visiting = [], set(), set()
@@ -143,15 +154,14 @@ def _object_condition_paths(node, bindings):
     walk(node, [])
     return paths
 
-def _rewrite_nested_toggle_conditions(cfg, tree, bridge_node, bindings):
+def _rewrite_nested_toggle_conditions(cfg, tree, bridge_node, bindings, game_value='WUTHERING'):
     folder = getattr(cfg, 'mod_output_folder', '')
     if not folder:
         return
     ini_path = Path(bpy.path.abspath(folder)) / 'mod.ini'
     if not ini_path.is_file():
         return
-    from velo_tools.games.wuthering_waves._wwmi_core.blender_export.text_formatter import TextFormatter
-    fmt = TextFormatter()
+    fmt = _velo_text_formatter(game_value)
     paths = _object_condition_paths(bridge_node, bindings)
     lines = ini_path.read_text(encoding='utf-8').splitlines()
     declared = {
@@ -215,7 +225,7 @@ def _normalize_draw_variables(text):
     return pattern.sub(lambda match: lookup[match.group(0).casefold()], text)
 
 
-def _inject_swap_toggles(cfg, tree, output_name=''):
+def _inject_swap_toggles(cfg, tree, output_name='', game_value='WUTHERING'):
     toggles = getattr(cfg, 'ini_toggles', None)
     if toggles is None or not hasattr(cfg, 'use_ini_toggles'):
         return None
@@ -226,6 +236,7 @@ def _inject_swap_toggles(cfg, tree, output_name=''):
     try:
         toggles.vars.clear()
         bindings = _swap_bindings(tree, output_name)
+        _swap_variable_replacements(bindings, game_value)
         for idx, node in enumerate(_swap_nodes(tree, output_name)):
             name = bindings[node.as_pointer()]
             var = toggles.vars.add()
@@ -286,10 +297,38 @@ def _seed_postprocess_detection_from_ini(tree, ini_path):
     except Exception:
         pass
 
-def _restore_th4_swap_variable_names(ini_path):
+def _swap_variable_replacements(bindings, game_value):
+    formatter = _velo_text_formatter(game_value)
+    replacements = {}
+    owners = {}
+    for name in bindings.values():
+        target = '$' + str(name).lstrip('$')
+        source = formatter.format_ini_swapvar(name)
+        key = source.casefold()
+        previous = owners.get(key)
+        if previous is not None and previous.casefold() != target.casefold():
+            raise ValueError(
+                f"物体切换变量 {previous} 和 {target} 会被 Velo 格式化为同一个变量 {source}，"
+                "请在物体切换节点中使用不同的变量名"
+            )
+        owners[key] = target
+        replacements[key] = target
+    return replacements
+
+
+def _restore_th4_swap_variable_names(ini_path, bindings, game_value):
+    """Replace Velo-generated identifiers with the exact ObjectSwap node variables."""
     path = Path(ini_path)
     text = path.read_text(encoding='utf-8')
-    text = re.sub(r'(?<![A-Za-z0-9_])\$swapvar_(swapkey\d+)(?![A-Za-z0-9_])', r'$\1', text, flags=re.IGNORECASE)
+    replacements = _swap_variable_replacements(bindings, game_value)
+    if replacements:
+        pattern = re.compile(
+            r'(?<![A-Za-z0-9_])(?:'
+            + '|'.join(re.escape(name) for name in sorted(replacements, key=len, reverse=True))
+            + r')(?![A-Za-z0-9_])',
+            re.IGNORECASE,
+        )
+        text = pattern.sub(lambda match: replacements[match.group(0).casefold()], text)
     path.write_text(text, encoding='utf-8')
 
 class SSMTNode_VeloExportBridge(bpy.types.Node):
@@ -428,7 +467,7 @@ class ExportVeloWorkspace(bpy.types.Operator):
                 for key in ('ignore_hidden_objects', 'ignore_hidden_collections', 'ignore_nested_collections'):
                     original_filters[key] = getattr(cfg, key)
                     setattr(cfg, key, False)
-            toggle_state = _inject_swap_toggles(cfg, tree, self.node_name)
+            toggle_state = _inject_swap_toggles(cfg, tree, self.node_name, desc.game_value)
             _debug('swap_toggles_injected=' + str(bool(toggle_state)))
             category, name = desc.export_op.split('.')
             from .efmi_selection import explicit_efmi_objects
@@ -438,9 +477,20 @@ class ExportVeloWorkspace(bpy.types.Operator):
             _debug('velo_export_result=' + repr(result) + ' output=' + str(cfg.mod_output_folder))
             if 'FINISHED' not in result or getattr(cfg, 'last_error_text', ''):
                 raise ValueError(getattr(cfg, 'last_error_text', '') or 'Velo 导出未完成')
-            _rewrite_nested_toggle_conditions(cfg, tree, tree.nodes[self.node_name], toggle_state[2] if toggle_state else {})
-            _seed_postprocess_detection_from_ini(tree, bpy.path.abspath(cfg.mod_output_folder) + '/mod.ini')
-            _restore_th4_swap_variable_names(bpy.path.abspath(cfg.mod_output_folder) + '/mod.ini')
+            _rewrite_nested_toggle_conditions(
+                cfg,
+                tree,
+                tree.nodes[self.node_name],
+                toggle_state[2] if toggle_state else {},
+                desc.game_value,
+            )
+            if desc.game_value == 'ENDFIELD':
+                _seed_postprocess_detection_from_ini(tree, bpy.path.abspath(cfg.mod_output_folder) + '/mod.ini')
+            _restore_th4_swap_variable_names(
+                bpy.path.abspath(cfg.mod_output_folder) + '/mod.ini',
+                toggle_state[2] if toggle_state else {},
+                desc.game_value,
+            )
             # Run TheHerta4's connected post-process chain against the final Velo INI.
             try:
                 from TheHerta4.blueprint.export_helper import BlueprintExportHelper

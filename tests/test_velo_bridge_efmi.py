@@ -34,13 +34,25 @@ def _fake_bpy():
     return module
 
 
+class _VeloStyleFormatter:
+    @staticmethod
+    def format_ini_swapvar(name):
+        text = str(name or '').replace('$', '').replace('-', ' ').replace('.', ' ').replace('_', ' ')
+        parts = (part.strip().lower() for part in text.split(' '))
+        return '$swapvar_' + '_'.join(part for part in parts if part and part not in ('var', 'swap'))
+
+
 class VeloBridgeEFMITests(unittest.TestCase):
-    def test_non_ascii_draw_variables_are_replaced_everywhere(self):
+    @staticmethod
+    def _load_bridge():
         fake_bpy = _fake_bpy()
         with mock.patch.dict(sys.modules, {'bpy': fake_bpy, 'bpy.props': fake_bpy.props}):
-            bridge = _load_module(
+            return _load_module(
                 '_test_velo_bridge', ROOT / 'TheHerta4_Velo_Bridge' / '__init__.py'
             )
+
+    def test_non_ascii_draw_variables_are_replaced_everywhere(self):
+        bridge = self._load_bridge()
 
         source = (
             'global $draw_component_4_丝袜下身 = 1\n'
@@ -57,6 +69,70 @@ class VeloBridgeEFMITests(unittest.TestCase):
         self.assertTrue(all(value.isascii() for value in variables))
         self.assertIn('Component 4 丝袜下身', result)
         self.assertNotIn('$draw_component_4_丝袜下身', result.casefold())
+
+    def test_wwmi_and_efmi_use_their_own_formatter_modules(self):
+        bridge = self._load_bridge()
+        loaded = []
+
+        def fake_import(module_name):
+            loaded.append(module_name)
+            return types.SimpleNamespace(TextFormatter=lambda: module_name)
+
+        with mock.patch.object(bridge.importlib, 'import_module', side_effect=fake_import):
+            wwmi = bridge._velo_text_formatter('WUTHERING')
+            efmi = bridge._velo_text_formatter('ENDFIELD')
+
+        self.assertIn('wuthering_waves._wwmi_core', wwmi)
+        self.assertIn('arknights_endfield._efmi_core', efmi)
+        self.assertEqual(loaded, [wwmi, efmi])
+        with self.assertRaisesRegex(ValueError, '不支持此游戏'):
+            bridge._velo_text_formatter('UNKNOWN')
+
+    def test_wwmi_and_efmi_swap_variables_use_exact_blueprint_names(self):
+        bridge = self._load_bridge()
+        source = (
+            '[Constants]\n'
+            'global persist $swapvar_legs_outfit = 0\n'
+            'global persist $swapvar_swapkey0 = 0\n'
+            '[KeySwapLegsOutfit]\n'
+            '$swapvar_legs_outfit = 0, 1\n'
+            '[CommandListProcessToggles]\n'
+            '$draw_body = ($SWAPVAR_LEGS_OUTFIT == 1) && ($swapvar_swapkey0 == 0)\n'
+            '[Draw]\n'
+            'if $swapvar_legs_outfit_extra == 1\n'
+            'endif\n'
+        )
+        with mock.patch.object(bridge, '_velo_text_formatter', return_value=_VeloStyleFormatter()):
+            for game_value in ('WUTHERING', 'ENDFIELD'):
+                with self.subTest(game_value=game_value), tempfile.TemporaryDirectory() as folder:
+                    ini = Path(folder) / 'mod.ini'
+                    ini.write_text(source, encoding='utf-8')
+                    bridge._restore_th4_swap_variable_names(
+                        ini,
+                        {101: 'Legs_Outfit', 102: 'swapkey0'},
+                        game_value,
+                    )
+                    result = ini.read_text(encoding='utf-8')
+
+                    self.assertIn('global persist $Legs_Outfit = 0', result)
+                    self.assertIn('global persist $swapkey0 = 0', result)
+                    self.assertIn('$Legs_Outfit = 0, 1', result)
+                    self.assertIn('($Legs_Outfit == 1) && ($swapkey0 == 0)', result)
+                    self.assertIn('$swapvar_legs_outfit_extra == 1', result)
+                    self.assertNotIn('$swapvar_swapkey0', result.casefold())
+
+    def test_efmi_swap_variable_format_collision_is_rejected(self):
+        bridge = self._load_bridge()
+        with tempfile.TemporaryDirectory() as folder:
+            ini = Path(folder) / 'mod.ini'
+            ini.write_text('global persist $swapvar_outfit = 0\n', encoding='utf-8')
+            with mock.patch.object(bridge, '_velo_text_formatter', return_value=_VeloStyleFormatter()):
+                with self.assertRaisesRegex(ValueError, '同一个变量'):
+                    bridge._restore_th4_swap_variable_names(
+                        ini,
+                        {101: 'outfit', 102: 'swap_outfit'},
+                        'ENDFIELD',
+                    )
 
     def test_explicit_efmi_selection_keeps_all_blueprint_objects(self):
         adapter = _load_module(
@@ -165,6 +241,43 @@ class SwapPanelEFMITests(unittest.TestCase):
                 {'[CommandList]': [r'run = CommandList\efmiv1\RegisterMod']}
             )
         )
+
+    def test_gui_only_guards_both_velo_and_wwmi_keyswap_names(self):
+        panel_module = self._load_panel()
+        panel = panel_module.SSMTNode_PostProcess_SwapPanel()
+        panel.gui_only = True
+        sections = {
+            '[KeySwapSwapkey0]': ['condition = $object_detected == 1', 'key = 1', '$swapkey0 = 0, 1'],
+            '[KeySwap_Swapkey1]': ['condition = $object_detected == 1', 'key = 2', '$swapkey1 = 0, 1'],
+            '[CommandListSwap1]': ['key = 1'],
+        }
+        buttons = [
+            {'var_names': ['$swapkey0']},
+            {'var_names': ['$swapkey1']},
+        ]
+        panel._apply_gui_only_guards(sections, 'swp_test', buttons)
+        self.assertIn('&& $swp_test_gui_only == 0', sections['[KeySwapSwapkey0]'][0])
+        self.assertIn('&& $swp_test_gui_only == 0', sections['[KeySwap_Swapkey1]'][0])
+        self.assertEqual(sections['[CommandListSwap1]'], ['key = 1'])
+
+    def test_named_velo_keyswap_sections_feed_exact_variables_to_panel(self):
+        panel_module = self._load_panel()
+        panel = panel_module.SSMTNode_PostProcess_SwapPanel()
+        with tempfile.TemporaryDirectory() as folder:
+            ini = Path(folder) / 'mod.ini'
+            ini.write_text(
+                '[KeySwapLegsOutfit]\n'
+                '; Legs\nkey = 1\ntype = cycle\n$Legs_Outfit = 0, 1, 2\n'
+                '[KeySwap_CoatMode]\n'
+                'key = 2\ntype = cycle\n$Coat_Mode = 0, 1\n'
+                '[KeyHelp]\nkey = F1\n$panel_help = 0, 1\n',
+                encoding='utf-8',
+            )
+            swaps = panel._parse_ini_key_swaps(str(ini))
+
+        self.assertEqual([item['var_name'] for item in swaps], ['$Legs_Outfit', '$Coat_Mode'])
+        self.assertEqual([item['option_count'] for item in swaps], [3, 2])
+        self.assertEqual(panel._cycle_command_lines('$Legs_Outfit', 3)[0], 'if $Legs_Outfit == 0')
 
 
 if __name__ == '__main__':

@@ -351,9 +351,16 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
         guard = f"${ns}_gui_only == 0"
         marker = self.GUI_GUARD_MARKER.format(ns=ns)
         for sec_name, lines in sections.items():
-            if not re.match(r"^\[KeySwap_[^\]]+\]$", sec_name.strip()):
+            # Velo/EFMI emits [KeySwapSwapkeyN], while WWMI and older
+            # generators commonly emit [KeySwap_SwapkeyN]. Both are original
+            # keyboard controls and must be gated in GUI-only mode.
+            if not re.match(r"^\[KeySwap(?:_|[^\]])[^\]]*\]$", sec_name.strip(), re.IGNORECASE):
                 continue
-            if not any(re.match(rf"^\s*{re.escape(var)}\s*=", line) for var in variables for line in lines):
+            if not any(
+                re.match(rf"^\s*{re.escape(var)}\s*=", line, re.IGNORECASE)
+                for var in variables
+                for line in lines
+            ):
                 continue
             condition_index = next(
                 (index for index, line in enumerate(lines)
@@ -792,9 +799,9 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
 
         swaps = []
         for order, (section_name, lines) in enumerate(sections.items()):
-            numeric_match = re.match(r'^\[KeySwap_(\d+)\]$', section_name.strip())
-            diffuse_match = re.match(r'^\[KeySwap_Diffuse_[^\]]+\]$', section_name.strip())
-            if not numeric_match and not diffuse_match:
+            numeric_match = re.match(r'^\[KeySwap_(\d+)\]$', section_name.strip(), re.IGNORECASE)
+            named_match = re.match(r'^\[KeySwap[^\]]+\]$', section_name.strip(), re.IGNORECASE)
+            if not named_match:
                 continue
             index = int(numeric_match.group(1)) if numeric_match else 1000000 + order
             entry = {"index": index, "var_name": "", "comment": "", "key": "", "option_count": 2}
