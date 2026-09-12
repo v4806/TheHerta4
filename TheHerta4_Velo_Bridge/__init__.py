@@ -297,6 +297,19 @@ def _seed_postprocess_detection_from_ini(tree, ini_path):
     except Exception:
         pass
 
+def _seed_detection_for_export(tree, cfg):
+    """导出后为切换面板回填物体检测值。
+
+    不按游戏分支：能否回填完全由 ini 决定——只有 `[TextureOverrideComponent<id>]`
+    形状的段（hash + match_index_count）才能解析出检测值，EFMI 的
+    `[TextureOverride_Component<id>_<hash>]` 段名匹配不到，自然跳过。
+    因此 WWMI 与 EFMI 走同一条路径，不需要在调用点判断 desc.game_value。
+    """
+    folder = getattr(cfg, 'mod_output_folder', '')
+    if not folder:
+        return
+    _seed_postprocess_detection_from_ini(tree, bpy.path.abspath(folder) + '/mod.ini')
+
 def _swap_variable_replacements(bindings, game_value):
     formatter = _velo_text_formatter(game_value)
     replacements = {}
@@ -491,8 +504,7 @@ class ExportVeloWorkspace(bpy.types.Operator):
                 toggle_state[2] if toggle_state else {},
                 desc.game_value,
             )
-            if desc.game_value == 'ENDFIELD':
-                _seed_postprocess_detection_from_ini(tree, bpy.path.abspath(cfg.mod_output_folder) + '/mod.ini')
+            _seed_detection_for_export(tree, cfg)
             _restore_th4_swap_variable_names(
                 bpy.path.abspath(cfg.mod_output_folder) + '/mod.ini',
                 toggle_state[2] if toggle_state else {},

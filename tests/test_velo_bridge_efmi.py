@@ -34,6 +34,7 @@ def _fake_bpy():
     props.FloatProperty = prop
     props.CollectionProperty = prop
     module.props = props
+    module.path = types.SimpleNamespace(abspath=lambda path: path)
     return module
 
 
@@ -521,6 +522,73 @@ class ExportHelperVeloMarkerTests(unittest.TestCase):
         self.assertEqual(previous, '')
         self.helper.set_runtime_velo_bridge_game(previous)
         self.assertEqual(self.helper.get_velo_bridge_game(), '')
+
+
+class VeloDetectionSeedTests(unittest.TestCase):
+    """导出后回填检测值：由 ini 形状决定，不按游戏分支（WWMI/EFMI 同一路径）。"""
+
+    WWMI_INI = (
+        '[Constants]\nglobal $mod_enabled = 0\n\n'
+        '[TextureOverrideComponent4]\n'
+        'hash = AB12CD34\n'
+        'match_first_index = 1000\n'
+        'match_index_count = 4242\n'
+        '$object_detected = 1\n'
+    )
+    EFMI_INI = (
+        '[Constants]\nglobal $component_count = 4\n\n'
+        '[TextureOverride_Component4_ab12cd34]\n'
+        'hash = ab12cd34\n'
+        'match_index_count = 4242\n'
+    )
+
+    class _Node:
+        bl_idname = 'SSMTNode_PostProcess_SwapPanel'
+        mute = False
+        target_object = 'Component 4 Body'
+
+        def __init__(self, detect_hash='', detect_index_count=''):
+            self.detect_hash = detect_hash
+            self.detect_index_count = detect_index_count
+
+    class _Tree:
+        def __init__(self, nodes):
+            self.nodes = nodes
+
+    class _Cfg:
+        def __init__(self, folder):
+            self.mod_output_folder = folder
+
+    def _seed(self, ini_text, **node_kwargs):
+        bridge = VeloBridgeEFMITests._load_bridge()
+        with tempfile.TemporaryDirectory() as folder:
+            Path(folder, 'mod.ini').write_text(ini_text, encoding='utf-8')
+            node = self._Node(**node_kwargs)
+            bridge._seed_detection_for_export(self._Tree([node]), self._Cfg(folder))
+        return node
+
+    def test_wwmi_component_section_is_seeded(self):
+        node = self._seed(self.WWMI_INI)
+        self.assertEqual(node.detect_hash, 'ab12cd34')
+        self.assertEqual(node.detect_index_count, '4242')
+
+    def test_efmi_section_shape_is_left_untouched(self):
+        node = self._seed(self.EFMI_INI)
+        self.assertEqual(node.detect_hash, '')
+        self.assertEqual(node.detect_index_count, '')
+
+    def test_existing_values_are_never_overwritten(self):
+        node = self._seed(self.WWMI_INI, detect_hash='deadbeef', detect_index_count='7')
+        self.assertEqual(node.detect_hash, 'deadbeef')
+        self.assertEqual(node.detect_index_count, '7')
+
+    def test_missing_output_folder_is_ignored(self):
+        bridge = VeloBridgeEFMITests._load_bridge()
+        node = self._Node()
+        bridge._seed_detection_for_export(
+            self._Tree([node]), types.SimpleNamespace(mod_output_folder='')
+        )
+        self.assertEqual(node.detect_hash, '')
 
 
 if __name__ == '__main__':
