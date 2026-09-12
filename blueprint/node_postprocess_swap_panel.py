@@ -50,14 +50,6 @@ except ImportError:
     PIL_AVAILABLE = False
 
 
-def _is_efmi_ini_sections(sections):
-    return any(
-        '\\efmiv1\\' in line.casefold()
-        for section_lines in sections.values()
-        for line in section_lines
-    )
-
-
 class SSMT_SwapPanelEntry(bpy.types.PropertyGroup):
     """面板中一个物体切换按钮的条目信息（仅用于节点 UI 预览）。"""
     variable_name: bpy.props.StringProperty(name="变量名", default="")   # 如 $swapkey6
@@ -1083,6 +1075,28 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
             print(f"[物体切换面板] 生成背景图失败: {e}")
             return None
 
+    def _is_velo_efmi_export(self, _in_place=False):
+        """本次后处理是否运行在 Velo / EFMI-Tools 后端上。
+
+        Velo 桥接是独立的输出节点，导出期间由它显式写入运行时标记；这里只读那个标记，
+        不做 ini 文本嗅探——TheHerta4 自身的 EFMI 导出同样会写 ``\\EFMIv1\\`` 命名空间，
+        用文本特征判断会把原生 EFMI 导出误判成 Velo 导出（进而跳过本面板自己的检测段）。
+
+        「原地刷新」没有导出上下文，回落到蓝图树 / 桥接节点上的持久标记。
+        """
+        try:
+            from .export_helper import BlueprintExportHelper
+        except Exception:
+            return False
+        try:
+            game = BlueprintExportHelper.get_velo_bridge_game(
+                tree=getattr(self, "id_data", None),
+                use_blueprint_marker=bool(_in_place),
+            )
+        except Exception:
+            return False
+        return game == 'ENDFIELD'
+
     def execute_postprocess(self, mod_export_path, _in_place=False, _ini_path=None):
         """生成 / 原地刷新物体切换面板配置。
 
@@ -1199,7 +1213,7 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
             return False
         sections, preserved_tail_content, preserved_driver_content = result
 
-        is_efmi = _is_efmi_ini_sections(sections)
+        is_efmi = self._is_velo_efmi_export(_in_place)
 
         # 刷新模式：先按专有标识移除本面板旧配置，再原地重新生成
         if _in_place:

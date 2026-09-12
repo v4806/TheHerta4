@@ -336,6 +336,9 @@ class SSMTNode_VeloExportBridge(bpy.types.Node):
     bl_label = 'Velo Mod（实验性）'
     bl_description = '实验性桥接：使用 Velo Tools 当前工作空间导出，并运行已连接的 TheHerta4 后处理节点。'
     bl_icon = 'EXPORT'
+    # 桥接节点自己的后端标记：后处理节点据此判断「本次导出是不是 Velo 桥接驱动的」，
+    # 不再依赖 ini 文本特征（TheHerta4 自家的 EFMI 导出同样会写 \EFMIv1\ 命名空间）。
+    velo_game: StringProperty(name='Velo 游戏', default='')
     @classmethod
     def poll(cls, tree):
         return tree.bl_idname == 'SSMTBlueprintTreeType'
@@ -377,6 +380,7 @@ class ImportVeloWorkspace(bpy.types.Operator):
             group.location = (0, 0)
             output = tree.nodes.new(NODE_ID)
             output.location = (340, 0)
+            output.velo_game = desc.game_value
             tree.links.new(group.outputs[0], output.inputs[0])
             for i, obj in enumerate(coll.all_objects):
                 node = tree.nodes.new('SSMTNode_Object_Info')
@@ -427,6 +431,9 @@ class ExportVeloWorkspace(bpy.types.Operator):
                 raise ValueError('没有检测到工作空间')
             if tree.get('velo_game', desc.game_value) != desc.game_value:
                 raise ValueError('请在 Velo 中切换回该蓝图的游戏')
+            # 桥接节点与蓝图树都显式记住自己的后端，供下游后处理节点判断。
+            tree.nodes[self.node_name].velo_game = desc.game_value
+            tree['velo_game'] = desc.game_value
             original = cfg.component_collection
             original_auto_split = getattr(cfg, 'velo_auto_split_by_material', None)
             if original_auto_split is not None:
@@ -494,26 +501,35 @@ class ExportVeloWorkspace(bpy.types.Operator):
             # Run TheHerta4's connected post-process chain against the final Velo INI.
             try:
                 from TheHerta4.blueprint.export_helper import BlueprintExportHelper
+                previous_runtime_tree = BlueprintExportHelper.runtime_blueprint_tree_name
+                previous_result_node_type = BlueprintExportHelper.runtime_result_output_node_type
+                previous_velo_game = BlueprintExportHelper.set_runtime_velo_bridge_game(desc.game_value)
                 BlueprintExportHelper.set_runtime_blueprint_tree(tree)
-                BlueprintExportHelper.runtime_result_output_node_type = NODE_ID
-                post_nodes = []
-                visited = set()
-                def collect_post(node):
-                    if node.as_pointer() in visited:
-                        return
-                    visited.add(node.as_pointer())
-                    if node.bl_idname.startswith('SSMTNode_PostProcess_') and not node.mute:
-                        post_nodes.append(node)
-                    for output in node.outputs:
-                        for link in output.links:
-                            collect_post(link.to_node)
-                collect_post(tree.nodes[self.node_name])
-                _debug('post_nodes=' + repr([(n.name, n.bl_idname) for n in post_nodes]))
-                for post_node in post_nodes:
-                    fn = getattr(post_node, 'execute_postprocess', None)
-                    if callable(fn):
-                        _debug('post_execute=' + post_node.bl_idname)
-                        fn(bpy.path.abspath(cfg.mod_output_folder))
+                BlueprintExportHelper.set_runtime_result_output_node_type(NODE_ID)
+                try:
+                    post_nodes = []
+                    visited = set()
+                    def collect_post(node):
+                        if node.as_pointer() in visited:
+                            return
+                        visited.add(node.as_pointer())
+                        if node.bl_idname.startswith('SSMTNode_PostProcess_') and not node.mute:
+                            post_nodes.append(node)
+                        for output in node.outputs:
+                            for link in output.links:
+                                collect_post(link.to_node)
+                    collect_post(tree.nodes[self.node_name])
+                    _debug('post_nodes=' + repr([(n.name, n.bl_idname) for n in post_nodes]))
+                    for post_node in post_nodes:
+                        fn = getattr(post_node, 'execute_postprocess', None)
+                        if callable(fn):
+                            _debug('post_execute=' + post_node.bl_idname)
+                            fn(bpy.path.abspath(cfg.mod_output_folder))
+                finally:
+                    # 运行时标记只在本次后处理过程内有效，避免泄漏给后续的原生导出。
+                    BlueprintExportHelper.runtime_blueprint_tree_name = previous_runtime_tree
+                    BlueprintExportHelper.set_runtime_result_output_node_type(previous_result_node_type)
+                    BlueprintExportHelper.set_runtime_velo_bridge_game(previous_velo_game)
             except Exception as post_exc:
                 raise ValueError('后处理节点执行失败: ' + str(post_exc))
         except Exception as exc:

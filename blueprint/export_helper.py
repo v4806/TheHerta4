@@ -27,6 +27,11 @@ class BlueprintExportHelper:
     runtime_result_output_node_type = ""
     multi_file_export_nodes = []
 
+    # Velo 桥接是独立的输出节点，导出期间由它显式写入自己的标记，
+    # 供下游后处理节点判断「这次后处理属于哪个后端」，不必再去嗅探 ini 文本。
+    VELO_BRIDGE_NODE_TYPE = 'SSMTNode_VeloExportBridge'
+    runtime_velo_bridge_game = ""
+
     current_buffer_folder_name = "Meshes"
 
     # 这些运行时字段由标准导出、并行导出和直出共同读写，用来传递形态键上下文。
@@ -116,6 +121,49 @@ class BlueprintExportHelper:
     @staticmethod
     def clear_runtime_result_output_node_type():
         BlueprintExportHelper.runtime_result_output_node_type = ""
+
+    @staticmethod
+    def set_runtime_velo_bridge_game(game_value: str = "") -> str:
+        """Velo 桥接导出前写入自己的标记；返回旧值供调用方还原。"""
+        previous = BlueprintExportHelper.runtime_velo_bridge_game
+        BlueprintExportHelper.runtime_velo_bridge_game = str(game_value or "").strip().upper()
+        return previous
+
+    @staticmethod
+    def get_velo_bridge_game(tree=None, use_blueprint_marker: bool = False) -> str:
+        """返回当前后处理所属的 Velo 后端游戏；不是 Velo 桥接驱动时返回空串。
+
+        下游节点（例如物体切换面板）据此判断要不要走 Velo 专用分支：
+
+        - 导出进行中只认桥接节点写入的运行时标记（`set_runtime_velo_bridge_game`）。
+          原生导出不写这个标记，所以「ini 里有 EFMIv1 命名空间」这种文本特征不会再
+          把 TheHerta4 自己的 EFMI 导出误判成 Velo/EFMI-Tools 导出。
+        - 「原地刷新」这类没有导出上下文的场景（use_blueprint_marker=True）回落到
+          蓝图树上的持久标记 ``tree['velo_game']``（导入 Velo 工作空间时写入），
+          再回落到树里 Velo 桥接节点自身的 ``velo_game`` 属性。
+        """
+        runtime_game = BlueprintExportHelper.runtime_velo_bridge_game
+        if runtime_game:
+            return runtime_game
+        if not use_blueprint_marker:
+            return ""
+        if tree is None:
+            try:
+                tree = BlueprintExportHelper.get_current_blueprint_tree()
+            except Exception:
+                tree = None
+        if tree is None:
+            return ""
+        tree_get = getattr(tree, "get", None)
+        game = str(tree_get("velo_game", "") or "").strip() if callable(tree_get) else ""
+        if not game:
+            for node in getattr(tree, "nodes", None) or []:
+                if getattr(node, "bl_idname", "") != BlueprintExportHelper.VELO_BRIDGE_NODE_TYPE:
+                    continue
+                game = str(getattr(node, "velo_game", "") or "").strip()
+                if game:
+                    break
+        return game.upper()
 
     @staticmethod
     def iter_result_output_node_types():
