@@ -262,6 +262,46 @@ class SwapPanelButtonIconTests(unittest.TestCase):
         with Image.open(path) as image:
             return max(pixel[3] for pixel in image.convert("RGBA").getdata())
 
+    # ------------------------------------------------- 按钮对齐
+    def test_button_align_center_matches_legacy_hardcoded_formula(self):
+        """默认 CENTER 必须与旧版硬编码居中完全等价（不影响既有 mod 几何）。"""
+        panel_w, grid_w, pad = 1.2, 0.6, 0.02
+
+        for align in ("CENTER", "center", "", None):
+            self.assertAlmostEqual(
+                self.panel._compute_grid_left(panel_w, grid_w, pad, align),
+                (panel_w - grid_w) * 0.5,
+                places=9,
+            )
+
+    def test_button_align_left_and_right_use_side_padding(self):
+        panel_w, grid_w, pad = 1.2, 0.6, 0.02
+
+        self.assertAlmostEqual(
+            self.panel._compute_grid_left(panel_w, grid_w, pad, "LEFT"), pad, places=9
+        )
+        self.assertAlmostEqual(
+            self.panel._compute_grid_left(panel_w, grid_w, pad, "RIGHT"),
+            panel_w - pad - grid_w,
+            places=9,
+        )
+
+    def test_button_align_falls_back_to_center_for_unknown_value(self):
+        self.assertAlmostEqual(
+            self.panel._compute_grid_left(1.0, 0.4, 0.02, "SOMETHING"), 0.3, places=9
+        )
+
+    # ------------------------------------------------- 颜色量化
+    @unittest.skipUnless(PIL_AVAILABLE, "需要 Pillow 才能生成按钮图")
+    def test_default_colors_match_the_pre_refactor_hardcoded_values(self):
+        """0.16/0.22/0.32 必须量化成旧硬编码的 (41, 56, 82)。"""
+        from PIL import Image
+
+        generated = self._generate(30, self._button())
+        with Image.open(generated) as image:
+            # 取按钮中心（避开 2px 边框与圆角区域）
+            self.assertEqual(image.convert("RGBA").getpixel((192, 32))[:3], (41, 56, 82))
+
 
 if __name__ == "__main__":
     unittest.main()

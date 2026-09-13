@@ -33,6 +33,10 @@ def _fake_bpy():
     props.IntProperty = prop
     props.FloatProperty = prop
     props.CollectionProperty = prop
+    # 切换面板新增了枚举（字体/按钮对齐）与颜色（FloatVectorProperty）属性，
+    # 桩必须补齐，否则模块级类体求值就会 AttributeError，整个文件加载失败。
+    props.EnumProperty = prop
+    props.FloatVectorProperty = prop
     module.props = props
     module.path = types.SimpleNamespace(abspath=lambda path: path)
     return module

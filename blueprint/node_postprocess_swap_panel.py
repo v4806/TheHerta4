@@ -1107,7 +1107,8 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
                 return None
 
             def float_to_int_rgb(vals):
-                return tuple(int(val * 255) for val in vals)
+                # 用 round 而不是 int：0.16/0.22/0.32 才能还原成旧硬编码的 (41, 56, 82)
+                return tuple(int(round(val * 255)) for val in vals)
 
             text_rgb = float_to_int_rgb(text_color)
             stroke_rgb = float_to_int_rgb(stroke_color)
@@ -1204,7 +1205,7 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
         if PIL_AVAILABLE:
             try:
                 def _to_rgb(vals):
-                    return tuple(int(val * 255) for val in vals)
+                    return tuple(int(round(val * 255)) for val in vals)
 
                 bg_rgb = _to_rgb(self.button_bg_color)
                 bd_rgb = _to_rgb(self.button_border_color)
@@ -1241,7 +1242,7 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
                 return None
 
             def float_to_int_rgb(vals):
-                return tuple(int(val * 255) for val in vals)
+                return tuple(int(round(val * 255)) for val in vals)
 
             if use_existing and os.path.exists(dest_path):
                 # 基于自定义背景图应用圆角/边框
@@ -1300,6 +1301,20 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
         except Exception as e:
             print(f"[物体切换面板] 生成背景图失败: {e}")
             return None
+
+    @staticmethod
+    def _compute_grid_left(panel_bg_width, grid_width, side_padding, align):
+        """按钮组在面板内的水平起点。
+
+        - LEFT  ：左对齐，留 side_padding 边距
+        - CENTER：居中（与旧版硬编码的居中公式完全一致）
+        - RIGHT ：右对齐，留 side_padding 边距
+        """
+        if str(align or '').upper() == 'RIGHT':
+            return panel_bg_width - side_padding - grid_width
+        if str(align or '').upper() == 'LEFT':
+            return side_padding
+        return (panel_bg_width - grid_width) * 0.5
 
     def _is_velo_efmi_export(self, _in_place=False):
         """本次后处理是否运行在 Velo / EFMI-Tools 后端上。
@@ -1485,11 +1500,9 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
         # 每个按钮固定行位置（相对父级高度）
         fixed_rel_y = []
         fixed_rel_x = []
-        grid_left = side_padding
-        if self.button_align == 'RIGHT':
-            grid_left = adjusted_panel_bg_width - side_padding - grid_width
-        elif self.button_align == 'CENTER':
-            grid_left = (adjusted_panel_bg_width - grid_width) * 0.5
+        grid_left = self._compute_grid_left(
+            adjusted_panel_bg_width, grid_width, side_padding, self.button_align
+        )
 
         for i in range(num_buttons):
             row_index = i // buttons_per_row
