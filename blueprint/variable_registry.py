@@ -12,6 +12,49 @@ UV_OFFSET_PREFIX = "uv_offset"
 
 _SAFE_NAME_RE = re.compile(r"[^a-zA-Z0-9_]")
 
+# --- 新增：CJK 字符 ASCII 化 ---
+# 常见 CJK 范围：基本区、扩展A、兼容区
+_CJK_RE = re.compile(r'[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]')
+# pypinyin 可用性缓存：None=尚未探测，True/False=探测结果
+_PINYIN_AVAILABLE: Optional[bool] = None
+
+
+def cjk_to_ascii(text: str) -> str:
+    """把 CJK 字符转成稳定的 ASCII 表示，供 3DMigoto 变量名使用。
+
+    - 优先使用拼音（需安装 pypinyin）；例如 “屁股摇摆” -> “piguyaobai”。
+    - 未安装 pypinyin 时回退到 Unicode 码点十六进制（uXXXX），完全可逆；
+      例如 “屁股摇摆” -> “u5c41u80a1u6447u6446”。
+    - 非 CJK 字符原样保留，因此纯英文名走的是零开销快路径。
+    """
+    if not text or not _CJK_RE.search(text):
+        return text
+
+    global _PINYIN_AVAILABLE
+    if _PINYIN_AVAILABLE is None:
+        try:
+            import pypinyin  # noqa: F401
+            _PINYIN_AVAILABLE = True
+        except ImportError:
+            _PINYIN_AVAILABLE = False
+
+    if _PINYIN_AVAILABLE:
+        from pypinyin import lazy_pinyin
+
+    parts: list[str] = []
+    for ch in text:
+        if not _CJK_RE.match(ch):
+            parts.append(ch)
+            continue
+        if _PINYIN_AVAILABLE:
+            py = lazy_pinyin(ch)
+            # 若 pypinyin 对该字符无音（返回原文），走十六进制回退
+            if py and py[0] and not _CJK_RE.search(py[0]):
+                parts.append(py[0])
+                continue
+        parts.append(f"u{ord(ch):04x}")
+    return "".join(parts)
+
 
 def _get_scene_global_properties(context=None):
     scene = getattr(context, "scene", None) if context is not None else getattr(bpy.context, "scene", None)
@@ -21,7 +64,8 @@ def _get_scene_global_properties(context=None):
 
 
 def _sanitize_name(text: str, fallback: str = "var") -> str:
-    safe_text = re.sub(r"\s+", "_", str(text or "").strip())
+    # 先做 CJK -> ASCII，再走原有的空格/非法字符清洗
+    safe_text = re.sub(r"\s+", "_", cjk_to_ascii(str(text or "").strip()))
     safe_text = _SAFE_NAME_RE.sub("", safe_text)
     if safe_text and safe_text[0].isdigit():
         safe_text = "_" + safe_text

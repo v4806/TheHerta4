@@ -17,71 +17,254 @@ except ImportError:
 
 
 class ShapeKeyPlayGroupItem(bpy.types.PropertyGroup):
-    shape_key_name: bpy.props.StringProperty(name="形态键名称")
-    object_name: bpy.props.StringProperty(name="物体名称")
-    group_index: bpy.props.IntProperty(name="分组编号", default=0, min=0)
+    shape_key_name: bpy.props.StringProperty(
+        name="形态键名称",
+        description="来自 Blender 模型的形态键名称。用于在 mod 配置里定位对应的变量",
+    )
+    object_name: bpy.props.StringProperty(
+        name="物体名称",
+        description="该形态键所属的 Blender 物体名称",
+    )
+    group_index: bpy.props.IntProperty(
+        name="分组编号",
+        description="该形态键所属的播放分组编号。0 表示未分组（未分组的形态键在 mod 中不生效）",
+        default=0,
+        min=0,
+    )
 
 
 class ShapeKeySpeedIntervalItem(bpy.types.PropertyGroup):
-    start: bpy.props.FloatProperty(default=0.0, min=0.0, max=100.0, subtype='PERCENTAGE')
-    end: bpy.props.FloatProperty(default=50.0, min=0.0, max=100.0, subtype='PERCENTAGE')
-    base_step: bpy.props.IntProperty(default=10, min=1, max=10000)
+    start: bpy.props.FloatProperty(
+        name="起点",
+        description="变速区间的起始位置（0-100，表示一个完整动画周期里的进度百分比）",
+        default=0.0,
+        min=0.0,
+        max=100.0,
+        subtype='PERCENTAGE',
+    )
+    end: bpy.props.FloatProperty(
+        name="终点",
+        description="变速区间的结束位置（0-100，表示一个完整动画周期里的进度百分比）",
+        default=50.0,
+        min=0.0,
+        max=100.0,
+        subtype='PERCENTAGE',
+    )
+    base_step: bpy.props.IntProperty(
+        name="速度百分比",
+        description=(
+            "该区间内动画的推进速度（相对于单位速度的百分比）。\n"
+            "  100% = 使用单位速度（100% 全局速度下每帧推进的细分数）\n"
+            "  10%  = 单位速度的十分之一，播放更慢\n"
+            "单位速度由「总细分」「总时长」「假设帧率」自动计算"
+        ),
+        default=100,
+        min=1,
+        max=10000,
+    )
+
+
+def _on_group_use_remark_as_icon_changed(self, context):
+    """勾选「用备注生成图标」时自动取消「以图片作为图标」，实现互斥。"""
+    if self.use_remark_as_icon and self.use_image_as_icon:
+        self.use_image_as_icon = False
+
+
+def _on_group_use_image_as_icon_changed(self, context):
+    """勾选「以图片作为图标」时自动取消「用备注生成图标」，实现互斥。"""
+    if self.use_image_as_icon and self.use_remark_as_icon:
+        self.use_remark_as_icon = False
 
 
 class ShapeKeyPlayGroupSettings(bpy.types.PropertyGroup):
-    group_index: bpy.props.IntProperty(name="分组编号", default=1, min=1)
+    group_index: bpy.props.IntProperty(
+        name="分组编号",
+        description="分组的唯一编号，用于区分不同分组。移动分组时编号会自动重排",
+        default=1,
+        min=1,
+    )
     group_mode: bpy.props.EnumProperty(
         name="分组模式",
+        description=(
+            "组内形态键的控制方式：\n"
+            "  同步 = 所有形态键同时受同一滑块控制，一起变化\n"
+            "  序列 = 形态键依次受滑块控制，滑到底时形成连续动画"
+        ),
         items=[
             ('SYNC', "同步", "组内所有形态键同时受滑块控制（默认）"),
             ('SEQUENCE', "序列", "组内形态键依次受滑块控制，形成连续动画路径"),
-        ], default='SYNC'
+        ],
+        default='SYNC',
     )
-    enable_auto_playback: bpy.props.BoolProperty(name="启用自动播放", default=False)
-    auto_playback_frame_count: bpy.props.IntProperty(name="细分份数", default=30, min=2, max=5000)
-    auto_playback_step_frames: bpy.props.IntProperty(name="每帧初始步进次数", default=5, min=1, max=5000)
+    enable_auto_playback: bpy.props.BoolProperty(
+        name="启用自动播放",
+        description="开启后该分组的形态键会自动循环播放，不需要玩家手动拖滑块。游戏内的滑块此时用来控制速度",
+        default=False,
+    )
+    auto_playback_frame_count: bpy.props.IntProperty(
+        name="总细分",
+        description=(
+            "一个完整动画周期被分成多少份（所有形态键的细分数总和）。\n"
+            "份数越多动画越细腻，但生成代码越多、文件越大。\n"
+            "与「总时长」「假设帧率」一起决定单位速度"
+        ),
+        default=30,
+        min=2,
+        max=5000,
+    )
+    auto_playback_step_frames: bpy.props.IntProperty(
+        name="每帧初始步进次数",
+        description="保留兼容用的旧参数，现在由「总细分 / 总时长 / 假设帧率」自动计算单位速度，修改此值一般不影响效果",
+        default=5,
+        min=1,
+        max=5000,
+    )
     auto_playback_cycle_mode: bpy.props.EnumProperty(
         name="循环模式",
-        items=[('FORWARD', "正向", "从0到1循环"), ('REVERSE', "反向", "从1到0循环"), ('PINGPONG', "往返", "0→1→0→1往返循环")],
-        default='FORWARD'
+        description=(
+            "自动播放到达终点后的循环方向：\n"
+            "  正向 = 0 到 1 循环（默认）\n"
+            "  反向 = 1 到 0 循环\n"
+            "  往返 = 0→1→0→1 来回播放"
+        ),
+        items=[
+            ('FORWARD', "正向", "从0到1循环"),
+            ('REVERSE', "反向", "从1到0循环"),
+            ('PINGPONG', "往返", "0→1→0→1往返循环"),
+        ],
+        default='FORWARD',
     )
-    speed_percent_min: bpy.props.IntProperty(name="速度百分比最小值", default=10, min=1, max=10000)
-    speed_percent_max: bpy.props.IntProperty(name="速度百分比最大值", default=1000, min=1, max=10000)
-    speed_percent: bpy.props.IntProperty(name="当前速度百分比", default=100, min=1, max=10000)
-    speed_intervals: bpy.props.CollectionProperty(type=ShapeKeySpeedIntervalItem)
+    auto_playback_duration: bpy.props.FloatProperty(
+        name="总时长（秒）",
+        description=(
+            "一次完整动画循环播放所需的时间（秒）。\n"
+            "配合「总细分」和「假设帧率」自动计算单位速度：\n"
+            "  单位速度 = round(总细分 / (总时长 × 假设帧率))"
+        ),
+        default=2.0,
+        min=0.1,
+        max=300.0,
+        precision=2,
+    )
+    playback_fps: bpy.props.IntProperty(
+        name="假设帧率（FPS）",
+        description=(
+            "用于计算单位速度时假设的游戏帧率。\n"
+            "游戏帧率越高，3dmigoto 每帧推进越快；\n"
+            "建议填写目标游戏的实际帧率（60 / 120 / 144 等）"
+        ),
+        default=60,
+        min=1,
+        max=360,
+    )
+    speed_percent_min: bpy.props.IntProperty(
+        name="速度百分比最小值",
+        description="游戏内速度滑块拉到最左边时的全局速度倍率。100 = 正常速度",
+        default=100,
+        min=1,
+        max=10000,
+    )
+    speed_percent_max: bpy.props.IntProperty(
+        name="速度百分比最大值",
+        description="游戏内速度滑块拉到最右边时的全局速度倍率。100 = 正常速度。数值越大，最快播放越快",
+        default=1000,
+        min=1,
+        max=10000,
+    )
+    speed_percent: bpy.props.IntProperty(
+        name="当前速度百分比",
+        description=(
+            "全局速度倍率（100% = 正常速度）。\n"
+            "启用自动播放后，游戏内的滑块会实时修改这个值。\n"
+            "实际每帧推进 = 单位速度 × 区间速度% × 全局速度%"
+        ),
+        default=100,
+        min=1,
+        max=10000,
+    )
+    speed_intervals: bpy.props.CollectionProperty(
+        type=ShapeKeySpeedIntervalItem,
+        description="按动画进度分段设置不同的推进速度（例如开头慢、中段快、结尾慢）",
+    )
     active_interval_index: bpy.props.IntProperty(default=0)
-    max_step_unroll: bpy.props.IntProperty(name="最大步进展开次数", default=100, min=1, max=500)
-    remark: bpy.props.StringProperty(name="备注")
-    button_icon_image: bpy.props.StringProperty(name="按钮图标", subtype='FILE_PATH', default="")
-    use_remark_as_icon: bpy.props.BoolProperty(name="用备注生成图标", default=True)
+    max_step_unroll: bpy.props.IntProperty(
+        name="最大步进展开次数",
+        description="（已废弃）以前需要手动设置的参数。现在会根据变速区间和速度自动计算，无需再管",
+        default=100,
+        min=1,
+        max=500,
+    )
+    remark: bpy.props.StringProperty(
+        name="备注",
+        description="分组备注，会显示在分组标题和游戏内按钮上。输入 / 符号可以强制换行",
+    )
+    button_icon_image: bpy.props.StringProperty(
+        name="按钮图标图片",
+        description="自定义游戏内按钮图标图片（勾选「以图片作为图标」时使用）",
+        subtype='FILE_PATH',
+        default="",
+    )
+    use_remark_as_icon: bpy.props.BoolProperty(
+        name="用备注生成图标",
+        description="勾选后会用备注文字自动生成按钮图标（需要安装 Pillow 库）。与「以图片作为图标」互斥",
+        default=True,
+        update=_on_group_use_remark_as_icon_changed,
+    )
+    use_image_as_icon: bpy.props.BoolProperty(
+        name="以图片作为图标",
+        description="勾选后使用自定义图片作为按钮图标。与「用备注生成图标」互斥；两个都不勾选时使用内置默认图标",
+        default=False,
+        update=_on_group_use_image_as_icon_changed,
+    )
 
-    expanded: bpy.props.BoolProperty(name="展开", default=True)
+    expanded: bpy.props.BoolProperty(
+        name="展开",
+        description="是否在节点面板里展开该分组的形态键列表",
+        default=True,
+    )
 
     remark_font_family: bpy.props.EnumProperty(
         name="字体",
+        description="备注文字使用的字体",
         items=[
             ('msyh.ttc', "微软雅黑", "Windows 标准中文字体"),
             ('simsun.ttc', "宋体", "Windows 经典衬线字体"),
             ('simhei.ttf', "黑体", "Windows 经典无衬线字体"),
             ('arial.ttf', "Arial", "标准英文字体"),
         ],
-        default='msyh.ttc'
+        default='msyh.ttc',
     )
-    remark_font_size: bpy.props.IntProperty(name="字号大小", default=36, min=10, max=300)
+    remark_font_size: bpy.props.IntProperty(
+        name="字号大小",
+        description="备注文字的字号（像素）。越大，生成的按钮图标越大",
+        default=36,
+        min=10,
+        max=300,
+    )
     remark_text_color: bpy.props.FloatVectorProperty(
         name="文字颜色",
+        description="备注文字的颜色",
         subtype='COLOR',
         size=3,
         default=(1.0, 1.0, 1.0),
-        min=0.0, max=1.0
+        min=0.0,
+        max=1.0,
     )
-    remark_stroke_width: bpy.props.IntProperty(name="描边宽度", default=4, min=0, max=20)
+    remark_stroke_width: bpy.props.IntProperty(
+        name="描边宽度",
+        description="备注文字的描边宽度，用于在复杂背景上增强可读性。0 = 不描边",
+        default=4,
+        min=0,
+        max=20,
+    )
     remark_stroke_color: bpy.props.FloatVectorProperty(
         name="描边颜色",
+        description="备注文字的描边颜色",
         subtype='COLOR',
         size=3,
         default=(0.0, 0.0, 0.0),
-        min=0.0, max=1.0
+        min=0.0,
+        max=1.0,
     )
 
 
@@ -108,7 +291,7 @@ class SSMT_OT_SpeedIntervalAdd(bpy.types.Operator):
             else:
                 interval.start = 0.0
                 interval.end = 50.0
-            interval.base_step = 10
+            interval.base_step = 100
         return {'FINISHED'}
 
 
@@ -333,27 +516,10 @@ class SSMT_OT_OpenGroupSettings(bpy.types.Operator):
     bl_idname = "ssmt.open_group_settings"
     bl_label = "分组详细设置"
     bl_options = {'REGISTER', 'INTERNAL'}
-    
+
     node_name: bpy.props.StringProperty()
     node_tree_name: bpy.props.StringProperty()
     target_group_index: bpy.props.IntProperty(default=1)
-    
-    prop_group_mode: bpy.props.EnumProperty(name="组内控制模式", items=[('SYNC', "同步", ""), ('SEQUENCE', "序列", "")], default='SYNC')
-    prop_enable_auto_playback: bpy.props.BoolProperty(name="启用自动播放", default=False)
-    prop_auto_playback_frame_count: bpy.props.IntProperty(name="细分份数", default=30, min=2, max=5000)
-    prop_auto_playback_cycle_mode: bpy.props.EnumProperty(name="循环模式", items=[('FORWARD', "正向", ""), ('REVERSE', "反向", ""), ('PINGPONG', "往返", "")], default='FORWARD')
-    prop_speed_percent_min: bpy.props.IntProperty(name="速度百分比最小值", default=10, min=1, max=10000)
-    prop_speed_percent_max: bpy.props.IntProperty(name="速度百分比最大值", default=1000, min=1, max=10000)
-    prop_speed_percent: bpy.props.IntProperty(name="当前速度百分比", default=100, min=1, max=10000)
-    prop_max_step_unroll: bpy.props.IntProperty(name="最大步进展开次数", default=100, min=1, max=500)
-    prop_remark: bpy.props.StringProperty(name="分组备注")
-    prop_use_remark_as_icon: bpy.props.BoolProperty(name="用备注生成图标", default=True)
-    prop_remark_font_family: bpy.props.EnumProperty(name="字体", items=[('msyh.ttc', "微软雅黑", ""), ('simsun.ttc', "宋体", ""), ('simhei.ttf', "黑体", ""), ('arial.ttf', "Arial", "")], default='msyh.ttc')
-    prop_remark_font_size: bpy.props.IntProperty(name="字号大小", default=36, min=10, max=300)
-    prop_remark_text_color: bpy.props.FloatVectorProperty(name="文字颜色", subtype='COLOR', size=3, default=(1.0, 1.0, 1.0), min=0.0, max=1.0, soft_min=0.0, soft_max=1.0)
-    prop_remark_stroke_width: bpy.props.IntProperty(name="描边宽度", default=4, min=0, max=20)
-    prop_remark_stroke_color: bpy.props.FloatVectorProperty(name="描边颜色", subtype='COLOR', size=3, default=(0.0, 0.0, 0.0), min=0.0, max=1.0, soft_min=0.0, soft_max=1.0)
-    prop_button_icon_image: bpy.props.StringProperty(name="按钮图标", subtype='FILE_PATH', default="")
 
     def invoke(self, context, event):
         space = getattr(context, "space_data", None)
@@ -361,124 +527,110 @@ class SSMT_OT_OpenGroupSettings(bpy.types.Operator):
         node = tree.nodes.get(self.node_name) if tree else None
         if not node or node.bl_idname != 'SSMTNode_PostProcess_ShapeKeyExt':
             return {'CANCELLED'}
-            
+
         self.node_tree_name = tree.name
         self.node_name = node.name
-            
+
         setting = node._find_group_setting(self.target_group_index)
         if not setting:
             return {'CANCELLED'}
-            
-        self.prop_group_mode = setting.group_mode
-        self.prop_enable_auto_playback = setting.enable_auto_playback
-        self.prop_auto_playback_frame_count = setting.auto_playback_frame_count
-        self.prop_auto_playback_cycle_mode = setting.auto_playback_cycle_mode
-        self.prop_speed_percent_min = setting.speed_percent_min
-        self.prop_speed_percent_max = setting.speed_percent_max
-        self.prop_speed_percent = setting.speed_percent
-        self.prop_max_step_unroll = setting.max_step_unroll
-        self.prop_remark = setting.remark
-        self.prop_use_remark_as_icon = setting.use_remark_as_icon
-        self.prop_remark_font_family = setting.remark_font_family
-        self.prop_remark_font_size = setting.remark_font_size
-        self.prop_remark_text_color = setting.remark_text_color
-        self.prop_remark_stroke_width = setting.remark_stroke_width
-        self.prop_remark_stroke_color = setting.remark_stroke_color
-        self.prop_button_icon_image = setting.button_icon_image
 
+        # 不再把 setting 拷贝到 prop_* —— draw 里直接绑定 setting 字段，
+        # 所有修改实时写回原数据，无需点确认。
         return context.window_manager.invoke_props_dialog(self, width=400)
 
     def draw(self, context):
         layout = self.layout
         box = layout.box()
         box.label(text=f"分组 {self.target_group_index} - 详细设置", icon='GROUP')
-        
-        box.prop(self, "prop_group_mode")
-        box.prop(self, "prop_enable_auto_playback")
-        
-        if self.prop_enable_auto_playback:
-            box.prop(self, "prop_auto_playback_frame_count")
-            box.prop(self, "prop_auto_playback_cycle_mode")
+
+        # 直接定位 setting —— 所有 prop 都渲染 setting 自身的字段，
+        # 任何修改都会实时写回原数据，不再依赖"点确认"。
+        tree = bpy.data.node_groups.get(self.node_tree_name)
+        node = tree.nodes.get(self.node_name) if tree else None
+        if node is None or node.bl_idname != 'SSMTNode_PostProcess_ShapeKeyExt':
+            box.label(text="无法定位形态键扩展节点", icon='ERROR')
+            return
+        setting = node._find_group_setting(self.target_group_index)
+        if setting is None:
+            box.label(text="无法定位分组设置", icon='ERROR')
+            return
+
+        box.prop(setting, "group_mode")
+        box.prop(setting, "enable_auto_playback")
+
+        if setting.enable_auto_playback:
+            box.prop(setting, "auto_playback_frame_count")
+            box.prop(setting, "auto_playback_duration")
+            box.prop(setting, "playback_fps")
+            box.prop(setting, "auto_playback_cycle_mode")
             col = box.column(align=True)
-            col.prop(self, "prop_speed_percent_min")
-            col.prop(self, "prop_speed_percent_max")
-            col.prop(self, "prop_speed_percent")
-            
+            col.prop(setting, "speed_percent_min")
+            col.prop(setting, "speed_percent_max")
+            col.prop(setting, "speed_percent")
+
             box.label(text="变速区间 (0-100%)", icon='IPO_EASE_IN_OUT')
             interval_box = box.box()
-            
-            tree = bpy.data.node_groups.get(self.node_tree_name)
-            if tree:
-                node = tree.nodes.get(self.node_name)
-                if node and node.bl_idname == 'SSMTNode_PostProcess_ShapeKeyExt':
-                    setting = node._find_group_setting(self.target_group_index)
-                    if setting:
-                        for idx, interval in enumerate(setting.speed_intervals):
-                            row_int = interval_box.row(align=True)
-                            row_int.prop(interval, "start", text="起点")
-                            row_int.prop(interval, "end", text="终点")
-                            row_int.prop(interval, "base_step", text="步进")
-                            
-                            op = row_int.operator("ssmt.speed_interval_remove", text="", icon='X')
-                            op.group_index = self.target_group_index
-                            op.interval_index = idx
-                            op.node_name = self.node_name
-                            op.node_tree_name = self.node_tree_name
 
-                        row_add = interval_box.row(align=True)
-                        op = row_add.operator("ssmt.speed_interval_add", text="添加区间", icon='ADD')
-                        op.group_index = self.target_group_index
-                        op.node_name = self.node_name
-                        op.node_tree_name = self.node_tree_name
+            for idx, interval in enumerate(setting.speed_intervals):
+                row_int = interval_box.row(align=True)
+                row_int.prop(interval, "start", text="起点")
+                row_int.prop(interval, "end", text="终点")
+                row_int.prop(interval, "base_step", text="速度")
 
-            box.prop(self, "prop_max_step_unroll")
-        
-        box.prop(self, "prop_remark")
+                op = row_int.operator("ssmt.speed_interval_remove", text="", icon='X')
+                op.group_index = self.target_group_index
+                op.interval_index = idx
+                op.node_name = self.node_name
+                op.node_tree_name = self.node_tree_name
+
+            row_add = interval_box.row(align=True)
+            op = row_add.operator("ssmt.speed_interval_add", text="添加区间", icon='ADD')
+            op.group_index = self.target_group_index
+            op.node_name = self.node_name
+            op.node_tree_name = self.node_tree_name
+
+            # 单位速度自动计算，只显示结果（其余信息已按需求隐藏）
+            unit_speed_cur = node._calc_unit_speed(setting)
+            info_box = box.box()
+            info_box.label(
+                text=f"单位速度（自动）= {unit_speed_cur} 细分/帧",
+                icon='AUTO',
+            )
+
+        box.prop(setting, "remark")
         box.label(text="提示：输入 / 符号可强制换行", icon='INFO')
 
+        # ---- 按钮图标来源：图片 / 备注生成 / 内置默认 三选一 ----
+        icon_box = box.box()
+        icon_box.label(text="按钮图标来源", icon='IMAGE_DATA')
+
+        row_img = icon_box.row(align=True)
+        row_img.prop(setting, "use_image_as_icon", text="以图片作为图标")
+        if setting.use_image_as_icon:
+            icon_box.prop(setting, "button_icon_image", text="图片文件")
+
         if PIL_AVAILABLE:
-            box.prop(self, "prop_use_remark_as_icon")
-            if self.prop_use_remark_as_icon:
-                box_style = box.box()
+            row_rem = icon_box.row(align=True)
+            row_rem.prop(setting, "use_remark_as_icon", text="用备注生成图标")
+            if setting.use_remark_as_icon:
+                box_style = icon_box.box()
                 box_style.label(text="文字图标样式", icon='COLOR')
-                box_style.prop(self, "prop_remark_font_family")
-                box_style.prop(self, "prop_remark_font_size")
+                box_style.prop(setting, "remark_font_family")
+                box_style.prop(setting, "remark_font_size")
                 row_c = box_style.row(align=True)
-                row_c.prop(self, "prop_remark_text_color")
-                row_c.prop(self, "prop_remark_stroke_color")
-                box_style.prop(self, "prop_remark_stroke_width")
-                box.label(text="注：导出时将自动生成文字图标替代图片选择", icon='INFO')
+                row_c.prop(setting, "remark_text_color")
+                row_c.prop(setting, "remark_stroke_color")
+                box_style.prop(setting, "remark_stroke_width")
         else:
-            box.prop(self, "prop_button_icon_image")
+            icon_box.label(text="未安装 Pillow 库，无法使用「用备注生成图标」", icon='ERROR')
+
+        if not setting.use_image_as_icon and not setting.use_remark_as_icon:
+            icon_box.label(text="两个都不勾选时将使用内置默认图标", icon='INFO')
 
     def execute(self, context):
-        space = getattr(context, "space_data", None)
-        tree = getattr(space, "edit_tree", None) if space and space.type == 'NODE_EDITOR' else None
-        node = tree.nodes.get(self.node_name) if tree else None
-        if not node or node.bl_idname != 'SSMTNode_PostProcess_ShapeKeyExt':
-            return {'CANCELLED'}
-            
-        setting = node._find_group_setting(self.target_group_index)
-        if not setting:
-            return {'CANCELLED'}
-            
-        setting.group_mode = self.prop_group_mode
-        setting.enable_auto_playback = self.prop_enable_auto_playback
-        setting.auto_playback_frame_count = self.prop_auto_playback_frame_count
-        setting.auto_playback_cycle_mode = self.prop_auto_playback_cycle_mode
-        setting.speed_percent_min = self.prop_speed_percent_min
-        setting.speed_percent_max = self.prop_speed_percent_max
-        setting.speed_percent = self.prop_speed_percent
-        setting.max_step_unroll = self.prop_max_step_unroll
-        setting.remark = self.prop_remark
-        setting.use_remark_as_icon = self.prop_use_remark_as_icon
-        setting.remark_font_family = self.prop_remark_font_family
-        setting.remark_font_size = self.prop_remark_font_size
-        setting.remark_text_color = self.prop_remark_text_color
-        setting.remark_stroke_width = self.prop_remark_stroke_width
-        setting.remark_stroke_color = self.prop_remark_stroke_color
-        setting.button_icon_image = self.prop_button_icon_image
-            
+        # 所有设置已在 draw 中通过直接绑定 setting 实时写回，
+        # 这里不再需要从 prop_* 拷贝，只需结束对话框。
         return {'FINISHED'}
 
 
@@ -527,6 +679,27 @@ class SSMT_OT_ShapeKeyAssignToCurrentGroup(bpy.types.Operator):
         for entry in node.play_group_entries:
             if entry.shape_key_name == self.shape_key_name:
                 entry.group_index = group
+                break
+        return {'FINISHED'}
+
+
+class SSMT_OT_ShapeKeyUnassignFromGroup(bpy.types.Operator):
+    bl_idname = "ssmt.shapekey_unassign_group"
+    bl_label = "移出分组"
+    bl_description = "把该形态键移至「未分组」，其在 mod 配置文件中的变量/定义/触发机制将被自动注释"
+    bl_options = {'REGISTER', 'INTERNAL'}
+    node_name: bpy.props.StringProperty()
+    shape_key_name: bpy.props.StringProperty()
+
+    def execute(self, context):
+        space = getattr(context, "space_data", None)
+        tree = getattr(space, "edit_tree", None) or getattr(space, "node_tree", None) if space and space.type == 'NODE_EDITOR' else None
+        node = tree.nodes.get(self.node_name) if tree else None
+        if not node or node.bl_idname != 'SSMTNode_PostProcess_ShapeKeyExt':
+            return {'CANCELLED'}
+        for entry in node.play_group_entries:
+            if entry.shape_key_name == self.shape_key_name:
+                entry.group_index = 0
                 break
         return {'FINISHED'}
 
@@ -596,66 +769,248 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
 
     play_group_settings: bpy.props.CollectionProperty(type=ShapeKeyPlayGroupSettings)
     active_group_index: bpy.props.IntProperty(
-        name="编辑分组", default=1, min=1,
+        name="编辑分组",
+        description="当前正在编辑的分组。点击分组标题左侧的复选框可切换",
+        default=1,
+        min=1,
         update=lambda self, ctx: self._on_active_group_changed(self.active_group_index)
     )
     play_group_entries: bpy.props.CollectionProperty(type=ShapeKeyPlayGroupItem)
-    auto_play_toggle_key: bpy.props.StringProperty(name="自动播放快捷键", default="space")
-    auto_play_key_global: bpy.props.BoolProperty(name="全局生效", default=False)
+    auto_play_toggle_key: bpy.props.StringProperty(
+        name="自动播放快捷键",
+        description="游戏内切换「自动播放开/关」的快捷键，默认空格",
+        default="space",
+    )
+    auto_play_key_global: bpy.props.BoolProperty(
+        name="全局生效",
+        description="勾选后快捷键在任何时候都生效；不勾选则只在滑块面板显示时生效",
+        default=False,
+    )
 
-    show_unassigned: bpy.props.BoolProperty(name="显示未分组", default=True)
+    show_unassigned: bpy.props.BoolProperty(
+        name="显示未分组",
+        description="是否在面板底部展开「未分组形态键」列表。未分组的形态键在 mod 中不生效",
+        default=True,
+    )
 
     # ==========================================
     # 【已合并】滑块面板-自定义 设置
     # ==========================================
-    use_slider_panel: bpy.props.BoolProperty(name="启用滑块面板", default=True)
-    create_cumulative_backup: bpy.props.BoolProperty(name="创建累积备份", default=True)
-    help_key: bpy.props.StringProperty(name="显示/隐藏面板", default="home")
-    reset_key: bpy.props.StringProperty(name="重置位置", default="ctrl home")
-    zoom_in_key: bpy.props.StringProperty(name="放大", default="up")
-    zoom_out_key: bpy.props.StringProperty(name="缩小", default="down")
-    drag_key: bpy.props.StringProperty(name="拖拽键", default="VK_LBUTTON")
+    use_slider_panel: bpy.props.BoolProperty(
+        name="启用滑块面板",
+        description="是否在 mod 中生成游戏内滑块面板 UI。关闭后只保留自动播放逻辑，不显示面板",
+        default=True,
+    )
+    create_cumulative_backup: bpy.props.BoolProperty(
+        name="创建累积备份",
+        description="每次生成/刷新时是否自动备份 mod ini 文件（避免误操作丢失数据）",
+        default=True,
+    )
+    help_key: bpy.props.StringProperty(
+        name="显示/隐藏面板",
+        description="游戏内显示或隐藏滑块面板的快捷键，默认 home",
+        default="home",
+    )
+    reset_key: bpy.props.StringProperty(
+        name="重置位置",
+        description="游戏内把滑块面板位置、缩放恢复默认的快捷键，默认 Ctrl+Home",
+        default="ctrl home",
+    )
+    zoom_in_key: bpy.props.StringProperty(
+        name="放大",
+        description="游戏内放大滑块面板的快捷键，默认上方向键",
+        default="up",
+    )
+    zoom_out_key: bpy.props.StringProperty(
+        name="缩小",
+        description="游戏内缩小滑块面板的快捷键，默认下方向键",
+        default="down",
+    )
+    drag_key: bpy.props.StringProperty(
+        name="拖拽键",
+        description="游戏内拖动滑块面板的鼠标按键，默认鼠标左键",
+        default="VK_LBUTTON",
+    )
 
-    slider_height: bpy.props.FloatProperty(name="滑块高度", default=0.042, min=0.001, max=1.0, precision=4)
-    button_height: bpy.props.FloatProperty(name="按钮高度", default=0.045, min=0.001, max=1.0, precision=4)
-    panel_min_height: bpy.props.FloatProperty(name="面板最小高度", default=0.75, min=0.01, max=1.0, precision=4)
+    slider_height: bpy.props.FloatProperty(
+        name="滑块高度",
+        description="游戏内滑块的高度（屏幕高度比例）。0.042 约等于屏幕高度的 4.2%",
+        default=0.042,
+        min=0.001,
+        max=1.0,
+        precision=4,
+    )
+    button_height: bpy.props.FloatProperty(
+        name="按钮高度",
+        description="游戏内播放/暂停按钮的高度（屏幕高度比例）",
+        default=0.045,
+        min=0.001,
+        max=1.0,
+        precision=4,
+    )
+    panel_min_height: bpy.props.FloatProperty(
+        name="面板最小高度",
+        description="滑块面板的最小高度。滑块数量少时会用这个值撑开面板，避免面板太扁",
+        default=0.75,
+        min=0.01,
+        max=1.0,
+        precision=4,
+    )
 
     def _update_target_object(self, context):
         self._update_from_object()
 
-    target_object: bpy.props.StringProperty(name="目标物体", default="", update=_update_target_object)
-    detect_hash: bpy.props.StringProperty(name="哈希值", default="")
-    detect_index_count: bpy.props.StringProperty(name="IndexCount", default="")
+    target_object: bpy.props.StringProperty(
+        name="目标物体",
+        description="用于自动解析滑块面板生效的哈希值和 IndexCount（从场景中选一个物体）",
+        default="",
+        update=_update_target_object,
+    )
+    detect_hash: bpy.props.StringProperty(
+        name="哈希值",
+        description="滑块面板生效的哈希值，通常从目标物体名称自动解析",
+        default="",
+    )
+    detect_index_count: bpy.props.StringProperty(
+        name="IndexCount",
+        description="滑块面板生效的 IndexCount，通常从目标物体名称自动解析",
+        default="",
+    )
 
-    background_image: bpy.props.StringProperty(name="背景图片", subtype='FILE_PATH', default="")
-    slider_handle_image: bpy.props.StringProperty(name="滑块图片", subtype='FILE_PATH', default="")
-    left_bar_image: bpy.props.StringProperty(name="左进度条图片", subtype='FILE_PATH', default="")
-    right_bar_image: bpy.props.StringProperty(name="右进度条图片", subtype='FILE_PATH', default="")
-    button_image: bpy.props.StringProperty(name="按钮图片", subtype='FILE_PATH', default="")
+    background_image: bpy.props.StringProperty(
+        name="背景图片",
+        description="自定义滑块面板的背景图（留空则用内置默认背景）",
+        subtype='FILE_PATH',
+        default="",
+    )
+    slider_handle_image: bpy.props.StringProperty(
+        name="滑块图片",
+        description="自定义滑块柄图片（留空则用内置默认滑块）",
+        subtype='FILE_PATH',
+        default="",
+    )
+    left_bar_image: bpy.props.StringProperty(
+        name="左进度条图片",
+        description="滑块左侧已填充部分的图片（留空则用内置默认）",
+        subtype='FILE_PATH',
+        default="",
+    )
+    right_bar_image: bpy.props.StringProperty(
+        name="右进度条图片",
+        description="滑块右侧未填充部分的图片（留空则用内置默认）",
+        subtype='FILE_PATH',
+        default="",
+    )
+    button_image: bpy.props.StringProperty(
+        name="按钮图片",
+        description="播放/暂停按钮的默认图片（分组没有单独设置图标时使用）",
+        subtype='FILE_PATH',
+        default="",
+    )
 
     # ---- 文字按钮样式（播放/暂停按钮，用分组备注生成；背景/边框紧贴文字，内边距极小不发糊）----
-    button_bg_color: bpy.props.FloatVectorProperty(name="按钮背景色", subtype='COLOR', default=(0.16, 0.22, 0.32), min=0.0, max=1.0, size=3)
-    button_border_color: bpy.props.FloatVectorProperty(name="按钮边框色", subtype='COLOR', default=(0.59, 0.75, 0.94), min=0.0, max=1.0, size=3)
-    button_border_width: bpy.props.IntProperty(name="按钮边框宽度", default=2, min=0, max=20)
-    button_opacity: bpy.props.FloatProperty(name="按钮透明度", default=0.9, min=0.0, max=1.0, precision=2)
+    button_bg_color: bpy.props.FloatVectorProperty(
+        name="按钮背景色",
+        description="文字按钮的背景颜色",
+        subtype='COLOR',
+        default=(0.16, 0.22, 0.32),
+        min=0.0,
+        max=1.0,
+        size=3,
+    )
+    button_border_color: bpy.props.FloatVectorProperty(
+        name="按钮边框色",
+        description="文字按钮的边框颜色",
+        subtype='COLOR',
+        default=(0.59, 0.75, 0.94),
+        min=0.0,
+        max=1.0,
+        size=3,
+    )
+    button_border_width: bpy.props.IntProperty(
+        name="按钮边框宽度",
+        description="文字按钮的边框宽度（像素）。0 = 无边框",
+        default=2,
+        min=0,
+        max=20,
+    )
+    button_opacity: bpy.props.FloatProperty(
+        name="按钮透明度",
+        description="文字按钮的整体不透明度。1.0 = 完全不透明，0.0 = 完全透明",
+        default=0.9,
+        min=0.0,
+        max=1.0,
+        precision=2,
+    )
     # ---- 面板背景样式（圆角 + 边框，未自定义背景图时生效）----
-    background_corner_radius: bpy.props.IntProperty(name="背景圆角", default=24, min=0, max=100)
-    background_border_color: bpy.props.FloatVectorProperty(name="背景边框色", subtype='COLOR', default=(0.59, 0.75, 0.94), min=0.0, max=1.0, size=3)
-    background_border_width: bpy.props.IntProperty(name="背景边框宽度", default=3, min=0, max=20)
-    background_opacity: bpy.props.FloatProperty(name="背景透明度", default=0.85, min=0.0, max=1.0, precision=2)
+    background_corner_radius: bpy.props.IntProperty(
+        name="背景圆角",
+        description="面板背景的圆角半径。0 = 直角，100 = 最大圆角（约半圆）",
+        default=24,
+        min=0,
+        max=100,
+    )
+    background_border_color: bpy.props.FloatVectorProperty(
+        name="背景边框色",
+        description="面板背景的边框颜色",
+        subtype='COLOR',
+        default=(0.59, 0.75, 0.94),
+        min=0.0,
+        max=1.0,
+        size=3,
+    )
+    background_border_width: bpy.props.IntProperty(
+        name="背景边框宽度",
+        description="面板背景的边框宽度（像素）。0 = 无边框",
+        default=3,
+        min=0,
+        max=20,
+    )
+    background_opacity: bpy.props.FloatProperty(
+        name="背景透明度",
+        description="面板背景的整体不透明度。1.0 = 完全不透明，0.0 = 完全透明",
+        default=0.85,
+        min=0.0,
+        max=1.0,
+        precision=2,
+    )
 
     panel_default_scale: bpy.props.FloatProperty(
         name="面板默认缩放",
         description="面板默认显示的缩放比例（1.0 = 原始大小；可在游戏内用放大/缩小键再调节）",
         default=1.0, min=0.1, max=5.0, precision=2
     )
-    check_hash: bpy.props.StringProperty(name="检测Hash值", default="")
-    match_index_count: bpy.props.IntProperty(name="Match Index Count", default=0, min=0)
+    check_hash: bpy.props.StringProperty(
+        name="检测Hash值",
+        description="备用哈希值。当「哈希值」为空时使用这个值来判断面板是否生效",
+        default="",
+    )
+    match_index_count: bpy.props.IntProperty(
+        name="Match Index Count",
+        description="备用 IndexCount。当「IndexCount」为空时使用这个值来判断面板是否生效",
+        default=0,
+        min=0,
+    )
 
     # ---- 原地刷新 - 实例标识与上次导出路径 ----
-    namespace: bpy.props.StringProperty(name="命名空间", default="", options={'HIDDEN'})
-    last_mod_ini_path: bpy.props.StringProperty(name="上次导出INI", default="", options={'HIDDEN'})
-    ini_file_path: bpy.props.StringProperty(name="INI文件", subtype='FILE_PATH', default="")
+    namespace: bpy.props.StringProperty(
+        name="命名空间",
+        description="节点实例的唯一标识（自动生成，不需要手动修改）",
+        default="",
+        options={'HIDDEN'},
+    )
+    last_mod_ini_path: bpy.props.StringProperty(
+        name="上次导出INI",
+        description="上次导出/刷新的 mod ini 文件路径（自动记录）",
+        default="",
+        options={'HIDDEN'},
+    )
+    ini_file_path: bpy.props.StringProperty(
+        name="INI文件",
+        description="手动指定要刷新的 mod ini 文件。留空则自动使用「上次导出」记录的文件",
+        subtype='FILE_PATH',
+        default="",
+    )
 
     def _ensure_namespace(self):
         """生成/返回节点实例唯一命名空间（仅用于标识注释，不改动 mod 业务变量）。"""
@@ -692,7 +1047,7 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
                 interval = s.speed_intervals.add()
                 interval.start = 0.0
                 interval.end = 100.0
-                interval.base_step = 10
+                interval.base_step = 100
         return s
 
     @classmethod
@@ -768,6 +1123,7 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
         if '[Constants]' not in sections: return freq_vars
         pattern = re.compile(r'^\s*global\s+persist\s+(\$Freq_[^\s=]+)\s*=\s*([\d.]+)')
         prev_line = ""
+        print("[ShapeKeyExt] ===== 变量名 <-> 形态键标签 对照表 =====")
         for line in sections['[Constants]']:
             m = pattern.match(line)
             if m:
@@ -776,7 +1132,9 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
                 name_match = re.search(r";\s*控制形态键\s+'([^']+)'\s*的强度", prev_line)
                 label = name_match.group(1).strip() if name_match else var_name
                 freq_vars[var_name] = {"default": default_val, "label": label}
+                print(f"[ShapeKeyExt]   {var_name}  ->  '{label}'")
             prev_line = line
+        print(f"[ShapeKeyExt] ===== 共 {len(freq_vars)} 个形态键变量 =====")
         return freq_vars
 
     def _scan_shapekey_names_from_classification(self):
@@ -796,10 +1154,131 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
         if not items: return []
         return [item.shape_key_name for item in items if item.shape_key_name.strip()]
 
+    def _scan_shapekey_name_to_var_map(self):
+        """从上游形态键配置节点读取 {形态键中文名: 变量名(不含$)} 映射。
+
+        用于「未分配形态键屏蔽」：需要把中文形态键名解析到实际 INI 变量名，
+        因为变量名可能经过 cjk_to_ascii（拼音/uXXXX）或用户手动改名，
+        不能简单从中文名推导。
+        """
+        if not self.inputs[0].is_linked:
+            return {}
+        upstream = self.inputs[0].links[0].from_node
+        if upstream.bl_idname != 'SSMTNode_PostProcess_ShapeKey':
+            return {}
+        items = getattr(upstream, "shapekey_variable_items", None)
+        if not items:
+            return {}
+        result = {}
+        for item in items:
+            name = str(getattr(item, "shape_key_name", "") or "").strip()
+            if not name:
+                continue
+            var = str(getattr(item, "custom_variable_name", "") or "").strip()
+            if not var:
+                var = str(getattr(item, "assigned_variable_name", "") or "").strip()
+            if var.startswith("$"):
+                var = var[1:]
+            if var:
+                result[name] = var
+        return result
+
+    # ---- 未分配形态键屏蔽标记（三层统一前缀，便于幂等恢复）----
+    UNASSIGNED_MASK_TAG = "[未分配-已屏蔽]"
+    UNASSIGNED_MASK_PREFIX = "; [未分配-已屏蔽] "
+
+    def _unmask_all_shapekeys(self, sections):
+        """清除上次的 [未分配-已屏蔽] 标记，把注释行恢复为原始有效行。
+
+        每次 execute_postprocess 生成时都先调用（无论导出/刷新），保证：
+        - 形态键被移回分组后，之前被注释的声明/赋值/shader 引用会自动恢复；
+        - 不依赖上游节点重新运行，纯文本可逆。
+        """
+        tag = self.UNASSIGNED_MASK_TAG
+        prefix = self.UNASSIGNED_MASK_PREFIX
+        for sec_name in list(sections.keys()):
+            new_lines = []
+            for line in sections[sec_name]:
+                if tag not in line:
+                    new_lines.append(line)
+                    continue
+                # 只恢复以 "; [未分配-已屏蔽] " 开头的整行注释
+                if line.lstrip().startswith(prefix.strip()):
+                    restored = re.sub(
+                        r'^\s*;\s*\[未分配-已屏蔽\]\s*',
+                        '',
+                        line,
+                    )
+                    new_lines.append(restored)
+                else:
+                    new_lines.append(line)
+            sections[sec_name] = new_lines
+
+    def _mask_unassigned_shapekeys(self, sections, unassigned_vars):
+        """把未分配形态键的三层引用全部注释：常量声明 / Present 赋值 / Shader 输入。
+
+        - [Constants]: "global [persist] $Freq_xxx = ..." 整行加注释前缀。
+        - [Present] : 所有 "$Freq_xxx = ..." 形式的赋值行加注释前缀。
+        - [CustomShader_*_Anim]: "x<N> = $Freq_xxx" 行加注释前缀（不追加归零行，
+          因为 x<N> 若不被任何 ini 写入则 IniParams 保持默认 0，Shader 读到 0，
+          等价于屏蔽生效）。
+        """
+        if not unassigned_vars:
+            return
+        target_set = set(unassigned_vars)
+        prefix = self.UNASSIGNED_MASK_PREFIX
+
+        # 1) [Constants]：注释 global [persist] $Freq_xxx = ...
+        decl_pattern = re.compile(r'^\s*global(?:\s+persist)?\s+(\$Freq_\S+)\s*=')
+        if '[Constants]' in sections:
+            new_lines = []
+            for line in sections['[Constants]']:
+                m = decl_pattern.match(line)
+                if m and m.group(1)[1:] in target_set:
+                    new_lines.append(prefix + line)
+                else:
+                    new_lines.append(line)
+            sections['[Constants]'] = new_lines
+
+        # 2) [Present]：注释 $Freq_xxx = ... 赋值
+        assign_pattern = re.compile(r'^\s*(\$Freq_\S+)\s*=')
+        if '[Present]' in sections:
+            new_lines = []
+            for line in sections['[Present]']:
+                m = assign_pattern.match(line)
+                if m and m.group(1)[1:] in target_set:
+                    new_lines.append(prefix + line)
+                else:
+                    new_lines.append(line)
+            sections['[Present]'] = new_lines
+
+        # 3) [CustomShader_*_Anim]：注释 x<N> = $Freq_xxx
+        shader_pattern = re.compile(r'^\s*x\d+\s*=\s*(\$Freq_\S+)')
+        for sec_name in list(sections.keys()):
+            if not (sec_name.startswith('[CustomShader_') and sec_name.endswith('_Anim]')):
+                continue
+            new_lines = []
+            for line in sections[sec_name]:
+                m = shader_pattern.match(line)
+                if m and m.group(1)[1:] in target_set:
+                    new_lines.append(prefix + line)
+                else:
+                    new_lines.append(line)
+            sections[sec_name] = new_lines
+
     def _build_var_to_group_map(self, freq_vars, shapekey_names):
+        """构建 变量 -> 分组编号 的映射，并返回实际使用的分组列表。
+
+        修复点（相对旧版）：
+        - 默认分组改为 0（未分组），而不是 1；避免未在 play_group_entries 里
+          出现的形态键被误归到分组 1，从而生成错误的分组同步逻辑。
+        - 返回的 all_groups 只包含 > 0 的分组，杜绝生成 "$Freq_Group0" 这类
+          虚假变量（此前会把未分组的变量也纳入 all_groups，导致后续生成
+          "global persist $Freq_Group0 = 0.0" 并污染同步块）。
+        """
         name_to_group = {}
         for name in shapekey_names:
-            group = 1
+            group = 0
             for entry in self.play_group_entries:
                 if entry.shape_key_name == name:
                     group = entry.group_index
@@ -808,11 +1287,82 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
         var_to_group = {}
         for var_name, info in freq_vars.items():
             label = info["label"]
-            group = name_to_group.get(label, 1)
+            group = name_to_group.get(label, 0)
             var_to_group[var_name] = group
-        return var_to_group, list(sorted(set(name_to_group.values())))
+        # 只保留真正存在的分组（排除 0 = 未分组）
+        all_groups = sorted({g for g in name_to_group.values() if g > 0})
+        return var_to_group, all_groups
 
-    def _add_auto_playback_logic_for_group(self, sections, group_id, intensity_var, frame_count, cycle_mode, speed_percent_min, speed_percent_max, speed_intervals, max_unroll):
+    @staticmethod
+    def _calc_unit_speed(setting):
+        """计算单位速度：100% 速度时每帧推进的细分数。
+
+        公式：单位速度 = round(总细分 / (总时长 × 假设帧率))
+        至少为 1，避免出现 0 导致动画停滞。
+
+        用户举例验证：2400 细分 / (2 秒 × 120fps) = 10 细分/帧。
+        """
+        try:
+            frame_count = int(getattr(setting, "auto_playback_frame_count", 30) or 30)
+            duration = float(getattr(setting, "auto_playback_duration", 2.0) or 2.0)
+            fps = int(getattr(setting, "playback_fps", 60) or 60)
+        except Exception:
+            return 1
+        total_frames = duration * fps
+        if total_frames <= 0 or frame_count <= 0:
+            return 1
+        unit_speed = frame_count / total_frames
+        return max(1, int(round(unit_speed)))
+
+    @staticmethod
+    def _calc_auto_max_step_unroll(setting):
+        """根据分组的变速区间 / 速度设置，自动计算单帧最大展开次数。
+
+        原理：
+          单位速度 = 100% 速度下每帧推进的细分数（见 _calc_unit_speed）
+          单帧最大推进帧数 = 单位速度 × 区间最大百分比 × 全局最大速度百分比
+          展开次数 = ceil(单帧最大推进帧数 × 1.5 安全余量)
+
+        最终夹在 [10, 500] 之间：下限保证默认场景可播放，上限避免 INI 膨胀。
+        """
+        # 1) 单位速度（100% 速度下每帧推进的细分数）
+        unit_speed = SSMTNode_PostProcess_ShapeKeyExt._calc_unit_speed(setting)
+
+        # 2) 变速区间里的最大百分比（无区间时兜底 100 = 单位速度）
+        max_interval_pct = 0
+        for interval in setting.speed_intervals:
+            try:
+                pct = int(interval.base_step)
+            except Exception:
+                pct = 0
+            if pct > max_interval_pct:
+                max_interval_pct = pct
+        if max_interval_pct <= 0:
+            max_interval_pct = 100
+
+        # 3) 全局最大速度百分比（考虑当前值，取更保守的最大值，且不低于 100）
+        try:
+            max_speed = max(
+                int(setting.speed_percent),
+                int(setting.speed_percent_max),
+                100,
+            )
+        except Exception:
+            max_speed = 100
+
+        # 4) 单帧最大推进帧数
+        max_per_tick = unit_speed * (max_interval_pct / 100.0) * (max_speed / 100.0)
+
+        # 5) 加 1.5 安全余量后向上取整
+        needed = math.ceil(max_per_tick * 1.5)
+
+        # 6) 夹在 [10, 500]
+        needed = max(10, needed)
+        needed = min(500, needed)
+
+        return needed
+
+    def _add_auto_playback_logic_for_group(self, sections, group_id, intensity_var, frame_count, cycle_mode, speed_percent_min, speed_percent_max, speed_intervals, max_unroll, unit_speed=1):
         if '[Constants]' not in sections: sections['[Constants]'] = []
         const_lines = sections['[Constants]']
         const_content = "\n".join(const_lines)
@@ -839,6 +1389,14 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
         for var_line in auto_vars:
             var_name_only = var_line.split('=')[0].strip()
             if var_name_only not in const_content: const_lines.append(var_line)
+
+        def _fmt_step(v):
+            """把浮点步数格式化成 INI 可读的字符串（整数省略小数点）。"""
+            if abs(v - round(v)) < 1e-9:
+                return str(int(round(v)))
+            s = f"{v:.4f}".rstrip('0').rstrip('.')
+            return s if s else "0"
+
         present_code = []
         present_code.append(f"; @@ShapeKeyExt:PLAY:{self._ensure_namespace()}@@")
         present_code.append(f"; ========== AUTO PLAYBACK GROUP {group_id} (Variable Speed) ==========")
@@ -849,17 +1407,22 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
             for i, interval in enumerate(intervals):
                 start = interval.start / 100.0
                 end = interval.end / 100.0
-                step = interval.base_step
+                # base_step 现在是速度百分比（相对于单位速度）
+                interval_pct = interval.base_step
+                actual_step = unit_speed * interval_pct / 100.0
+                step_str = _fmt_step(actual_step)
                 if i == 0: cond = f"{norm_frame_var} < {end}"
                 else: cond = f"({norm_frame_var} >= {start} && {norm_frame_var} < {end})"
                 present_code.append(f"    if ({cond})")
-                present_code.append(f"        {base_step_var} = {step}")
+                present_code.append(f"        {base_step_var} = {step_str}")
                 if i < len(intervals) - 1: present_code.append(f"    else")
                 else:
                     present_code.append(f"    else")
-                    present_code.append(f"        {base_step_var} = 1")
+                    # 时间线末端的兜底：使用单位速度（= 100% 速度）
+                    present_code.append(f"        {base_step_var} = {_fmt_step(unit_speed)}")
         else:
-            present_code.append(f"    {base_step_var} = 10")
+            # 无区间定义时的兜底：使用单位速度（= 100% 速度）
+            present_code.append(f"    {base_step_var} = {_fmt_step(unit_speed)}")
         for _ in range(len(intervals)): present_code.append(f"    endif")
         present_code.append(f"    {step_frames_var} = {base_step_var} * {speed_percent_var} / 100.0")
         present_code.append(f"    {step_accum_var} = {step_accum_var} + {step_frames_var}")
@@ -1063,7 +1626,7 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
         except Exception as e:
             print(f"[滑块面板] 生成背景图失败: {e}")
             return None
-            
+
     # ==========================================
     # 【修复】添加自然排序的辅助函数
     # ==========================================
@@ -1819,6 +2382,10 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
                         op_add = item_row.operator("ssmt.shapekey_assign_current_group", text="移入当前分组", icon='ADD')
                         op_add.node_name = self.name
                         op_add.shape_key_name = entry.shape_key_name
+
+                        op_rm = item_row.operator("ssmt.shapekey_unassign_group", text="移出分组", icon='REMOVE')
+                        op_rm.node_name = self.name
+                        op_rm.shape_key_name = entry.shape_key_name
                 if not has_items:
                     child_box.label(text="     (暂无形态键)", icon='INFO')
         # --- 底部：未分组区域 ---
@@ -1958,6 +2525,9 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
                 print("检测到旧格式的形态键扩展配置（无标识标记）。请先重新导出一次 mod 以生成带标识的新配置。")
                 return False
 
+        # 清除上次的未分配-已屏蔽标记（幂等恢复），保证移回分组后变量能重新生效
+        self._unmask_all_shapekeys(sections)
+
         freq_vars = self._scan_freq_vars_from_ini(sections)
         if not freq_vars and not _in_place:
             return False
@@ -1972,7 +2542,15 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
         const_lines.append(self.BLOCK_BEGIN.format(ns=ns))
         const_content = "\n".join(const_lines)
         for setting in self.play_group_settings:
-            if PIL_AVAILABLE and setting.use_remark_as_icon and setting.remark.strip():
+            # 图标来源优先级：图片 > 备注生成 > 内置默认
+            if setting.use_image_as_icon and setting.button_icon_image.strip():
+                comment = f"; SLOT_ICON_{setting.group_index} = {setting.button_icon_image}"
+                if comment not in const_lines: const_lines.append(comment)
+                print(
+                    f"[形态键扩展] 分组 {setting.group_index} 使用自定义图片作为图标: "
+                    f"{setting.button_icon_image}"
+                )
+            elif PIL_AVAILABLE and setting.use_remark_as_icon and setting.remark.strip():
                 res_dir = os.path.join(mod_export_path, "res")
                 os.makedirs(res_dir, exist_ok=True)
                 icon_name = f"4_{setting.group_index}.png"
@@ -1991,9 +2569,16 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
                 if generated:
                     comment = f"; SLOT_ICON_{setting.group_index} = {os.path.abspath(generated)}"
                     if comment not in const_lines: const_lines.append(comment)
-            elif setting.button_icon_image:
-                comment = f"; SLOT_ICON_{setting.group_index} = {setting.button_icon_image}"
-                if comment not in const_lines: const_lines.append(comment)
+            elif setting.use_remark_as_icon and not PIL_AVAILABLE:
+                print(
+                    f"[形态键扩展] 分组 {setting.group_index} 勾选了「用备注生成图标」但未安装 Pillow，"
+                    f"将使用内置默认图标"
+                )
+            elif setting.use_image_as_icon and not setting.button_icon_image.strip():
+                print(
+                    f"[形态键扩展] 分组 {setting.group_index} 勾选了「以图片作为图标」但未指定图片，"
+                    f"将使用内置默认图标"
+                )
         group_strength_vars = {}
         for g in all_groups:
             group_var = f"$Freq_Group{g}"
@@ -2029,6 +2614,11 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
                 first_code_pos = i
                 break
         # ---- 组内变量同步块（插入式，带标识注释）----
+        # 修复：同步模式不再使用 `if sync_line not in present_lines` 检查。
+        # 原来的检查语义错误 —— present_lines 是"已存在的行"，而 sync_lines 是
+        # 本次要新插入的行；一旦 present_lines 中残留同名字符串（例如上次手改过的
+        # ini、或其它来源的行），本应写入的同步赋值就会被跳过，导致同步模式失效。
+        # 直接 append 即可：group_member_vars 是去重后的列表，每行只出现一次。
         sync_lines = [f"; @@ShapeKeyExt:SYNC:{ns}@@", ""]
         sync_lines.append("; ===== 形态键扩展配置：组内变量同步 ===== ")
         for g in all_groups:
@@ -2052,8 +2642,7 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
             else:
                 sync_lines.append(f"; 分组{g}{remark}：同步模式（{group_var} 控制 {num_members} 个形态键）")
                 for member_var in group_member_vars:
-                    sync_line = f"    {member_var} = {group_var}"
-                    if sync_line not in present_lines: sync_lines.append(sync_line)
+                    sync_lines.append(f"    {member_var} = {group_var}")
         sync_lines.append("; ===== 结束组内变量同步 ===== ")
         sync_lines.append("")
         for code_line in reversed(sync_lines): present_lines.insert(first_code_pos, code_line)
@@ -2065,12 +2654,25 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
                 interval = setting.speed_intervals.add()
                 interval.start = 0.0
                 interval.end = 100.0
-                interval.base_step = 10
+                interval.base_step = 100
+            unit_speed = self._calc_unit_speed(setting)
+            auto_unroll = self._calc_auto_max_step_unroll(setting)
+            max_bs = max((int(iv.base_step) for iv in setting.speed_intervals), default=100)
+            max_sp = max(int(setting.speed_percent), int(setting.speed_percent_max), 100)
+            print(
+                f"[形态键扩展] 分组 {g} 单位速度 = {unit_speed} 细分/帧 "
+                f"(总细分 {setting.auto_playback_frame_count} / "
+                f"(时长 {setting.auto_playback_duration:.2f}s × 帧率 {setting.playback_fps}))"
+            )
+            print(
+                f"[形态键扩展] 分组 {g} 自动展开次数 = {auto_unroll} "
+                f"(区间最大 {max_bs}% × 全局最大 {max_sp}%)"
+            )
             self._add_auto_playback_logic_for_group(
                 sections, g, group_strength_vars[g],
                 setting.auto_playback_frame_count, setting.auto_playback_cycle_mode,
                 setting.speed_percent_min, setting.speed_percent_max,
-                list(setting.speed_intervals), setting.max_step_unroll
+                list(setting.speed_intervals), auto_unroll, unit_speed
             )
 
         auto_play_key = self.auto_play_toggle_key.strip() or "space"
@@ -2092,6 +2694,24 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
         # 【已合并】滑块面板-自定义
         if self.use_slider_panel:
             self._apply_slider_panel(mod_export_path, target_ini_file, sections)
+
+        # ---- 未分配形态键屏蔽：把变量声明 / Present 赋值 / Shader 输入全部注释掉 ----
+        unassigned_names = {e.shape_key_name for e in self.play_group_entries if e.group_index == 0}
+        if unassigned_names:
+            name_to_var = self._scan_shapekey_name_to_var_map()
+            unassigned_vars = {name_to_var[n] for n in unassigned_names if n in name_to_var}
+            if unassigned_vars:
+                self._mask_unassigned_shapekeys(sections, unassigned_vars)
+                print(
+                    f"[形态键扩展] 已屏蔽 {len(unassigned_vars)} 个未分配形态键: "
+                    f"{sorted(unassigned_vars)}"
+                )
+            else:
+                print(
+                    f"[形态键扩展] 检测到 {len(unassigned_names)} 个未分配形态键，"
+                    f"但未能从上游节点解析出变量名映射（跳过屏蔽）"
+                )
+
         self._write_ordered_dict_to_ini(sections, target_ini_file, preserved_tail_content, preserved_driver_content)
         print(f"形态键扩展配置已{'原地更新' if _in_place else '合并到'}: {os.path.basename(target_ini_file)}")
         return True
@@ -2102,8 +2722,8 @@ classes = (
     SSMTNode_PostProcess_ShapeKeyExt, SSMT_OT_ShapeKeyExtSetGroup,
     SSMT_OT_ScanShapeKeyExt, SSMT_OT_SpeedIntervalAdd, SSMT_OT_SpeedIntervalRemove,
     SSMT_OT_SelectPlayGroup, SSMT_OT_OpenGroupSettings, SSMT_OT_ShapeKeyMoveUpDown,
-    SSMT_OT_ShapeKeyAssignToCurrentGroup, SSMT_OT_ShapeKeyGroupAdd, 
-    SSMT_OT_ShapeKeyGroupRemove, SSMT_OT_ShapeKeyGroupMoveUpDown,
+    SSMT_OT_ShapeKeyAssignToCurrentGroup, SSMT_OT_ShapeKeyUnassignFromGroup,
+    SSMT_OT_ShapeKeyGroupAdd, SSMT_OT_ShapeKeyGroupRemove, SSMT_OT_ShapeKeyGroupMoveUpDown,
     SSMT_OT_ShapeKeyExt_ParseSliderObject, SSMT_OT_ShapeKeyExt_Refresh,
 )
 
