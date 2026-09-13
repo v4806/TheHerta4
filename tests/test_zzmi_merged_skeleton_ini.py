@@ -991,41 +991,64 @@ class ZZSIMultiInstanceGuardTests(unittest.TestCase):
                     f"run = CustomShaderZZMIMergedSkeletonAttach_C{cid}_s{slot}", text
                 )
 
-    def test_replay_guard_requires_group_slot_seen_only(self):
-        """重放守卫只读该槽的本组 seen（v9）；不再有 phase / drawn / ready。"""
+    def test_direct_path_draw_gated_by_own_occurrence_only(self):
+        """v9.1：直连路径按**本部件**出现次绑槽绘制，绝不等组内其它部件。
+
+        回归背景（2026-09-13 FrameAnalysis 实证）：组级「本组全部部件当帧到达」
+        门控只可能在组内**最后一个**到达的部件那段成立，而每个部件的几何只有它
+        自己的 deform 段能画（该段已被 `handling = skip` 吃掉原 draw）⇒ 先到的
+        部件整帧没有变形输出，渲染读到旧内容/零值 → 模型随引擎提交顺序逐帧闪/
+        消失（三部件 deform 顺序实测为 B→C→A 与 A→B→C 两种，后者最后到的是 3
+        顶点占位桩 → 整帧无可见几何 = 用户看到的"模型消失"帧）。
+        自足挂点（几何只采样自己 vg_map 覆盖的槽位）自己的槽位已由本段 attach
+        用当帧 palette 写全，等其它部件没有任何正确性收益。
+        """
         exporter, models = self._make_exporter(self._components())
         builder = _FakeIniBuilder()
         exporter.add_unity_vs_texture_override_vb_sections(builder, models[1])
-        text = "\n".join(_all_builder_lines(builder))
+        lines = _all_builder_lines(builder)
+        text = "\n".join(lines)
 
-        # 直连路径（该夹具无重定向）：每槽守卫条件 = 本组该槽全部 seen 相与
-        self.assertIn("if $zz_ms_seen_01 == 1 && $zz_ms_seen_11 == 1", text)
-        self.assertIn("if $zz_ms_seen_02 == 1 && $zz_ms_seen_12 == 1", text)
+        # 本部件（b20f90ea = 组件 1）每槽一条绘制，条件只读自己的出现次
+        for slot, skeleton in ((1, "ResourceZZMergedSkeleton_G0_s1"),
+                               (2, "ResourceZZMergedSkeleton_G0_s2")):
+            self.assertIn(
+                f"if $zz_ms_occ_1 == {slot}\n"
+                f"    vs-t0 = {skeleton}\n"
+                "    draw = 4643, 0\n"
+                "endif",
+                text,
+            )
+        # 任何 if 条件都不得再挂组级 seen（那正是"先到的部件整帧不画"的成因）
+        for line in lines:
+            if line.startswith("if "):
+                self.assertNotIn("$zz_ms_seen_", line, line)
         self.assertNotIn("$zz_ms_group_phase", text)
         self.assertNotIn("$zz_ms_redirect_drawn", text)
         self.assertNotIn("$zz_ms_group_ready", text)
-        # 槽 1 守卫在槽 2 守卫之前，且各自换绑自己的槽骨架
+        # 槽 1 绘制在槽 2 绘制之前，且各自换绑自己的槽骨架
         self.assertLess(
-            text.index("vs-t0 = ResourceZZMergedSkeleton_G0_s1"),
-            text.index("vs-t0 = ResourceZZMergedSkeleton_G0_s2"),
+            text.index("if $zz_ms_occ_1 == 1"),
+            text.index("if $zz_ms_occ_1 == 2"),
         )
 
     def test_guard_body_contains_only_bindings_and_draw(self):
-        """v9 硬约束：守卫体内只允许绑定与 draw；不得出现 run、不得给 $变量赋值。
+        """v9 硬约束：绘制体内只允许绑定与 draw；不得出现 run、不得给 $变量赋值。
 
-        直连路径的守卫体内只有 `vs-t0` 与 `draw`（没有 SO 重定向）。
+        直连路径自足挂点的绘制体内只有 `vs-t0` 与 `draw`（没有 SO 重定向）。
         """
         exporter, models = self._make_exporter(self._components())
         builder = _FakeIniBuilder()
         exporter.add_unity_vs_texture_override_vb_sections(builder, models[0])
         lines = _all_builder_lines(builder)
 
+        # 出现次 palette 捕获与自足绘制各有一条 `if $zz_ms_occ_0 == 1`
         guard_starts = [
             index for index, line in enumerate(lines)
-            if line.startswith("if $zz_ms_seen_01 == 1")
+            if line.startswith("if $zz_ms_occ_0 == 1")
         ]
-        self.assertEqual(len(guard_starts), 1, "槽 1 守卫应只出现一次")
-        start = guard_starts[0]
+        self.assertEqual(len(guard_starts), 2, "palette 捕获 + 自足绘制各一条")
+        start = guard_starts[-1]
         end = lines.index("endif", start)
         body = lines[start + 1 : end]
         self.assertTrue(body, "守卫体内必须有绑定与 draw")
@@ -1123,12 +1146,12 @@ class ZZSIMultiInstanceGuardTests(unittest.TestCase):
         self.assertEqual(len(run_lines), 4)
 
     def test_slot_locals_are_shared_across_group_deform_sections(self):
-        """同一 IB 被画多次（10>2 的多实例）：组内部件的 run 序列与槽守卫逐字相同。
+        """同一 IB 被画多次（10>2 的多实例）：组内部件的 run 序列逐字相同。
 
-        槽资源与守卫条件都是**组级**的：每个部件的 deform 段都发出同一套
-        (组内全部部件 × 全部槽) attach 与同一套每槽守卫，因此同一帧内无论实例
-        提交顺序如何，后到的部件都会把先到部件留下的半帧内容补齐/覆盖到**另一个
-        槽**——不会出现半帧拼接被消费。
+        槽资源与 attach run 序列都是**组级**的：每个部件的 deform 段都发出同一套
+        (组内全部部件 × 全部槽) attach，因此同一帧内无论实例提交顺序如何，每个
+        部件都会按自己的出现次把当帧 palette 落到对应槽；绘制则各画各的几何
+        （v9.1：按本部件出现次绑本槽，不等其它部件）。
         """
         exporter, models = self._make_exporter(self._components())
         text_a = self._vb_text(exporter, models[0])
@@ -1146,11 +1169,26 @@ class ZZSIMultiInstanceGuardTests(unittest.TestCase):
                 "run = CustomShaderZZMIMergedSkeletonAttach_C1_s2",
             ],
         )
-        # 每槽守卫的条件也必须两组逐字相同（同一个组级门控）
-        for slot in (1, 2):
-            condition = f"if $zz_ms_seen_0{slot} == 1 && $zz_ms_seen_1{slot} == 1"
-            self.assertIn(condition, text_a)
-            self.assertIn(condition, text_b)
+        # 绘制门控按**本部件自己**的出现次（v9.1）：每个部件只画自己的几何，
+        # 不等组内其它部件——组级 seen 门控只会在最后到达的部件那段成立。
+        self.assertIn(
+            "if $zz_ms_occ_0 == 1\n"
+            "    vs-t0 = ResourceZZMergedSkeleton_G0_s1\n"
+            "    draw = 12314, 0\n"
+            "endif",
+            text_a,
+        )
+        self.assertIn(
+            "if $zz_ms_occ_1 == 1\n"
+            "    vs-t0 = ResourceZZMergedSkeleton_G0_s1\n"
+            "    draw = 4643, 0\n"
+            "endif",
+            text_b,
+        )
+        for text in (text_a, text_b):
+            for line in text.splitlines():
+                if line.startswith("if "):
+                    self.assertNotIn("$zz_ms_seen_", line, line)
 
     def _vb_text(self, exporter, model):
         builder = _FakeIniBuilder()
@@ -1353,13 +1391,28 @@ class ZZSIDirectPathGuardTests(unittest.TestCase):
         self.assertEqual(exporter._redirect_target_map, {})
 
     def test_direct_path_emits_per_slot_guard(self):
-        """直连路径：每槽守卫只在「本组全部部件在该槽都已当帧到达」时绘制。"""
+        """直连路径：每槽按**本部件出现次**绑槽绘制（v9.1，不等组内其它部件）。"""
         exporter, models = self._make_exporter(self._components())
         text = self._vb_text(exporter, models[0])
 
-        # 1) 每槽守卫：只用本组该槽的 seen 条件（无 phase / drawn / ready）
-        self.assertIn("if $zz_ms_seen_01 == 1 && $zz_ms_seen_11 == 1", text)
-        self.assertIn("if $zz_ms_seen_02 == 1 && $zz_ms_seen_12 == 1", text)
+        # 1) 每槽绘制条件只读本部件出现次（无组级 seen、无 phase / drawn / ready）
+        self.assertIn(
+            "if $zz_ms_occ_0 == 1\n"
+            "    vs-t0 = ResourceZZMergedSkeleton_G0_s1\n"
+            "    draw = 12314, 0\n"
+            "endif",
+            text,
+        )
+        self.assertIn(
+            "if $zz_ms_occ_0 == 2\n"
+            "    vs-t0 = ResourceZZMergedSkeleton_G0_s2\n"
+            "    draw = 12314, 0\n"
+            "endif",
+            text,
+        )
+        for line in text.splitlines():
+            if line.startswith("if "):
+                self.assertNotIn("$zz_ms_seen_", line, line)
         self.assertNotIn("$zz_ms_group_phase", text)
         self.assertNotIn("$zz_ms_redirect_drawn", text)
         self.assertNotIn("$zz_ms_group_ready", text)
@@ -1388,6 +1441,52 @@ class ZZSIDirectPathGuardTests(unittest.TestCase):
         # draw_number 桩值 4643 不得再出现（导出顶点数 = 12314）
         self.assertNotIn("draw = 4643, 0", text)
         self.assertIn("draw = 12314, 0", text)
+
+    def test_absorbed_direct_hangpoint_keeps_group_gate(self):
+        """边界：几何被吸收、又没有可用重放宿主的挂点仍保留组级 seen 门控。
+
+        这类挂点画的是含组内其它部件顶点的合并几何——用半帧拼接的骨架画会得到
+        错位/塌陷的模型。只有「几何只采样自己 vg_map 覆盖的槽位」的自足挂点才
+        可以按本部件出现次直接绘制（v9.1）。
+        """
+        dcm = sys.modules[f"{PKG}.common.draw_call_model"].DrawCallModel
+        sub_host = _FakeSubmesh("LOD0.a23aa8a3-42759-0", 0, 105, 0,
+                                exported_vertex_count=12314, match_first_index=0)
+        sub_absorbed = _FakeSubmesh("LOD0.b20f90ea-19182-0", 105, 51, 0,
+                                    exported_vertex_count=4643, match_first_index=19182)
+        # 引用骨骼从**源对象**权重反查：必须挂上 drawcall（obj_name）才有数据可读
+        sub_host.drawcall_model_list = [dcm(
+            obj_name="LOD0.a23aa8a3-42759-0",
+            source_obj_name="LOD0.a23aa8a3-42759-0",
+        )]
+        sub_absorbed.drawcall_model_list = [dcm(
+            obj_name="LOD0.b20f90ea-19182-0",
+            source_obj_name="LOD0.b20f90ea-19182-0",
+        )]
+        exporter = _make_exporter(
+            [
+                _FakeDrawIBModel("a23aa8a3", [sub_host]),
+                _FakeDrawIBModel("b20f90ea", [sub_absorbed]),
+            ],
+            merged_vgmap=True,
+        )
+        exporter.merged_skeleton_components = self._components()
+        exporter.merged_skeleton_component_id_dict = {"a23aa8a3": 0, "b20f90ea": 1}
+        # b20f90ea 的顶点权重挂在 a23aa8a3 的槽位 0 上 ⇒ 几何被吸收；再把重定向
+        # 计划清空（模拟"本轮没有任何可行的重放宿主"）⇒ 只能在本挂点用组级门控重放。
+        self._register_obj("LOD0.a23aa8a3-42759-0", [(0, 1.0)])
+        self._register_obj("LOD0.b20f90ea-19182-0", [(0, 1.0)])
+        exporter._redirect_carrier_map = {}
+        exporter._redirect_target_map = {}
+        self.assertTrue(
+            exporter._merged_component_geometry_absorbed(0, "b20f90ea"),
+            "夹具失效：b20f90ea 应当被判为几何被吸收",
+        )
+        text = self._vb_text(exporter, exporter.drawib_model_list[1])
+
+        self.assertIn("if $zz_ms_seen_01 == 1 && $zz_ms_seen_11 == 1", text)
+        self.assertIn("if $zz_ms_seen_02 == 1 && $zz_ms_seen_12 == 1", text)
+        self.assertNotIn("if $zz_ms_occ_1 == 1\n    vs-t0 = ResourceZZMergedSkeleton", text)
 
     def test_no_frame_latch_variables_in_constants_or_present(self):
         """直连/重定向路径都不再声明或复位帧闩锁/相位变量（v9 契约）。"""
@@ -1512,8 +1611,8 @@ class ZZSIDirectPathGuardTests(unittest.TestCase):
             used <= (declared | present_vars | {"$zz_ms_seen_11", "$zz_ms_seen_12"})
         )
 
-    def test_single_component_group_uses_single_seen_condition(self):
-        """单部件组（没有跨部件合并）仍走同一套契约，且每槽只有 1 个 seen 条件。"""
+    def test_single_component_group_draws_without_cross_part_gate(self):
+        """单部件组：直接按出现次绘制，不需要任何跨部件条件（与用户实测口径一致）。"""
         submesh = _FakeSubmesh("LOD0.aaaaaaaa-100-0", 0, 11, 0)
         model = _FakeDrawIBModel("aaaaaaaa", [submesh])
         exporter = _make_exporter([model], merged_vgmap=True)
@@ -1522,10 +1621,195 @@ class ZZSIDirectPathGuardTests(unittest.TestCase):
         )
         text = self._vb_text(exporter, model)
 
-        self.assertIn("if $zz_ms_seen_01 == 1", text)
-        self.assertIn("if $zz_ms_seen_02 == 1", text)
+        # 单部件组：出现次恒为 1 的那一轮直接绘制（组件号 0）
+        self.assertIn("if $zz_ms_occ_0 == 1", text)
+        self.assertIn("if $zz_ms_occ_0 == 2", text)
+        self.assertIn(
+            "if $zz_ms_occ_0 == 1\n"
+            "    vs-t0 = ResourceZZMergedSkeleton_G0_s1\n"
+            "    draw = 4643, 0\n"
+            "endif",
+            text,
+        )
+        # 单部件组不得出现其它部件的变量（曾把组级 seen 当门控）
         self.assertNotIn("$zz_ms_seen_11", text)
         self.assertNotIn("$zz_ms_group_phase", text)
+
+
+class ZZSIMergedHostDirectPathTests(unittest.TestCase):
+    """合并（join 成一个物体）导出的直连路径回归：合并几何由**任意兼容挂点**重放。
+
+    背景（用户实测 2026-09-13）：合并几何挂在自己的导出 VB 上（宿主，几何引用组内
+    其它部件的骨骼），旧口径只在宿主**自己**的 deform 段用组级守卫画它。而引擎把
+    同组部件的 deform pass 排成什么顺序每帧都可能不同（dump 实证：同一批部件在
+    075255/075506 是 B→C→A、080752 是 A→B→C）——宿主排在前面的帧里守卫永不成立，
+    合并几何整段不写 → 用户看到的"合并之后还在闪"。
+
+    v9.1 口径：宿主在自己段顶层把本轮 SO 引用捕获到 `ResourceZZRedirectSO_s<k>`，
+    **本组每个 Blend 布局兼容的挂点**都发一条组级守卫重放（绑定宿主的 vb0/vb2 +
+    该 SO + 宿主导出顶点数）——哪个挂点最后到达都能写，与提交顺序无关。
+    """
+
+    def setUp(self):
+        _fake_bpy_data.objects._items.clear()
+        _fake_bpy_data.meshes._items.clear()
+
+    def _register_obj(self, name, weighted_groups):
+        """注册假对象；weighted_groups = [(vertex_group_index, weight), ...]。"""
+        mesh = _fake_bpy_data.meshes.new(name=name + "_mesh")
+        mesh.vertices = [
+            types.SimpleNamespace(
+                groups=[
+                    types.SimpleNamespace(group=gid, weight=weight)
+                    for gid, weight in weighted_groups
+                ]
+            )
+        ]
+        obj = _fake_bpy_data.objects.new(name=name, object_data=mesh)
+        obj.vertex_groups = _FakeVertexGroups()
+        max_index = max(gid for gid, _weight in weighted_groups)
+        named = {gid: str(gid) for gid, _weight in weighted_groups}
+        for index in range(max_index + 1):
+            obj.vertex_groups.append(_FakeVertexGroup(named.get(index, f"pad{index}")))
+        return obj
+
+    def _components(self):
+        """宿主 a23aa8a3（deform 20 = 组内最后一个，故不产生重定向计划）+ 两个占位部件。"""
+        return [
+            {"draw_ib": "a23aa8a3", "vg_offset": 0, "vg_count": 105, "skeleton_group": 0,
+             "deform_draw": 20, "vg_map": {i: i for i in range(105)}},
+            {"draw_ib": "b20f90ea", "vg_offset": 105, "vg_count": 51, "skeleton_group": 0,
+             "deform_draw": 2, "vg_map": {i: 105 + i for i in range(51)}},
+            {"draw_ib": "b30db54e", "vg_offset": 156, "vg_count": 14, "skeleton_group": 0,
+             "deform_draw": 8, "vg_map": {i: 156 + i for i in range(14)}},
+        ]
+
+    def _make_exporter(self, sibling_blend_stride=32):
+        dcm = sys.modules[f"{PKG}.common.draw_call_model"].DrawCallModel
+        sub_host = _FakeSubmesh("LOD0.a23aa8a3-42759-0", 0, 105, 0,
+                                deform_draw=20, exported_vertex_count=12482)
+        sub_b = _FakeSubmesh("LOD0.b20f90ea-19182-0", 105, 51, 0,
+                             deform_draw=2, exported_vertex_count=3)
+        sub_c = _FakeSubmesh("LOD0.b30db54e-7383-0", 156, 14, 0,
+                             deform_draw=8, exported_vertex_count=3)
+        for sub in (sub_host, sub_b, sub_c):
+            sub.drawcall_model_list = [dcm(
+                obj_name=sub.unique_str, source_obj_name=sub.unique_str
+            )]
+        models = [
+            _FakeDrawIBModel("a23aa8a3", [sub_host]),
+            _FakeDrawIBModel("b20f90ea", [sub_b]),
+            _FakeDrawIBModel("b30db54e", [sub_c]),
+        ]
+        for sibling in models[1:]:
+            sibling.d3d11GameType.CategoryStrideDict["Blend"] = sibling_blend_stride
+        exporter = _make_exporter(models, merged_vgmap=True)
+        exporter.merged_skeleton_components = self._components()
+        exporter.merged_skeleton_component_id_dict = {
+            "a23aa8a3": 0, "b20f90ea": 1, "b30db54e": 2
+        }
+        # 宿主的顶点引用了兄弟部件的槽位（105/156）⇒ 几何被吸收 = 合并宿主
+        self._register_obj("LOD0.a23aa8a3-42759-0", [(0, 1.0), (105, 1.0), (156, 1.0)])
+        self._register_obj("LOD0.b20f90ea-19182-0", [(105, 1.0)])
+        self._register_obj("LOD0.b30db54e-7383-0", [(156, 1.0)])
+        (
+            exporter._redirect_carrier_map,
+            exporter._redirect_target_map,
+            _unredirected,
+        ) = exporter._build_merged_mesh_redirect_plan()
+        return exporter, models
+
+    def _vb_text(self, exporter, model):
+        builder = _FakeIniBuilder()
+        exporter.add_unity_vs_texture_override_vb_sections(builder, model)
+        return "\n".join(_all_builder_lines(builder))
+
+    def test_fixture_is_direct_path_with_absorbed_host(self):
+        """前置断言：宿主被判定为几何被吸收，且本轮没有产生重定向计划。"""
+        exporter, _models = self._make_exporter()
+        self.assertTrue(exporter._merged_component_geometry_absorbed(0, "a23aa8a3"))
+        self.assertFalse(exporter._merged_component_geometry_absorbed(0, "b20f90ea"))
+        self.assertEqual(exporter._redirect_carrier_map, {})
+        self.assertEqual(exporter._redirect_target_map, {})
+        self.assertEqual(
+            [host["draw_ib"] for host in exporter._merged_group_absorbed_hosts(0)],
+            ["a23aa8a3"],
+        )
+
+    def test_host_captures_own_so_and_replays_own_geometry(self):
+        """宿主段：顶层捕获本轮 SO 引用 + 组级守卫重放自己的合并几何。"""
+        exporter, models = self._make_exporter()
+        text = self._vb_text(exporter, models[0])
+
+        # 两槽各捕获一次 SO 引用（在自己的 deform 段里，so0 就是本部件的 SO）
+        self.assertEqual(text.count("    ResourceZZRedirectSO_s1 = ref so0"), 1)
+        self.assertEqual(text.count("    ResourceZZRedirectSO_s2 = ref so0"), 1)
+        # 组级守卫 + 显式绑定 SO/宿主的 vb0/vb2 + 宿主导出顶点数
+        self.assertIn(
+            "if $zz_ms_seen_01 == 1 && $zz_ms_seen_11 == 1 && $zz_ms_seen_21 == 1\n"
+            "    vs-t0 = ResourceZZMergedSkeleton_G0_s1\n"
+            "    so0 = ref ResourceZZRedirectSO_s1\n"
+            "    vb2 = Resourcea23aa8a3Blend\n"
+            "    vb0 = Resourcea23aa8a3Position\n"
+            "    draw = 12482, 0\n"
+            "    so0 = null\n"
+            "endif",
+            text,
+        )
+        # 宿主的几何**不得**自足绘制（它跨部件、必须等全组到位）
+        self.assertNotIn("if $zz_ms_occ_0 == 1\n    vs-t0 = ResourceZZMergedSkeleton", text)
+
+    def test_compatible_sibling_also_replays_host_geometry(self):
+        """关键回归：布局兼容的兄弟挂点也要发同一条重放（与提交顺序无关）。"""
+        exporter, models = self._make_exporter()
+        host_text = self._vb_text(exporter, models[0])
+        sib_text = self._vb_text(exporter, models[1])
+
+        # 兄弟挂点：先自足画自己的几何（3 顶点占位）……
+        self.assertIn(
+            "if $zz_ms_occ_1 == 1\n"
+            "    vs-t0 = ResourceZZMergedSkeleton_G0_s1\n"
+            "    draw = 3, 0\n"
+            "endif",
+            sib_text,
+        )
+        # ……再发宿主合并几何的组级守卫重放（宿主排在前面的帧由它闭合）
+        self.assertIn(
+            "if $zz_ms_seen_01 == 1 && $zz_ms_seen_11 == 1 && $zz_ms_seen_21 == 1\n"
+            "    vs-t0 = ResourceZZMergedSkeleton_G0_s1\n"
+            "    so0 = ref ResourceZZRedirectSO_s1\n"
+            "    vb2 = Resourcea23aa8a3Blend\n"
+            "    vb0 = Resourcea23aa8a3Position\n"
+            "    draw = 12482, 0\n"
+            "    so0 = null\n"
+            "endif",
+            sib_text,
+        )
+        self.assertIn("so0 = ref ResourceZZRedirectSO_s2", sib_text)
+        # 宿主段不能捕获兄弟的 SO：捕获只在宿主自己段发生
+        self.assertNotIn("ResourceZZRedirectSO_s1 = ref so0", sib_text)
+        self.assertIn("ResourceZZRedirectSO_s1 = ref so0", host_text)
+
+    def test_incompatible_sibling_does_not_replay(self):
+        """Blend 布局不兼容的兄弟挂点不得重放（BI4 与 BW16_BI16 不能混用）。"""
+        exporter, models = self._make_exporter(sibling_blend_stride=16)
+        sib_text = self._vb_text(exporter, models[1])
+        # 自己那段照旧自足绘制
+        self.assertIn("    draw = 3, 0", sib_text)
+        # 但不发宿主重放（否则会把权重按错误格式解释 → 流输出全零）
+        self.assertNotIn("so0 = ref ResourceZZRedirectSO", sib_text)
+        self.assertNotIn("vb0 = Resourcea23aa8a3Position", sib_text)
+
+    def test_host_without_compatible_sibling_prints_diagnostic(self):
+        """没有兼容兄弟时大声报警（该组合仍依赖提交顺序，需要开发者介入）。"""
+        import contextlib
+        import io
+
+        exporter, models = self._make_exporter(sibling_blend_stride=16)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self._vb_text(exporter, models[0])
+        self.assertIn("没有 Blend 布局兼容的其它挂点", buf.getvalue())
 
 
 class ZZMIStubObjectTests(unittest.TestCase):

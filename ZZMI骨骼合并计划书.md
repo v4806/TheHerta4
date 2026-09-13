@@ -308,7 +308,7 @@ if (
      3. **按槽捕获**：`if $zz_ms_occ_<i> == 1 … else … endif` 把本部件当帧 palette 复制进该槽的 palette 资源（`ResourceZZPalette_<draw_ib>_s<k> = copy vs-t0 unless_null`）；**SO 的捕获只由 SO owner（载体）部件做**（`ResourceZZRedirectSO_s<k> = ref so0`）；
      4. **attach 全在顶层**：每个 (部件, 槽) 一个 CustomShader attach 段（`cs-t0` = 该槽 palette，`cs-u0` = 该槽骨架，`Dispatch = ceil(vg_count/64),1,1`），deform 段**顶层无条件** `run` 全部 槽×部件 的 attach；
      5. **骨架按槽分份**：每组两份 `ResourceZZMergedSkeleton_G<g>_s1 / _s2`（array 同现状全宽）；
-     6. **每槽守卫**：段末 `if <组内所有部件的 seen_<i><k> == 1 相与>`，体内**只允许** `vs-t0 = ResourceZZMergedSkeleton_G<g>_s<k>`、`so0 = ref ResourceZZRedirectSO_s<k>`、`vb2 = <载体 blend>`、`vb0 = <载体 position>`、`draw = <merged_count>, 0`、`so0 = null`——**体内不得出现 `run`、不得给 `$变量` 赋值**；
+     6. **每槽绘制**：段末 `if <门控>`，体内**只允许** `vs-t0 = ResourceZZMergedSkeleton_G<g>_s<k>`、`so0 = ref ResourceZZRedirectSO_s<k>`、`vb2 = <载体 blend>`、`vb0 = <载体 position>`、`draw = <merged_count>, 0`、`so0 = null`——**体内不得出现 `run`、不得给 `$变量` 赋值**。门控两种：**自足挂点**（直连路径且几何只采样自己的槽位）`if $zz_ms_occ_<i> == <k>` 直接绘制；**组级门控** `if <组内所有部件的 seen_<i><k> == 1 相与>`（重定向重放宿主、吸收挂点，以及 v9.1 的**合并宿主重放**——宿主捕获本轮 SO 到 `ResourceZZRedirectSO_s<k>`，组内每个 Blend 布局兼容的挂点都发同一条 `so0 = ref … + 宿主 vb0/vb2 + draw` 重放，见第 8 条）；
      7. `[Constants]` **只声明 occ/seen**；`[Present]` **只把它们清零**（不生成任何 drawn/ready 闩锁变量，也不写任何资源复位）。
      8. 渲染段 / 载体 3 顶点前缀 stub / `handling = skip` 保持现状不变。
    - **已知限制**：
@@ -316,6 +316,16 @@ if (
      - 某部件整帧被剔除时，该槽守卫**不闭合** = 保持上一帧内容（方向安全：不会画出半帧拼接，但该帧的合并几何不更新）；`[Present]` 的 occ/seen 清零只作跨帧兜底；
      - `ResourceZZRedirectSO_s<k>` 按槽共享（不按 target 区分）：若同一帧同一槽内有两个不同 target 的重放，后捕获者生效——当前导出每组恰有一个 target，不受影响。
    - **对照产物与回归**：手改版 `浮波柚叶.ini`（8571B，用户实测通过）作为 v9 语义基准固化进 `tests/test_zzmi_merged_skeleton_ini.py`——断言生成器输出具备：顶层 `run`（无 run 进 if）、sticky seen 顶层赋值、每槽守卫体内只有绑定与 draw、无闩锁变量、`[Constants]` 只声明 occ/seen、`[Present]` 只清零 occ/seen 且无任何资源复位。
+8. **2026-09-13 v9.1 直连路径顺序无关化（FrameAnalysis 实证回归修复）**：
+   - **症状（不合并）**：未 join 的多部件模组（各部件各自导出、同属一个骨架组）在游戏里**持续闪烁 / 整帧消失**；把物体全部 join 成一个对象后正常（用户口径："合并到一个没问题，不合并就闪"）。
+   - **症状（合并，同一个根因的另一半）**：join 之后合并几何挂在宿主的导出 VB 上，宿主段仍用组级 seen 守卫画它 —— 宿主自己的 deform pass 每帧排在第几**不固定**，排在前面时守卫永不成立 ⇒ 合并几何整段不写（用户实测"合并之后还在闪"）。
+   - **根因**：旧口径把「本槽骨架齐全」与「几何必须落盘」绑在**同一个组级 seen 守卫**上，而该守卫只可能在组内**最后一个**到达的部件那段成立。**顺序不固定已实测**：同一批 3 部件（`c2b4ce3a`/`e6afd8d1`/`403eace9`）在 `FrameAnalysis-2026-09-13-075255`、`075506` 里的 deform 顺序是 **B→C→A**，在 `080752`（用户标注"模型消失"的帧）里是 **A→B→C**：前者只有 A 被画出来，后者最后到达的是 3 顶点占位桩 `403eace9` ⇒ 整帧没有任何可见几何输出。三份 dump 里每个部件的 deform pass 都只出现 1 次，palette copy 各 1 次（6240/1296/1680 字节 = 130/27/35 骨骼），即"每帧一轮 + 谁最后到在变"。
+   - **修复（已固化进生成器 `ui/universal/zzmi.py`）**：新增两个判据 + 一条重放通道：
+     1. **自足挂点**（`_merged_direct_draw_is_self_contained` = 本部件几何只采样自己 vg_map 覆盖的槽位）：`if $zz_ms_occ_<i> == <k>` → `vs-t0 = ResourceZZMergedSkeleton_G<g>_s<k>` → `draw = <本部件导出顶点数>, 0`，**不引用任何其它部件的 seen**（自己的槽位已由本段顶层 attach 用当帧 palette 写全；组内共享 canonical 槽位按导出期去重口径 bitwise 相同，谁写都一样）；
+     2. **合并宿主**（`_merged_group_absorbed_hosts` = 导出 VB 上挂着跨部件几何的 DrawIB）：几何引用全组骨骼 ⇒ **必须**等全组当帧到位；宿主在自己段顶层把本轮 SO 引用捕获到 `ResourceZZRedirectSO_s<k>`（与重定向路径同名资源、同语义），守卫体内显式绑定 `so0 = ref ResourceZZRedirectSO_s<k>` + 自己的 `vb2`/`vb0` + `draw = <宿主导出顶点数>, 0` + `so0 = null`；
+     3. **兼容挂点重放**（`_merged_absorbed_replay_compatible`，Blend 输入布局必须一致 = BI4 与 BW16_BI16 不能混用）：**本组每个布局兼容的挂点**都发同一条宿主重放 —— 哪个挂点最后到达都能把合并几何写进宿主捕获的 SO，与提交顺序无关；布局不兼容则退回只在宿主自己段重放并**大声报警**（该组合仍依赖顺序，需要开发者介入）。
+   - **实测支撑**：工作空间 `K:\SSMT-Package-master\WorkSpace\ZZMI\主角\LOD0\*` 里三个部件的类型目录均为 `...BW16_BI16_` ⇒ 用户这一例的重放布局兼容（生成器会按真实 `d3d11GameType` 的 Blend 元素签名判定，签名缺失时保守不重放）。
+   - **回归**：`tests/test_zzmi_merged_skeleton_ini.py` 改写 5 个直连路径用例（契约：直连路径的任何 `if` 条件都不得出现 `$zz_ms_seen_`）+ 新增 1 个吸收挂点边界用例 + 新增 `ZZSIMergedHostDirectPathTests` 5 个用例（宿主捕获 SO / 宿主组级重放 / 兼容兄弟也重放 / 不兼容兄弟不重放 / 无兼容兄弟时报警）；全量 `pytest tests` 1758 passed / 19 skipped。
 
 **分组实测（dump 122152，按渲染 cb1 对象变换，2026-08-24 分组定案口径）**：5 组——
 | 组 | 部件 | 对象变换平移（row3） | 全局槽位范围 |
@@ -333,7 +343,7 @@ if (
 2. 去重结果与实测一致：5 个骨架组（身体/头部/头发/19086112/add6ff13+d892c658），全局骨骼编号按组基址拼接（0..6/7..29/30..78/79..248/249..265，Σ 266）；头部组内 `454ff522#0` ↔ `48625d6d#2`（质心距 0.034）合并为全局槽 7、`64d7d56f` 头顶件与 `b51bdd59#0` 后脑发饰骨被刚性门控拆开（槽 18/19）；身体组 b20f90ea 38 新 + 13 共享等（对照 §2.5）；**同部件内部零合并；48625d6d 的 `#1/#8/#9`（同骨骼异帧）保持独立不被误并；跨组部件的骨骼分占各组槽位，运行时各自组内直拷（无校准）**。
 3. 幂等：二次导入不重复反查（跳过并提示）；`force=True` 可重建。
 4. **统一顶点组**：复选框开导入后，所有子网格对象共用同一套全局顶点组（组名 = 全局骨骼 id）；**同组部件可互刷权重（组内统一骨架）；跨组别引用被禁止——导出时 `_warn_cross_group_bone_references` 大声报警**；导入对象按 `SkeletonGroup` 归入对应 `SkeletonGroup_<N>` 合集。
-5. **导出合并骨架（v9 出现次槽位口径）**：复选框开 + 有 VGMap 时，导出 vb2 的 BLENDINDICES = 全局骨骼 id；INI 含 Merged Skeleton 全套——`[Constants]` **只声明** `$zz_ms_occ_<i>` 与 `$zz_ms_seen_<i><k>`；每组每槽一份全宽 `ResourceZZMergedSkeleton_G<N>_s<k>`（array=266）；每 (部件, 槽) 一个直拷 attach CustomShader（`cs = ./res/zzmi_merged_skeleton_attach.hlsl`，无 cb1 引用）；deform 段**顶层无条件** `run` 全部 槽×部件 的 attach（**`run` 绝不在 if 内**）；到达标记 `$zz_ms_seen_<i><k>` 全部**顶层 sticky 累加**（if 体内赋值会被优化器静态折叠 → 守卫被删）；每槽守卫条件 = 组内全部部件该槽的 seen 相与，**守卫体内只有资源绑定与 `draw`/`so0 = null`**（无 `run`、无 `$变量` 赋值）；`[Present]` **只清零 occ/seen**（**不得含 `ResourceZZRedirectSO_* = null`**——F8 已回退，也不得含任何其它资源复位）。**INI 不得含任何 cb1 捕获段/捕获资源/校准着色器引用，不得在 [Present] 重放持久 palette attach，也不得出现 `$zz_ms_redirect_drawn_*` / `$zz_ms_group_ready_*` 闩锁变量或 `$zz_ms_group_phase_*` 相位变量**。
+5. **导出合并骨架（v9 出现次槽位口径）**：复选框开 + 有 VGMap 时，导出 vb2 的 BLENDINDICES = 全局骨骼 id；INI 含 Merged Skeleton 全套——`[Constants]` **只声明** `$zz_ms_occ_<i>` 与 `$zz_ms_seen_<i><k>`；每组每槽一份全宽 `ResourceZZMergedSkeleton_G<N>_s<k>`（array=266）；每 (部件, 槽) 一个直拷 attach CustomShader（`cs = ./res/zzmi_merged_skeleton_attach.hlsl`，无 cb1 引用）；deform 段**顶层无条件** `run` 全部 槽×部件 的 attach（**`run` 绝不在 if 内**）；到达标记 `$zz_ms_seen_<i><k>` 全部**顶层 sticky 累加**（if 体内赋值会被优化器静态折叠 → 守卫被删）；每槽绘制的门控：**自足挂点（直连路径、几何只采样自己槽位）= `if $zz_ms_occ_<i> == <k>` 直接绘制、不引用其它部件 seen**（v9.1），**重定向重放宿主 = 组内全部部件该槽的 seen 相与**，**合并宿主（join 成一个物体）= 宿主段捕获本轮 SO 引用 + 组内每个 Blend 布局兼容的挂点各发一条组级守卫重放**（v9.1，顺序无关），**两种体内都只有资源绑定与 `draw`/`so0 = null`**（无 `run`、无 `$变量` 赋值）；`[Present]` **只清零 occ/seen**（**不得含 `ResourceZZRedirectSO_* = null`**——F8 已回退，也不得含任何其它资源复位）。**INI 不得含任何 cb1 捕获段/捕获资源/校准着色器引用，不得在 [Present] 重放持久 palette attach，也不得出现 `$zz_ms_redirect_drawn_*` / `$zz_ms_group_ready_*` 闩锁变量或 `$zz_ms_group_phase_*` 相位变量**。
 6. **游戏内实测**：导出的 mod 在 ZZMIv1 加载端下姿态正确，同组跨部件权重生效（每个 deform pass 的 vs-t0 使用当帧合并骨架；每槽守卫成立后重放该槽的合并可见几何，帧内无部件间不一致；**同一 IB 多实例（同帧多个 draw/多个对象变换）各自独立动画**：两个实例分别落在 s1/s2，不抖动、不卡首帧）；渲染 draw 无 R3 异常。
 7. **多实例回归基线（v9 语义基准）**：生成的 ini 与手改版 `浮波柚叶.ini`（8571B，用户实测通过）语义一致——顶层 `run`（无 run 进 if）、`$zz_ms_seen_<i><k>` 顶层 sticky 累加、每槽守卫体内只有绑定与 draw、`[Constants]` 只声明 occ/seen、`[Present]` 只清零 occ/seen 且无任何资源复位、无闩锁/相位变量、骨架与 palette 按槽分份（`_s1`/`_s2`）、SO 捕获只由 SO owner 部件做；`tests/test_zzmi_merged_skeleton_ini.py` 全绿。
 8. 复选框关闭：导入与导出行为均与现状完全一致（无 VGMap 读写、无 ModImpRuntime 写入、BLENDINDICES 走 `g.group` 原路径、无 Merged Skeleton 段）。

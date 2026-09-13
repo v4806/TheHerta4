@@ -69,6 +69,16 @@ ZZMI_STUB_PREFIX_ROWS = 3
 # - 两个 pass 的实例提交顺序相反时，出现次槽位会配错（与 v6 同源）。
 # - 某部件整帧被剔除时，该槽守卫不闭合 = 可能保持上一帧内容（不会画出半帧拼接，
 #   方向是安全的）；[Present] 的 occ/seen 清零只作跨帧兜底。
+#
+# v9.1（2026-09-13，FrameAnalysis 实证回归修复）：**直连路径不再等组内其它部件**。
+# 旧口径把「本槽骨架齐全」与「本部件几何必须落盘」绑在同一个组级 seen 守卫上，
+# 而该守卫只可能在组内**最后一个**到达的部件那段成立，且每个部件的几何只有它
+# 自己的 deform 段能画（那一笔的 VB/SO 绑定只在该段有效）⇒ 先到的部件被
+# `handling = skip` 吞掉且没有替代 draw，其 SO 当帧不写 → 模型随引擎的提交顺序
+# 逐帧闪/消失（同一批 3 部件在两份 dump 里的 deform 顺序为 B→C→A 与 A→B→C，
+# 后者最后到的是 3 顶点占位桩 → 整帧无可见几何 = 用户看到的"模型消失"帧）。
+# 自足挂点（几何只采样自己 vg_map 覆盖的槽位）改为按本轮出现次绑本槽骨架后
+# **无条件绘制**；只有画「含组内其它部件顶点的合并几何」的吸收挂点仍保留组级守卫。
 ZZMI_MERGED_SKELETON_SLOTS: tuple[int, ...] = (1, 2)
 # 出现次回绕上限：occ 自增到该值即回绕为槽位起点（1/2 循环）。
 ZZMI_MERGED_SKELETON_OCC_WRAP = len(ZZMI_MERGED_SKELETON_SLOTS) + 1
@@ -950,9 +960,12 @@ class ExportZZMI(ExportUnity):
            里 if 内的 run 不执行 → 骨架为空 → 模型整体消失）；
         5. `vs-t0 = <本组 s1 骨架>` 顶层默认换绑；
         6. `handling = skip` 与载体 3 顶点前缀 stub（`draw = 3, 0`，在守卫之前）；
-        7. 每槽守卫：`if <组内全部部件 seen_<i><k> == 1 相与>`，体内**只允许**
-           绑定与 draw（vs-t0 / so0 = ref / vb2 / vb0 / draw / so0 = null），
-           **不得出现 run、不得给 $变量赋值**。
+        7. 每槽绘制：体内**只允许**绑定与 draw（vs-t0 / so0 = ref / vb2 / vb0 /
+           draw / so0 = null），**不得出现 run、不得给 $变量赋值**。两种门控：
+           - 自足挂点（直连路径且几何只采样自己的槽位）：`if <本部件 occ> == 槽`
+             后直接画自己的几何（不等组内其它部件，v9.1）；
+           - 组级门控：`if <组内全部部件 seen_<i><k> == 1 相与>`（重定向重放宿主
+             与吸收挂点——它们画的是含组内其它部件顶点的合并几何）。
         """
         draw_ib = drawib_model.draw_ib
         component_id = int(self.merged_skeleton_component_id_dict[draw_ib])
@@ -978,7 +991,21 @@ class ExportZZMI(ExportUnity):
                 f"{seen_var} = {seen_var} + ({occ_var} == {slot})"
             )
 
-        # 3) 按槽捕获 palette（与 SO owner 的 SO 引用）
+        # 3) 按槽捕获 palette（与 SO owner / 合并宿主的 SO 引用）
+        #
+        # 合并几何的归属先算出来：直连路径（该组没有重定向计划）里，宿主导出的
+        # 合并几何必须能在**任何**布局兼容的挂点闭合守卫后重放——引擎把同组部件
+        # 的 deform pass 排成什么顺序每帧都可能不同，只让宿主自己那段重放时，
+        # 宿主排在前面的帧里合并几何整段不写（用户实测"合并之后还在闪"）。
+        redirect_carrier = self._redirect_carrier_map.get(draw_ib)
+        group_target = self._merged_group_redirect_target(skeleton_group)
+        group_plan = self._redirect_target_map.get(group_target) if group_target else None
+        absorbed_hosts = (
+            self._merged_group_absorbed_hosts(skeleton_group) if group_plan is None else []
+        )
+        is_absorbed_host = any(
+            int(host["component_id"]) == int(component_id) for host in absorbed_hosts
+        )
         so_owner_target_ibs = self._merged_so_owner_target_ibs(draw_ib)
         texture_override_vb_section.append("; 按槽捕获 palette 与 SO 引用")
         for index, slot in enumerate(slots):
@@ -989,6 +1016,12 @@ class ExportZZMI(ExportUnity):
             texture_override_vb_section.append(condition)
             texture_override_vb_section.append(f"    {palette_line}")
             for _so_owner_target_ib in so_owner_target_ibs:
+                texture_override_vb_section.append(
+                    f"    {self._merged_redirect_so_name(slot)} = ref so0"
+                )
+            if is_absorbed_host:
+                # 直连路径的合并宿主：把本轮自己的 SO 引用捕获下来（与重定向路径
+                # 同名资源、同语义），任何兼容挂点闭合守卫后都能把合并几何写进去。
                 texture_override_vb_section.append(
                     f"    {self._merged_redirect_so_name(slot)} = ref so0"
                 )
@@ -1003,15 +1036,11 @@ class ExportZZMI(ExportUnity):
                     f"run = {self._merged_attach_name(group_component_id, slot)}"
                 )
 
-        # 5) 默认换绑本组 s<slot_first> 骨架（守卫按槽覆盖）
+        # 5) 默认换绑本组 s<slot_first> 骨架（每槽绘制按需按槽覆盖）
         texture_override_vb_section.append(
             f"vs-t0 = {self._merged_skeleton_name(skeleton_group, slot_first)}"
         )
         texture_override_vb_section.append("handling = skip")
-
-        redirect_carrier = self._redirect_carrier_map.get(draw_ib)
-        group_target = self._merged_group_redirect_target(skeleton_group)
-        group_plan = self._redirect_target_map.get(group_target) if group_target else None
 
         # 6) 每槽守卫（体内只有绑定与 draw）
         #
@@ -1023,20 +1052,23 @@ class ExportZZMI(ExportUnity):
         #   退化为 3 顶点前缀 stub，写本槽 SO 的前缀行，不发守卫；
         # - 几何已被吸收、但本轮没有任何挂点能承载重放：不画（没有可见几何，
         #   也不该画自己的占位 stub）；
-        # - 该组没有可行的重定向：合并几何留在**拥有导出几何的那个部件**自己的
-        #   deform draw 上（直连路径），由本挂点的每槽守卫绘制。
+        # - 该组没有可行的重定向：几何留在**拥有导出几何的那个部件**自己的
+        #   deform draw 上（直连路径）——几何只采样自己槽位时按「本部件出现次」
+        #   自足绘制；几何跨部件（合并宿主）时把重放发给组内每个布局兼容的挂点
+        #   （v9.1，不依赖引擎的提交顺序）。
         #
         # 无论哪条路径，`run = <CustomShader>` 都已在上面**顶层**无条件执行完毕
         # （if 内的 run 在本 fork 上不执行）。
         if group_plan is None:
             # 该组没有可行的重定向计划（未发生重定向，或计划被判为不可行）：
-            # 合并几何留在承载部件自己的 deform draw 上（直连路径）。
+            # 几何留在承载部件自己的 deform draw 上（直连路径）。
             self._append_merged_direct_slot_guards(
                 texture_override_vb_section,
                 draw_ib,
                 skeleton_group,
                 slots,
                 fallback_draw_number=int(getattr(drawib_model, "draw_number", 0) or 0),
+                absorbed_hosts=absorbed_hosts,
             )
             return
 
@@ -1242,21 +1274,119 @@ class ExportZZMI(ExportUnity):
             section.append("    so0 = null")
             section.append("endif")
 
-    def _append_merged_direct_slot_guards(
-        self, section, draw_ib: str, skeleton_group: int, slots, fallback_draw_number: int = 0
-    ) -> None:
-        """直连路径（无 SO 重定向）的每槽守卫：组内全部部件当帧到达才画合并几何。
+    def _merged_direct_draw_is_self_contained(
+        self, skeleton_group: int, draw_ib: str
+    ) -> bool:
+        """本部件 deform 段画的几何是否**只依赖自己的槽位**（= 无需等组内其它部件）。
 
-        vb0/vb2 沿用本部件自己的绑定（合并几何就是从本部件导出的 VB 读的），
-        因此守卫体内只有 `vs-t0` 与 `draw`——同样满足「if 内不得 run / 不得给
+        自足 = 该部件不是「几何被吸收」的挂点：它导出的 VB 里只有自己的顶点，
+        顶点采样的全局槽位全部被自己的 vg_map 覆盖 ⇒ 本段 attach 用当帧 palette
+        写进本槽之后，本槽骨架对这段几何就是完整的（跨部件共享 canonical 槽位
+        的取值按导出期去重口径 bitwise 相同，谁写都一样）。
+        """
+        if draw_ib not in self.merged_skeleton_component_id_dict:
+            return False
+        return not self._merged_component_geometry_absorbed(skeleton_group, draw_ib)
+
+    def _merged_group_absorbed_hosts(self, skeleton_group: int) -> list[dict]:
+        """本组「几何被吸收」的挂点：跨部件的合并几何就挂在这些 DrawIB 的导出 VB 上。
+
+        它们画的几何引用组内其它部件的骨骼 ⇒ 必须等全组当帧到位才能画。返回
+        `[{"component_id", "draw_ib", "draw_count"}]`（按组件号升序）。
+        """
+        hosts: list[dict] = []
+        for component_id in self._merged_group_component_ids(skeleton_group):
+            component = self.merged_skeleton_components[int(component_id)]
+            draw_ib = str(component["draw_ib"])
+            if not self._merged_component_geometry_absorbed(skeleton_group, draw_ib):
+                continue
+            draw_count = int(self._drawib_exported_vertex_count(draw_ib) or 0)
+            if draw_count <= 0:
+                continue
+            hosts.append(
+                {
+                    "component_id": int(component_id),
+                    "draw_ib": draw_ib,
+                    "draw_count": draw_count,
+                }
+            )
+        return hosts
+
+    def _merged_absorbed_replay_compatible(self, draw_ib: str, host_ib: str) -> bool:
+        """本挂点能否重放宿主导出的合并几何（Blend 输入布局必须一致）。
+
+        重放在本挂点的 IA 状态下执行、绑定宿主的 vb0/vb2：BI4 与 BW16_BI16
+        混用时 BLENDINDICES 会被按错误格式解释，流输出通常直接全零。布局元数据
+        缺失时按「不可重放」处理（保守方向：退回只在宿主自己段重放）。
+        """
+        if draw_ib == host_ib:
+            return True
+        here = self._drawib_blend_layout_signature(draw_ib)
+        there = self._drawib_blend_layout_signature(host_ib)
+        return here is not None and here == there
+
+    def _append_merged_absorbed_replay(
+        self, section, host: dict, skeleton_group: int, slot: int
+    ) -> None:
+        """组级守卫的合并几何重放：把宿主导出的合并几何写进它捕获的 SO。
+
+        宿主在自己的 deform 段顶层把本轮 SO 引用捕获到
+        `ResourceZZRedirectSO_s<k>`；本块的守卫条件保证该宿主**当帧**在该槽已
+        到达（引用不会是上一轮的），因此任何布局兼容的挂点闭合守卫后都能写。
+        """
+        section.append(
+            "; 合并宿主重放（直连路径）：本组全部部件在该槽都已当帧到达才写宿主 SO"
+            "（体内只有绑定与 draw；任何兼容挂点闭合守卫都能写，不依赖提交顺序）"
+        )
+        section.append(f"if {self._merged_group_slot_seen_condition(skeleton_group, slot)}")
+        section.append(f"    vs-t0 = {self._merged_skeleton_name(skeleton_group, slot)}")
+        section.append(f"    so0 = ref {self._merged_redirect_so_name(slot)}")
+        section.append(f"    vb2 = Resource{host['draw_ib']}Blend")
+        section.append(f"    vb0 = Resource{host['draw_ib']}Position")
+        section.append(f"    draw = {int(host['draw_count'])}, 0")
+        section.append("    so0 = null")
+        section.append("endif")
+
+    def _append_merged_direct_slot_guards(
+        self,
+        section,
+        draw_ib: str,
+        skeleton_group: int,
+        slots,
+        fallback_draw_number: int = 0,
+        absorbed_hosts: list[dict] | None = None,
+    ) -> None:
+        """直连路径（无 SO 重定向）的每槽绘制。
+
+        vb0/vb2 沿用本部件自己的绑定（几何就是从本部件导出的 VB 读的）或按宿主
+        显式绑定，各分支体内都只有绑定与 draw——满足「if 内不得 run / 不得给
         $变量赋值」。
 
         draw 顶点数取本 DrawIB 的**导出顶点数**（所有子网格导出顶点之和 =
-        合并网格在本部件 VB 里的实际行数）——不用 draw_number：合并几何是从
-        导出 buffer 读的，超出原部件顶点数的部分正是被合并进来的其它部件几何，
-        按原部件顶点数画会截掉它们。
-        只有导出顶点数为 0 的测试桩/空变体才回退到 `fallback_draw_number`
+        本部件 VB 里的实际行数）——不用 draw_number：合并几何是从导出 buffer 读的，
+        超出原部件顶点数的部分正是被合并进来的其它部件几何，按原部件顶点数画会
+        截掉它们。只有导出顶点数为 0 的测试桩/空变体才回退到 `fallback_draw_number`
         （保持旧行为，避免旧工作空间突然不画）。
+
+        三种角色（判据见 `_merged_direct_draw_is_self_contained` /
+        `_merged_group_absorbed_hosts`）：
+
+        1. **自足挂点**（本部件几何只采样自己的槽位、本组没有合并宿主）：按本轮
+           出现次绑定本槽骨架后**无条件绘制**，绝不使用组级 seen 门控。理由
+           （2026-09-13 FrameAnalysis 实证）：组级门控只可能在组内**最后一个**
+           到达的部件那段成立，而每个部件的几何只有它自己的 deform 段能画（那一
+           笔的 VB/SO 绑定只在该段有效、且该段被 `handling = skip` 吃掉了原
+           draw）⇒ 先到的部件整帧没有变形输出，渲染只能读到旧内容/零值 → 模型随
+           引擎提交顺序逐帧闪/消失。自足挂点自己的槽位已由本段 attach 写全，等
+           其它部件没有任何正确性收益。
+        2. **合并宿主**（本部件导出 VB 上挂着跨部件的合并几何）：自己的几何**必须
+           等全组当帧到位**（半帧拼接的骨架会把跨部件几何画错位/塌陷）→ 组级
+           seen 守卫；体内显式绑定自己捕获的 SO（`ResourceZZRedirectSO_s<k>`）与
+           自己的 vb0/vb2。
+        3. **普通挂点 + 本组有合并宿主**：先按第 1 条自足画自己的几何，再对本组
+           每个布局兼容的宿主各发一条第 2 条的重放——**哪个挂点最后到达每帧都
+           可能不同**，只让宿主自己发重放时，宿主先 deform 的帧里合并几何整段
+           消失（用户实测"合并之后还在闪"）。
         """
         draw_count = int(self._drawib_exported_vertex_count(draw_ib) or 0)
         if draw_count <= 0:
@@ -1264,9 +1394,63 @@ class ExportZZMI(ExportUnity):
         if draw_count <= 0:
             # 该变体下没有任何可画的合并几何：不发守卫，避免 `draw = 0, 0`。
             return
+
+        hosts = list(absorbed_hosts or [])
+        own_host = next(
+            (host for host in hosts if str(host["draw_ib"]) == str(draw_ib)), None
+        )
+
+        if own_host is not None:
+            for slot in slots:
+                self._append_merged_absorbed_replay(section, own_host, skeleton_group, slot)
+            group_component_ids = self._merged_group_component_ids(skeleton_group)
+            if len(group_component_ids) > 1 and not any(
+                self._merged_absorbed_replay_compatible(
+                    str(self.merged_skeleton_components[int(other_id)]["draw_ib"]),
+                    str(draw_ib),
+                )
+                for other_id in group_component_ids
+                if int(other_id) != int(own_host["component_id"])
+            ):
+                print(
+                    "⚠️ [ZZMI骨骼合并] 合并宿主 " + str(draw_ib) + " 在本组内没有 Blend "
+                    "布局兼容的其它挂点：合并几何只能由它自己的 deform 段重放，"
+                    "若引擎把它的 deform pass 排在组内其它部件之前，该帧合并几何不写 "
+                    "→ 模型闪/消失。影响：合并（join 成一个物体）的导出。"
+                    "处置：把这条打印发给开发者（需要按 IA 布局兼容性放宽重放挂点）。"
+                )
+            return
+
+        if self._merged_direct_draw_is_self_contained(skeleton_group, draw_ib):
+            occ_var = self._merged_occ_var(
+                int(self.merged_skeleton_component_id_dict[draw_ib])
+            )
+            replay_hosts = [
+                host
+                for host in hosts
+                if self._merged_absorbed_replay_compatible(draw_ib, str(host["draw_ib"]))
+            ]
+            for slot in slots:
+                section.append(
+                    "; 直连路径自足挂点：按本轮出现次绑本槽骨架后直接绘制本部件几何"
+                    "（本段 attach 已用当帧 palette 写全自己的槽位；不等组内其它部件"
+                    "——组级门控只会在最后到达的部件那段成立，先到的部件整帧不画）"
+                )
+                section.append(f"if {occ_var} == {slot}")
+                section.append(
+                    f"    vs-t0 = {self._merged_skeleton_name(skeleton_group, slot)}"
+                )
+                section.append(f"    draw = {draw_count}, 0")
+                section.append("endif")
+                for host in replay_hosts:
+                    self._append_merged_absorbed_replay(
+                        section, host, skeleton_group, slot
+                    )
+            return
+
         for slot in slots:
             section.append(
-                "; 每槽守卫（直连路径）：本组全部部件在该槽都已当帧到达才绘制"
+                "; 每槽守卫（直连路径/吸收挂点）：本组全部部件在该槽都已当帧到达才绘制"
                 "（if 内只有绑定与 draw）"
             )
             section.append(f"if {self._merged_group_slot_seen_condition(skeleton_group, slot)}")
