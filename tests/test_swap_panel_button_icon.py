@@ -18,6 +18,14 @@ PKG = "_test_swap_panel_button_icon"
 PIL_AVAILABLE = importlib.util.find_spec("PIL") is not None
 DEFAULT_BUTTON_SIZE = (384, 64)
 
+# 顶层先把 PIL 导入 sys.modules：_load_panel() 用 mock.patch.dict 替换 sys.modules，
+# 若 PIL 是在该 patch 内首次导入，patch 退出时会把它逐出 sys.modules；此后测试内的
+# 再导入会生成第二个 PIL.Image 实例，而被测模块仍绑定第一个实例——它的 EXTENSION
+# 永远拿不到 PngImagePlugin 注册（插件模块已在 sys.modules 中，不会再次执行），
+# 于是 save("*.png") 会以 unknown file extension 失败。先导入可避免这种假失败。
+if PIL_AVAILABLE:
+    from PIL import Image as PILImage  # noqa: F401
+
 
 def _load_module(name, path):
     spec = importlib.util.spec_from_file_location(name, path)
@@ -81,8 +89,17 @@ class SwapPanelButtonIconTests(unittest.TestCase):
         "remark_text_color": (1.0, 1.0, 1.0),
         "remark_stroke_color": (0.0, 0.0, 0.0),
         "remark_stroke_width": 2,
+        "button_bg_color": (0.16, 0.22, 0.32),
+        "button_border_color": (0.59, 0.75, 0.94),
+        "button_border_width": 2,
+        "button_opacity": 0.9,
+        "button_align": "CENTER",
         "button_image": "",
         "button_border_image": "",
+        "background_opacity": 1.0,
+        "background_corner_radius": 24,
+        "background_border_color": (0.59, 0.75, 0.94),
+        "background_border_width": 3,
     }
 
     def setUp(self):
@@ -174,6 +191,76 @@ class SwapPanelButtonIconTests(unittest.TestCase):
         generated = self._generate(8, self._button(image_path=missing, comment="武器切换"))
         self.assertTrue(generated and Path(generated).is_file())
         self.assertNotEqual(self._size(generated), DEFAULT_BUTTON_SIZE)
+
+    # ------------------------------------------------- 按钮样式（默认按钮图）
+    @unittest.skipUnless(PIL_AVAILABLE, "需要 Pillow 才能生成按钮图")
+    def test_default_button_follows_button_style(self):
+        plain = self._generate(10, self._button())
+        self.panel.button_bg_color = (1.0, 0.0, 0.0)
+        self.panel.button_border_width = 8
+        styled = self._generate(11, self._button())
+        self.assertEqual(self._size(plain), DEFAULT_BUTTON_SIZE)
+        self.assertEqual(self._size(styled), DEFAULT_BUTTON_SIZE)
+        self.assertNotEqual(Path(plain).read_bytes(), Path(styled).read_bytes())
+
+    @unittest.skipUnless(PIL_AVAILABLE, "需要 Pillow 才能生成按钮图")
+    def test_default_button_follows_opacity(self):
+        opaque = self._generate(12, self._button())
+        self.panel.button_opacity = 0.2
+        faded = self._generate(13, self._button())
+        self.assertLess(self._max_alpha(faded), self._max_alpha(opaque))
+
+    @unittest.skipUnless(PIL_AVAILABLE, "需要 Pillow 才能生成文字图标")
+    def test_text_icon_follows_button_style(self):
+        first = self._generate(14, self._button(comment="武器切换"))
+        self.panel.button_bg_color = (0.9, 0.1, 0.1)
+        self.panel.button_border_color = (0.1, 0.9, 0.1)
+        second = self._generate(15, self._button(comment="武器切换"))
+        self.assertNotEqual(Path(first).read_bytes(), Path(second).read_bytes())
+
+    # ------------------------------------------------- 面板背景样式
+    @unittest.skipUnless(PIL_AVAILABLE, "需要 Pillow 才能生成背景图")
+    def test_background_corner_radius_cuts_corners(self):
+        square = self._background(20, corner_radius=0, border_width=0)
+        rounded = self._background(21, corner_radius=50, border_width=0)
+        self.assertGreater(self._corner_alpha(square), 0)
+        self.assertEqual(self._corner_alpha(rounded), 0)
+
+    @unittest.skipUnless(PIL_AVAILABLE, "需要 Pillow 才能生成背景图")
+    def test_background_border_width_changes_output(self):
+        none = self._background(22, corner_radius=24, border_width=0)
+        bordered = self._background(23, corner_radius=24, border_width=8)
+        self.assertNotEqual(Path(none).read_bytes(), Path(bordered).read_bytes())
+
+    @unittest.skipUnless(PIL_AVAILABLE, "需要 Pillow 才能生成背景图")
+    def test_background_opacity_scales_alpha(self):
+        solid = self._background(24, corner_radius=0, border_width=0, opacity=1.0)
+        faded = self._background(25, corner_radius=0, border_width=0, opacity=0.4)
+        self.assertGreater(self._corner_alpha(solid), self._corner_alpha(faded))
+
+    def _background(self, index, corner_radius, border_width, opacity=None):
+        self.panel.background_corner_radius = corner_radius
+        self.panel.background_border_width = border_width
+        if opacity is not None:
+            self.panel.background_opacity = opacity
+        dest = str(self.res / f"swpbg_{index}.png")
+        generated = self.panel._generate_background_image(dest, 0.6, 0.75)
+        self.assertTrue(generated and Path(generated).is_file())
+        return generated
+
+    @staticmethod
+    def _corner_alpha(path):
+        from PIL import Image
+
+        with Image.open(path) as image:
+            return image.convert("RGBA").getpixel((0, 0))[3]
+
+    @staticmethod
+    def _max_alpha(path):
+        from PIL import Image
+
+        with Image.open(path) as image:
+            return max(pixel[3] for pixel in image.convert("RGBA").getdata())
 
 
 if __name__ == "__main__":
