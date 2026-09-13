@@ -1211,41 +1211,115 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
 
     # ---- 未分配形态键屏蔽标记（三层统一前缀，便于幂等恢复）----
     UNASSIGNED_MASK_TAG = "[未分配-已屏蔽]"
+    # 旧格式（无变量名），仍能识别并还原，保证已生成过的 mod 不卡死
     UNASSIGNED_MASK_PREFIX = "; [未分配-已屏蔽] "
-    # 被屏蔽的 shader 槽位额外写一行显式归零：IniParams 是粘滞的，同槽位可能还有
+    # 新格式：把变量名写进标记，还原时按“身份”判定而不是无条件还原
+    UNASSIGNED_MASK_PREFIX_FMT = "; [未分配-已屏蔽:{token}] "
+    UNASSIGNED_MASK_HEAD = "; [未分配-已屏蔽"
+    # 被屏蔽的 shader 槽位额外写一行**有效**归零行：IniParams 是粘滞的，同槽位可能还有
     # 拖拽交互 / UV 偏移等模块每帧写入，只注释原行并不能保证 Shader 读到 0。
+    # 归零行自己带变量名标记，与它的屏蔽行同生共死（还原时按身份一起保留/一起删除）。
     UNASSIGNED_ZERO_TAG = "[未分配-已屏蔽-归零]"
-    UNASSIGNED_ZERO_PREFIX = "; [未分配-已屏蔽-归零] "
+    # 行内匹配用「不带右括号」的头：带 token 时右括号在 token 之后
+    UNASSIGNED_ZERO_HEAD = "[未分配-已屏蔽-归零"
+    UNASSIGNED_ZERO_LINE_FMT = "{indent}{index} = 0 ; [未分配-已屏蔽-归零:{token}]"
 
-    def _unmask_all_shapekeys(self, sections):
-        """清除上次的 [未分配-已屏蔽] 标记，把注释行恢复为原始有效行。
-
-        每次 execute_postprocess 生成时都先调用（无论导出/刷新），保证：
-        - 形态键被移回分组后，之前被注释的声明/赋值/shader 引用会自动恢复；
-        - 不依赖上游节点重新运行，纯文本可逆。
-
-        采用「固定前缀整行还原」（而不是正则吃空白）以保持原始缩进；
-        屏蔽时补写的归零行带独立标记，这里直接删除，不参与还原。
+    @classmethod
+    def _parse_masked_token(cls, line):
+        """解析屏蔽行里的变量名。
 
         Returns:
-            int: 本次还原的有效行数量（用于判断屏蔽是否发生了 fail-open 回滚）。
+            None: 不是屏蔽行；
+            "":   旧格式屏蔽行（标记里没有变量名，无法判定身份）；
+            其他: 屏蔽时记录的变量名。
         """
+        if not line.startswith(cls.UNASSIGNED_MASK_HEAD):
+            return None
+        end = line.find("] ")
+        if end == -1:
+            return None
+        inner = line[len("; ["):end]  # "未分配-已屏蔽" 或 "未分配-已屏蔽:token"
+        _tag, _, token = inner.partition(":")
+        return token.strip()
+
+    @classmethod
+    def _parse_zero_token(cls, line):
+        """解析归零行里的变量名（旧实现没有 token 时返回 ""，非归零行返回 None）。"""
+        if cls.UNASSIGNED_ZERO_HEAD not in line:
+            return None
+        inner = line.split(cls.UNASSIGNED_ZERO_HEAD, 1)[1]
+        _sep, _, token = inner.partition(":")
+        return token.split("]", 1)[0].strip()
+
+    @classmethod
+    def _strip_mask_prefix(cls, line):
+        """去掉屏蔽标记，还原成原始行（保留原有缩进）。"""
+        end = line.find("] ")
+        if end == -1:
+            return line
+        return line[end + 2:]
+
+    @staticmethod
+    def _normalize_token(value):
+        token = str(value or "").strip()
+        return token[1:] if token.startswith("$") else token
+
+    def _unmask_all_shapekeys(self, sections, keep_masked=None, active_vars=None):
+        """按“身份”处理上一次的屏蔽标记。
+
+        每次 execute_postprocess 生成时都先调用（无论导出/刷新）：
+
+        - 带变量名的屏蔽行（新格式）：变量名仍在本次屏蔽集合 ``keep_masked`` 里 →
+          保持注释；不在屏蔽集合、但仍是当前有效的形态键变量（``active_vars``）→
+          还原为有效行；两者都不是（变量已改名/废弃）→ **保守保持屏蔽**，
+          避免把旧名残行悄悄复活成有效行（这正是 PR 描述里“改名后屏蔽失效”的坑）。
+        - 旧格式屏蔽行（标记里没有变量名）：无法判定身份，按旧行为还原。
+        - 无任何上下文（上游节点未连线、解析不出变量名）：按旧行为还原，
+          由调用方打印 fail-open 警告。
+
+        采用「固定前缀整行还原」（而不是正则吃空白）以保持原始缩进；
+        屏蔽时补写的归零行按行尾标记整行删除，不参与还原。
+
+        Returns:
+            (restored, kept): 还原的有效行数与保持屏蔽的行数（都不含归零行）。
+        """
+        keep = {self._normalize_token(t) for t in (keep_masked or ()) if self._normalize_token(t)}
+        active = {self._normalize_token(t) for t in (active_vars or ()) if self._normalize_token(t)}
+        # 有上下文才敢“保守保持屏蔽”；什么都没有时退回旧的 fail-open 行为
+        has_context = bool(keep or active)
         restored_count = 0
-        mask_prefix = self.UNASSIGNED_MASK_PREFIX
-        zero_prefix = self.UNASSIGNED_ZERO_PREFIX
+        kept_count = 0
         for sec_name in list(sections.keys()):
             new_lines = []
             for line in sections[sec_name]:
-                if line.startswith(zero_prefix):
-                    # 上次屏蔽补写的归零行：直接丢弃（原始行会由下面的还原恢复）
+                zero_token = self._parse_zero_token(line)
+                if zero_token is not None:
+                    # 归零行跟随它的屏蔽行：token 仍在屏蔽集合（或身份未知且保守）
+                    # 就保留，否则删除。
+                    if zero_token and (zero_token in keep or (has_context and zero_token not in active)):
+                        new_lines.append(line)
                     continue
-                if line.startswith(mask_prefix):
-                    new_lines.append(line[len(mask_prefix):])
+                token = self._parse_masked_token(line)
+                if token is None:
+                    new_lines.append(line)
+                    continue
+                if token and token in keep:
+                    new_lines.append(line)
+                    kept_count += 1
+                    continue
+                if token and token in active:
+                    new_lines.append(self._strip_mask_prefix(line))
                     restored_count += 1
                     continue
-                new_lines.append(line)
+                if token and has_context:
+                    # 变量已改名/不再属于本节点：保持屏蔽，不让旧行复活
+                    new_lines.append(line)
+                    kept_count += 1
+                    continue
+                new_lines.append(self._strip_mask_prefix(line))
+                restored_count += 1
             sections[sec_name] = new_lines
-        return restored_count
+        return restored_count, kept_count
 
     @staticmethod
     def _extract_variable_token(match):
@@ -1254,43 +1328,56 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
         return token[1:] if token.startswith("$") else token
 
     def _mask_unassigned_shapekeys(self, sections, unassigned_vars):
-        """把未分配形态键的三层引用全部注释：常量声明 / Present 赋值 / Shader 输入。
+        """把未分配形态键的引用注释掉：常量声明 / Present 赋值 / Shader 输入。
 
-        - [Constants]: "global [persist] $var = ..." 整行加注释前缀。
-        - [Present] : 所有 "$var = ..." 形式的赋值行加注释前缀。
-        - [CustomShader_*_Anim]: "x<N> = $var" 行加注释前缀，并紧接一行带
-          「归零」标记的 "x<N> = 0"——IniParams 是粘滞的，本仓库其它模块
-          （拖拽交互 x101..x104、UV 偏移 IniParams[100]/[101]）会写同一段槽位，
-          只注释原行并不能保证 Shader 读到 0。归零行在 _unmask_all_shapekeys
-          中被丢弃，不污染可逆性。
+        - [Constants]: "global [persist] $var = ..." 整行加带变量名的屏蔽标记。
+        - [Present] : 所有 "$var = ..." 形式的赋值行加屏蔽标记。
+        - [CustomShader_*_Anim]: "x<N> = $var" 行加屏蔽标记，并紧接一行**有效**的
+          "x<N> = 0 ; [归零标记]"——IniParams 是粘滞的、同槽位还有其它模块在写，
+          只注释原行并不能保证 Shader 读到 0（注释行本身不写寄存器）。
+          归零行在 _unmask_all_shapekeys 中按行尾标记删除，不污染可逆性。
 
         注意：变量名**不要求**以 ``Freq_`` 开头——「导出变量」是自由文本，
         用户可以填任意名字（中文名经 cjk_to_ascii 后也没有 Freq_ 前缀），
         所以这里按解析出的 token 匹配，而不是按前缀匹配。
+
+        Returns:
+            (newly_masked, already_masked): 本次新加标记的行数、以及上次已屏蔽且仍然
+            生效（保持原样）的行数。调用方据此如实汇报，避免“匹配不到却照样打印已屏蔽”。
         """
         if not unassigned_vars:
-            return
-        target_set = set()
-        for name in unassigned_vars:
-            token = str(name or "").strip()
-            if token.startswith("$"):
-                token = token[1:]
-            if token:
-                target_set.add(token)
+            return 0, 0, []
+        target_set = {self._normalize_token(name) for name in unassigned_vars}
+        target_set.discard("")
         if not target_set:
-            return
-        prefix = self.UNASSIGNED_MASK_PREFIX
-        zero_prefix = self.UNASSIGNED_ZERO_PREFIX
+            return 0, 0, []
+        zero_line_fmt = self.UNASSIGNED_ZERO_LINE_FMT
+        masked_lines = 0
+        already_masked = 0
+        matched_tokens = set()
+
+        def _mask_prefix(token):
+            return self.UNASSIGNED_MASK_PREFIX_FMT.format(token=token)
+
+        def _mask_line(raw_line, token):
+            return _mask_prefix(token) + raw_line
 
         # 1) [Constants]：注释 global [persist] $var = ...
         decl_pattern = re.compile(r'^\s*global(?:\s+persist)?\s+(\$\S+)\s*=')
         if '[Constants]' in sections:
             new_lines = []
             for line in sections['[Constants]']:
-                if self._extract_variable_token(decl_pattern.match(line)) in target_set:
-                    new_lines.append(prefix + line)
-                else:
-                    new_lines.append(line)
+                token = self._extract_variable_token(decl_pattern.match(line))
+                if token in target_set:
+                    new_lines.append(_mask_line(line, token))
+                    masked_lines += 1
+                    matched_tokens.add(token)
+                    continue
+                kept_token = self._parse_masked_token(line)
+                if kept_token and kept_token in target_set:
+                    already_masked += 1
+                    matched_tokens.add(kept_token)
+                new_lines.append(line)
             sections['[Constants]'] = new_lines
 
         # 2) [Present]：注释 $var = ... 赋值
@@ -1298,13 +1385,20 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
         if '[Present]' in sections:
             new_lines = []
             for line in sections['[Present]']:
-                if self._extract_variable_token(assign_pattern.match(line)) in target_set:
-                    new_lines.append(prefix + line)
-                else:
-                    new_lines.append(line)
+                token = self._extract_variable_token(assign_pattern.match(line))
+                if token in target_set:
+                    new_lines.append(_mask_line(line, token))
+                    masked_lines += 1
+                    matched_tokens.add(token)
+                    continue
+                kept_token = self._parse_masked_token(line)
+                if kept_token and kept_token in target_set:
+                    already_masked += 1
+                    matched_tokens.add(kept_token)
+                new_lines.append(line)
             sections['[Present]'] = new_lines
 
-        # 3) [CustomShader_*_Anim]：注释 x<N> = $var，并补一行显式归零
+        # 3) [CustomShader_*_Anim]：注释 x<N> = $var，并补一行**有效**归零
         shader_pattern = re.compile(r'^\s*(x\d+)\s*=\s*(\$\S+)')
         for sec_name in list(sections.keys()):
             if not (sec_name.startswith('[CustomShader_') and sec_name.endswith('_Anim]')):
@@ -1316,11 +1410,71 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
                 if m:
                     token = m.group(2)[1:] if m.group(2).startswith("$") else m.group(2)
                 if m and token in target_set:
-                    new_lines.append(prefix + line)
-                    new_lines.append(f"{zero_prefix}{m.group(1)} = 0")
-                else:
-                    new_lines.append(line)
+                    indent = line[:len(line) - len(line.lstrip())]
+                    new_lines.append(_mask_line(line, token))
+                    new_lines.append(
+                        zero_line_fmt.format(indent=indent, index=m.group(1), token=token)
+                    )
+                    masked_lines += 1
+                    matched_tokens.add(token)
+                    continue
+                kept_token = self._parse_masked_token(line)
+                if kept_token and kept_token in target_set:
+                    # 上次已屏蔽：归零行由 _unmask_all_shapekeys 按身份保留，这里不重复添加
+                    already_masked += 1
+                    matched_tokens.add(kept_token)
+                new_lines.append(line)
             sections[sec_name] = new_lines
+
+        # 一个匹配行都没有的未分配形态键：多半是变量名刚被刷新、ini 还没重新导出
+        unmatched = sorted(target_set - matched_tokens)
+        return masked_lines, already_masked, unmatched
+
+    @classmethod
+    def _collect_live_references(cls, sections, tokens):
+        """找出仍以“有效行”（非注释）方式引用给定变量的位置。
+
+        用于屏蔽之后的不变量校验：屏蔽只注释了「变量作左值」的行，若还有别的模块
+        （例如滑块面板）以右值/读取方式引用这些变量，这里会显式报出来，
+        而不是让 ini 静默引用一个已被注释掉声明的变量。
+
+        Returns:
+            list[(section, 1-based 行号, 行内容)]
+        """
+        names = []
+        for token in tokens or ():
+            name = cls._normalize_token(token)
+            if name:
+                names.append(name)
+        if not names:
+            return []
+        patterns = [
+            re.compile(r"\$" + re.escape(name) + r"(?![A-Za-z0-9_])") for name in names
+        ]
+        hits = []
+        for sec_name, lines in sections.items():
+            for index, line in enumerate(lines, 1):
+                stripped = line.lstrip()
+                if not stripped or stripped.startswith(";"):
+                    continue
+                if any(pattern.search(line) for pattern in patterns):
+                    hits.append((sec_name, index, stripped))
+        return hits
+
+    @classmethod
+    def _exclude_disabled_freq_params(cls, freq_params, exclude_vars):
+        """从滑块参数集合里剔除被屏蔽的变量。
+
+        Returns:
+            (kept: set, skipped: list) —— skipped 已排序，便于日志输出。
+        """
+        excluded = {cls._normalize_token(v) for v in (exclude_vars or ())}
+        excluded.discard("")
+        if not excluded:
+            return set(freq_params or ()), []
+        skipped = sorted(v for v in (freq_params or ()) if cls._normalize_token(v) in excluded)
+        kept = {v for v in (freq_params or ()) if v not in skipped}
+        return kept, skipped
 
     def _build_var_to_group_map(self, freq_vars, shapekey_names):
         """构建 变量 -> 分组编号 的映射，并返回实际使用的分组列表。
@@ -1881,8 +2035,13 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
                     slider_to_group[idx] = gid
         return slider_to_group
 
-    def _apply_slider_panel(self, mod_export_path, target_ini_file, sections):
-        """【已合并】生成滑块面板-自定义配置并合并到 sections（不写盘）。"""
+    def _apply_slider_panel(self, mod_export_path, target_ini_file, sections, exclude_vars=None):
+        """【已合并】生成滑块面板-自定义配置并合并到 sections（不写盘）。
+
+        exclude_vars: 不给这些变量生成滑块。用于「未分配形态键」——它们的引用会被
+        屏蔽注释，如果继续建滑块，面板里既会留下一个点了没反应的死滑块，还会生成
+        ``$paramN = $被屏蔽变量`` 这类对已注释声明变量的读取行。
+        """
         ns = self._ensure_namespace()
         if '[Present]' in sections and any("SLIDER PANEL CUSTOM LOGIC (appended)" in l for l in sections['[Present]']):
             print("滑块面板配置已存在于文件中。请手动删除后再生成。")
@@ -1895,6 +2054,15 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
                 m = param_pattern.match(line)
                 if m:
                     freq_params_temp.add(m.group(1))
+
+        if exclude_vars:
+            freq_params_temp, skipped = self._exclude_disabled_freq_params(
+                freq_params_temp, exclude_vars
+            )
+            if skipped:
+                print(
+                    f"[形态键扩展] 滑块面板跳过 {len(skipped)} 个未分配形态键的滑块: {skipped}"
+                )
 
         group_pattern = re.compile(r'^\$Freq_Group(\d+)$')
         group_var_matches = {}
@@ -2625,10 +2793,19 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
                 print("检测到旧格式的形态键扩展配置（无标识标记）。请先重新导出一次 mod 以生成带标识的新配置。")
                 return False
 
-        # 清除上次的未分配-已屏蔽标记（幂等恢复），保证移回分组后变量能重新生效。
-        # 返回还原行数：若本次没有任何可屏蔽对象却又还原了行，说明屏蔽发生回滚
-        # （上游节点未连线/变量名映射失败），需要显式提示，避免“以为已屏蔽其实没屏蔽”。
-        restored_mask_lines = self._unmask_all_shapekeys(sections)
+        # 未分配形态键：先解析出变量名集合，供"按身份还原屏蔽"与"滑块面板排除"共用。
+        unassigned_names = {e.shape_key_name for e in self.play_group_entries if e.group_index == 0}
+        name_to_var = self._scan_shapekey_name_to_var_map() if unassigned_names else {}
+        masked_vars = {name_to_var[n] for n in unassigned_names if n in name_to_var}
+        active_vars = set(name_to_var.values())
+
+        # 处理上次的未分配-已屏蔽标记：仍在屏蔽集合里的保持注释、移回分组的还原、
+        # 变量已改名/废弃的保守保持屏蔽（不许旧行复活）。
+        restored_mask_lines, kept_mask_lines = self._unmask_all_shapekeys(
+            sections, keep_masked=masked_vars, active_vars=active_vars
+        )
+        if kept_mask_lines:
+            print(f"[形态键扩展] 保持 {kept_mask_lines} 行未分配形态键的屏蔽注释")
 
         freq_vars = self._scan_freq_vars_from_ini(sections)
         if not freq_vars and not _in_place:
@@ -2712,9 +2889,15 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
         first_code_pos = len(present_lines)
         for i, line in enumerate(present_lines):
             stripped = line.strip()
-            if stripped and not stripped.startswith(';'):
-                first_code_pos = i
-                break
+            if not stripped:
+                continue
+            if stripped.startswith(';') and self.UNASSIGNED_MASK_HEAD not in line:
+                # 普通注释不参与定位；但「未分配-已屏蔽」标记行要参与——它是被注释掉的
+                # 真实语句，若跳过它，[Present] 里只剩屏蔽行时插入点会从行首漂到行尾，
+                # 同一个 mod 反复刷新就会出现“同步块位置来回跳”的伪变更。
+                continue
+            first_code_pos = i
+            break
         # ---- 组内变量同步块（插入式，带标识注释）----
         # 修复：同步模式不再使用 `if sync_line not in present_lines` 检查。
         # 原来的检查语义错误 —— present_lines 是"已存在的行"，而 sync_lines 是
@@ -2803,21 +2986,30 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
                 cmd_g = f"[CommandListToggleAutoPlayGroup{g}_{ns}]"
                 if cmd_g not in sections: sections[cmd_g] = [f"$auto_play_enabled_group{g} = 1 - $auto_play_enabled_group{g}"]
         # 【已合并】滑块面板-自定义
+        # 未分配（被屏蔽）的形态键不建滑块：否则会留下点了没反应的死滑块，
+        # 并生成 `$paramN = $被屏蔽变量` 这类读取已注释声明变量的行。
         if self.use_slider_panel:
-            self._apply_slider_panel(mod_export_path, target_ini_file, sections)
+            self._apply_slider_panel(
+                mod_export_path, target_ini_file, sections, exclude_vars=masked_vars
+            )
 
-        # ---- 未分配形态键屏蔽：把变量声明 / Present 赋值 / Shader 输入全部注释掉 ----
-        unassigned_names = {e.shape_key_name for e in self.play_group_entries if e.group_index == 0}
-        masked_vars = set()
+        # ---- 未分配形态键屏蔽：把变量声明 / Present 赋值 / Shader 输入注释掉 ----
         if unassigned_names:
-            name_to_var = self._scan_shapekey_name_to_var_map()
-            masked_vars = {name_to_var[n] for n in unassigned_names if n in name_to_var}
             if masked_vars:
-                self._mask_unassigned_shapekeys(sections, masked_vars)
-                print(
-                    f"[形态键扩展] 已屏蔽 {len(masked_vars)} 个未分配形态键: "
-                    f"{sorted(masked_vars)}"
+                new_masked, already_masked, unmatched_vars = self._mask_unassigned_shapekeys(
+                    sections, masked_vars
                 )
+                matched_vars = sorted(set(masked_vars) - set(unmatched_vars))
+                print(
+                    f"[形态键扩展] 未分配形态键屏蔽：本次新增 {new_masked} 行、"
+                    f"沿用上次 {already_masked} 行；已处理 {len(matched_vars)} 个: {matched_vars}"
+                )
+                if unmatched_vars:
+                    print(
+                        f"[形态键扩展] 警告：以下未分配形态键在 ini 里找不到对应行"
+                        f"（可能变量名已被刷新，ini 需重新导出一次），当前未产生屏蔽: "
+                        f"{unmatched_vars}"
+                    )
             else:
                 print(
                     f"[形态键扩展] 检测到 {len(unassigned_names)} 个未分配形态键，"
@@ -2829,6 +3021,17 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
                 f"{restored_mask_lines} 行屏蔽注释（上游节点未连线/映射失败时会出现）。"
                 f"若这些形态键本应保持失效，请检查形态键节点的连线与「导出变量」设置。"
             )
+
+        # ---- 不变量校验：屏蔽之后，输出里不应再有对被屏蔽变量的有效引用 ----
+        # （滑块面板之外若还有别的模块读/写这些变量，这里会显式报出来，而不是静默错下去）
+        if masked_vars:
+            leftovers = self._collect_live_references(sections, masked_vars)
+            if leftovers:
+                preview = "; ".join(f"{sec}#{idx}: {text}" for sec, idx, text in leftovers[:5])
+                print(
+                    f"[形态键扩展] 警告：屏蔽后仍有 {len(leftovers)} 处有效引用未处理：{preview}"
+                    f"{' …' if len(leftovers) > 5 else ''}"
+                )
 
         # ---- 未列入分组条目的形态键：升级后不再跟随分组 1 ----
         # 旧版本把“没有任何条目的形态键”默认归到分组 1，会跟着 $Freq_Group1 一起动；
