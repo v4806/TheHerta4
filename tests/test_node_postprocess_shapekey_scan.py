@@ -70,6 +70,9 @@ _install_module(
     allocate_shape_key_variable_name=lambda shape_key_name, **_kwargs: f"Freq_{shape_key_name}",
     mark_variable_name_used=lambda *_args, **_kwargs: None,
     normalize_variable_name=lambda value: str(value or "").strip(),
+    cjk_to_ascii=lambda value: str(value or ""),
+    is_pinyin_available=lambda **_kwargs: False,
+    reset_pinyin_cache=lambda *_args, **_kwargs: None,
 )
 _install_module(
     f"{PKG}.common.mod_path_compat",
@@ -608,6 +611,18 @@ class NodePostprocessShapeKeyScanTests(unittest.TestCase):
 
             def template_list(self, *args, **kwargs):
                 calls.append(("template_list", args, kwargs))
+
+            def operator(self, *args, **kwargs):
+                calls.append(("box_operator", args, kwargs))
+                return _FakeOperator()
+
+            def box(self):
+                calls.append(("box", (), {}))
+                return _FakeBox()
+
+            def row(self, *args, **kwargs):
+                calls.append(("row", args, kwargs))
+                return _FakeLayout()
 
         class _FakeLayout:
             def operator(self, *args, **kwargs):

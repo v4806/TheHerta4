@@ -66,6 +66,9 @@ _install_module(
     allocate_shape_key_variable_name=lambda name, **_kw: f"Freq_{name}",
     mark_variable_name_used=lambda *_a, **_kw: None,
     normalize_variable_name=lambda value: str(value or "").strip(),
+    cjk_to_ascii=lambda value: str(value or ""),
+    is_pinyin_available=lambda **_kwargs: False,
+    reset_pinyin_cache=lambda *_args, **_kwargs: None,
 )
 _install_module(
     f"{PKG}.common.mod_path_compat",

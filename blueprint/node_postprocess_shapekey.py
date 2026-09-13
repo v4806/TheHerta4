@@ -19,7 +19,14 @@ try:
 except ImportError:  # 测试 stub 包无 __path__ 时退化为绝对导入
     from blueprint import deform_chain
 from .node_postprocess_base import SSMTNode_PostProcess_Base
-from .variable_registry import allocate_shape_key_variable_name, mark_variable_name_used, normalize_variable_name
+from .variable_registry import (
+    allocate_shape_key_variable_name,
+    mark_variable_name_used,
+    normalize_variable_name,
+    cjk_to_ascii,
+    is_pinyin_available,
+    reset_pinyin_cache,
+)
 from ..common.mod_path_compat import collect_base_position_resource_map
 from ..common.mod_path_compat import derive_shapekey_base_resource_name
 from ..common.mod_path_compat import derive_shapekey_freq_resource_name
@@ -300,6 +307,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
         }
         created_count = 0
         backfilled_count = 0
+        refreshed_count = 0
 
         rebuilt_items = []
         for shape_key_name in normalized_names:
@@ -312,18 +320,52 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                 created_count += 1
                 rebuilt_items.append(item)
             else:
+                old_assigned = normalize_variable_name(getattr(existing, "assigned_variable_name", "") or "")
+                old_custom = normalize_variable_name(getattr(existing, "custom_variable_name", "") or "")
                 owned_names = (
                     getattr(existing, "assigned_variable_name", ""),
                     getattr(existing, "custom_variable_name", ""),
                 )
-                if not existing.assigned_variable_name:
+
+                if not old_assigned:
+                    # 之前没有预分配：现在首次分配
                     existing.assigned_variable_name = allocate_shape_key_variable_name(
                         shape_key_name,
-                        preferred=existing.custom_variable_name,
+                        preferred=old_custom,
                         owned_names=owned_names,
                     )
-                elif self._backfill_shape_key_variable_input(existing):
+                    if not old_custom:
+                        existing.custom_variable_name = normalize_variable_name(existing.assigned_variable_name)
                     backfilled_count += 1
+                else:
+                    # 已存在预分配：用当前规则重算“理想名”，判断是否需要刷新。
+                    # 会触发刷新的场景：
+                    #   * 之前生成时 pypinyin 未安装，中文形态键名被 _sanitize_name 剥离，
+                    #     只剩后缀（如 "摇摆_001" -> "Freq__001"）；装上 pypinyin 后
+                    #     能正确转换（"Freq_yaobai_001"）。
+                    #   * 反过来 pypinyin 被卸载，需要回落到 uXXXX 编码。
+                    #   * cjk_to_ascii 实现升级导致转换结果变化。
+                    # 重算时把本项自身已占用的名字作为 owned 排除，避免自我冲突。
+                    ideal_assigned = allocate_shape_key_variable_name(
+                        shape_key_name,
+                        owned_names=owned_names,
+                    )
+                    if ideal_assigned != old_assigned:
+                        existing.assigned_variable_name = ideal_assigned
+                        # 仅当 custom 仍等于旧 assigned（即未被用户手动修改）时才同步更新，
+                        # 否则保留用户自定义输入。
+                        if old_custom == old_assigned:
+                            existing.custom_variable_name = ideal_assigned
+                        print(
+                            f"[ShapeKey] 已刷新变量名: '{shape_key_name}' "
+                            f"'{old_assigned}' -> '{ideal_assigned}'"
+                        )
+                        refreshed_count += 1
+                    elif not old_custom:
+                        # 名字没变但 custom 是空的：按老逻辑回填
+                        existing.custom_variable_name = old_assigned
+                        backfilled_count += 1
+
                 rebuilt_items.append(existing)
 
         # 形态键集合未变化：即使顺序不同也不重建，避免清空区域/档位/方向等拖拽设置
@@ -332,6 +374,8 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
             for item in self.shapekey_variable_items
         }
         if existing_names == set(normalized_names):
+            if refreshed_count:
+                print(f"[ShapeKey] 已自动刷新 {refreshed_count} 个形态键变量名")
             return created_count, backfilled_count
 
         serialized_items = [
@@ -360,6 +404,8 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
             item.drag_click_stage = serialized["drag_click_stage"]
             item.drag_dir_id = serialized["drag_dir_id"]
 
+        if refreshed_count:
+            print(f"[ShapeKey] 已自动刷新 {refreshed_count} 个形态键变量名")
         return created_count, backfilled_count
 
     def _is_shape_key_export_enabled(self, shape_key_name) -> bool:
@@ -547,6 +593,23 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
         return sorted(result)
 
     def draw_buttons(self, context, layout):
+        # --- 新增：pypinyin 依赖安装（中文形态键转拼音变量名）---
+        # 走 variable_registry 的缓存探测：UI 每次重绘不再扫描 sys.path。
+        _pypinyin_installed = is_pinyin_available()
+
+        dep_box = layout.box()
+        dep_box.label(text="中文形态键支持 (pypinyin)", icon='SORT_ASC')
+        if _pypinyin_installed:
+            dep_box.label(text="pypinyin 已安装 ✓", icon='CHECKMARK')
+        else:
+            dep_box.label(text="未安装：中文形态键将回退为 uXXXX 编码", icon='INFO')
+            dep_box.operator(
+                "ssmt.install_pypinyin",
+                text="安装 pypinyin（中文形态键转拼音）",
+                icon='IMPORT',
+            )
+
+        # --- 原有逻辑保持不变 ---
         layout.operator("ssmt.scan_shapekey_variables", text="预分配蓝图形态键变量", icon='FILE_REFRESH').node_name = self.name
         if self.shapekey_variable_items:
             enabled_count = sum(
@@ -584,6 +647,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
         if not text:
             text = "unnamed"
 
+        text = cjk_to_ascii(str(text))          # <-- 新增：CJK 中文 -> ASCII（拼音或 uXXXX）
         safe_text = re.sub(r'\s+', '_', text)
         safe_text = re.sub(r'[^a-zA-Z0-9_]', '', safe_text)
 
@@ -2867,9 +2931,93 @@ class SSMT_OT_ScanShapeKeyVariables(bpy.types.Operator):
         created_count, backfilled_count = node.ensure_shape_key_variable_map(shape_key_names)
         self.report(
             {'INFO'},
-            f"已扫描 {len(shape_key_names)} 个形态键，新增预分配 {created_count} 个变量，回填变量框 {backfilled_count} 项"
+            f"已扫描 {len(shape_key_names)} 个形态键，"
+            f"新增预分配 {created_count} 个变量，回填变量框 {backfilled_count} 项"
+            f"（详细刷新日志见控制台）"
         )
         return {'FINISHED'}
+
+
+class SSMT_OT_InstallPypinyin(bpy.types.Operator):
+    bl_idname = "ssmt.install_pypinyin"
+    bl_label = "安装 pypinyin 依赖"
+    bl_description = (
+        "为 Blender 自带的 Python 安装 pypinyin 库，"
+        "用于将中文形态键名称自动转换为拼音变量名（兼容 Blender 4.x / 5.0 / 5.1）。\n"
+        "需要联网；安装期间 Blender 界面会短暂无响应，请耐心等待"
+    )
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        import subprocess
+        import sys
+
+        python_exe = sys.executable
+        if not python_exe:
+            self.report({'ERROR'}, "无法获取 Blender Python 可执行文件路径")
+            return {'CANCELLED'}
+
+        try:
+            # 1) 确保 pip 可用（部分精简版 Blender 不带 pip）
+            subprocess.run(
+                [python_exe, "-m", "ensurepip", "--default-pip"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            # 2) 安装 pypinyin
+            #    不在此处升级 pip 自身：--upgrade pip 在 Blender 自带 Python 里有
+            #    破坏 bundled pip 的风险，且明显拉长安装时间（几十秒～几分钟）。
+            result = subprocess.run(
+                [python_exe, "-m", "pip", "install", "pypinyin"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            if result.returncode != 0:
+                error_msg = result.stderr.strip() or result.stdout.strip() or "未知错误"
+                self.report({'ERROR'}, f"pypinyin 安装失败：{error_msg}")
+                return {'CANCELLED'}
+
+            # 3) 无论验证结果如何，都要让命名逻辑重新探测依赖是否可用，
+            #    否则同一会话里缓存的 False 会让中文形态键一直停留在 uXXXX。
+            reset_pinyin_cache()
+
+            # 4) 安装后立即验证导入
+            try:
+                import importlib
+                import importlib.util
+                # 清除可能存在的导入缓存，确保拿到最新模块
+                if "pypinyin" in sys.modules:
+                    del sys.modules["pypinyin"]
+                spec = importlib.util.find_spec("pypinyin")
+                if spec is None:
+                    self.report({'ERROR'}, "pypinyin 安装后仍无法找到模块，请重启 Blender 后重试")
+                    return {'CANCELLED'}
+                importlib.import_module("pypinyin")
+            except Exception as verify_err:
+                self.report(
+                    {'WARNING'},
+                    f"pypinyin 已安装，但当前 Blender 会话中验证导入失败：{verify_err}。"
+                    f"请重启 Blender 后生效。"
+                )
+                return {'FINISHED'}
+
+            self.report(
+                {'INFO'},
+                "pypinyin 安装成功！请重新点「预分配蓝图形态键变量」，"
+                "中文形态键会自动刷新为拼音变量名。",
+            )
+            return {'FINISHED'}
+
+        except FileNotFoundError:
+            self.report({'ERROR'}, f"找不到 Python 可执行文件：{python_exe}")
+            return {'CANCELLED'}
+        except Exception as e:
+            self.report({'ERROR'}, f"安装 pypinyin 时发生异常：{e}")
+            return {'CANCELLED'}
 
 
 classes = (
@@ -2877,6 +3025,7 @@ classes = (
     SSMT_UL_ShapeKeyVariableMappings,
     SSMTNode_PostProcess_ShapeKey,
     SSMT_OT_ScanShapeKeyVariables,
+    SSMT_OT_InstallPypinyin,
 )
 
 

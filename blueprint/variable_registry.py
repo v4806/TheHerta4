@@ -12,6 +12,80 @@ UV_OFFSET_PREFIX = "uv_offset"
 
 _SAFE_NAME_RE = re.compile(r"[^a-zA-Z0-9_]")
 
+# --- 新增：CJK 字符 ASCII 化 ---
+# 常见 CJK 范围：基本区、扩展A、兼容区
+_CJK_RE = re.compile(r'[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]')
+# pypinyin 可用性缓存：None=尚未探测，True/False=探测结果
+_PINYIN_AVAILABLE: Optional[bool] = None
+
+
+def _probe_pinyin_available() -> bool:
+    """探测 pypinyin 是否可导入（只看 spec，不真正导入，避免副作用）。"""
+    try:
+        import importlib.util
+
+        return importlib.util.find_spec("pypinyin") is not None
+    except Exception:
+        return False
+
+
+def is_pinyin_available(refresh: bool = False) -> bool:
+    """返回 pypinyin 是否可用。
+
+    结果会缓存：命名逻辑与节点 UI 共用同一个缓存，UI 重绘不再每次扫盘。
+    ``refresh=True`` 强制重新探测；安装/卸载依赖后请调用 ``reset_pinyin_cache()``。
+    """
+    global _PINYIN_AVAILABLE
+    if refresh or _PINYIN_AVAILABLE is None:
+        _PINYIN_AVAILABLE = _probe_pinyin_available()
+    return bool(_PINYIN_AVAILABLE)
+
+
+def reset_pinyin_cache() -> None:
+    """清空 pypinyin 探测缓存。
+
+    安装/卸载 pypinyin 之后必须调用：否则同一 Blender 会话会一直沿用旧的探测结果
+    （表现为“刚装好 pypinyin，中文形态键变量名仍是 uXXXX，重启才变拼音”）。
+    """
+    global _PINYIN_AVAILABLE
+    _PINYIN_AVAILABLE = None
+
+
+def cjk_to_ascii(text: str) -> str:
+    """把 CJK 字符转成稳定的 ASCII 表示，供 3DMigoto 变量名使用。
+
+    - 优先使用拼音（需安装 pypinyin）；例如 “屁股摇摆” -> “piguyaobai”。
+    - 未安装 pypinyin 时回退到 Unicode 码点十六进制（uXXXX），完全可逆；
+      例如 “屁股摇摆” -> “u5c41u80a1u6447u6446”。
+    - 非 CJK 字符原样保留，因此纯英文名走的是零开销快路径。
+    """
+    if not text or not _CJK_RE.search(text):
+        return text
+
+    lazy_pinyin = None
+    if is_pinyin_available():
+        try:
+            from pypinyin import lazy_pinyin as _lazy_pinyin
+        except Exception:
+            # 探测到但实际导入失败（残缺/损坏安装）：清缓存供下次重探，本次回落 uXXXX
+            reset_pinyin_cache()
+        else:
+            lazy_pinyin = _lazy_pinyin
+
+    parts: list[str] = []
+    for ch in text:
+        if not _CJK_RE.match(ch):
+            parts.append(ch)
+            continue
+        if lazy_pinyin is not None:
+            py = lazy_pinyin(ch)
+            # 若 pypinyin 对该字符无音（返回原文），走十六进制回退
+            if py and py[0] and not _CJK_RE.search(py[0]):
+                parts.append(py[0])
+                continue
+        parts.append(f"u{ord(ch):04x}")
+    return "".join(parts)
+
 
 def _get_scene_global_properties(context=None):
     scene = getattr(context, "scene", None) if context is not None else getattr(bpy.context, "scene", None)
@@ -21,7 +95,8 @@ def _get_scene_global_properties(context=None):
 
 
 def _sanitize_name(text: str, fallback: str = "var") -> str:
-    safe_text = re.sub(r"\s+", "_", str(text or "").strip())
+    # 先做 CJK -> ASCII，再走原有的空格/非法字符清洗
+    safe_text = re.sub(r"\s+", "_", cjk_to_ascii(str(text or "").strip()))
     safe_text = _SAFE_NAME_RE.sub("", safe_text)
     if safe_text and safe_text[0].isdigit():
         safe_text = "_" + safe_text
