@@ -24,6 +24,8 @@ from .variable_registry import (
     mark_variable_name_used,
     normalize_variable_name,
     cjk_to_ascii,
+    is_pinyin_available,
+    reset_pinyin_cache,
 )
 from ..common.mod_path_compat import collect_base_position_resource_map
 from ..common.mod_path_compat import derive_shapekey_base_resource_name
@@ -592,11 +594,8 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
 
     def draw_buttons(self, context, layout):
         # --- 新增：pypinyin 依赖安装（中文形态键转拼音变量名）---
-        import importlib.util as _ilu
-        try:
-            _pypinyin_installed = _ilu.find_spec("pypinyin") is not None
-        except Exception:
-            _pypinyin_installed = False
+        # 走 variable_registry 的缓存探测：UI 每次重绘不再扫描 sys.path。
+        _pypinyin_installed = is_pinyin_available()
 
         dep_box = layout.box()
         dep_box.label(text="中文形态键支持 (pypinyin)", icon='SORT_ASC')
@@ -2944,9 +2943,10 @@ class SSMT_OT_InstallPypinyin(bpy.types.Operator):
     bl_label = "安装 pypinyin 依赖"
     bl_description = (
         "为 Blender 自带的 Python 安装 pypinyin 库，"
-        "用于将中文形态键名称自动转换为拼音变量名（兼容 Blender 4.x / 5.0 / 5.1）"
+        "用于将中文形态键名称自动转换为拼音变量名（兼容 Blender 4.x / 5.0 / 5.1）。\n"
+        "需要联网；安装期间 Blender 界面会短暂无响应，请耐心等待"
     )
-    bl_options = {'REGISTER', 'UNDO'}
+    bl_options = {'REGISTER'}
 
     def execute(self, context):
         import subprocess
@@ -2966,15 +2966,9 @@ class SSMT_OT_InstallPypinyin(bpy.types.Operator):
                 check=False,
             )
 
-            # 2) 升级 pip 自身（可选但推荐，避免旧版 pip 不兼容新 Python）
-            subprocess.run(
-                [python_exe, "-m", "pip", "install", "--upgrade", "pip"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-
-            # 3) 安装 pypinyin
+            # 2) 安装 pypinyin
+            #    不在此处升级 pip 自身：--upgrade pip 在 Blender 自带 Python 里有
+            #    破坏 bundled pip 的风险，且明显拉长安装时间（几十秒～几分钟）。
             result = subprocess.run(
                 [python_exe, "-m", "pip", "install", "pypinyin"],
                 capture_output=True,
@@ -2986,6 +2980,10 @@ class SSMT_OT_InstallPypinyin(bpy.types.Operator):
                 error_msg = result.stderr.strip() or result.stdout.strip() or "未知错误"
                 self.report({'ERROR'}, f"pypinyin 安装失败：{error_msg}")
                 return {'CANCELLED'}
+
+            # 3) 无论验证结果如何，都要让命名逻辑重新探测依赖是否可用，
+            #    否则同一会话里缓存的 False 会让中文形态键一直停留在 uXXXX。
+            reset_pinyin_cache()
 
             # 4) 安装后立即验证导入
             try:
@@ -3007,7 +3005,11 @@ class SSMT_OT_InstallPypinyin(bpy.types.Operator):
                 )
                 return {'FINISHED'}
 
-            self.report({'INFO'}, "pypinyin 安装成功！中文形态键将自动转换为拼音变量名。")
+            self.report(
+                {'INFO'},
+                "pypinyin 安装成功！请重新点「预分配蓝图形态键变量」，"
+                "中文形态键会自动刷新为拼音变量名。",
+            )
             return {'FINISHED'}
 
         except FileNotFoundError:

@@ -51,11 +51,13 @@ class ShapeKeySpeedIntervalItem(bpy.types.PropertyGroup):
         subtype='PERCENTAGE',
     )
     base_step: bpy.props.IntProperty(
-        name="速度百分比",
+        name="区间速度",
         description=(
-            "该区间内动画的推进速度（相对于单位速度的百分比）。\n"
+            "该区间内动画的推进速度。\n"
+            "分组勾选「区间数值按速度百分比」时：相对单位速度的百分比\n"
             "  100% = 使用单位速度（100% 全局速度下每帧推进的细分数）\n"
             "  10%  = 单位速度的十分之一，播放更慢\n"
+            "未勾选（升级前的老工程）时：旧的「每帧步进数」，行为与升级前一致。\n"
             "单位速度由「总细分」「总时长」「假设帧率」自动计算"
         ),
         default=100,
@@ -187,6 +189,15 @@ class ShapeKeyPlayGroupSettings(bpy.types.PropertyGroup):
         description="按动画进度分段设置不同的推进速度（例如开头慢、中段快、结尾慢）",
     )
     active_interval_index: bpy.props.IntProperty(default=0)
+    speed_percent_mode: bpy.props.BoolProperty(
+        name="区间数值按速度百分比",
+        description=(
+            "勾选后，变速区间里的数值表示「相对单位速度的百分比」（100 = 单位速度）。\n"
+            "升级前保存的老工程默认不勾选：数值仍按旧的「每帧步进数」解释，"
+            "播放速度与升级前完全一致；想改用新语义时勾选本项即可"
+        ),
+        default=False,
+    )
     max_step_unroll: bpy.props.IntProperty(
         name="最大步进展开次数",
         description="（已废弃）以前需要手动设置的参数。现在会根据变速区间和速度自动计算，无需再管",
@@ -291,7 +302,8 @@ class SSMT_OT_SpeedIntervalAdd(bpy.types.Operator):
             else:
                 interval.start = 0.0
                 interval.end = 50.0
-            interval.base_step = 100
+            # 新语义分组默认 100%（= 单位速度）；老语义分组默认沿用旧的步进默认值 10
+            interval.base_step = 100 if getattr(settings, "speed_percent_mode", False) else 10
         return {'FINISHED'}
 
 
@@ -422,6 +434,8 @@ class SSMT_OT_ShapeKeyGroupAdd(bpy.types.Operator):
                 max_idx = setting.group_index
         new_group = node.play_group_settings.add()
         new_group.group_index = max_idx + 1
+        # 新建分组一律使用新语义（区间数值 = 相对单位速度的百分比）
+        new_group.speed_percent_mode = True
         node.active_group_index = new_group.group_index
         self.report({'INFO'}, f"已创建并切换至分组 {new_group.group_index}")
         return {'FINISHED'}
@@ -570,13 +584,20 @@ class SSMT_OT_OpenGroupSettings(bpy.types.Operator):
             col.prop(setting, "speed_percent")
 
             box.label(text="变速区间 (0-100%)", icon='IPO_EASE_IN_OUT')
+            box.prop(setting, "speed_percent_mode")
+            percent_mode = bool(getattr(setting, "speed_percent_mode", True))
+            if not percent_mode:
+                box.label(
+                    text="当前按旧版「每帧步进数」解释区间数值（播放速度与升级前一致）",
+                    icon='INFO',
+                )
             interval_box = box.box()
 
             for idx, interval in enumerate(setting.speed_intervals):
                 row_int = interval_box.row(align=True)
                 row_int.prop(interval, "start", text="起点")
                 row_int.prop(interval, "end", text="终点")
-                row_int.prop(interval, "base_step", text="速度")
+                row_int.prop(interval, "base_step", text="速度%" if percent_mode else "步进")
 
                 op = row_int.operator("ssmt.speed_interval_remove", text="", icon='X')
                 op.group_index = self.target_group_index
@@ -594,7 +615,7 @@ class SSMT_OT_OpenGroupSettings(bpy.types.Operator):
             unit_speed_cur = node._calc_unit_speed(setting)
             info_box = box.box()
             info_box.label(
-                text=f"单位速度（自动）= {unit_speed_cur} 细分/帧",
+                text=f"单位速度（自动）= {unit_speed_cur:g} 细分/帧",
                 icon='AUTO',
             )
 
@@ -1028,6 +1049,8 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
         if len(self.play_group_settings) == 0:
             s = self.play_group_settings.add()
             s.group_index = 1
+            # 全新节点：使用新语义（区间数值 = 相对单位速度的百分比）
+            s.speed_percent_mode = True
 
     def _find_group_setting(self, group_index):
         for s in self.play_group_settings:
@@ -1043,6 +1066,9 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
         if s is None:
             s = self.play_group_settings.add()
             s.group_index = group_index
+            # 新建分组使用新语义；升级前保存的老分组 speed_percent_mode 保持 False，
+            # 由 _interval_step_value 按旧的「每帧步进数」解释，播放速度与升级前一致。
+            s.speed_percent_mode = True
             if len(s.speed_intervals) == 0:
                 interval = s.speed_intervals.add()
                 interval.start = 0.0
@@ -1186,6 +1212,10 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
     # ---- 未分配形态键屏蔽标记（三层统一前缀，便于幂等恢复）----
     UNASSIGNED_MASK_TAG = "[未分配-已屏蔽]"
     UNASSIGNED_MASK_PREFIX = "; [未分配-已屏蔽] "
+    # 被屏蔽的 shader 槽位额外写一行显式归零：IniParams 是粘滞的，同槽位可能还有
+    # 拖拽交互 / UV 偏移等模块每帧写入，只注释原行并不能保证 Shader 读到 0。
+    UNASSIGNED_ZERO_TAG = "[未分配-已屏蔽-归零]"
+    UNASSIGNED_ZERO_PREFIX = "; [未分配-已屏蔽-归零] "
 
     def _unmask_all_shapekeys(self, sections):
         """清除上次的 [未分配-已屏蔽] 标记，把注释行恢复为原始有效行。
@@ -1193,75 +1223,101 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
         每次 execute_postprocess 生成时都先调用（无论导出/刷新），保证：
         - 形态键被移回分组后，之前被注释的声明/赋值/shader 引用会自动恢复；
         - 不依赖上游节点重新运行，纯文本可逆。
+
+        采用「固定前缀整行还原」（而不是正则吃空白）以保持原始缩进；
+        屏蔽时补写的归零行带独立标记，这里直接删除，不参与还原。
+
+        Returns:
+            int: 本次还原的有效行数量（用于判断屏蔽是否发生了 fail-open 回滚）。
         """
-        tag = self.UNASSIGNED_MASK_TAG
-        prefix = self.UNASSIGNED_MASK_PREFIX
+        restored_count = 0
+        mask_prefix = self.UNASSIGNED_MASK_PREFIX
+        zero_prefix = self.UNASSIGNED_ZERO_PREFIX
         for sec_name in list(sections.keys()):
             new_lines = []
             for line in sections[sec_name]:
-                if tag not in line:
-                    new_lines.append(line)
+                if line.startswith(zero_prefix):
+                    # 上次屏蔽补写的归零行：直接丢弃（原始行会由下面的还原恢复）
                     continue
-                # 只恢复以 "; [未分配-已屏蔽] " 开头的整行注释
-                if line.lstrip().startswith(prefix.strip()):
-                    restored = re.sub(
-                        r'^\s*;\s*\[未分配-已屏蔽\]\s*',
-                        '',
-                        line,
-                    )
-                    new_lines.append(restored)
-                else:
-                    new_lines.append(line)
+                if line.startswith(mask_prefix):
+                    new_lines.append(line[len(mask_prefix):])
+                    restored_count += 1
+                    continue
+                new_lines.append(line)
             sections[sec_name] = new_lines
+        return restored_count
+
+    @staticmethod
+    def _extract_variable_token(match):
+        """取正则捕获到的变量 token（形如 ``$Freq_xxx``）并去掉前导 ``$``。"""
+        token = (match.group(1) or "").strip() if match else ""
+        return token[1:] if token.startswith("$") else token
 
     def _mask_unassigned_shapekeys(self, sections, unassigned_vars):
         """把未分配形态键的三层引用全部注释：常量声明 / Present 赋值 / Shader 输入。
 
-        - [Constants]: "global [persist] $Freq_xxx = ..." 整行加注释前缀。
-        - [Present] : 所有 "$Freq_xxx = ..." 形式的赋值行加注释前缀。
-        - [CustomShader_*_Anim]: "x<N> = $Freq_xxx" 行加注释前缀（不追加归零行，
-          因为 x<N> 若不被任何 ini 写入则 IniParams 保持默认 0，Shader 读到 0，
-          等价于屏蔽生效）。
+        - [Constants]: "global [persist] $var = ..." 整行加注释前缀。
+        - [Present] : 所有 "$var = ..." 形式的赋值行加注释前缀。
+        - [CustomShader_*_Anim]: "x<N> = $var" 行加注释前缀，并紧接一行带
+          「归零」标记的 "x<N> = 0"——IniParams 是粘滞的，本仓库其它模块
+          （拖拽交互 x101..x104、UV 偏移 IniParams[100]/[101]）会写同一段槽位，
+          只注释原行并不能保证 Shader 读到 0。归零行在 _unmask_all_shapekeys
+          中被丢弃，不污染可逆性。
+
+        注意：变量名**不要求**以 ``Freq_`` 开头——「导出变量」是自由文本，
+        用户可以填任意名字（中文名经 cjk_to_ascii 后也没有 Freq_ 前缀），
+        所以这里按解析出的 token 匹配，而不是按前缀匹配。
         """
         if not unassigned_vars:
             return
-        target_set = set(unassigned_vars)
+        target_set = set()
+        for name in unassigned_vars:
+            token = str(name or "").strip()
+            if token.startswith("$"):
+                token = token[1:]
+            if token:
+                target_set.add(token)
+        if not target_set:
+            return
         prefix = self.UNASSIGNED_MASK_PREFIX
+        zero_prefix = self.UNASSIGNED_ZERO_PREFIX
 
-        # 1) [Constants]：注释 global [persist] $Freq_xxx = ...
-        decl_pattern = re.compile(r'^\s*global(?:\s+persist)?\s+(\$Freq_\S+)\s*=')
+        # 1) [Constants]：注释 global [persist] $var = ...
+        decl_pattern = re.compile(r'^\s*global(?:\s+persist)?\s+(\$\S+)\s*=')
         if '[Constants]' in sections:
             new_lines = []
             for line in sections['[Constants]']:
-                m = decl_pattern.match(line)
-                if m and m.group(1)[1:] in target_set:
+                if self._extract_variable_token(decl_pattern.match(line)) in target_set:
                     new_lines.append(prefix + line)
                 else:
                     new_lines.append(line)
             sections['[Constants]'] = new_lines
 
-        # 2) [Present]：注释 $Freq_xxx = ... 赋值
-        assign_pattern = re.compile(r'^\s*(\$Freq_\S+)\s*=')
+        # 2) [Present]：注释 $var = ... 赋值
+        assign_pattern = re.compile(r'^\s*(\$\S+)\s*=')
         if '[Present]' in sections:
             new_lines = []
             for line in sections['[Present]']:
-                m = assign_pattern.match(line)
-                if m and m.group(1)[1:] in target_set:
+                if self._extract_variable_token(assign_pattern.match(line)) in target_set:
                     new_lines.append(prefix + line)
                 else:
                     new_lines.append(line)
             sections['[Present]'] = new_lines
 
-        # 3) [CustomShader_*_Anim]：注释 x<N> = $Freq_xxx
-        shader_pattern = re.compile(r'^\s*x\d+\s*=\s*(\$Freq_\S+)')
+        # 3) [CustomShader_*_Anim]：注释 x<N> = $var，并补一行显式归零
+        shader_pattern = re.compile(r'^\s*(x\d+)\s*=\s*(\$\S+)')
         for sec_name in list(sections.keys()):
             if not (sec_name.startswith('[CustomShader_') and sec_name.endswith('_Anim]')):
                 continue
             new_lines = []
             for line in sections[sec_name]:
                 m = shader_pattern.match(line)
-                if m and m.group(1)[1:] in target_set:
+                token = ""
+                if m:
+                    token = m.group(2)[1:] if m.group(2).startswith("$") else m.group(2)
+                if m and token in target_set:
                     new_lines.append(prefix + line)
+                    new_lines.append(f"{zero_prefix}{m.group(1)} = 0")
                 else:
                     new_lines.append(line)
             sections[sec_name] = new_lines
@@ -1297,8 +1353,13 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
     def _calc_unit_speed(setting):
         """计算单位速度：100% 速度时每帧推进的细分数。
 
-        公式：单位速度 = round(总细分 / (总时长 × 假设帧率))
-        至少为 1，避免出现 0 导致动画停滞。
+        公式：单位速度 = 总细分 / (总时长 × 假设帧率)
+
+        保留小数、不向上钳到 1：INI 侧的步进是累加式的
+        （``$step_accum += $base_step * 速度%``，累加值 > 0 才推进 1 个细分），
+        因此 0.25 这类步进会正确地每 4 帧推进一次。若钳到 1，像
+        「30 细分 / 2 秒 / 60fps」这种常见配置（数学值 0.25）会变成 4 倍速播放，
+        与用户填写的「总时长」不符。
 
         用户举例验证：2400 细分 / (2 秒 × 120fps) = 10 细分/帧。
         """
@@ -1307,38 +1368,73 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
             duration = float(getattr(setting, "auto_playback_duration", 2.0) or 2.0)
             fps = int(getattr(setting, "playback_fps", 60) or 60)
         except Exception:
-            return 1
+            return 1.0
         total_frames = duration * fps
         if total_frames <= 0 or frame_count <= 0:
-            return 1
+            return 1.0
         unit_speed = frame_count / total_frames
-        return max(1, int(round(unit_speed)))
+        # 下限留一个极小值：0 会让动画完全停滞
+        return max(0.01, round(unit_speed, 4))
+
+    @staticmethod
+    def _interval_step_value(interval, unit_speed, speed_percent_mode):
+        """区间在 100% 全局速度下每帧推进的细分数。
+
+        - speed_percent_mode=True（新语义）：base_step 是相对单位速度的百分比；
+        - speed_percent_mode=False（升级前保存的老工程）：base_step 就是旧的
+          「每帧步进数」，直接返回，从而与升级前的播放速度完全一致。
+        """
+        try:
+            base = float(getattr(interval, "base_step", 0) or 0)
+        except Exception:
+            base = 0.0
+        if speed_percent_mode:
+            return unit_speed * base / 100.0
+        return base
+
+    @staticmethod
+    def _no_interval_fallback_step(unit_speed, speed_percent_mode):
+        """没有任何变速区间时的兜底步进。
+
+        老语义下与升级前一致（固定 10），新语义下等于单位速度。
+        """
+        return unit_speed if speed_percent_mode else 10.0
+
+    @staticmethod
+    def _tail_step_value(unit_speed, speed_percent_mode):
+        """最后一个区间之后的兜底步进（老语义固定 1，新语义等于单位速度）。"""
+        return unit_speed if speed_percent_mode else 1.0
 
     @staticmethod
     def _calc_auto_max_step_unroll(setting):
         """根据分组的变速区间 / 速度设置，自动计算单帧最大展开次数。
 
         原理：
-          单位速度 = 100% 速度下每帧推进的细分数（见 _calc_unit_speed）
-          单帧最大推进帧数 = 单位速度 × 区间最大百分比 × 全局最大速度百分比
+          单帧最大推进帧数 = 区间最大每帧步进 × 全局最大速度百分比
           展开次数 = ceil(单帧最大推进帧数 × 1.5 安全余量)
 
         最终夹在 [10, 500] 之间：下限保证默认场景可播放，上限避免 INI 膨胀。
         """
         # 1) 单位速度（100% 速度下每帧推进的细分数）
         unit_speed = SSMTNode_PostProcess_ShapeKeyExt._calc_unit_speed(setting)
+        percent_mode = bool(getattr(setting, "speed_percent_mode", True))
 
-        # 2) 变速区间里的最大百分比（无区间时兜底 100 = 单位速度）
-        max_interval_pct = 0
+        # 2) 区间里最大的每帧步进（无区间时用兜底步进）
+        max_step = 0.0
         for interval in setting.speed_intervals:
-            try:
-                pct = int(interval.base_step)
-            except Exception:
-                pct = 0
-            if pct > max_interval_pct:
-                max_interval_pct = pct
-        if max_interval_pct <= 0:
-            max_interval_pct = 100
+            step_value = SSMTNode_PostProcess_ShapeKeyExt._interval_step_value(
+                interval, unit_speed, percent_mode
+            )
+            if step_value > max_step:
+                max_step = step_value
+        if max_step <= 0:
+            max_step = SSMTNode_PostProcess_ShapeKeyExt._no_interval_fallback_step(
+                unit_speed, percent_mode
+            )
+        max_step = max(
+            max_step,
+            SSMTNode_PostProcess_ShapeKeyExt._tail_step_value(unit_speed, percent_mode),
+        )
 
         # 3) 全局最大速度百分比（考虑当前值，取更保守的最大值，且不低于 100）
         try:
@@ -1351,7 +1447,7 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
             max_speed = 100
 
         # 4) 单帧最大推进帧数
-        max_per_tick = unit_speed * (max_interval_pct / 100.0) * (max_speed / 100.0)
+        max_per_tick = max_step * (max_speed / 100.0)
 
         # 5) 加 1.5 安全余量后向上取整
         needed = math.ceil(max_per_tick * 1.5)
@@ -1362,7 +1458,7 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
 
         return needed
 
-    def _add_auto_playback_logic_for_group(self, sections, group_id, intensity_var, frame_count, cycle_mode, speed_percent_min, speed_percent_max, speed_intervals, max_unroll, unit_speed=1):
+    def _add_auto_playback_logic_for_group(self, sections, group_id, intensity_var, frame_count, cycle_mode, speed_percent_min, speed_percent_max, speed_intervals, max_unroll, unit_speed=1, speed_percent_mode=True):
         if '[Constants]' not in sections: sections['[Constants]'] = []
         const_lines = sections['[Constants]']
         const_content = "\n".join(const_lines)
@@ -1407,9 +1503,11 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
             for i, interval in enumerate(intervals):
                 start = interval.start / 100.0
                 end = interval.end / 100.0
-                # base_step 现在是速度百分比（相对于单位速度）
-                interval_pct = interval.base_step
-                actual_step = unit_speed * interval_pct / 100.0
+                # 新语义：base_step 是相对单位速度的百分比；
+                # 老语义（升级前的工程）：base_step 就是每帧步进数，行为保持不变。
+                actual_step = self._interval_step_value(
+                    interval, unit_speed, speed_percent_mode
+                )
                 step_str = _fmt_step(actual_step)
                 if i == 0: cond = f"{norm_frame_var} < {end}"
                 else: cond = f"({norm_frame_var} >= {start} && {norm_frame_var} < {end})"
@@ -1418,11 +1516,13 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
                 if i < len(intervals) - 1: present_code.append(f"    else")
                 else:
                     present_code.append(f"    else")
-                    # 时间线末端的兜底：使用单位速度（= 100% 速度）
-                    present_code.append(f"        {base_step_var} = {_fmt_step(unit_speed)}")
+                    # 时间线末端的兜底
+                    tail_step = self._tail_step_value(unit_speed, speed_percent_mode)
+                    present_code.append(f"        {base_step_var} = {_fmt_step(tail_step)}")
         else:
-            # 无区间定义时的兜底：使用单位速度（= 100% 速度）
-            present_code.append(f"    {base_step_var} = {_fmt_step(unit_speed)}")
+            # 无区间定义时的兜底
+            fallback_step = self._no_interval_fallback_step(unit_speed, speed_percent_mode)
+            present_code.append(f"    {base_step_var} = {_fmt_step(fallback_step)}")
         for _ in range(len(intervals)): present_code.append(f"    endif")
         present_code.append(f"    {step_frames_var} = {base_step_var} * {speed_percent_var} / 100.0")
         present_code.append(f"    {step_accum_var} = {step_accum_var} + {step_frames_var}")
@@ -2525,8 +2625,10 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
                 print("检测到旧格式的形态键扩展配置（无标识标记）。请先重新导出一次 mod 以生成带标识的新配置。")
                 return False
 
-        # 清除上次的未分配-已屏蔽标记（幂等恢复），保证移回分组后变量能重新生效
-        self._unmask_all_shapekeys(sections)
+        # 清除上次的未分配-已屏蔽标记（幂等恢复），保证移回分组后变量能重新生效。
+        # 返回还原行数：若本次没有任何可屏蔽对象却又还原了行，说明屏蔽发生回滚
+        # （上游节点未连线/变量名映射失败），需要显式提示，避免“以为已屏蔽其实没屏蔽”。
+        restored_mask_lines = self._unmask_all_shapekeys(sections)
 
         freq_vars = self._scan_freq_vars_from_ini(sections)
         if not freq_vars and not _in_place:
@@ -2650,29 +2752,38 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
         for g in all_groups:
             setting = self._find_group_setting(g)
             if not setting or not setting.enable_auto_playback: continue
+            percent_mode = bool(getattr(setting, "speed_percent_mode", True))
             if len(setting.speed_intervals) == 0:
                 interval = setting.speed_intervals.add()
                 interval.start = 0.0
                 interval.end = 100.0
-                interval.base_step = 100
+                # 新语义分组默认 100%（= 单位速度）；老语义分组沿用旧的步进默认值 10
+                interval.base_step = 100 if percent_mode else 10
             unit_speed = self._calc_unit_speed(setting)
             auto_unroll = self._calc_auto_max_step_unroll(setting)
-            max_bs = max((int(iv.base_step) for iv in setting.speed_intervals), default=100)
+            max_step = max(
+                (
+                    self._interval_step_value(iv, unit_speed, percent_mode)
+                    for iv in setting.speed_intervals
+                ),
+                default=self._no_interval_fallback_step(unit_speed, percent_mode),
+            )
             max_sp = max(int(setting.speed_percent), int(setting.speed_percent_max), 100)
             print(
-                f"[形态键扩展] 分组 {g} 单位速度 = {unit_speed} 细分/帧 "
+                f"[形态键扩展] 分组 {g} 单位速度 = {unit_speed:g} 细分/帧 "
                 f"(总细分 {setting.auto_playback_frame_count} / "
                 f"(时长 {setting.auto_playback_duration:.2f}s × 帧率 {setting.playback_fps}))"
+                f"{'' if percent_mode else '  [区间按旧版步进语义解释]'}"
             )
             print(
                 f"[形态键扩展] 分组 {g} 自动展开次数 = {auto_unroll} "
-                f"(区间最大 {max_bs}% × 全局最大 {max_sp}%)"
+                f"(区间最大步进 {max_step:g} × 全局最大 {max_sp}%)"
             )
             self._add_auto_playback_logic_for_group(
                 sections, g, group_strength_vars[g],
                 setting.auto_playback_frame_count, setting.auto_playback_cycle_mode,
                 setting.speed_percent_min, setting.speed_percent_max,
-                list(setting.speed_intervals), auto_unroll, unit_speed
+                list(setting.speed_intervals), auto_unroll, unit_speed, percent_mode
             )
 
         auto_play_key = self.auto_play_toggle_key.strip() or "space"
@@ -2697,20 +2808,42 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
 
         # ---- 未分配形态键屏蔽：把变量声明 / Present 赋值 / Shader 输入全部注释掉 ----
         unassigned_names = {e.shape_key_name for e in self.play_group_entries if e.group_index == 0}
+        masked_vars = set()
         if unassigned_names:
             name_to_var = self._scan_shapekey_name_to_var_map()
-            unassigned_vars = {name_to_var[n] for n in unassigned_names if n in name_to_var}
-            if unassigned_vars:
-                self._mask_unassigned_shapekeys(sections, unassigned_vars)
+            masked_vars = {name_to_var[n] for n in unassigned_names if n in name_to_var}
+            if masked_vars:
+                self._mask_unassigned_shapekeys(sections, masked_vars)
                 print(
-                    f"[形态键扩展] 已屏蔽 {len(unassigned_vars)} 个未分配形态键: "
-                    f"{sorted(unassigned_vars)}"
+                    f"[形态键扩展] 已屏蔽 {len(masked_vars)} 个未分配形态键: "
+                    f"{sorted(masked_vars)}"
                 )
             else:
                 print(
                     f"[形态键扩展] 检测到 {len(unassigned_names)} 个未分配形态键，"
                     f"但未能从上游节点解析出变量名映射（跳过屏蔽）"
                 )
+        if restored_mask_lines and not masked_vars:
+            print(
+                f"[形态键扩展] 警告：本次没有可屏蔽的未分配形态键，但已还原了上次的 "
+                f"{restored_mask_lines} 行屏蔽注释（上游节点未连线/映射失败时会出现）。"
+                f"若这些形态键本应保持失效，请检查形态键节点的连线与「导出变量」设置。"
+            )
+
+        # ---- 未列入分组条目的形态键：升级后不再跟随分组 1 ----
+        # 旧版本把“没有任何条目的形态键”默认归到分组 1，会跟着 $Freq_Group1 一起动；
+        # 现在按未分组处理（保持 IniParams 默认值）。这里显式提示，避免静默变化。
+        entry_names = {e.shape_key_name for e in self.play_group_entries}
+        orphan_labels = sorted({
+            info.get("label", "")
+            for info in freq_vars.values()
+            if info.get("label") and info.get("label") not in entry_names
+        })
+        if orphan_labels:
+            print(
+                f"[形态键扩展] 提示：{len(orphan_labels)} 个形态键没有分组条目，"
+                f"按未分组处理（不再跟随分组 1）：{orphan_labels}"
+            )
 
         self._write_ordered_dict_to_ini(sections, target_ini_file, preserved_tail_content, preserved_driver_content)
         print(f"形态键扩展配置已{'原地更新' if _in_place else '合并到'}: {os.path.basename(target_ini_file)}")
