@@ -36,8 +36,9 @@ TheHerta4V146.zip
 tests/_verify_*.log
 # review 期间产出的临时 diff（如 .review_t1_zzmi.diff）
 .review_*.diff
-# 复核基线日志（只忽略 .log，保留 review-reports/*.md 留档）
-review-reports/*.log
+# 评审工作产物整目录不入库（报告 md / 补丁 / 归档 zip / 验证日志 / 临时脚本，
+# 全仓零引用且从未入库；需要把某一份报告留档时用 git add -f 单独强加）
+review-reports/
 
-# 残余清理的离线回滚归档（保留在 review-reports/ 供回滚，明确不入库）
-review-reports/*.zip
+# ZZMI / FrameAnalysis 排查用的临时脚本与日志（本地诊断产物，全仓零引用）
+zzz_diag/
