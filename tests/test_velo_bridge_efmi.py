@@ -33,6 +33,10 @@ def _fake_bpy():
     props.IntProperty = prop
     props.FloatProperty = prop
     props.CollectionProperty = prop
+    # 切换面板新增了枚举（字体/按钮对齐）与颜色（FloatVectorProperty）属性，
+    # 桩必须补齐，否则模块级类体求值就会 AttributeError，整个文件加载失败。
+    props.EnumProperty = prop
+    props.FloatVectorProperty = prop
     module.props = props
     module.path = types.SimpleNamespace(abspath=lambda path: path)
     return module
@@ -368,6 +372,13 @@ class SwapPanelVeloBranchTests(unittest.TestCase):
         'button_top_padding': 0.03, 'panel_min_height': 0.75,
         'panel_default_scale': 1.0, 'background_opacity': 0.85,
         'background_image': '', 'button_image': '', 'button_border_image': '',
+        'use_remark_as_icon': False, 'remark_font_family': 'msyh.ttc', 'remark_font_size': 36,
+        'remark_text_color': (1.0, 1.0, 1.0), 'remark_stroke_color': (0.0, 0.0, 0.0),
+        'remark_stroke_width': 2,
+        'button_bg_color': (0.16, 0.22, 0.32), 'button_border_color': (0.59, 0.75, 0.94),
+        'button_border_width': 2, 'button_opacity': 0.9, 'button_align': 'CENTER',
+        'background_corner_radius': 24, 'background_border_color': (0.59, 0.75, 0.94),
+        'background_border_width': 3,
         'target_object': 'Body', 'detect_hash': 'ab12cd34', 'detect_index_count': '',
         'check_hash': '', 'match_index_count': 0,
         'ini_file_path': '', 'namespace': 'swp_ab12cd34', 'last_mod_ini_path': '',

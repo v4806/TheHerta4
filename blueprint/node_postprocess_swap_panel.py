@@ -1,4 +1,4 @@
-﻿"""
+"""
 物体切换面板 后处理节点
 ================================
 读取蓝图中的物体切换节点、贴图切换后处理节点，以及 mod 的 ini 中的切换配置
@@ -45,6 +45,7 @@ except ImportError:
 try:
     from PIL import Image as PILImage
     from PIL import ImageDraw as PILDraw
+    from PIL import ImageFont as PILImageFont
     PIL_AVAILABLE = True
 except ImportError:
     PIL_AVAILABLE = False
@@ -193,10 +194,60 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
     detect_index_count: bpy.props.StringProperty(name="IndexCount", default="")
 
     background_image: bpy.props.StringProperty(name="背景图片", subtype='FILE_PATH', default="")
-    button_image: bpy.props.StringProperty(name="按钮图片", subtype='FILE_PATH', default="")
+    button_image: bpy.props.StringProperty(name="按钮图片（全局回退）", subtype='FILE_PATH', default="")
     button_border_image: bpy.props.StringProperty(name="按钮边框图片", subtype='FILE_PATH', default="")
 
-    # ---- 面板背景透明度（背景仅保留直角矩形，不做圆角/边框）----
+    # ---- 备注文字图标（用切换备注自动生成按钮图标）----
+    # 完整优先级：单按钮图片 → 全局回退图片 → 备注文字图标 → 纯色默认按钮图
+    use_remark_as_icon: bpy.props.BoolProperty(
+        name="用备注生成图标",
+        description="勾选后，没有单独指定图片的按钮会用其备注文字自动生成图标（需要安装 Pillow）",
+        default=True,
+    )
+    remark_font_family: bpy.props.EnumProperty(
+        name="字体",
+        description="备注文字图标使用的字体",
+        items=[
+            ('msyh.ttc', "微软雅黑", ""),
+            ('simsun.ttc', "宋体", ""),
+            ('simhei.ttf', "黑体", ""),
+            ('arial.ttf', "Arial", ""),
+        ],
+        default='msyh.ttc',
+    )
+    remark_font_size: bpy.props.IntProperty(name="字号大小", default=36, min=10, max=300)
+    remark_text_color: bpy.props.FloatVectorProperty(
+        name="文字颜色", subtype='COLOR', default=(1.0, 1.0, 1.0), min=0.0, max=1.0, size=3
+    )
+    remark_stroke_color: bpy.props.FloatVectorProperty(
+        name="描边颜色", subtype='COLOR', default=(0.0, 0.0, 0.0), min=0.0, max=1.0, size=3
+    )
+    remark_stroke_width: bpy.props.IntProperty(name="描边粗细", default=2, min=0, max=20)
+
+    # ---- 按钮样式（文字图标底色/边框，以及没有图片时的默认按钮图）----
+    button_bg_color: bpy.props.FloatVectorProperty(
+        name="按钮背景色", subtype='COLOR', default=(0.16, 0.22, 0.32), min=0.0, max=1.0, size=3
+    )
+    button_border_color: bpy.props.FloatVectorProperty(
+        name="按钮边框色", subtype='COLOR', default=(0.59, 0.75, 0.94), min=0.0, max=1.0, size=3
+    )
+    button_border_width: bpy.props.IntProperty(name="边框宽度", default=2, min=0, max=20)
+    button_opacity: bpy.props.FloatProperty(
+        name="按钮透明度", default=0.9, min=0.0, max=1.0, precision=2
+    )
+    button_align: bpy.props.EnumProperty(
+        name="按钮对齐",
+        description="按钮组在面板内的水平对齐方式",
+        items=[('LEFT', "左对齐", ""), ('CENTER', "居中", ""), ('RIGHT', "右对齐", "")],
+        default='CENTER',
+    )
+
+    # ---- 面板背景样式（圆角 + 边框，对背景图应用；自定义背景同样生效）----
+    background_corner_radius: bpy.props.IntProperty(name="背景圆角", default=24, min=0, max=100)
+    background_border_color: bpy.props.FloatVectorProperty(
+        name="背景边框色", subtype='COLOR', default=(0.59, 0.75, 0.94), min=0.0, max=1.0, size=3
+    )
+    background_border_width: bpy.props.IntProperty(name="背景边框宽度", default=3, min=0, max=20)
     background_opacity: bpy.props.FloatProperty(name="背景透明度", default=0.85, min=0.0, max=1.0, precision=2)
 
     check_hash: bpy.props.StringProperty(name="检测Hash值", default="")
@@ -438,13 +489,13 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
         else:
             box.label(text="未检测到切换，点击「刷新列表」", icon='INFO')
 
-        # ---- 右列（仅保留图片资源设置）----
+        # ---- 右列（图片资源 + 备注文字图标设置）----
         box = col_right.box()
         box.label(text="面板图片资源（自定义）", icon='TEXTURE')
         box.prop(self, "background_image", text="背景")
         box.prop(self, "button_image", text="按钮全局回退")
         box.prop(self, "button_border_image", text="按钮边框")
-        box.label(text="单独按钮图片优先；留空时使用全局回退或自动生成", icon='INFO')
+        box.label(text="优先级：单按钮图片 → 全局回退 → 备注文字图标 → 默认按钮", icon='INFO')
         box.label(text="边框会缩放并叠加到所有按钮，建议使用透明PNG", icon='INFO')
         if self.swap_panel_button_entries:
             box.separator()
@@ -453,6 +504,41 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
                 row = box.row(align=True)
                 row.label(text=entry.label or "(无备注)", icon='NONE')
                 row.prop(entry, "image_path", text="")
+
+        box = col_right.box()
+        box.label(text="备注文字图标（自动生成）", icon='FILE_FONT')
+        if PIL_AVAILABLE:
+            box.prop(self, "use_remark_as_icon", text="用备注生成图标")
+            style_col = box.column(align=True)
+            style_col.active = bool(self.use_remark_as_icon)
+            style_col.prop(self, "remark_font_family", text="字体")
+            style_col.prop(self, "remark_font_size", text="字号")
+            style_row = style_col.row(align=True)
+            style_row.prop(self, "remark_text_color", text="文字色")
+            style_row.prop(self, "remark_stroke_color", text="描边色")
+            style_col.prop(self, "remark_stroke_width", text="描边粗细")
+            box.label(text="备注里输入 / 可强制换行；已单独设置图片的按钮不受影响", icon='INFO')
+        else:
+            box.label(text="未安装 Pillow，无法用备注生成图标", icon='ERROR')
+
+        box = col_right.box()
+        box.label(text="按钮样式（文字图标/默认按钮）", icon='COLOR')
+        style_col = box.column(align=True)
+        style_row = style_col.row(align=True)
+        style_row.prop(self, "button_bg_color", text="背景色")
+        style_row.prop(self, "button_border_color", text="边框色")
+        style_col.prop(self, "button_border_width", text="边框宽度")
+        style_col.prop(self, "button_opacity", text="透明度")
+        style_col.prop(self, "button_align", text="按钮对齐")
+
+        box = col_right.box()
+        box.label(text="面板背景样式（圆角/边框）", icon='MATERIAL')
+        bg_col = box.column(align=True)
+        bg_col.prop(self, "background_corner_radius", text="背景圆角")
+        bg_col.prop(self, "background_border_color", text="边框色")
+        bg_col.prop(self, "background_border_width", text="边框宽度")
+        bg_col.prop(self, "background_opacity", text="透明度")
+        box.label(text="对背景图应用圆角/边框（自定义背景同样生效）", icon='INFO')
 
     # ==========================================
     # 扫描 / 解析
@@ -1008,11 +1094,83 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
             print(f"[物体切换面板] 叠加按钮边框失败: {e}")
         return dest_path
 
+    def _generate_text_icon(self, text, dest_path, font_size=36, font_family="msyh.ttc",
+                            text_color=(1.0, 1.0, 1.0), stroke_width=2, stroke_color=(0.0, 0.0, 0.0),
+                            bg_color=(0.16, 0.22, 0.32), border_color=(0.59, 0.75, 0.94),
+                            border_width=2, opacity=0.9):
+        """根据备注文本生成按钮图标（圆角按钮背景 + 居中文字）。"""
+        try:
+            if not PIL_AVAILABLE:
+                return None
+            text = text.replace('/', '\n').strip()
+            if not text:
+                return None
+
+            def float_to_int_rgb(vals):
+                # 用 round 而不是 int：0.16/0.22/0.32 才能还原成旧硬编码的 (41, 56, 82)
+                return tuple(int(round(val * 255)) for val in vals)
+
+            text_rgb = float_to_int_rgb(text_color)
+            stroke_rgb = float_to_int_rgb(stroke_color)
+
+            font = None
+            try:
+                font = PILImageFont.truetype(font_family, font_size)
+            except Exception:
+                for f in ["msyh.ttc", "simsun.ttc", "simhei.ttf", "arial.ttf"]:
+                    try:
+                        font = PILImageFont.truetype(f, font_size)
+                        break
+                    except Exception:
+                        continue
+            if font is None:
+                font = PILImageFont.load_default()
+
+            temp_img = PILImage.new('RGBA', (1, 1), (0, 0, 0, 0))
+            temp_draw = PILDraw.Draw(temp_img)
+            bbox = temp_draw.multiline_textbbox((0, 0), text, font=font, align='center', spacing=4)
+            text_w = bbox[2] - bbox[0]
+            text_h = bbox[3] - bbox[1]
+
+            pad_x = 18 + (stroke_width * 2)
+            pad_y = 10 + (stroke_width * 2)
+            img_w = math.ceil(text_w + pad_x * 2)
+            img_h = math.ceil(text_h + pad_y * 2)
+
+            bg_rgb = float_to_int_rgb(bg_color)
+            bd_rgb = float_to_int_rgb(border_color)
+            btn_alpha = int(255 * max(0.0, min(1.0, opacity)))
+
+            img = PILImage.new('RGBA', (img_w, img_h), (0, 0, 0, 0))
+            draw = PILDraw.Draw(img)
+            radius = min(14, img_h // 3)
+            try:
+                draw.rounded_rectangle([0, 0, img_w - 1, img_h - 1], radius=radius,
+                                       fill=bg_rgb + (btn_alpha,),
+                                       outline=bd_rgb + (btn_alpha,), width=border_width)
+            except Exception:
+                draw.rectangle([0, 0, img_w - 1, img_h - 1], fill=bg_rgb + (btn_alpha,),
+                               outline=bd_rgb + (btn_alpha,))
+
+            x = (img_w - text_w) / 2 - bbox[0]
+            y = (img_h - text_h) / 2 - bbox[1]
+            draw.multiline_text((x, y), text, font=font, fill=text_rgb + (255,),
+                                align='center', spacing=4,
+                                stroke_width=stroke_width, stroke_fill=stroke_rgb + (255,))
+            img.save(dest_path)
+            return dest_path
+        except Exception as e:
+            print(f"[物体切换面板] 生成文字图标失败: {e}")
+            return None
+
     def _ensure_button_image(self, dest_res_dir, ns, i, source_asset_dir, button):
         """生成第 i 个按钮的图标图片，返回路径。
 
-        不再使用备注文字或按钮样式设置；只使用该按钮自定义图片 / 全局回退图片，
-        都没有时生成一块纯色直角矩形按钮。若配置了按钮边框图片，仍会叠加。
+        优先级：
+          1. 该按钮单独设置的图片（按钮列表里的 image_path）
+          2. 全局回退图片（button_image）
+          3. 用备注文字自动生成的图标（use_remark_as_icon 且备注非空，需要 Pillow）
+          4. 纯色默认按钮图（仍会叠加按钮边框图片）
         """
         dest_name = f"swpbtn_{ns}_{i}.png"
         dest_path = os.path.join(dest_res_dir, dest_name)
@@ -1024,13 +1182,44 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
             shutil.copy2(custom, dest_path)
             return self._apply_button_border_image(dest_path)
 
+        # 备注文字图标（未单独指定图片时按备注自动生成）
+        comment = str(button.get("comment") or "").strip()
+        if self.use_remark_as_icon and comment:
+            generated = self._generate_text_icon(
+                comment,
+                dest_path,
+                font_size=self.remark_font_size,
+                font_family=self.remark_font_family,
+                text_color=self.remark_text_color,
+                stroke_width=self.remark_stroke_width,
+                stroke_color=self.remark_stroke_color,
+                bg_color=self.button_bg_color,
+                border_color=self.button_border_color,
+                border_width=self.button_border_width,
+                opacity=self.button_opacity,
+            )
+            if generated:
+                return self._apply_button_border_image(generated)
+
+        # 用按钮样式生成默认按钮图（没有图片、也没有备注图标时）
         if PIL_AVAILABLE:
             try:
-                bg_rgb = (41, 56, 82)
-                btn_alpha = 230
+                def _to_rgb(vals):
+                    return tuple(int(round(val * 255)) for val in vals)
+
+                bg_rgb = _to_rgb(self.button_bg_color)
+                bd_rgb = _to_rgb(self.button_border_color)
+                btn_alpha = int(255 * max(0.0, min(1.0, self.button_opacity)))
                 img = PILImage.new('RGBA', (384, 64), (0, 0, 0, 0))
                 draw = PILDraw.Draw(img)
-                draw.rectangle([0, 0, 383, 63], fill=bg_rgb + (btn_alpha,))
+                try:
+                    draw.rounded_rectangle([0, 0, 383, 63], radius=12,
+                                           fill=bg_rgb + (btn_alpha,),
+                                           outline=bd_rgb + (btn_alpha,),
+                                           width=self.button_border_width)
+                except Exception:
+                    draw.rectangle([0, 0, 383, 63], fill=bg_rgb + (btn_alpha,),
+                                   outline=bd_rgb + (btn_alpha,))
                 img.save(dest_path)
                 return self._apply_button_border_image(dest_path)
             except Exception as e:
@@ -1043,37 +1232,89 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
         return None
 
     def _generate_background_image(self, dest_path, panel_w, panel_h, use_existing=False):
-        """生成/处理面板背景图（直角矩形，圆角为 0，无边框）。
+        """生成/处理面板背景图（圆角 + 边框）。panel_w/panel_h 为面板在屏幕单位的宽高。
 
-        use_existing=False：生成纯色背景（默认 512 高）。
-        use_existing=True：直接使用现有背景图并应用透明度。
+        use_existing=False：生成纯色圆角背景（默认 512 高）。
+        use_existing=True：基于 dest_path 现有图（自定义背景）应用圆角遮罩 + 边框。
         """
         try:
             if not PIL_AVAILABLE:
                 return None
 
+            def float_to_int_rgb(vals):
+                return tuple(int(round(val * 255)) for val in vals)
+
             if use_existing and os.path.exists(dest_path):
+                # 基于自定义背景图应用圆角/边框
                 with PILImage.open(dest_path) as src:
                     img = src.convert('RGBA')
             else:
+                # 生成纯色底图（按面板在 16:9 屏幕上的显示比例，保证圆角不变形）
                 img_h = 512
                 pixel_ratio = (panel_w / panel_h) * (1920.0 / 1080.0) if panel_h > 0 else 1.0
                 img_w = max(64, int(round(img_h * pixel_ratio)))
-                fill_rgb = (13, 20, 31)
+                fill_rgb = float_to_int_rgb((0.05, 0.08, 0.12))
                 img = PILImage.new('RGBA', (img_w, img_h), (0, 0, 0, 0))
                 d = PILDraw.Draw(img)
                 d.rectangle([0, 0, img_w - 1, img_h - 1], fill=fill_rgb + (255,))
 
+            img_w, img_h = img.size
+            bd_rgb = float_to_int_rgb(self.background_border_color)
             alpha = int(255 * max(0.0, min(1.0, self.background_opacity)))
+
+            # 圆角半径按图片实际尺寸比例（自定义大图圆角视觉一致）
+            radius_px = int(min(img_w, img_h) * max(0, min(100, self.background_corner_radius)) / 100.0)
+            # 边框宽度按 512 参考高缩放（自定义大图也可见）
+            border_scale = max(1.0, img_h / 512.0)
+            border_px = max(0, int(round(self.background_border_width * border_scale)))
+
+            # 应用整体透明度
             if alpha < 255:
                 r, g, b, a = img.split()
                 a = a.point(lambda v: int(v * alpha / 255))
                 img = PILImage.merge('RGBA', (r, g, b, a))
+
+            # 圆角 alpha 遮罩
+            mask = PILImage.new('L', (img_w, img_h), 0)
+            md = PILDraw.Draw(mask)
+            if radius_px > 0:
+                md.rounded_rectangle([0, 0, img_w - 1, img_h - 1], radius=radius_px, fill=255)
+            else:
+                md.rectangle([0, 0, img_w - 1, img_h - 1], fill=255)
+            r, g, b, a = img.split()
+            a = PILImage.composite(a, PILImage.new('L', (img_w, img_h), 0), mask)
+            img = PILImage.merge('RGBA', (r, g, b, a))
+
+            # 边框（在圆角区域内）
+            if border_px > 0:
+                draw = PILDraw.Draw(img)
+                inset = max(0, border_px // 2)
+                try:
+                    draw.rounded_rectangle([inset, inset, img_w - 1 - inset, img_h - 1 - inset],
+                                           radius=max(0, radius_px - inset),
+                                           outline=bd_rgb + (alpha,), width=border_px)
+                except Exception:
+                    draw.rectangle([inset, inset, img_w - 1 - inset, img_h - 1 - inset],
+                                   outline=bd_rgb + (alpha,), width=border_px)
             img.save(dest_path)
             return dest_path
         except Exception as e:
             print(f"[物体切换面板] 生成背景图失败: {e}")
             return None
+
+    @staticmethod
+    def _compute_grid_left(panel_bg_width, grid_width, side_padding, align):
+        """按钮组在面板内的水平起点。
+
+        - LEFT  ：左对齐，留 side_padding 边距
+        - CENTER：居中（与旧版硬编码的居中公式完全一致）
+        - RIGHT ：右对齐，留 side_padding 边距
+        """
+        if str(align or '').upper() == 'RIGHT':
+            return panel_bg_width - side_padding - grid_width
+        if str(align or '').upper() == 'LEFT':
+            return side_padding
+        return (panel_bg_width - grid_width) * 0.5
 
     def _is_velo_efmi_export(self, _in_place=False):
         """本次后处理是否运行在 Velo / EFMI-Tools 后端上。
@@ -1259,7 +1500,9 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
         # 每个按钮固定行位置（相对父级高度）
         fixed_rel_y = []
         fixed_rel_x = []
-        grid_left = (adjusted_panel_bg_width - grid_width) * 0.5
+        grid_left = self._compute_grid_left(
+            adjusted_panel_bg_width, grid_width, side_padding, self.button_align
+        )
 
         for i in range(num_buttons):
             row_index = i // buttons_per_row
