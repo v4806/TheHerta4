@@ -1401,6 +1401,7 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
             RESTORE_MARKER_END,
         ]
         seen_custom_target = False
+        restore_inserted = False
         mesh_index = 0
         while mesh_index < len(lines):
             line = lines[mesh_index]
@@ -1417,8 +1418,27 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
             elif seen_custom_target:
                 lines[mesh_index + 1:mesh_index + 1] = default_block
                 mesh_index += len(default_block) + 1
+                restore_inserted = True
                 continue
             mesh_index += 1
+        # 指定部件位于段尾（例如被移动到段尾）时，段内没有后续默认部件可以
+        # “顺路”恢复默认贴图，需要在段尾补一次恢复。
+        # 仅对原神 GIMI ORFix 写法生效（ORFix 会在描边/夜魂通道按
+        # ResourcePST1/PST2 抓取并写回槽位，残留的自定义贴图会污染未指定部件），
+        # 其它游戏(ZZZ/崩铁/NTEMI…)保持原有行为，输出完全不变。
+        from .node_postprocess_material import _load_gimi_orfix_adapter
+        _orfix_adapter = _load_gimi_orfix_adapter()
+        if (seen_custom_target and not restore_inserted
+                and _orfix_adapter is not None
+                and _orfix_adapter.uses_orfix(lines)):
+            insert_at = len(lines)
+            while insert_at > 0:
+                stripped = str(lines[insert_at - 1]).strip()
+                if not stripped or stripped.upper().startswith(";MARK:"):
+                    insert_at -= 1
+                    continue
+                break
+            lines[insert_at:insert_at] = default_block
 
     def _strip_generated_material_lines(self, lines, preserved_ps_slots=None):
         """先移除上一轮写入的恢复块，再交给材质转资源清理常规生成行。"""

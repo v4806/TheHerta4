@@ -23,6 +23,15 @@ _TTL_DEFAULT_BRIGHTNESS = "1.5"
 _DRAG_OBJVIS_LINE_RE = re.compile(r'^\s*\$ssmtdrag_objvis_[\w]*\s*=\s*1\s*$')
 
 
+def _load_gimi_orfix_adapter():
+    """加载原神 ORFix 适配模块；模块缺失时返回 None，不影响其它游戏导出。"""
+    try:
+        from . import gimi_orfix_adapter
+    except ImportError:
+        return None
+    return gimi_orfix_adapter
+
+
 def clear_name_mapping_cache():
     global _name_mapping_cache, _reverse_name_mapping_cache, _material_resource_cache
     _name_mapping_cache.clear()
@@ -2520,6 +2529,19 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
                 )
 
             del sections['_config_path']
+
+            # 原神 GIMI ORFix 适配：只有检测到 ORFix 写法的段才会被重排，
+            # 绝区零(ZZZ)/崩铁/NTEMI 等其它游戏的段落原样通过。
+            _orfix_adapter = _load_gimi_orfix_adapter()
+            if _orfix_adapter is not None:
+                for _section_name in list(sections.keys()):
+                    if not str(_section_name or "").lower().startswith("[textureoverride"):
+                        continue
+                    _section_lines = sections[_section_name]
+                    if _orfix_adapter.uses_orfix(_section_lines):
+                        sections[_section_name] = _orfix_adapter.place_orfix_runs(
+                            _section_lines
+                        )
 
             for _section_name in list(sections.keys()):
                 if not str(_section_name or "").lower().startswith("[textureoverride"):
