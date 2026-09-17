@@ -1,5 +1,3 @@
-import hashlib
-
 import bpy
 
 from ..common.global_config import GlobalConfig
@@ -199,9 +197,13 @@ class BlueprintExportHelper:
 
     @staticmethod
     def get_preferred_blueprint_name(selected_name="", context=None):
-        selected_tree = BlueprintExportHelper.get_blueprint_tree_by_name(selected_name)
-        if selected_tree:
-            return selected_tree.name
+        requested_name = str(selected_name or "").strip()
+        if requested_name:
+            # 调用方已明确指定蓝图时只认这一项。指定项失效时不要静默回落到
+            # 「当前上下文里开着的另一个蓝图」：切换蓝图后节点编辑器里往往仍开着旧蓝图，
+            # 一旦回落，删除/重命名等操作就会作用到与用户选择不一致的蓝图。
+            selected_tree = BlueprintExportHelper.get_blueprint_tree_by_name(requested_name)
+            return selected_tree.name if selected_tree else ""
 
         current_tree = BlueprintExportHelper._get_blueprint_tree_from_context(context)
         if BlueprintExportHelper._is_valid_blueprint_tree(current_tree):
@@ -224,32 +226,6 @@ class BlueprintExportHelper:
         return ""
 
     @staticmethod
-    def _stable_blueprint_enum_number(identifier: str, used_numbers: set[int]) -> int:
-        if identifier == BlueprintExportHelper.BLUEPRINT_NONE_IDENTIFIER:
-            used_numbers.add(BlueprintExportHelper.BLUEPRINT_NONE_ENUM_NUMBER)
-            return BlueprintExportHelper.BLUEPRINT_NONE_ENUM_NUMBER
-
-        digest = hashlib.blake2s(str(identifier).encode("utf-8"), digest_size=4).digest()
-        number = int.from_bytes(digest, "little") & 0x7FFFFFFF
-        if number == BlueprintExportHelper.BLUEPRINT_NONE_ENUM_NUMBER:
-            number = 1
-        while number in used_numbers:
-            number += 1
-            if number > 0x7FFFFFFF:
-                number = 1
-        used_numbers.add(number)
-        return number
-
-    @staticmethod
-    def _enum_item_number(item, fallback_index: int) -> int:
-        try:
-            if len(item) >= 5:
-                return int(item[4])
-        except Exception:
-            pass
-        return int(fallback_index)
-
-    @staticmethod
     def ensure_valid_selected_blueprint_name(context=None) -> str:
         scene = getattr(context, "scene", None) if context else getattr(bpy.context, "scene", None)
         global_properties = getattr(scene, "global_properties", None)
@@ -259,38 +235,18 @@ class BlueprintExportHelper:
         items = BlueprintExportHelper.get_blueprint_enum_items(context=context)
         identifiers = [item[0] for item in items]
         identifier_set = set(identifiers)
-        number_to_identifier = {
-            BlueprintExportHelper._enum_item_number(item, index): item[0]
-            for index, item in enumerate(items)
-        }
 
-        raw_value = None
-        raw_value_available = False
+        # 枚举项现在只以蓝图名（identifier）为准，这里也只按名字判断有效性。
+        # 旧实现还会去读 global_properties.get(...)——PropertyGroup 并没有该方法，恒抛异常——
+        # 再用自算的枚举编号反查；而编号一旦因蓝图改名/删除而失效，下拉框就会渲染成空白。
+        current_identifier = ""
         try:
-            raw_value = global_properties.get("selected_blueprint_name")
-            raw_value_available = True
+            current_identifier = str(getattr(global_properties, "selected_blueprint_name", "") or "")
         except Exception:
-            pass
+            current_identifier = ""
 
-        if isinstance(raw_value, str) and raw_value in identifier_set:
-            return raw_value
-
-        try:
-            raw_number = int(raw_value)
-            if raw_number in number_to_identifier:
-                selected_identifier = number_to_identifier[raw_number]
-                global_properties.selected_blueprint_name = selected_identifier
-                return selected_identifier
-        except Exception:
-            pass
-
-        if not raw_value_available:
-            try:
-                current_identifier = str(getattr(global_properties, "selected_blueprint_name", "") or "")
-                if current_identifier in identifier_set:
-                    return current_identifier
-            except Exception:
-                pass
+        if current_identifier in identifier_set:
+            return current_identifier
 
         preferred_name = BlueprintExportHelper.get_preferred_blueprint_name(context=context)
         if preferred_name not in identifier_set:
@@ -440,20 +396,19 @@ class BlueprintExportHelper:
     def get_blueprint_enum_items(context=None):
         items = []
         preferred_name = BlueprintExportHelper.get_preferred_blueprint_name(context=context)
-        used_numbers = set()
 
         for tree in BlueprintExportHelper.get_all_blueprint_trees():
             description = "当前默认蓝图" if tree.name == preferred_name else "选择该蓝图进行打开或生成 Mod"
-            enum_number = BlueprintExportHelper._stable_blueprint_enum_number(tree.name, used_numbers)
-            items.append((tree.name, tree.name, description, 0, enum_number))
+            # 只给标准三元组，让 Blender 直接以蓝图名作为枚举 identifier 存取。
+            # 旧实现额外塞入自算的枚举编号（5 元组），该编号一旦因蓝图改名/删除而失效，
+            # Blender 就会警告 "matches no enum" 并把下拉框画成空白。
+            items.append((tree.name, tree.name, description))
 
         if not items:
             items.append((
                 BlueprintExportHelper.BLUEPRINT_NONE_IDENTIFIER,
                 "当前没有蓝图",
                 "当前没有可选蓝图，请先打开蓝图界面或执行一键导入",
-                0,
-                BlueprintExportHelper.BLUEPRINT_NONE_ENUM_NUMBER,
             ))
 
         return items

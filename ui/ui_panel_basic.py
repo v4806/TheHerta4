@@ -348,6 +348,13 @@ class PanelBasicInformation(bpy.types.Panel):
 
     @classmethod
     def poll(cls, context):
+        # 在面板绘制之前先把失效的蓝图选择收敛成合法项：poll 早于 draw 执行，且允许写数据。
+        # 若只在 draw 里修正，Blender 可能忽略绘制期间的属性写入，下拉框就会一直空白。
+        try:
+            BlueprintExportHelper.ensure_valid_selected_blueprint_name(context=context)
+        except Exception:
+            pass
+
         if not hasattr(context.scene, 'herta_show_toolkit'):
             return True
         return not context.scene.herta_show_toolkit
@@ -358,14 +365,15 @@ class PanelBasicInformation(bpy.types.Panel):
 
         GlobalConfig.read_from_main_json_ssmt4()
 
-        selected_blueprint_name = (
-            BlueprintExportHelper.get_preferred_blueprint_name(
-                selected_name=getattr(global_properties, "selected_blueprint_name", ""),
-                context=context,
-            )
-            or getattr(global_properties, "selected_blueprint_name", "")
-            or BlueprintExportHelper.BLUEPRINT_NONE_IDENTIFIER
+        # 先把保存的选中值收敛成合法枚举项并写回，让下拉框与下面所有按钮共用同一个值。
+        # 原先这里只把推断结果放进局部变量：prop() 仍渲染原始（可能已失效）的保存值，
+        # 而按钮拿到的是推断值，两者会不一致 —— 切换蓝图后下拉显示为空白，
+        # 删除/重命名还会作用到切换前的那个蓝图。
+        selected_blueprint_name = BlueprintExportHelper.ensure_valid_selected_blueprint_name(
+            context=context,
         )
+        if not selected_blueprint_name:
+            selected_blueprint_name = BlueprintExportHelper.BLUEPRINT_NONE_IDENTIFIER
 
         layout.label(text="TheHerta4 v4.4.47", icon='INFO')
         layout.label(text=TR.translate("SSMT缓存文件夹路径: ") + GlobalConfig.ssmtlocation)

@@ -31,6 +31,71 @@ def _get_blueprint_enum_items(self, context):
     return _blueprint_enum_items_cache
 
 
+# 下拉切换蓝图时，把节点编辑器里显示的蓝图一并切过去，保证「所见即所选」。
+# 否则节点编辑器仍开着旧蓝图，而多处逻辑会从上下文里把它推断成当前蓝图，
+# 造成界面显示、删除/重命名目标、导出目标三者不一致。
+_blueprint_editor_sync_timer_active = False
+_pending_blueprint_editor_name = ""
+
+
+def _sync_node_editors_to_blueprint(tree_name: str) -> None:
+    """把所有 NODE_EDITOR 区域切到指定蓝图；没有节点编辑器的窗口保持原样。"""
+    tree = bpy.data.node_groups.get(tree_name)
+    if tree is None:
+        return
+
+    for window in bpy.context.window_manager.windows:
+        for area in window.screen.areas:
+            if area.type != 'NODE_EDITOR':
+                continue
+            for space in area.spaces:
+                if space.type != 'NODE_EDITOR':
+                    continue
+                if getattr(space, "node_tree", None) == tree:
+                    continue
+                try:
+                    space.node_tree = tree
+                    area.tag_redraw()
+                except Exception as exc:
+                    print(f"SSMT: 切换节点编辑器蓝图失败: {exc!r}")
+
+
+def _apply_pending_blueprint_editor_sync():
+    """延迟到下一帧执行，避免在 draw / 属性更新过程中直接改写界面数据。"""
+    global _blueprint_editor_sync_timer_active, _pending_blueprint_editor_name
+
+    _blueprint_editor_sync_timer_active = False
+    tree_name = _pending_blueprint_editor_name
+    _pending_blueprint_editor_name = ""
+
+    if tree_name:
+        try:
+            _sync_node_editors_to_blueprint(tree_name)
+        except Exception as exc:
+            print(f"SSMT: 同步节点编辑器蓝图失败: {exc!r}")
+    return None
+
+
+def _update_selected_blueprint_name(self, context):
+    """下拉选中蓝图后：更新运行时蓝图，并让节点编辑器跟随切换。"""
+    global _blueprint_editor_sync_timer_active, _pending_blueprint_editor_name
+
+    tree_name = str(getattr(self, "selected_blueprint_name", "") or "").strip()
+    if not tree_name or tree_name == "__NONE__":
+        return
+
+    try:
+        from ..blueprint.export_helper import BlueprintExportHelper
+        BlueprintExportHelper.set_runtime_blueprint_tree(bpy.data.node_groups.get(tree_name))
+    except Exception:
+        pass
+
+    _pending_blueprint_editor_name = tree_name
+    if not _blueprint_editor_sync_timer_active:
+        _blueprint_editor_sync_timer_active = True
+        bpy.app.timers.register(_apply_pending_blueprint_editor_sync, first_interval=0.0)
+
+
 def _get_workspace_enum_items(self, context):
     try:
         from .global_config import GlobalConfig
@@ -88,6 +153,7 @@ class GlobalProterties(bpy.types.PropertyGroup):
         name="当前蓝图",
         description="选择要打开或快捷生成 Mod 的蓝图",
         items=_get_blueprint_enum_items,
+        update=_update_selected_blueprint_name,
     ) # type: ignore
 
     open_mod_folder_after_generate_mod: bpy.props.BoolProperty(

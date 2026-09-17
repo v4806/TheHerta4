@@ -77,27 +77,23 @@ class BlueprintEnumSelectionTests(unittest.TestCase):
             types.SimpleNamespace(name="Beta", bl_idname="SSMTBlueprintTreeType"),
         ]
 
-    def test_enum_items_use_stable_numbers(self):
-        """测试两次调用 get_blueprint_enum_items 返回一致的列表"""
+    def test_enum_items_are_identifier_based_and_stable(self):
+        """测试两次调用 get_blueprint_enum_items 返回一致的、以蓝图名为标识的列表"""
         first_items = export_helper.BlueprintExportHelper.get_blueprint_enum_items()
         second_items = export_helper.BlueprintExportHelper.get_blueprint_enum_items()
 
         self.assertEqual(first_items, second_items)
-        self.assertTrue(all(len(item) == 5 for item in first_items))
+        self.assertEqual([item[0] for item in first_items], ["Alpha", "Beta"])
+        self.assertTrue(all(len(item) == 3 for item in first_items))
 
-    def test_ensure_valid_selection_repairs_saved_numeric_value(self):
-        """测试 ensure_valid_selected_blueprint_name 将数字值修复为对应名称"""
-        beta_number = next(
-            item[4]
-            for item in export_helper.BlueprintExportHelper.get_blueprint_enum_items()
-            if item[0] == "Beta"
-        )
-        _fake_global_properties["selected_blueprint_name"] = str(beta_number)
+    def test_ensure_valid_selection_repairs_stale_numeric_value(self):
+        """测试保存值是旧版遗留的失效枚举编号时，会被修正为有效蓝图名"""
+        _fake_global_properties["selected_blueprint_name"] = "1963487488"
 
         selected = export_helper.BlueprintExportHelper.ensure_valid_selected_blueprint_name()
 
-        self.assertEqual(selected, "Beta")
-        self.assertEqual(_fake_global_properties["selected_blueprint_name"], "Beta")
+        self.assertEqual(_fake_global_properties["selected_blueprint_name"], selected)
+        self.assertIn(selected, ("Alpha", "Beta"))
 
     def test_ensure_valid_selection_replaces_deleted_blueprint(self):
         """测试当已保存的蓝图名称不存在时，自动回退到第一个可用蓝图"""
