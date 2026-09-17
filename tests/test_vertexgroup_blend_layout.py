@@ -1,0 +1,285 @@
+"""顶点组 Blend 重排：**只允许等宽或升宽，任何形式的降宽一律报错**（用户裁定 2026-09）。
+
+覆盖两层：
+- `utils/vertexgroup_utils.py` 的 `VertexGroupUtils.get_blendweights_blendindices_for_layout`
+  （纵深防御：任一顶点有效影响数 > 目标通道数 ⇒ 抛 `Fatal`，绝不再「按权重取前 N 归一化」）；
+- `common/obj_buffer_helper.py` 的 `ObjBufferHelper.parse_elementname_data_dict`
+  （ZZMI 合并分支主守卫：M > N ⇒ `SSMTErrorUtils.raise_fatal`，消息含对象名、
+  目标 `Format`/`ByteWidth`/槽位数 N、实际 M、首个违规顶点索引与处理建议）。
+"""
+import importlib.util
+import sys
+import types
+import unittest
+from pathlib import Path
+
+import numpy as np
+
+
+ROOT = Path(__file__).resolve().parents[1]
+PKG = "_vertexgroup_blend_layout_test_pkg"
+
+
+def _install_module(name, **attrs):
+    module = types.ModuleType(name)
+    for key, value in attrs.items():
+        setattr(module, key, value)
+    sys.modules[name] = module
+    return module
+
+
+def _load_module(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+# --- 假包树：{PKG} / {PKG}.common / {PKG}.utils ------------------------------
+for package_name in (PKG, f"{PKG}.common", f"{PKG}.utils"):
+    package = _install_module(package_name)
+    package.__path__ = []
+
+_install_module("bpy", types=types.SimpleNamespace(Object=object, Mesh=object))
+_install_module("mathutils", Vector=lambda value: value)
+
+# utils：只桩掉与本用例无关的重依赖；format_utils / ssmt_error_utils /
+# vertexgroup_utils 一律用**真实实现**（要断言的正是它们的行为）。
+_install_module(
+    f"{PKG}.utils.timer_utils",
+    TimerUtils=types.SimpleNamespace(Start=lambda *_: None, End=lambda *_: None),
+)
+_install_module(
+    f"{PKG}.utils.color_attribute_utils",
+    read_color_attribute_data=lambda *args, **kwargs: None,
+    sample_color_attribute_to_loops=lambda *args, **kwargs: None,
+)
+
+_load_module(f"{PKG}.utils.tbn_codec", ROOT / "utils" / "tbn_codec.py")
+format_utils = _load_module(f"{PKG}.utils.format_utils", ROOT / "utils" / "format_utils.py")
+ssmt_error_utils = _load_module(
+    f"{PKG}.utils.ssmt_error_utils", ROOT / "utils" / "ssmt_error_utils.py"
+)
+vertexgroup_utils = _load_module(
+    f"{PKG}.utils.vertexgroup_utils", ROOT / "utils" / "vertexgroup_utils.py"
+)
+
+# common：只有主守卫需要的字段，全部用替身（避免拖入 bpy 重型依赖）
+_install_module(f"{PKG}.common.d3d11_gametype", D3D11GameType=object)
+_install_module(f"{PKG}.common.draw_call_model", DrawCallModel=object)
+_install_module(
+    f"{PKG}.common.logic_name",
+    LogicName=types.SimpleNamespace(
+        ZZMI="ZZMI",
+        ZZMIDX12="ZZMIDX12",
+        WWMI="WWMI",
+        NTEMI="NTEMI",
+        EFMI="EFMI",
+        SnowBreak="SnowBreak",
+        is_zzmi_family=lambda logic_name: logic_name in {"ZZMI", "ZZMIDX12"},
+    ),
+)
+_install_module(f"{PKG}.common.global_config", GlobalConfig=types.SimpleNamespace(logic_name="ZZMI"))
+_install_module(
+    f"{PKG}.common.global_properties",
+    GlobalProterties=types.SimpleNamespace(import_merged_vgmap=lambda: True),
+)
+
+obj_buffer_helper = _load_module(
+    f"{PKG}.common.obj_buffer_helper", ROOT / "common" / "obj_buffer_helper.py"
+)
+
+ObjBufferHelper = obj_buffer_helper.ObjBufferHelper
+VertexGroupUtils = vertexgroup_utils.VertexGroupUtils
+Fatal = ssmt_error_utils.Fatal
+
+
+class _Assignment:
+    def __init__(self, group, weight):
+        self.group = group
+        self.weight = weight
+
+
+class _Vertex:
+    def __init__(self, index, groups):
+        self.index = index
+        self.groups = [_Assignment(group, weight) for group, weight in groups]
+
+
+class _Loops:
+    def __init__(self, indices):
+        self.indices = np.asarray(indices, dtype=np.int64)
+
+    def __len__(self):
+        return len(self.indices)
+
+    def foreach_get(self, name, output):
+        if name != "vertex_index":
+            raise AssertionError(name)
+        output[:] = self.indices
+
+
+class _Mesh:
+    def __init__(self, vertices, loop_indices, name="TestMesh"):
+        self.name = name
+        self.vertices = [_Vertex(i, groups) for i, groups in enumerate(vertices)]
+        self.loops = _Loops(loop_indices)
+
+
+class _FakeGameType:
+    """`D3D11GameType` 的最小替身：只给 ZZMI 合并分支主守卫用到的字段。"""
+
+    def __init__(self, blend_format="R32G32_UINT", byte_width=8):
+        self.D3D11ElementList = [
+            types.SimpleNamespace(
+                SemanticName="BLENDINDICES", Format=blend_format, ByteWidth=byte_width
+            )
+        ]
+        self.OrderedCategoryNameList = ["Blend", "Position"]
+        # 元素循环走空表 ⇒ 守卫放行时函数直接返回 {}（用于证明没有误报）
+        self.OrderedFullElementList = []
+        self.ElementNameD3D11ElementDict = {}
+
+
+class BlendLayoutExtractionTests(unittest.TestCase):
+    """纵深防御层：提取函数只接受等宽或升宽。"""
+
+    def test_upcast_pads_rigid_and_preserves_four_channels(self):
+        mesh = _Mesh([[(12, 1.0)], [(2, 0.5), (5, 0.3)]], [0, 1])
+        weights, indices = VertexGroupUtils.get_blendweights_blendindices_for_layout(
+            mesh, 4
+        )
+        np.testing.assert_array_equal(indices[0], [[12, 0, 0, 0], [2, 5, 0, 0]])
+        np.testing.assert_allclose(weights[0], [[1.0, 0.0, 0.0, 0.0], [0.625, 0.375, 0.0, 0.0]])
+
+    def test_downcast_four_influences_to_two_channels_raises(self):
+        """改写自 `test_downcast_selects_highest_weights_and_renormalizes`：
+
+        旧口径期望「按权重取前 2 再归一化」正常返回；用户裁定**不允许任何形式的降宽**
+        ⇒ 现在必须抛错（该用例被改写、未删除）。
+        """
+        mesh = _Mesh(
+            [
+                [(9, 0.1), (3, 0.6), (7, 0.3), (11, 0.2)],
+                [(4, 1.0)],
+            ],
+            [0, 1, 0],
+        )
+        with self.assertRaises(Fatal) as ctx:
+            VertexGroupUtils.get_blendweights_blendindices_for_layout(mesh, 2)
+        message = str(ctx.exception)
+        self.assertIn("禁止降宽", message)
+        self.assertIn("channel_count=2", message)
+        self.assertIn("有效影响数=4", message)
+        self.assertIn("顶点索引 0", message)
+
+    def test_downcast_four_influences_to_one_channel_raises(self):
+        mesh = _Mesh([[(9, 0.1), (3, 0.6), (7, 0.3), (11, 0.2)]], [0])
+        with self.assertRaises(Fatal) as ctx:
+            VertexGroupUtils.get_blendweights_blendindices_for_layout(mesh, 1)
+        message = str(ctx.exception)
+        self.assertIn("禁止降宽", message)
+        self.assertIn("channel_count=1", message)
+        self.assertIn("有效影响数=4", message)
+        self.assertIn("顶点索引 0", message)
+
+    def test_widen_one_or_two_influences_to_four_channels_pads_and_normalizes(self):
+        mesh = _Mesh([[(2, 0.5), (5, 0.3)], [(12, 1.0)]], [0, 1])
+        weights, indices = VertexGroupUtils.get_blendweights_blendindices_for_layout(
+            mesh, 4
+        )
+        np.testing.assert_array_equal(indices[0], [[2, 5, 0, 0], [12, 0, 0, 0]])
+        np.testing.assert_allclose(weights[0], [[0.625, 0.375, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]])
+        np.testing.assert_allclose(weights[0].sum(axis=1), [1.0, 1.0])
+
+    def test_zero_or_nonfinite_weight_groups_do_not_count_as_influences(self):
+        """`weight == 0` / 负权重 / NaN 都不算有效影响数（否则会被误判成降宽）。"""
+        mesh = _Mesh([[(1, 0.0), (2, -0.5), (3, float("nan")), (4, 0.7)]], [0])
+        weights, indices = VertexGroupUtils.get_blendweights_blendindices_for_layout(
+            mesh, 1
+        )
+        # 只有一个有效影响（组 4）⇒ 1 槽不算降宽，直接通过
+        np.testing.assert_array_equal(indices[0], [[4]])
+        np.testing.assert_allclose(weights[0], [[1.0]])
+
+        mesh_many_zero = _Mesh(
+            [[(1, 0.0), (2, 0.0), (3, 0.0), (4, 0.0), (5, 0.25)]], [0]
+        )
+        weights, indices = VertexGroupUtils.get_blendweights_blendindices_for_layout(
+            mesh_many_zero, 1
+        )
+        np.testing.assert_array_equal(indices[0], [[5]])
+        np.testing.assert_allclose(weights[0], [[1.0]])
+
+    def test_ties_use_group_id_as_stable_tiebreaker(self):
+        """tie-break 稳定性在**等宽**（允许）区间继续锁定：同权重按 group id 升序。
+
+        旧版本用 1 槽（3 影响降宽）来测 tie-break，与新口径冲突 ⇒ 改成等宽 3 槽；
+        断言的是同一套稳定排序语义，未放松覆盖。
+        """
+        mesh = _Mesh([[(8, 0.5), (2, 0.5), (4, 0.1)]], [0])
+        weights, indices = VertexGroupUtils.get_blendweights_blendindices_for_layout(
+            mesh, 3
+        )
+        self.assertEqual(indices[0].tolist(), [[2, 8, 4]])
+        np.testing.assert_allclose(weights[0], [[5 / 11, 5 / 11, 1 / 11]])
+        np.testing.assert_allclose(weights[0].sum(axis=1), [1.0])
+
+
+class ZZMIBlendDowncastGuardTests(unittest.TestCase):
+    """主守卫层：ZZMI 合并分支在调用提取函数**之前**就以 fatal 终止导出。"""
+
+    def test_guard_raises_fatal_when_influences_exceed_target_slots(self):
+        mesh = _Mesh(
+            [
+                [(9, 0.1), (3, 0.6), (7, 0.3), (11, 0.2)],
+                [(4, 1.0)],
+            ],
+            [0, 1, 0],
+            name="MergedObject",
+        )
+        game_type = _FakeGameType(blend_format="R32G32_UINT", byte_width=8)  # N = 2
+        with self.assertRaises(Fatal) as ctx:
+            ObjBufferHelper.parse_elementname_data_dict(mesh, game_type)
+        message = str(ctx.exception)
+        self.assertIn("MergedObject", message)
+        self.assertIn("禁止任何形式的 Blend 降宽", message)
+        self.assertIn("R32G32_UINT", message)
+        self.assertIn("ByteWidth=8", message)
+        self.assertIn("N=2", message)
+        self.assertIn("M=4", message)
+        self.assertIn("首个违规顶点索引 0", message)
+        self.assertIn("或不要把该部件合并到更窄的槽位", message)
+
+    def test_guard_reports_single_channel_target(self):
+        mesh = _Mesh([[(1, 0.6), (2, 0.4)]], [0], name="RigidMerged")
+        game_type = _FakeGameType(blend_format="R32_UINT", byte_width=4)  # N = 1
+        with self.assertRaises(Fatal) as ctx:
+            ObjBufferHelper.parse_elementname_data_dict(mesh, game_type)
+        message = str(ctx.exception)
+        self.assertIn("N=1", message)
+        self.assertIn("M=2", message)
+        self.assertIn("R32_UINT", message)
+        self.assertIn("ByteWidth=4", message)
+        self.assertIn("首个违规顶点索引 0", message)
+
+    def test_guard_allows_equal_width_target(self):
+        """等宽（M == N = 2）不得误报：守卫放行，函数继续走到元素循环（空表 ⇒ {}）。"""
+        mesh = _Mesh([[(2, 0.5), (5, 0.5)]], [0], name="EqualWidth")
+        game_type = _FakeGameType(blend_format="R32G32_UINT", byte_width=8)
+        self.assertEqual(
+            ObjBufferHelper.parse_elementname_data_dict(mesh, game_type), {}
+        )
+
+    def test_guard_allows_wider_target(self):
+        """升宽（M = 2 < N = 4）不得误报。"""
+        mesh = _Mesh([[(2, 0.5), (5, 0.5)]], [0], name="WideWidth")
+        game_type = _FakeGameType(blend_format="R32G32B32A32_UINT", byte_width=16)
+        self.assertEqual(
+            ObjBufferHelper.parse_elementname_data_dict(mesh, game_type), {}
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

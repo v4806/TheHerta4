@@ -568,7 +568,83 @@ class ObjBufferHelper:
         normalize_weights = "Blend" in d3d11_game_type.OrderedCategoryNameList
 
         # normalize_weights = False
-        if GlobalConfig.logic_name == LogicName.WWMI or GlobalConfig.logic_name == LogicName.NTEMI:
+        if (
+            LogicName.is_zzmi_family(GlobalConfig.logic_name)
+            and GlobalProterties.import_merged_vgmap()
+        ):
+            # ZZMI 合并对象可把 BI4/BI8/BI16 混在同一个 Blender Mesh 中。
+            # 目标 IB 的 BLENDINDICES 通道数就是最终 ABI。用户裁定（2026-09）：
+            # **不允许任何形式的 Blend 降宽** —— 顶点骨骼影响数超过目标槽位数时
+            # （包括「按权重取前 N 再归一化」）一律**直接报错终止导出**，绝不静默丢影响。
+            blend_index_element = next(
+                (
+                    element
+                    for element in getattr(d3d11_game_type, "D3D11ElementList", [])
+                    if str(getattr(element, "SemanticName", "") or "").upper()
+                    == "BLENDINDICES"
+                ),
+                None,
+            )
+            if blend_index_element is not None:
+                try:
+                    scalar_size = numpy.dtype(
+                        FormatUtils.get_nptype_from_format(blend_index_element.Format)
+                    ).itemsize
+                    blend_size = max(
+                        1,
+                        int(blend_index_element.ByteWidth) // max(scalar_size, 1),
+                    )
+                except (TypeError, ValueError, ZeroDivisionError):
+                    blend_size = 4
+            # 降宽守卫（在调用提取函数**之前**）：统计每个顶点的**有效影响数**
+            # （weight > 0 且有限），取全网格最大值 M 与**首个违规顶点索引**。
+            max_effective_influences = 0
+            first_offender_index = -1
+            for vertex in mesh_vertices:
+                effective_influences = 0
+                for assignment in getattr(vertex, "groups", ()) or ():
+                    try:
+                        weight = float(getattr(assignment, "weight", 0.0) or 0.0)
+                    except (TypeError, ValueError):
+                        continue
+                    if weight > 0.0 and numpy.isfinite(weight):
+                        effective_influences += 1
+                if effective_influences > max_effective_influences:
+                    max_effective_influences = effective_influences
+                if effective_influences > blend_size and first_offender_index < 0:
+                    first_offender_index = int(
+                        getattr(vertex, "index", len(mesh_vertices))
+                    )
+            if max_effective_influences > blend_size:
+                target_format = (
+                    str(getattr(blend_index_element, "Format", "") or "unknown")
+                    if blend_index_element is not None
+                    else "unknown"
+                )
+                try:
+                    target_byte_width = int(
+                        getattr(blend_index_element, "ByteWidth", 0) or 0
+                    ) if blend_index_element is not None else 0
+                except (TypeError, ValueError):
+                    target_byte_width = 0
+                SSMTErrorUtils.raise_fatal(
+                    f"对象 [{getattr(mesh, 'name', '') or '<unnamed mesh>'}] 的顶点骨骼"
+                    "影响数超过目标 BLENDINDICES 槽位 —— 禁止任何形式的 Blend 降宽"
+                    "（含按权重取前 N 再归一化）："
+                    f"目标 BLENDINDICES Format={target_format} / "
+                    f"ByteWidth={target_byte_width} ⇒ 槽位数 N={blend_size}，"
+                    f"本网格最大有效影响数 M={max_effective_influences}"
+                    f"（首个违规顶点索引 {first_offender_index}）。"
+                    "骨骼影响无法压缩：请改用能容纳 M 个槽位的目标布局"
+                    "（如 BLENDINDICES R32G32B32A32_UINT / 16B ⇒ N=4），"
+                    "或不要把该部件合并到更窄的槽位。"
+                )
+            blendweights_dict, blendindices_dict = VertexGroupUtils.get_blendweights_blendindices_for_layout(
+                mesh=mesh,
+                channel_count=blend_size,
+                normalize_weights=True,
+            )
+        elif GlobalConfig.logic_name == LogicName.WWMI or GlobalConfig.logic_name == LogicName.NTEMI:
             # print("鸣潮专属测试版权重处理：")
             blendweights_dict, blendindices_dict = VertexGroupUtils.get_blendweights_blendindices_v4_fast(mesh=mesh,normalize_weights = normalize_weights,blend_size=blend_size)
 

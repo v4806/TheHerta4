@@ -743,6 +743,88 @@ class VertexGroupUtils:
         # print("blendindices_dict: " + str(blendindices_dict[2][0]))
 
         return blendweights_dict, blendindices_dict
+
+    @classmethod
+    def get_blendweights_blendindices_for_layout(
+        cls,
+        mesh,
+        channel_count: int,
+        normalize_weights: bool = True,
+    ):
+        """按目标 GPU Blend 布局提取每个顶点的索引和权重。
+
+        ZZMI 的同组部件可能分别使用 BI4、BI8、BI16。合并到一个目标 IB 时
+        **只允许等宽或升宽**：目标通道多于源影响数时必须补零；目标通道
+        **少于**某顶点的有效影响数时**直接报错、绝不压缩** —— 旧行为「按权重取
+        前 N 再归一化」会静默丢掉影响，已按用户裁定（不允许任何形式的降宽）删除。
+        若不做这一步，`fit_component_width` 只会机械截断，留下权重和小于 1 的顶点
+        或把低权重骨骼排在高权重骨骼前面。返回值保持旧接口
+        （semantic index 0 的二维数组）。
+        """
+        try:
+            channel_count = int(channel_count)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid Blend channel count: {channel_count!r}") from exc
+        if channel_count <= 0:
+            raise ValueError("Blend channel count must be positive")
+
+        loops = mesh.loops
+        vertices = mesh.vertices
+        loop_count = len(loops)
+        vertex_count = len(vertices)
+        loop_vertex_indices = numpy.empty(loop_count, dtype=numpy.int64)
+        loops.foreach_get("vertex_index", loop_vertex_indices)
+
+        indices_by_vertex = numpy.zeros((vertex_count, channel_count), dtype=numpy.uint32)
+        weights_by_vertex = numpy.zeros((vertex_count, channel_count), dtype=numpy.float32)
+        for vertex in vertices:
+            influences = []
+            for assignment in vertex.groups:
+                try:
+                    group_id = int(assignment.group)
+                    weight = float(assignment.weight)
+                except (TypeError, ValueError):
+                    continue
+                if group_id < 0 or not numpy.isfinite(weight) or weight <= 0.0:
+                    continue
+                influences.append((weight, group_id))
+            # 用户裁定（2026-09）：不允许任何形式的 Blend 降宽 —— 有效影响数超过
+            # 目标通道数时**直接报错终止**，绝不「按权重取前 N 再归一化」掩盖丢影响。
+            if len(influences) > channel_count:
+                raise Fatal(
+                    "Blend 影响数超过目标通道数，禁止降宽："
+                    f"顶点索引 {int(vertex.index)} 的有效影响数={len(influences)}"
+                    f" 超过 channel_count={channel_count}。"
+                    "骨骼影响无法压缩：请改用能容纳这些影响的布局"
+                    "（如 BLENDINDICES R32G32B32A32_UINT / 16B ⇒ 4 槽），"
+                    "或不要把该部件合并到更窄的槽位。"
+                )
+            # Stable tie break by group id makes output deterministic across Blender
+            # versions and independent of the order in which groups were joined.
+            influences.sort(key=lambda item: (-item[0], item[1]))
+            # 等宽 / 升宽：上面的守卫已保证 len(influences) <= channel_count，
+            # 因此这里保留**全部**影响，不再做任何截断。
+            selected = influences
+            if not selected:
+                # A malformed/unweighted vertex must still be a valid rigid vertex;
+                # zero-weight all-zero rows are interpreted differently by some ZZZ
+                # shaders and can send the vertex to the origin.
+                indices_by_vertex[vertex.index, 0] = 0
+                weights_by_vertex[vertex.index, 0] = 1.0
+                continue
+            total = sum(weight for weight, _group_id in selected)
+            divisor = total if normalize_weights and total > 0.0 else 1.0
+            for slot, (weight, group_id) in enumerate(selected):
+                indices_by_vertex[vertex.index, slot] = group_id
+                weights_by_vertex[vertex.index, slot] = weight / divisor
+
+        valid = (loop_vertex_indices >= 0) & (loop_vertex_indices < vertex_count)
+        loop_indices = numpy.zeros((loop_count, channel_count), dtype=numpy.uint32)
+        loop_weights = numpy.zeros((loop_count, channel_count), dtype=numpy.float32)
+        if numpy.any(valid):
+            loop_indices[valid] = indices_by_vertex[loop_vertex_indices[valid]]
+            loop_weights[valid] = weights_by_vertex[loop_vertex_indices[valid]]
+        return {0: loop_weights}, {0: loop_indices}
     
 
 
