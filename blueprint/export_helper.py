@@ -187,11 +187,54 @@ class BlueprintExportHelper:
         return blueprint_trees
 
     @staticmethod
+    def normalize_blueprint_identifier(value) -> str:
+        """把任意来源的蓝图选择值归一成蓝图名字符串。
+
+        ``selected_blueprint_name`` 是枚举属性：Blender 内部存的是**枚举序号**。
+        一旦蓝图被重命名/删除，或者旧存档里的序号对不上当前列表，读取这个属性
+        只会得到空串（部分版本给回 int 序号）并刷屏
+        ``current value ... matches no enum in 'GlobalProterties'`` 警告。
+
+        这里把 int 序号按当前枚举表反查回蓝图名，其余非法输入一律回到空串。
+
+        **字符串一律原样返回，绝不 strip**：蓝图名就是 datablock 名，Blender 允许
+        首尾空白（中文输入法敲空格会打进出全角空格 U+3000），插件自己的
+        「创建新蓝图」对话框也是原样建树。strip 会把 ``'A　'`` 解析成另一个 datablock
+        ``'A'``（或直接解析不到），让下拉框显示的和按钮作用的不再是同一个蓝图。
+
+        **也绝不把非字符串透传给 bpy 集合接口**：``bpy.data.node_groups.get(<int>)``
+        抛的是 SystemError（"returned a result with an exception set"）而不是
+        返回 None，会让面板绘制在解析蓝图名时直接中断。
+        """
+        if value is None or isinstance(value, bool):
+            return ""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, int):
+            items = BlueprintExportHelper.get_blueprint_enum_items()
+            for index, item in enumerate(items):
+                if BlueprintExportHelper._enum_item_number(item, index) == value:
+                    return str(item[0])
+            # 老存档：存的是「与名字绑定的哈希序号」，按旧算法反查回蓝图名
+            for item in items:
+                if BlueprintExportHelper._legacy_blueprint_enum_number(str(item[0])) == value:
+                    return str(item[0])
+            return ""
+        return ""
+
+    @staticmethod
     def get_blueprint_tree_by_name(tree_name):
-        if not tree_name:
+        identifier = BlueprintExportHelper.normalize_blueprint_identifier(tree_name)
+        if not identifier:
             return None
 
-        tree = bpy.data.node_groups.get(tree_name)
+        try:
+            tree = bpy.data.node_groups.get(identifier)
+        except Exception:
+            # 键非法（历史遗留的 int 序号）或数据已被销毁：一律当作「找不到」，
+            # 不让 bpy 的 SystemError 冒到面板绘制/算子执行里。
+            return None
+
         if BlueprintExportHelper._is_valid_blueprint_tree(tree):
             return tree
 
@@ -224,21 +267,38 @@ class BlueprintExportHelper:
         return ""
 
     @staticmethod
-    def _stable_blueprint_enum_number(identifier: str, used_numbers: set[int]) -> int:
-        if identifier == BlueprintExportHelper.BLUEPRINT_NONE_IDENTIFIER:
-            used_numbers.add(BlueprintExportHelper.BLUEPRINT_NONE_ENUM_NUMBER)
-            return BlueprintExportHelper.BLUEPRINT_NONE_ENUM_NUMBER
+    def _blueprint_enum_item_number(index: int) -> int:
+        """蓝图枚举项声明的序号 = **该项在 items 列表里的下标**。
 
+        这里曾经用「与蓝图名绑定的稳定哈希」当序号（想让已存值在列表增删后仍然
+        指向同一个蓝图），但对**动态枚举回调**来说那是错的：Blender 的枚举控件在
+        用户点菜单项时写回的是**项下标**，而不是回调声明的自定义 number。
+        两者不一致时控件就认为当前值非法，症状是：
+
+        * 每次重绘刷 ``current value ... matches no enum in 'GlobalProterties'``；
+        * 下拉框永远显示第一项、点其他蓝图不生效（点完仍是第一项）；
+        * Python 侧读回空串，面板上的删除/重命名因此失去目标。
+
+        序号与下标一致后，UI 写回的值必然对得上某一项，Python 侧也能读回蓝图名。
+
+        代价：列表增删会让已存序号指向相邻蓝图（位置漂移）。插件自身改列表的路径
+        （打开/导入/重命名/删除）都会在改完后立刻按名字重写一次选择，所以只有
+        在 Blender 原生改列表（Outliner 删除、节点编辑器改名）时才会漂移。
+        """
+        return int(index)
+
+    @staticmethod
+    def _legacy_blueprint_enum_number(identifier: str) -> int:
+        """旧版「与名字绑定的哈希序号」，只用于把老存档里存的值迁移回蓝图名。
+
+        历史版本用 blake2s(名字) 当枚举序号，存档里因此是一串大整数。现在序号
+        改回下标（见 ``_blueprint_enum_item_number``），这些遗留值需要按同一算法
+        反查，才能保住用户升级前的蓝图选择。旧实现的碰撞进位（+1）没有复现：
+        31 位哈希撞车概率可忽略。
+        """
         digest = hashlib.blake2s(str(identifier).encode("utf-8"), digest_size=4).digest()
         number = int.from_bytes(digest, "little") & 0x7FFFFFFF
-        if number == BlueprintExportHelper.BLUEPRINT_NONE_ENUM_NUMBER:
-            number = 1
-        while number in used_numbers:
-            number += 1
-            if number > 0x7FFFFFFF:
-                number = 1
-        used_numbers.add(number)
-        return number
+        return number or 1
 
     @staticmethod
     def _enum_item_number(item, fallback_index: int) -> int:
@@ -250,7 +310,24 @@ class BlueprintExportHelper:
         return int(fallback_index)
 
     @staticmethod
+    def _set_selected_blueprint_identifier(global_properties, identifier: str) -> bool:
+        """把校验过的蓝图标识符写回枚举属性；值没变则不写（避免面板绘制期空转）。"""
+        try:
+            if getattr(global_properties, "selected_blueprint_name", None) != identifier:
+                global_properties.selected_blueprint_name = identifier
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
     def ensure_valid_selected_blueprint_name(context=None) -> str:
+        """保证 ``selected_blueprint_name`` 指向一个**当前存在**的蓝图，返回该蓝图名。
+
+        枚举值失效（蓝图被重命名/删除、旧存档序号对不上、items 回调曾异常）
+        时会把下拉框留成空白并刷 RNA 警告，同时让面板上的删除/重命名/打开按钮
+        失去目标。这里统一修复：读原始序号 → 反查蓝图名 → 都不行就回落到
+        「当前优先蓝图」，并把修复结果写回属性，让 UI 和算子看到同一个值。
+        """
         scene = getattr(context, "scene", None) if context else getattr(bpy.context, "scene", None)
         global_properties = getattr(scene, "global_properties", None)
         if global_properties is None:
@@ -263,6 +340,11 @@ class BlueprintExportHelper:
             BlueprintExportHelper._enum_item_number(item, index): item[0]
             for index, item in enumerate(items)
         }
+        # 升级迁移：老存档里的序号是「名字哈希」，按旧算法反查，保住用户原有的选择
+        legacy_hash_to_identifier = {
+            BlueprintExportHelper._legacy_blueprint_enum_number(identifier): identifier
+            for identifier in identifiers
+        }
 
         raw_value = None
         raw_value_available = False
@@ -272,17 +354,35 @@ class BlueprintExportHelper:
         except Exception:
             pass
 
-        if isinstance(raw_value, str) and raw_value in identifier_set:
-            return raw_value
+        def identifier_for_enum_number(number):
+            key = int(number)
+            mapped = str(number_to_identifier.get(key, "") or "")
+            if not mapped:
+                mapped = str(legacy_hash_to_identifier.get(key, "") or "")
+            return mapped if mapped in identifier_set else ""
 
-        try:
-            raw_number = int(raw_value)
-            if raw_number in number_to_identifier:
-                selected_identifier = number_to_identifier[raw_number]
-                global_properties.selected_blueprint_name = selected_identifier
-                return selected_identifier
-        except Exception:
-            pass
+        if isinstance(raw_value, str):
+            # 精确匹配优先：蓝图名可能含首尾空白（全角空格），strip 后是另一个名字
+            if raw_value in identifier_set:
+                return raw_value
+            candidate = raw_value.strip()
+            if candidate and candidate in identifier_set:
+                BlueprintExportHelper._set_selected_blueprint_identifier(global_properties, candidate)
+                return candidate
+            # 兼容旧存档/历史版本：值可能是枚举序号的字符串形式
+            try:
+                mapped = identifier_for_enum_number(int(raw_value))
+            except (TypeError, ValueError):
+                mapped = ""
+            if mapped:
+                BlueprintExportHelper._set_selected_blueprint_identifier(global_properties, mapped)
+                return mapped
+        elif isinstance(raw_value, int) and not isinstance(raw_value, bool):
+            # Blender 存的就是枚举序号：反查回蓝图名（旧值对应的蓝图可能已删除）
+            mapped = identifier_for_enum_number(int(raw_value))
+            if mapped:
+                BlueprintExportHelper._set_selected_blueprint_identifier(global_properties, mapped)
+                return mapped
 
         if not raw_value_available:
             try:
@@ -296,11 +396,24 @@ class BlueprintExportHelper:
         if preferred_name not in identifier_set:
             preferred_name = identifiers[0] if identifiers else BlueprintExportHelper.BLUEPRINT_NONE_IDENTIFIER
 
-        try:
-            global_properties.selected_blueprint_name = preferred_name
-        except Exception:
-            pass
+        BlueprintExportHelper._set_selected_blueprint_identifier(global_properties, preferred_name)
         return preferred_name
+
+    @staticmethod
+    def resolve_blueprint_target_tree(blueprint_name="", context=None):
+        """把面板/算子传入的蓝图名解析成蓝图树（删除、重命名等操作的目标）。
+
+        传入值可能是陈旧的枚举序号、``__NONE__`` 或空串——蓝图在插件算子之外被
+        重命名/删除后，面板按钮带的就正是这种值。此时回退到**已校验的当前选择**，
+        而不是让算子直接取消：否则用户点删除只会得到一句「当前没有蓝图可删除」，
+        看起来就是「删不掉」。
+        """
+        tree = BlueprintExportHelper.get_blueprint_tree_by_name(blueprint_name)
+        if tree is not None:
+            return tree
+
+        fallback_name = BlueprintExportHelper.ensure_valid_selected_blueprint_name(context=context)
+        return BlueprintExportHelper.get_blueprint_tree_by_name(fallback_name)
 
     @staticmethod
     def set_runtime_shapekey_buffer_names(shapekey_names):
@@ -440,11 +553,10 @@ class BlueprintExportHelper:
     def get_blueprint_enum_items(context=None):
         items = []
         preferred_name = BlueprintExportHelper.get_preferred_blueprint_name(context=context)
-        used_numbers = set()
 
-        for tree in BlueprintExportHelper.get_all_blueprint_trees():
+        for index, tree in enumerate(BlueprintExportHelper.get_all_blueprint_trees()):
             description = "当前默认蓝图" if tree.name == preferred_name else "选择该蓝图进行打开或生成 Mod"
-            enum_number = BlueprintExportHelper._stable_blueprint_enum_number(tree.name, used_numbers)
+            enum_number = BlueprintExportHelper._blueprint_enum_item_number(index)
             items.append((tree.name, tree.name, description, 0, enum_number))
 
         if not items:
@@ -779,7 +891,6 @@ class BlueprintExportHelper:
                 return
             seen_names.add(clean_name)
             object_names.append(clean_name)
-
         for node in BlueprintExportHelper.collect_connected_start_nodes(tree):
             if node.bl_idname == 'SSMTNode_Object_Info':
                 append_name(

@@ -156,6 +156,17 @@ class SSMT_OT_CreateBlueprintFromNest(Operator):
             self.report({'WARNING'}, "请输入蓝图名称")
             return {'CANCELLED'}
 
+        # 蓝图枚举的序号就是列表下标：新建蓝图会让排在它后面的蓝图下标整体后移，
+        # 于是「已选蓝图」的位置会漂到邻居身上。先记下当前选择，建完再按名字写回，
+        # 保持面板里选中的还是原来那个蓝图。
+        global_properties = getattr(getattr(context, "scene", None), "global_properties", None)
+        previous_selection = ""
+        if global_properties is not None:
+            try:
+                previous_selection = str(getattr(global_properties, "selected_blueprint_name", "") or "")
+            except Exception:
+                previous_selection = ""
+
         existing_tree = bpy.data.node_groups.get(self.blueprint_name)
 
         if existing_tree and existing_tree.bl_idname == 'SSMTBlueprintTreeType':
@@ -168,6 +179,13 @@ class SSMT_OT_CreateBlueprintFromNest(Operator):
 
             output_node = tree.nodes.new('SSMTNode_Result_Output')
             output_node.location = (400, 0)
+
+        if global_properties is not None and previous_selection:
+            try:
+                global_properties.selected_blueprint_name = previous_selection
+            except Exception:
+                # 原选择已被删除/改名：交给面板下一次绘制的自愈逻辑处理
+                pass
 
         space_data = getattr(context, "space_data", None)
         if space_data and space_data.type == 'NODE_EDITOR':
