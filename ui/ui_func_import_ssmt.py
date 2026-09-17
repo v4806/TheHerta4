@@ -580,7 +580,16 @@ def ImprotFromWorkSpaceFull(self, context):
     # 提取文件还在；来源日志更新时读侧自动淘汰、回退实时扫描（生成侧
     # efmi.py::_efmi_pass_layouts 先读此缓存）。按 IB 增量合并：本批导入只更新
     # 自己这些部件，旧批次部件不丢。任何失败都不阻断导入（生成侧有兜底）。
-    if GlobalConfig.logic_name == LogicName.EFMI:
+    # 受导出节点「多pass贴图槽位镜像」总开关控制
+    # （GlobalProterties.efmi_pass_mirror_enabled，默认关）：开启时本流程才走并写缓存；
+    # 默认关 ⇒ 不写缓存（生成侧开关同为关闭态，缓存存在与否无所谓）。
+    # 访问器兜底（与本文件既有 getattr 习惯一致）：轻量宿主（测试桩、旧版本 add-on
+    # 的 GlobalProterties）可能没有该访问器，此时按属性默认值「关」处理，与属性声明
+    # 一致；访问器存在时读它的真实返回值（开启即走本流程）。
+    _efmi_pass_mirror_enabled = getattr(
+        GlobalProterties, "efmi_pass_mirror_enabled", lambda: False
+    )
+    if GlobalConfig.logic_name == LogicName.EFMI and _efmi_pass_mirror_enabled():
         try:
             from ..common.efmi_skeleton import EFMISkeletonMergeHelper as _EFMIPassHelper
             from .universal.efmi_pass_mirror import (

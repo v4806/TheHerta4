@@ -15,6 +15,7 @@
 """
 import importlib.util
 import os
+import re
 import sys
 import unittest
 
@@ -389,6 +390,56 @@ class ImportWritebackSourceTests(unittest.TestCase):
         read_pos = self.efmi_code.index("efmi_read_pass_layouts(")
         scan_pos = self.efmi_code.index("efmi_scan_pass_layouts(")
         self.assertLess(read_pos, scan_pos)
+
+
+class ToggleSwitchSourceTests(unittest.TestCase):
+    """「多 pass 槽位镜像」总开关的源码级回归（2026-09-15 用户要求加在导出节点上）。"""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(os.path.join(REPO_ROOT, "common", "global_properties.py"), "r", encoding="utf-8") as handle:
+            cls.gp_code = handle.read()
+        with open(os.path.join(REPO_ROOT, "blueprint", "node_obj.py"), "r", encoding="utf-8") as handle:
+            cls.node_code = handle.read()
+        with open(os.path.join(REPO_ROOT, "ui", "universal", "efmi.py"), "r", encoding="utf-8") as handle:
+            cls.efmi_code = handle.read()
+        with open(os.path.join(REPO_ROOT, "ui", "ui_func_import_ssmt.py"), "r", encoding="utf-8") as handle:
+            cls.import_code = handle.read()
+
+    def test_property_and_getter_defined(self):
+        """GlobalProperties 上有开关属性 + GlobalProterties 上有 getter（默认关）。"""
+        self.assertIn("efmi_pass_mirror_enabled: bpy.props.BoolProperty", self.gp_code)
+        self.assertIn("def efmi_pass_mirror_enabled(cls)", self.gp_code)
+        # 默认关（用户 2026-09-17 裁定：改开关默认为关，需手动开启）
+        self.assertIn('_bool_attr("efmi_pass_mirror_enabled", False)', self.gp_code)
+        # 属性声明本身也必须是默认关，且描述文案按「默认关（需手动开启）」口径
+        block = re.search(
+            r"efmi_pass_mirror_enabled: bpy\.props\.BoolProperty\((.*?)\n    \) # type: ignore",
+            self.gp_code,
+            re.S,
+        )
+        self.assertIsNotNone(block, "找不到 efmi_pass_mirror_enabled 属性声明块")
+        self.assertIn("default=False", block.group(1))
+        self.assertIn("默认关（需手动开启）", block.group(1))
+
+    def test_node_shows_toggle_for_efmi(self):
+        """Generate Mod 节点在 EFMI 逻辑名下展示本开关。"""
+        self.assertIn(
+            'layout.prop(context.scene.global_properties, "efmi_pass_mirror_enabled")',
+            self.node_code,
+        )
+
+    def test_generation_gated(self):
+        """镜像发射钩子必须先看开关：关闭时直接返回（连带标签注册段也不发射）。"""
+        start = self.efmi_code.index("def _efmi_append_pass_mirrors")
+        end = self.efmi_code.index("def _efmi_pass_layouts")
+        body = self.efmi_code[start:end]
+        self.assertIn("efmi_pass_mirror_enabled()", body)
+        self.assertIn("return", body)
+
+    def test_import_writeback_gated(self):
+        """导入侧的工作空间布局写回同样受开关控制。"""
+        self.assertIn("efmi_pass_mirror_enabled", self.import_code)
 
 
 if __name__ == "__main__":

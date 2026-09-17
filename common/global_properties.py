@@ -129,6 +129,12 @@ class GlobalProterties(bpy.types.PropertyGroup):
         default=False,
     ) # type: ignore
 
+    efmi_pass_mirror_enabled: bpy.props.BoolProperty(
+        name="多pass贴图槽位镜像（修颜色偏差）",
+        description="默认关（需手动开启）：开启后导出时按工作空间缓存/抓帧推导，把槽位贴图镜像到 G-buffer(t0/t1) 与前向第二层(t12等) 槽位，并注册 pass 标签——修自定义贴图只覆盖第一层、其余 pass 仍读原图导致的颜色偏差。默认关＝回到旧行为（只绑标记槽，不发射镜像赋值与 [ShaderOverride_PassMirror...] 标签段）；导入侧也不再写回 Config/PassLayouts.json。",
+        default=False,
+    ) # type: ignore
+
     recalculate_tangent: bpy.props.BoolProperty(
         name="向量归一化法线存入TANGENT(全局)",
         description="轮廓线专用：将平滑法线写入 TANGENT，而不是生成标准切线空间。使用法线贴图或标准 TBN 光照时不要开启；“重新计算标准切线(TBN)”启用时本选项不会生效。",
@@ -414,6 +420,16 @@ class GlobalProterties(bpy.types.PropertyGroup):
     @classmethod
     def use_rabbitfx_slot(cls):
         return cls._instance().use_rabbitfx_slot
+
+    @classmethod
+    def efmi_pass_mirror_enabled(cls):
+        """EFMI 多 pass 贴图槽位镜像总开关（默认关，需手动开启）。
+
+        覆盖两处：导出侧 efmi.py 的镜像赋值/标签注册发射、导入侧
+        ui_func_import_ssmt.py 的 Config/PassLayouts.json 写回。
+        关闭（默认）时两处都不执行，即回到引入本开关前的旧行为。
+        """
+        return cls._bool_attr("efmi_pass_mirror_enabled", False)
 
     @classmethod
     def generate_branch_mod_gui(cls):

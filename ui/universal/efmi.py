@@ -2745,7 +2745,13 @@ class ExportEFMI:
         G-buffer（t0/t1）与第二层（t12…）各读不同槽，只在标记槽绑定会让那些
         pass 仍读原图 → 颜色偏差；直绑会闪退（那些槽在前向层是 StructuredBuffer），
         必须按 pass 的 PS 标签门控。标签"只借不抢"：别家已注册的哈希借用其标签。
+
+        总开关：导出节点上的「多pass贴图槽位镜像」复选框
+        （GlobalProterties.efmi_pass_mirror_enabled，默认关）——关闭时直接返回，
+        不发射镜像赋值；_efmi_pass_tag_needed 不累积 → 注册段也随之不发射。
         """
+        if not GlobalProterties.efmi_pass_mirror_enabled():
+            return
         from .efmi_pass_mirror import (
             efmi_mirror_block_lines,
             efmi_mirror_condition,
