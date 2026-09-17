@@ -1548,21 +1548,32 @@ class DragInteractionEFMIExporter:
                         f"区域容量 {capacity}（最大被引用区域号 + 1，zone id 0-255），已跳过"
                     )
                     continue
+                # 有效循环档数（跨节点只读契约，与 zzmi 同款）：节点配置了「开关值」
+                # 时列表长度即循环，否则回退循环档数属性（旧节点/测试桩无此方法）
+                cycle_fn = getattr(anim_node, "effective_cycle_length", None)
                 try:
-                    cycle = int(getattr(anim_node, "cycle_length", 0) or 0)
+                    if callable(cycle_fn):
+                        cycle = int(cycle_fn())
+                    else:
+                        cycle = int(getattr(anim_node, "cycle_length", 0) or 0)
                 except (TypeError, ValueError):
                     cycle = 0
                 # 循环档数钳制（与 zzmi 同款 min(64, ...)，终审 F3）：防止布局
                 # 档位扩展越界/超大缓冲
                 cycle = min(64, max(0, cycle))
+                # 「开关值」模式下不提供冷启动播种变量：列表值 → 点击计数不可逆
+                #（列表允许重复项），重启后统一回到列表首项（与 zzmi 同款）
+                seq_fn = getattr(anim_node, "click_value_sequence", None)
+                uses_click_values = bool(seq_fn()) if callable(seq_fn) else False
                 first_var = ""
-                for target in getattr(anim_node, "click_target_list", None) or []:
-                    name = _normalize_var_name(
-                        getattr(target, "variable_name", "") or ""
-                    )
-                    if name:
-                        first_var = f"${name}"
-                        break
+                if not uses_click_values:
+                    for target in getattr(anim_node, "click_target_list", None) or []:
+                        name = _normalize_var_name(
+                            getattr(target, "variable_name", "") or ""
+                        )
+                        if name:
+                            first_var = f"${name}"
+                            break
                 entries.append((zone, cycle, first_var))
         return entries
 

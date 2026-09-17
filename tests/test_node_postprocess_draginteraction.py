@@ -888,6 +888,36 @@ class DragNodeEmitTests(unittest.TestCase):
 
         self.assertEqual(node._collect_click_export_drivers(), [(2, 3, "$Enabled")])
 
+    def test_click_export_value_list_drives_cycle_and_skips_seed(self):
+        """「开关值」模式跨节点契约：列表长度即循环档数（覆盖循环档数属性），
+        且不提供冷启动播种变量（列表值 → 点击计数不可逆，重启回列表首项）。"""
+        click_node = types.SimpleNamespace(
+            bl_idname="SSMTNode_AnimDriver_ClickExport",
+            mute=False,
+            click_zone_id=2,
+            cycle_length=7,
+            click_target_list=[types.SimpleNamespace(variable_name="$Swap")],
+            effective_cycle_length=lambda: 3,
+            click_value_sequence=lambda: ["0", "0", "1"],
+        )
+        anim_tree = types.SimpleNamespace(name="AnimTree", nodes=[click_node])
+        postprocess = types.SimpleNamespace(
+            bl_idname="SSMTNode_PostProcess_AnimDriver",
+            mute=False,
+            blueprint_name="AnimTree",
+        )
+        node = _make_node(self.mod, enable_shapekey_drive=True)
+        node.id_data = types.SimpleNamespace(nodes=[postprocess])
+
+        class _Groups(list):
+            def get(self, name, default=None):
+                return next((item for item in self if item.name == name), default)
+
+        self.mod.bpy.data.node_groups = _Groups([anim_tree])
+
+        self.assertEqual(node._collect_click_export_drivers(), [(2, 3, "")])
+        self.assertEqual(node._click_export_seed_entries(), [])
+
     def test_click_export_entries_ignore_muted_anim_driver_postprocess_node(self):
         click_node = types.SimpleNamespace(
             bl_idname="SSMTNode_AnimDriver_ClickExport",

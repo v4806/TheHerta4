@@ -3159,8 +3159,14 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                     zone = int(getattr(anim_node, "click_zone_id", -1))
                 except Exception:
                     zone = -1
+                # 有效循环档数（跨节点只读契约）：节点配置了「开关值」时列表长度即
+                # 该区域的循环，否则回退循环档数属性（旧节点/测试桩无此方法）
+                cycle_fn = getattr(anim_node, "effective_cycle_length", None)
                 try:
-                    cycle = int(getattr(anim_node, "cycle_length", 0) or 0)
+                    if callable(cycle_fn):
+                        cycle = int(cycle_fn())
+                    else:
+                        cycle = int(getattr(anim_node, "cycle_length", 0) or 0)
                 except Exception:
                     cycle = 0
                 if not (0 <= zone < MAX_ZONES):
@@ -3169,12 +3175,17 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                         f"0-{MAX_ZONES - 1}，已跳过"
                     )
                     continue
+                # 「开关值」模式下不提供冷启动播种变量：列表值 → 点击计数不可逆
+                #（列表允许重复项），重启后统一回到列表首项（见点击导出节点注释）
+                seq_fn = getattr(anim_node, "click_value_sequence", None)
+                uses_click_values = bool(seq_fn()) if callable(seq_fn) else False
                 first_var = ""
-                for target in getattr(anim_node, "click_target_list", None) or []:
-                    name = normalize_variable_name(getattr(target, "variable_name", "") or "")
-                    if name:
-                        first_var = f"${name}"
-                        break
+                if not uses_click_values:
+                    for target in getattr(anim_node, "click_target_list", None) or []:
+                        name = normalize_variable_name(getattr(target, "variable_name", "") or "")
+                        if name:
+                            first_var = f"${name}"
+                            break
                 entries.append((zone, min(64, max(0, cycle)), first_var))
         return entries
 
