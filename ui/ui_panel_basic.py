@@ -358,12 +358,13 @@ class PanelBasicInformation(bpy.types.Panel):
 
         GlobalConfig.read_from_main_json_ssmt4()
 
+        # 蓝图选择是枚举属性（Blender 内部存枚举序号）：蓝图被重命名/删除，或
+        # 旧存档里的序号对不上当前列表时，下拉框会显示空白、每次重绘刷
+        # "current value ... matches no enum" 警告，删除/重命名/打开也会失去目标。
+        # 这里先修复（写回一个确实存在的蓝图名）再取值，保证「下拉框显示的选择」
+        # 和「按钮作用的目标」永远是同一个蓝图。
         selected_blueprint_name = (
-            BlueprintExportHelper.get_preferred_blueprint_name(
-                selected_name=getattr(global_properties, "selected_blueprint_name", ""),
-                context=context,
-            )
-            or getattr(global_properties, "selected_blueprint_name", "")
+            BlueprintExportHelper.ensure_valid_selected_blueprint_name(context=context)
             or BlueprintExportHelper.BLUEPRINT_NONE_IDENTIFIER
         )
 
@@ -438,6 +439,8 @@ class PanelBasicInformation(bpy.types.Panel):
         blueprint_row = blueprint_box.row(align=True)
         blueprint_row.prop(global_properties, "selected_blueprint_name", text="SSMT蓝图")
 
+        # 布局保持原样：下拉框 + 重命名/删除两个图标按钮同一行（不显示文字）。
+        # 「打开」只由下面的“打开蓝图界面”负责，不再重复一个图标入口。
         rename_operator = blueprint_row.operator(
             "theherta3.rename_persistent_blueprint",
             text="",
@@ -451,17 +454,6 @@ class PanelBasicInformation(bpy.types.Panel):
             icon='TRASH',
         )
         delete_operator.blueprint_name = selected_blueprint_name
-
-        open_operator = blueprint_row.operator(
-            "theherta3.open_persistent_blueprint",
-            text="",
-            icon='NODETREE',
-        )
-        open_operator.blueprint_name = (
-            selected_blueprint_name
-            if selected_blueprint_name != BlueprintExportHelper.BLUEPRINT_NONE_IDENTIFIER
-            else ""
-        )
 
         open_current = blueprint_box.operator(
             "theherta3.open_persistent_blueprint",

@@ -22,11 +22,20 @@ def _get_blueprint_enum_items(self, context):
 
     try:
         from ..blueprint.export_helper import BlueprintExportHelper
-        _blueprint_enum_items_cache = BlueprintExportHelper.get_blueprint_enum_items(context=context)
+        items = BlueprintExportHelper.get_blueprint_enum_items(context=context)
     except Exception:
-        _blueprint_enum_items_cache = [
+        # items 回调抛异常时 Blender 只会拿到空列表：下拉框会塌成「当前没有蓝图」，
+        # 已存的枚举序号同时失效（刷 "current value ... matches no enum" 警告、
+        # 选择显示空白、删除/重命名失去目标）。所以失败时保留上一次成功算出的
+        # 列表，不让一次瞬时异常把用户的选择清掉。
+        items = _blueprint_enum_items_cache
+
+    if not items:
+        items = [
             ("__NONE__", "当前没有蓝图", "当前没有可选蓝图，请先打开蓝图界面或执行一键导入"),
         ]
+
+    _blueprint_enum_items_cache = list(items)
 
     return _blueprint_enum_items_cache
 
