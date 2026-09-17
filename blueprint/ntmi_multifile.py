@@ -10,6 +10,7 @@ import numpy as np
 
 from .direct_export_multifile import DirectMultiFileGenerator, MultiFileDirectExportError
 from ..common.d3d11_gametype import D3D11GameType
+from ..common.safe_write import write_text_if_changed
 from ..ui.ntmi_modimp.ini_swap_patcher import ACTIVE_FLAG
 from .ntmi_layout_adapter import (
     iter_name_variants,
@@ -486,8 +487,8 @@ class NTMIDirectMultiFileGenerator(DirectMultiFileGenerator):
                 "}",
             ]
         )
-        with open(shader_path, "w", encoding="utf-8") as file_obj:
-            file_obj.write(shader_source)
+        # 内容没变就不写：保持 .hlsl 的 mtime，避免无谓地作废 3DMigoto 编译缓存
+        write_text_if_changed(shader_path, shader_source)
 
     def _patch_skin_commandlists(self, sections, runtime_infos):
         runtime_info_by_part = {

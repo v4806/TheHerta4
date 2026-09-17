@@ -9,6 +9,7 @@ import bpy
 
 from ..utils.log_utils import LOG
 from ..utils.shapekey_utils import ShapeKeyUtils
+from ..common.safe_write import write_text_if_changed
 from .direct_export_runtime_utils import normalize_runtime_name as _normalize_runtime_name
 from .direct_export_shapekey_output_mixin import DirectShapeKeyOutputMixin
 from .direct_export_shapekey_runtime_mixin import DirectShapeKeyRuntimeMixin
@@ -378,7 +379,12 @@ class DirectShapeKeyGenerator(
             if logical_hash not in hash_slot_data_map or not hash_slot_data_map[logical_hash]:
                 continue
             shader_dest_path = os.path.join(dest_res_dir, f"shapekey_anim_{logical_hash}.hlsl")
-            shutil.copy2(shader_source_path, shader_dest_path)
+            # 只播种缺失的模板；已存在则保持原样，由 _update_shader_file 以模板为源
+            # 重新注入。不能用 shutil.copy2：它每轮把目标 mtime 重置成模板的旧
+            # mtime，而 3DMigoto 的 .bin 缓存按"注入后写入时刻"对齐 → 每轮必错配。
+            if not os.path.exists(shader_dest_path):
+                with open(shader_source_path, 'r', encoding='utf-8') as f:
+                    write_text_if_changed(shader_dest_path, f.read())
             hash_to_shader_paths[logical_hash] = shader_dest_path
 
         for logical_hash in processed_hashes:
@@ -432,6 +438,7 @@ class DirectShapeKeyGenerator(
                     drag_stage_count=self.node._drag_drive_stage_count(),
                     drag_dirs=self.node._drag_drive_dirs(hash_unique_names) if drag_drive_enabled else None,
                     hash_val=logical_hash,
+                    source_path=shader_source_path,
                 )
         LOG.info(f"直出形态键: shader/freq 写出完成 {perf_counter() - stage_start:.3f}s")
 

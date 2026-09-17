@@ -14,6 +14,7 @@ from .variable_registry import (
 )
 from ..common.mod_path_compat import ensure_resource_alias_section
 from ..common.object_prefix_helper import ObjectPrefixHelper
+from ..common.safe_write import write_text_if_changed
 
 
 UV_TYPE_SIZES = {
@@ -893,9 +894,15 @@ class SSMTNode_PostProcess_UVOffset(SSMTNode_PostProcess_Base):
         warning = ("未参与偏移的属性: " + ", ".join(skipped)) if skipped else None
         return "\n".join(apply_lines), warning
 
-    def _update_shader_file(self, shader_path, ranges, attributes, stride):
+    def _update_shader_file(self, shader_path, ranges, attributes, stride, source_path=None):
+        """把 UV 配置注入模板并写到 ``shader_path``。
+
+        ``source_path`` 指定读取的模板；缺省时读 ``shader_path`` 自身（旧语义）。
+        生产路径传 ``source_path``：读模板、写目标，输出只由"模板 + 配置"决定，
+        避免读到上一次的注入结果而与播种互相覆盖。
+        """
         try:
-            with open(shader_path, 'r', encoding='utf-8') as f:
+            with open(source_path or shader_path, 'r', encoding='utf-8') as f:
                 content = f.read()
 
             uints_per_vertex = stride // 4
@@ -953,8 +960,8 @@ class SSMTNode_PostProcess_UVOffset(SSMTNode_PostProcess_Base):
                 flags=re.DOTALL,
             )
 
-            with open(shader_path, 'w', encoding='utf-8') as f:
-                f.write(content)
+            # 内容没变就不写：保持 .hlsl 的 mtime，避免无谓地作废 3DMigoto 编译缓存
+            write_text_if_changed(shader_path, content)
             return True
         except Exception as e:
             print(f"更新UV偏移着色器文件失败: {e}")
@@ -1147,8 +1154,13 @@ class SSMTNode_PostProcess_UVOffset(SSMTNode_PostProcess_Base):
                     )
 
                 shader_dest_path = os.path.join(dest_res_dir, f"uv_offset_{h_prefix}.hlsl")
-                shutil.copy2(shader_source_path, shader_dest_path)
-                if not self._update_shader_file(shader_dest_path, [(r[1], r[2]) for r in ranges], attributes, stride):
+                # 只播种缺失的模板；已存在则保持原样，由 _update_shader_file 以模板
+                # 为源重新注入。不能用 shutil.copy2：它每轮把目标 mtime 重置成模板的
+                # 旧 mtime，3DMigoto 的 .bin 缓存（按注入后写入时刻对齐）必然错配。
+                if not os.path.exists(shader_dest_path):
+                    with open(shader_source_path, 'r', encoding='utf-8') as f:
+                        write_text_if_changed(shader_dest_path, f.read())
+                if not self._update_shader_file(shader_dest_path, [(r[1], r[2]) for r in ranges], attributes, stride, source_path=shader_source_path):
                     print(f"更新哈希 {h_prefix} 的UV偏移着色器失败")
                     continue
 

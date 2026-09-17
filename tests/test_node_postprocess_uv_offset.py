@@ -7,6 +7,8 @@ import types
 import unittest
 from pathlib import Path
 
+from tests import _real_modules
+
 
 def _install_module(name, **attrs):
     """安装 Fake 模块到 sys.modules"""
@@ -21,6 +23,9 @@ PKG = "_node_postprocess_uv_offset_test_pkg"
 for package_name in (PKG, f"{PKG}.blueprint", f"{PKG}.common"):
     package = _install_module(package_name)
     package.__path__ = []
+
+# 真实 common 子模块按 fake 包前缀注册（空 __path__ 假包解析不了相对导入）
+_real_modules.register_real_common_modules(f"{PKG}.common")
 
 
 class _FakeItem:

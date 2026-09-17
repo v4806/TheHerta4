@@ -37,6 +37,7 @@ from ..common.mod_path_compat import derive_shapekey_slot_resource_name
 from ..common.mod_path_compat import ensure_resource_alias_section
 from ..common.mod_path_compat import resolve_hash_buffer_candidate
 from ..common.object_prefix_helper import ObjectPrefixHelper
+from ..common.safe_write import write_text_if_changed
 
 
 class ShapeKeyVariableItem(bpy.types.PropertyGroup):
@@ -2016,9 +2017,16 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
 
         return _DEFAULT_VERTEX_STRUCT_DEFINITION
 
-    def _update_shader_file(self, shader_path, hash_slot_data, use_packed, use_delta, unique_names, unique_objects, use_optimized=False, merge_slot_files=False, drag_drive_enabled=False, drag_zone_ids=None, drag_click_stages=None, drag_stage_count=1, drag_dirs=None, hash_val=None):
+    def _update_shader_file(self, shader_path, hash_slot_data, use_packed, use_delta, unique_names, unique_objects, use_optimized=False, merge_slot_files=False, drag_drive_enabled=False, drag_zone_ids=None, drag_click_stages=None, drag_stage_count=1, drag_dirs=None, hash_val=None, source_path=None):
+        """把配置注入着色器模板并写到 ``shader_path``。
+
+        ``source_path`` 指定读取的模板；缺省（None）时读 ``shader_path`` 自身，
+        保持旧调用方语义。生产路径必须传 ``source_path``：读模板、写目标，输出
+        只由"模板 + 配置"决定。若读写同一路径，本函数会读到自己上一次的注入
+        结果，与"按模板重算"的播种互相覆盖，文件每轮都在两个状态间反复横跳。
+        """
         try:
-            with open(shader_path, 'r', encoding='utf-8') as f:
+            with open(source_path or shader_path, 'r', encoding='utf-8') as f:
                 content = f.read()
 
             vertex_struct = self._get_vertex_struct_definition(hash_val=hash_val)
@@ -2209,8 +2217,8 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                              f"// --- [PYTHON-MANAGED LOGIC START] ---\n{chr(10).join(logic_lines)}    // --- [PYTHON-MANAGED LOGIC END] ---",
                              content, flags=re.DOTALL)
 
-            with open(shader_path, 'w', encoding='utf-8') as f:
-                f.write(content)
+            # 内容没变就不写：保持 .hlsl 的 mtime，3DMigoto 的着色器编译缓存才继续命中
+            write_text_if_changed(shader_path, content)
 
             mode_str = (
                 f"紧凑:{'是' if use_packed else '否'}, "
@@ -2595,7 +2603,13 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
             hash_to_shader_paths = {}
             for hash_val in unique_hashes:
                 shader_dest_path = os.path.join(dest_res_dir, f"shapekey_anim_{hash_val}.hlsl")
-                shutil.copy2(shader_source_path, shader_dest_path)
+                # 只播种**从未注入过**的模板；目标已存在则保持原样，交给
+                # _update_shader_file 以模板为源重新注入。这样文件只在"注入结果
+                # 真的变了"时被写，mtime 稳定，3DMigoto 的编译缓存才继续命中。
+                # 不能用 shutil.copy2：它每轮都把目标 mtime 重置成模板的旧 mtime。
+                if not os.path.exists(shader_dest_path):
+                    with open(shader_source_path, 'r', encoding='utf-8') as f:
+                        write_text_if_changed(shader_dest_path, f.read())
                 hash_to_shader_paths[hash_val] = shader_dest_path
                 print(f"已创建独立着色器文件: shapekey_anim_{hash_val}.hlsl")
 
@@ -2634,6 +2648,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                         drag_stage_count=self._drag_drive_stage_count(),
                         drag_dirs=self._drag_drive_dirs(hash_unique_names) if drag_drive_enabled else None,
                         hash_val=hash_val,
+                        source_path=shader_source_path,
                     ):
                         print(f"更新哈希 {hash_val} 的着色器文件失败")
 

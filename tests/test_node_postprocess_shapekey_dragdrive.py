@@ -3,9 +3,12 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
+
+from tests import _real_modules
 
 
 def _install_module(name, **attrs):
@@ -21,6 +24,10 @@ def _install_module(name, **attrs):
 PKG = "_sk_dragdrive_test_pkg"
 for package_name in (PKG, f"{PKG}.blueprint", f"{PKG}.common"):
     _install_module(package_name)
+
+# 真实 common 子模块按 fake 包前缀注册（空 __path__ 假包解析不了相对导入）
+_real_modules.register_real_common_modules(f"{PKG}.common")
+_safe_write = sys.modules[f"{PKG}.common.safe_write"]
 
 _fake_bpy = types.SimpleNamespace(
     types=types.SimpleNamespace(PropertyGroup=object, Operator=object, UIList=object, Node=object),
@@ -93,6 +100,14 @@ _module = importlib.util.module_from_spec(_spec)
 sys.modules[_spec.name] = _module
 _spec.loader.exec_module(_module)
 
+
+def _read_text(path):
+    with open(path, encoding="utf-8") as file_obj:
+        return file_obj.read()
+
+
+_write_text_if_changed = _safe_write.write_text_if_changed
+
 _TEMPLATES = {
     "merged_delta": "shapekey_anim_packed_delta_v5_merged.hlsl",
     "merged_full": "shapekey_anim_packed_v5_merged.hlsl",
@@ -136,7 +151,11 @@ class ShapeKeyDragDriveTests(unittest.TestCase):
         if not os.path.exists(src):
             self.skipTest(f"template missing: {src}")
         dest = os.path.join(self.out_dir, template_name)
-        shutil.copy2(src, dest)
+        # 与生产路径一致：只在缺失时播种模板，随后**以模板为源**注入到目标。
+        # 生产侧已不再用 shutil.copy2 —— 它会每轮重置目标 mtime，使 3DMigoto
+        # 的编译缓存必然错配。
+        if not os.path.exists(dest):
+            _write_text_if_changed(dest, _read_text(src))
         self.node._update_shader_file(
             dest,
             {1: {"Breast_L": ["obj1"], "Breast_R": ["obj2"]}, 2: {"Hip": ["obj3"]}},
@@ -148,6 +167,7 @@ class ShapeKeyDragDriveTests(unittest.TestCase):
             merge_slot_files=(template_name in ("shapekey_anim_packed_delta_v5_merged.hlsl", "shapekey_anim_packed_v5_merged.hlsl")),
             drag_drive_enabled=True,
             drag_zone_ids=self.node._drag_drive_zone_ids(["Breast_L", "Breast_R", "Hip"]),
+            source_path=src,
         )
         with open(dest, encoding="utf-8") as f:
             return f.read()
@@ -167,6 +187,39 @@ class ShapeKeyDragDriveTests(unittest.TestCase):
     def test_default_dir_is_no_direction_mapped_to_slot_4(self):
         node = _make_node({"A": 0, "B": 2})
         self.assertEqual(node._drag_drive_dirs(["A", "B"]), [4, 4])
+
+    def test_regenerating_same_config_does_not_retouch_shader_file(self):
+        """形态键着色器是**动态生成**的；同一配置重复导出必须不重写文件。
+
+        3DMigoto 按 ``.hlsl`` 的 mtime 与 ``<stage>_5_0.<flags>.bin`` 配对
+        （``CompareFileTime`` 必须精确相等）。若每次导出都重写，即使生成内容
+        完全相同，mtime 也会被刷新、编译缓存整族失效，下次进游戏/F10 全量重编译。
+
+        这里直接走生产路径（``shutil.copy2`` 模板 → ``_update_shader_file`` 注入）
+        连跑两次，断言第二次不触碰文件。
+        """
+        template = "shapekey_anim_packed_delta_v5_merged.hlsl"
+        target = os.path.join(self.out_dir, template)
+
+        self._generate(template)
+        self.assertTrue(os.path.isfile(target))
+        with open(target, "rb") as file_obj:
+            bytes_first = file_obj.read()
+        mtime_first = os.path.getmtime(target)
+
+        time.sleep(0.05)
+        content_second = self._generate(template)
+        mtime_second = os.path.getmtime(target)
+
+        self.assertEqual(
+            mtime_first, mtime_second,
+            "同配置重复导出不得刷新着色器 mtime（否则 3DMigoto 编译缓存失效）",
+        )
+        with open(target, "rb") as file_obj:
+            self.assertEqual(bytes_first, file_obj.read(), "磁盘字节不得变化")
+        # 同时确认生成本身是确定性的（内容一致才有资格谈"不变就不写"）
+        with open(target, encoding="utf-8") as file_obj:
+            self.assertEqual(file_obj.read(), content_second)
 
     def test_negative_dir_maps_to_no_direction_slot(self):
         node = _make_node(

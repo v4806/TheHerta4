@@ -1,8 +1,12 @@
+import ast
 import importlib.util
+import inspect
 import sys
 import types
 import unittest
 from pathlib import Path
+
+from tests import _real_modules
 
 
 def _install_module(name, **attrs):
@@ -24,6 +28,9 @@ for package_name in (
 ):
     package = _install_module(package_name)
     package.__path__ = []
+
+# 真实 common 子模块按 fake 包前缀注册（空 __path__ 假包解析不了相对导入）
+_real_modules.register_real_common_modules(f"{PKG}.common")
 
 
 _install_module("bpy", data=types.SimpleNamespace(objects={}))
@@ -79,6 +86,70 @@ class NTMIShapeKeyAdapterTests(unittest.TestCase):
         )
 
         self.assertEqual(adapter._compute_dispatch_group_count(17, threads_per_group=16), 2)
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _production_update_shader_file_call_shapes():
+    """取出 `blueprint/direct_export_shapekey.py` 里 `_update_shader_file` 调用点的实参形态。
+
+    直接解析生产源码，而不是在这里硬编码一份实参清单：调用点新增实参、而被调方
+    （NTMI 下 `self.node` 就是 `NTMIShapeKeyNodeAdapter`）没跟上，正是 F1 的形态。
+    返回 ``[(位置实参个数, [关键字实参名, ...]), ...]``。
+    """
+    source_path = REPO_ROOT / "blueprint" / "direct_export_shapekey.py"
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    calls = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_update_shader_file"
+    ]
+    return [
+        (len(call.args), [keyword.arg for keyword in call.keywords if keyword.arg])
+        for call in calls
+    ]
+
+
+class NTMIUpdateShaderFileSignatureTests(unittest.TestCase):
+    """F1 回归：生产调用点的实参集合必须 ⊆ NTMI 适配器签名。
+
+    崩铁路径上 `DirectShapeKeyGenerator.generate()` 的 `self.node` 就是
+    `NTMIShapeKeyNodeAdapter`；调用点传了适配器不接受的 `source_path=` 时，整个
+    直出形态键导出会抛 `TypeError`。这里把「调用点实参」与「被调方签名」直接对账，
+    任何一侧单独变动都会失败——而不是只重跑一遍 happy path。
+    """
+
+    def test_adapter_signature_covers_the_production_call_site(self):
+        signature = inspect.signature(
+            ntmi_shapekey.NTMIShapeKeyNodeAdapter._update_shader_file
+        )
+        accepted = sorted(signature.parameters)
+        call_shapes = _production_update_shader_file_call_shapes()
+        self.assertTrue(
+            call_shapes,
+            "未在 blueprint/direct_export_shapekey.py 里找到 _update_shader_file 调用点"
+            "（生产契约变了，本回归测试需要同步更新）",
+        )
+
+        for positional, keywords in call_shapes:
+            with self.subTest(positional=positional, keywords=keywords):
+                unknown = sorted(set(keywords) - set(accepted))
+                self.assertEqual(
+                    unknown,
+                    [],
+                    "生产调用点传了 NTMI 适配器不接受的实参 "
+                    f"{unknown}；适配器签名={accepted}。崩铁直出形态键导出会因此抛 "
+                    "TypeError，需给适配器补上同名形参（或让调用点不再传）。",
+                )
+                # 形状也要真能绑定：必需形参齐全、位置实参个数不超限。
+                signature.bind(
+                    object(),
+                    *[object()] * positional,
+                    **{name: None for name in keywords},
+                )
 
 
 if __name__ == "__main__":

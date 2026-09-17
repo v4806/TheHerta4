@@ -22,6 +22,7 @@ from ..common.mod_path_compat import (
     iter_position_buffer_candidates,
 )
 from ..common.logic_name import LogicName
+from ..common.safe_write import write_text_if_changed, copy_file_if_changed
 from ..utils.export_space import position_export_matrix
 
 try:
@@ -2035,6 +2036,14 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
     # =======================================================================
 
     def _copy_shaders(self, res_dir):
+        """把所需着色器准备到 ``res_dir``。
+
+        安全合并：内容与目标相同的文件**不重写**，从而不改动它的 mtime。
+        3DMigoto 的自定义着色器编译缓存按 ``.hlsl`` 的 mtime 与同名
+        ``<stage>_5_0.<flags>.bin`` 配对（``CompareFileTime`` 必须精确相等），
+        无条件重写会让整族缓存失效、下次进游戏/按 F10 全量重编译
+        （实测单次两分钟量级）。详见 ``common/safe_write.py``。
+        """
         toolset = self._get_toolset_dir()
         files = list(SHADER_FILES)
         if self._feature_skd():
@@ -2042,6 +2051,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         if self._feature_var():
             files += list(SHADER_VARSYNC_FILES)
         vertex_struct = self._get_vertex_struct_definition()
+        rewritten = 0
         for fname in files:
             src = os.path.join(toolset, fname)
             if not os.path.exists(src):
@@ -2057,27 +2067,31 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 flags=re.DOTALL,
             )
             dest = os.path.join(res_dir, fname)
-            with open(dest, 'w', encoding='utf-8') as f:
-                f.write(content)
-        # PathVectors 按稳定区域 ID 容量在导出阶段生成，不再复制旧版 12 项模板。
-        # 手部着色器 + 网格/法线资产：全部字节级原样复制。手部着色器读自己
+            # 内容没变就不写：保持 .hlsl 的 mtime，3DMigoto 的编译缓存才继续命中
+            if write_text_if_changed(dest, content):
+                rewritten += 1
+        # 手部着色器 + 网格/法线资产：全部字节级原样合并。手部着色器读自己
         # 的 vb0（stride 28 固定布局），不含 struct VertexAttributes，无需也
         # 不许走文本替换路径（避免行尾转换）——与原作保持字节一致。
         if self.enable_hand_cursor:
             for fname in HAND_SHADER_FILES + HAND_ASSET_FILES:
                 src = os.path.join(toolset, fname)
                 if os.path.exists(src):
-                    shutil.copy2(src, os.path.join(res_dir, fname))
+                    if copy_file_if_changed(src, os.path.join(res_dir, fname)):
+                        rewritten += 1
                 else:
                     print(f"[DragInteraction][WARNING] 手部文件缺失: {src}")
-        # 视口探针着色器：字节级原样复制（不读角色网格，无 struct VertexAttributes）
+        # 视口探针着色器：字节级原样合并（不读角色网格，无 struct VertexAttributes）
         if self.enable_viewport_probe:
             for fname in VIEWPORT_SHADER_FILES:
                 src = os.path.join(toolset, fname)
                 if os.path.exists(src):
-                    shutil.copy2(src, os.path.join(res_dir, fname))
+                    if copy_file_if_changed(src, os.path.join(res_dir, fname)):
+                        rewritten += 1
                 else:
                     print(f"[DragInteraction][WARNING] 视口探针着色器缺失: {src}")
+        if rewritten:
+            print(f"[DragInteraction] 着色器已更新 {rewritten} 个")
 
     # =======================================================================
     # 资源烘焙（稀疏区域权重 / ObjectMap / ZoneParams / PathVectors）

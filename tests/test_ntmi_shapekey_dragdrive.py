@@ -6,6 +6,8 @@ import types
 import unittest
 from pathlib import Path
 
+from tests import _real_modules
+
 
 def _install_module(name, **attrs):
     module = types.ModuleType(name)
@@ -20,6 +22,9 @@ def _install_module(name, **attrs):
 PKG = "_ntmi_sk_drive_test_pkg"
 for package_name in (PKG, f"{PKG}.blueprint", f"{PKG}.common", f"{PKG}.utils", f"{PKG}.ui"):
     _install_module(package_name)
+
+# 真实 common 子模块按 fake 包前缀注册（空 __path__ 假包解析不了相对导入）
+_real_modules.register_real_common_modules(f"{PKG}.common")
 
 _fake_bpy = types.SimpleNamespace(
     types=types.SimpleNamespace(PropertyGroup=object, Operator=object, UIList=object, Node=object),
