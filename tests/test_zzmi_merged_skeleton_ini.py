@@ -1,8 +1,12 @@
 """ExportZZMI 合并骨架 INI 生成单测（fake 环境，不依赖 bpy/游戏）。"""
 
+import ast
+import contextlib
 import importlib.util
+import io
 import json
 import os
+import re
 import shutil
 import struct
 import sys
@@ -11,6 +15,8 @@ import types
 import unittest
 from unittest import mock
 from pathlib import Path
+
+from tests import _real_modules
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PKG = "zzmi_merged_skeleton_ini_test_pkg"
@@ -27,6 +33,9 @@ def _install_module(name, **attrs):
 for package_name in (PKG, f"{PKG}.ui", f"{PKG}.ui.universal", f"{PKG}.common", f"{PKG}.utils"):
     package = _install_module(package_name)
     package.__path__ = []
+
+# 真实 common 子模块按 fake 包前缀注册（空 __path__ 假包解析不了相对导入）
+_real_modules.register_real_common_modules(f"{PKG}.common")
 
 
 class _FakeIniSection:
@@ -202,6 +211,12 @@ _load_real_module(f"{PKG}.utils.ssmt_error_utils", "utils/ssmt_error_utils.py")
 _load_real_module(f"{PKG}.common.m_key", "common/m_key.py")
 _load_real_module(f"{PKG}.common.object_prefix_helper", "common/object_prefix_helper.py")
 _load_real_module(f"{PKG}.common.draw_call_model", "common/draw_call_model.py")
+# B1：契约判定模块（zzmi.py 的 `_enforce_merged_skeleton_contract` 在调用时按
+# 相对导入取它）。这里登记**真实**实现，让「接线 + 各档行为」测试覆盖真实语义；
+# 它自身无任何依赖，按 fake 包前缀登记即可。
+_zzmi_contract_module = _load_real_module(
+    f"{PKG}.common.zzmi_merged_contract", "common/zzmi_merged_contract.py"
+)
 
 _install_module(
     f"{PKG}.common.global_config",
@@ -483,6 +498,11 @@ class ZZSIMergedSkeletonIniTests(unittest.TestCase):
         self.assertIn("global $zz_ms_seen_02 = 0", text)
         self.assertIn("global $zz_ms_seen_11 = 0", text)
         self.assertIn("global $zz_ms_seen_12 = 0", text)
+        # 按槽「上一帧到达」预测值也要在 [Constants] 声明（守卫条件引用它们）
+        for cid in (0, 1):
+            for slot in (1, 2):
+                # 初值 1：首帧保守等待（没有上一帧可参考时按「都会到」处理）
+                self.assertIn(f"global $zz_ms_prev_{cid}{slot} = 1", text)
         # 每槽一份合并骨架
         self.assertIn("[ResourceZZMergedSkeleton_G0_s1]", text)
         self.assertIn("[ResourceZZMergedSkeleton_G0_s2]", text)
@@ -508,8 +528,8 @@ class ZZSIMergedSkeletonIniTests(unittest.TestCase):
         self.assertIn("[ResourceZZVgMap_b20f90ea]", text)
         self.assertIn("filename = Meshes/zz_vgmap_b20f90ea.buf", text)
         # 每槽一份 SO 重定向资源
-        self.assertIn("[ResourceZZRedirectSO_s1]", text)
-        self.assertIn("[ResourceZZRedirectSO_s2]", text)
+        self.assertIn("[ResourceZZRedirectSO_G0_s1]", text)
+        self.assertIn("[ResourceZZRedirectSO_G0_s2]", text)
         self.assertNotIn("[ResourceZZRedirectSO_a23aa8a3]", text)
         # 逐 (部件, 槽) attach 段（x1=0 / y1=vg_count；cs-t0 = 本槽 palette；
         # cs-u0 = 本组本槽骨架；Dispatch 动态取整）
@@ -528,13 +548,28 @@ class ZZSIMergedSkeletonIniTests(unittest.TestCase):
         self.assertIn("cs-u0 = ref ResourceZZMergedSkeleton_G0_s1", text)
         self.assertIn("cs-u0 = ref ResourceZZMergedSkeleton_G0_s2", text)
         self.assertIn("Dispatch = 2, 1, 1", text)  # ceil(105 / 64)
-        # [Present] 只清零 occ/seen，不重放 attach、不复位任何资源。
+        # [Present] 先把 seen 抄进 prev（下一帧守卫的按槽「期望集合」预测值），
+        # 再清零 occ/seen；不重放 attach、不复位任何资源。
         self.assertIn("[Present]", text)
         present_text = text.split("[Present]")[1]
         self.assertIn("$zz_ms_occ_0 = 0", present_text)
         self.assertIn("$zz_ms_occ_1 = 0", present_text)
         self.assertIn("$zz_ms_seen_01 = 0", present_text)
         self.assertIn("$zz_ms_seen_12 = 0", present_text)
+        # 抄录语句必须在清零语句**之前**（否则 prev 恒为 0 → 帧首守卫提前落笔）
+        for cid in (0, 1):
+            for slot in (1, 2):
+                copy_line = f"$zz_ms_prev_{cid}{slot} = $zz_ms_seen_{cid}{slot}"
+                clear_line = f"$zz_ms_seen_{cid}{slot} = 0"
+                self.assertIn(copy_line, present_text)
+                self.assertLess(
+                    present_text.index(copy_line),
+                    present_text.index(clear_line),
+                    "prev 抄录必须早于 seen 清零",
+                )
+        # 「本帧出现过」口径（$zz_ms_any_*）已被按槽预测取代：帧首恒真会让守卫
+        # 在载体自己的 deform pass 就落笔（2026-09-17 dump 实证）。
+        self.assertNotIn("$zz_ms_any_", text)
         self.assertNotIn("run = CustomShaderZZMIMergedSkeletonAttach_", present_text)
         self.assertNotIn("$zz_ms_attach_offset", present_text)
         self.assertNotIn("$zz_ms_attach_count", present_text)
@@ -753,6 +788,41 @@ class ZZSIMergedSkeletonIniTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 exporter.add_merged_skeleton_sections(_FakeIniBuilder())
         self.assertEqual(target.read_bytes(), b"previous")
+
+    def test_skin_publish_shader_matches_generator_parameters(self):
+        """蒙皮 CS 与生成器参数必须同源（行布局 / 线程数 / 参数槽位）。
+
+        回归（2026-09-17 FrameAnalysis-025058「一直闪」）：draw 版重放只能在
+        Blend 布局与载体一致的锚点落笔，窄布局必需部件最后到达时无人落笔 →
+        该槽 SO 整帧不写。修复 = 新增 `res/zzmi_merged_skin.hlsl`：完全绕开 IA
+        输入布局（顶点属性按 SV_DispatchThreadID 从 SRV 读），**任意必需部件**
+        都能发布，且按索引写 = 幂等（帧内最后一次派发即最终内容）。
+        """
+        shader = (REPO_ROOT / "Toolset" / "zzmi_merged_skin.hlsl").read_text(
+            encoding="utf-8"
+        )
+        # 行布局：位置 0..2 / 法线 3..5 / 切线 6..9（40 字节 = 10 floats）
+        self.assertIn("struct ZZVertex40", shader)
+        self.assertIn("RWStructuredBuffer<float> dst_rows", shader)
+        self.assertIn("[numthreads(64, 1, 1)]", shader)
+        self.assertIn("SV_DispatchThreadID", shader)
+        self.assertIn("src_rows.GetDimensions(src_count, src_stride)", shader)
+        self.assertIn("merged_skeleton.GetDimensions(bone_count, bone_stride)", shader)
+        self.assertIn("bone >= bone_count", shader)
+        # 与 ini 段参数同源：x1 = 行数、y1 = 目标起始行、z1 = 前缀行、w1 = 每行 float 数
+        self.assertIn("IniParams[1].x", shader)
+        self.assertIn("IniParams[1].y", shader)
+        self.assertIn("IniParams[1].z", shader)
+        self.assertIn("IniParams[1].w", shader)
+        self.assertIn("float4 t = float4(v.b.z, v.b.w, v.c.x, v.c.y);", shader)
+        self.assertEqual(
+            _zzmi_module.ExportZZMI._merged_skin_dispatch_count(18776, 3), 294
+        )
+        self.assertEqual(_zzmi_module.ExportZZMI._merged_skin_dispatch_count(0, 3), 1)
+        self.assertEqual(
+            _zzmi_module.ExportZZMI._merged_skin_shader_filename(),
+            "zzmi_merged_skin.hlsl",
+        )
 
     def test_missing_attach_shader_aborts_export(self):
         exporter = _make_exporter([], merged_vgmap=True)
@@ -1101,7 +1171,7 @@ class ZZSIMultiInstanceGuardTests(unittest.TestCase):
         lines = text.splitlines()
         start = next(
             index for index, line in enumerate(lines)
-            if line.startswith("if $zz_ms_seen_01 == 1")
+            if "($zz_ms_prev_01 == 0" in line
         )
         end = lines.index("endif", start)
         body = [line.strip() for line in lines[start + 1 : end]]
@@ -1109,13 +1179,78 @@ class ZZSIMultiInstanceGuardTests(unittest.TestCase):
             body,
             [
                 "vs-t0 = ResourceZZMergedSkeleton_G0_s1",
-                "so0 = ref ResourceZZRedirectSO_s1",
+                "so0 = ref ResourceZZRedirectSO_G0_s1",
                 "vb2 = Resourceb20f90eaBlend",
                 "vb0 = Resourceb20f90eaPosition",
                 "draw = 4643, 0",
                 "so0 = null",
             ],
         )
+
+    def test_guard_uses_previous_frame_slot_prediction(self):
+        """重放时机回归（2026-09-17 FrameAnalysis-022132 实证）。
+
+        守卫的豁免项必须是**按槽的上一帧预测**（`$zz_ms_prev_<i><k>`），不能用
+        「本帧至今是否出现过」（旧 `$zz_ms_any_<i>`）：后者在帧首对**所有尚未
+        deform** 的部件恒真 → 守卫在载体自己的 deform pass 就落笔，排在载体
+        之后的部件用**上一帧** palette。dump 比对（叶瞬光01 单实例帧，载体
+        999bff94 是第 2 个 deform pass、最后到达是 38b3bd13 第 6 个）：
+        载体 SO 行 3..13673 与「载体 pass 时刻的 vs-t0」重算蒙皮 13671/13671
+        吻合（最大误差 2.2e-07），与「最后一个必需部件 pass 时刻的 vs-t0」
+        最大误差 0.0226（G2 同样 1.9e-07 vs 0.0857）→ 用户实测「身体莫名其妙的
+        一卡一卡」（慢的部件集合随提交顺序逐帧变化）。
+
+        另一条同源回归：`any == 0` 对「整帧只出现一次」的部件永远不成立，
+        却要求它 `seen_<i><2> == 1`（它没有第 2 次）→ 第 2 槽守卫永不闭合 →
+        该实例的 SO 永不写（用户实测「只有那个实例化的物体有问题」）。
+        按槽预测下这种部件在 s2 的预测值为 0 ⇒ 豁免 ⇒ 第 2 槽守卫正常闭合。
+        """
+        exporter, models = self._make_exporter(self._components())
+        # 与 test_redirect_guard_body_contains_so_binding_and_draw 同一份重定向计划：
+        # b20f90ea = carrier（SO owner），a23aa8a3 = 纯占位 target 挂点。
+        exporter.merged_skeleton_component_id_dict = {
+            m.draw_ib: i for i, m in enumerate(models)
+        }
+        exporter._redirect_carrier_map = {
+            "b20f90ea": {
+                "target": "a23aa8a3",
+                "base_vertex": 3,
+                "target_first_index": 0,
+                "vertex_count": 4643,
+            }
+        }
+        exporter._redirect_target_map = {
+            "a23aa8a3": {
+                "target_ib": "a23aa8a3",
+                "target_component_id": 0,
+                "deform_draws": [
+                    ("Resourceb20f90eaPosition", "Resourceb20f90eaBlend", 4643)
+                ],
+                "so_vertex_count": 4646,
+                "target_own_vertices": 3,
+                "so_prefix_rows": 3,
+                "target_has_real_geometry": False,
+                "so_owner_ib": "b20f90ea",
+                "required_component_ids": [0, 1],
+                "compatible_component_ids": [0, 1],
+                "target_viable": True,
+                "so_stride": 40,
+            }
+        }
+        builder = _FakeIniBuilder()
+        exporter.add_unity_vs_texture_override_vb_sections(builder, models[0])
+        builder_carrier = _FakeIniBuilder()
+        exporter.add_unity_vs_texture_override_vb_sections(builder_carrier, models[1])
+        text = "\n".join(_all_builder_lines(builder))
+        text_carrier = "\n".join(_all_builder_lines(builder_carrier))
+
+        self.assertNotIn("$zz_ms_any_", text + text_carrier)
+        # s1 与 s2 用各自的上一帧预测值（不是同一个「本帧出现过」标记）
+        for chunk in (text, text_carrier):
+            self.assertIn("$zz_ms_prev_01 == 0 || $zz_ms_seen_01 >= 1", chunk)
+            self.assertIn("$zz_ms_prev_02 == 0 || $zz_ms_seen_02 >= 1", chunk)
+            self.assertIn("$zz_ms_prev_11 == 0 || $zz_ms_seen_11 >= 1", chunk)
+            self.assertIn("$zz_ms_prev_12 == 0 || $zz_ms_seen_12 >= 1", chunk)
 
     def test_all_attach_runs_are_top_level(self):
         """v9 硬约束：所有 attach run 必须在 deform 段**顶层**（if 内 run 不执行）。
@@ -1484,8 +1619,16 @@ class ZZSIDirectPathGuardTests(unittest.TestCase):
         )
         text = self._vb_text(exporter, exporter.drawib_model_list[1])
 
-        self.assertIn("if $zz_ms_seen_01 == 1 && $zz_ms_seen_11 == 1", text)
-        self.assertIn("if $zz_ms_seen_02 == 1 && $zz_ms_seen_12 == 1", text)
+        self.assertIn(
+            "if ($zz_ms_seen_11 >= 1) && ($zz_ms_prev_01 == 0 || $zz_ms_seen_01 >= 1)"
+            " && ($zz_ms_prev_11 == 0 || $zz_ms_seen_11 >= 1)",
+            text,
+        )
+        self.assertIn(
+            "if ($zz_ms_seen_12 >= 1) && ($zz_ms_prev_02 == 0 || $zz_ms_seen_02 >= 1)"
+            " && ($zz_ms_prev_12 == 0 || $zz_ms_seen_12 >= 1)",
+            text,
+        )
         self.assertNotIn("if $zz_ms_occ_1 == 1\n    vs-t0 = ResourceZZMergedSkeleton", text)
 
     def test_no_frame_latch_variables_in_constants_or_present(self):
@@ -1742,13 +1885,15 @@ class ZZSIMergedHostDirectPathTests(unittest.TestCase):
         text = self._vb_text(exporter, models[0])
 
         # 两槽各捕获一次 SO 引用（在自己的 deform 段里，so0 就是本部件的 SO）
-        self.assertEqual(text.count("    ResourceZZRedirectSO_s1 = ref so0"), 1)
-        self.assertEqual(text.count("    ResourceZZRedirectSO_s2 = ref so0"), 1)
+        self.assertEqual(text.count("    ResourceZZRedirectSO_G0_s1 = ref so0"), 1)
+        self.assertEqual(text.count("    ResourceZZRedirectSO_G0_s2 = ref so0"), 1)
         # 组级守卫 + 显式绑定 SO/宿主的 vb0/vb2 + 宿主导出顶点数
         self.assertIn(
-            "if $zz_ms_seen_01 == 1 && $zz_ms_seen_11 == 1 && $zz_ms_seen_21 == 1\n"
+            "if ($zz_ms_seen_01 >= 1) && ($zz_ms_prev_01 == 0 || $zz_ms_seen_01 >= 1)"
+            " && ($zz_ms_prev_11 == 0 || $zz_ms_seen_11 >= 1)"
+            " && ($zz_ms_prev_21 == 0 || $zz_ms_seen_21 >= 1)\n"
             "    vs-t0 = ResourceZZMergedSkeleton_G0_s1\n"
-            "    so0 = ref ResourceZZRedirectSO_s1\n"
+            "    so0 = ref ResourceZZRedirectSO_G0_s1\n"
             "    vb2 = Resourcea23aa8a3Blend\n"
             "    vb0 = Resourcea23aa8a3Position\n"
             "    draw = 12482, 0\n"
@@ -1775,9 +1920,11 @@ class ZZSIMergedHostDirectPathTests(unittest.TestCase):
         )
         # ……再发宿主合并几何的组级守卫重放（宿主排在前面的帧由它闭合）
         self.assertIn(
-            "if $zz_ms_seen_01 == 1 && $zz_ms_seen_11 == 1 && $zz_ms_seen_21 == 1\n"
+            "if ($zz_ms_seen_01 >= 1) && ($zz_ms_prev_01 == 0 || $zz_ms_seen_01 >= 1)"
+            " && ($zz_ms_prev_11 == 0 || $zz_ms_seen_11 >= 1)"
+            " && ($zz_ms_prev_21 == 0 || $zz_ms_seen_21 >= 1)\n"
             "    vs-t0 = ResourceZZMergedSkeleton_G0_s1\n"
-            "    so0 = ref ResourceZZRedirectSO_s1\n"
+            "    so0 = ref ResourceZZRedirectSO_G0_s1\n"
             "    vb2 = Resourcea23aa8a3Blend\n"
             "    vb0 = Resourcea23aa8a3Position\n"
             "    draw = 12482, 0\n"
@@ -1785,10 +1932,10 @@ class ZZSIMergedHostDirectPathTests(unittest.TestCase):
             "endif",
             sib_text,
         )
-        self.assertIn("so0 = ref ResourceZZRedirectSO_s2", sib_text)
+        self.assertIn("so0 = ref ResourceZZRedirectSO_G0_s2", sib_text)
         # 宿主段不能捕获兄弟的 SO：捕获只在宿主自己段发生
-        self.assertNotIn("ResourceZZRedirectSO_s1 = ref so0", sib_text)
-        self.assertIn("ResourceZZRedirectSO_s1 = ref so0", host_text)
+        self.assertNotIn("ResourceZZRedirectSO_G0_s1 = ref so0", sib_text)
+        self.assertIn("ResourceZZRedirectSO_G0_s1 = ref so0", host_text)
 
     def test_incompatible_sibling_does_not_replay(self):
         """Blend 布局不兼容的兄弟挂点不得重放（BI4 与 BW16_BI16 不能混用）。"""
@@ -2026,6 +2173,88 @@ class ZZMIStubObjectTests(unittest.TestCase):
             for group_index in group_indices
         ]
         return obj
+
+    def _write_vgmap_json_full(self, bare, vg_map, vg_offset, vg_count, group=None):
+        """写出带真实 VGOffset/VGCount 的部件 json（复刻工作空间真实布局）。
+
+        VGMap 值允许借位落在别的部件声明段（跨部件 bitwise 去重的 canonical），
+        自属声明段 = [vg_offset, vg_offset + vg_count)。
+        """
+        type_dir = os.path.join(self.tmp, "LOD0", bare, "TYPE_GPU_TEST_")
+        os.makedirs(type_dir, exist_ok=True)
+        payload = {
+            "VGMap": {str(k): str(v) for k, v in vg_map.items()},
+            "VGOffset": int(vg_offset),
+            "VGCount": int(vg_count),
+        }
+        if group is not None:
+            payload["SkeletonGroup"] = group
+        with open(os.path.join(type_dir, bare + ".json"), "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+
+    def _write_component_map(self, component_map):
+        lod0 = os.path.join(self.tmp, "LOD0")
+        os.makedirs(lod0, exist_ok=True)
+        with open(os.path.join(lod0, "DrawIB-Component.json"), "w", encoding="utf-8") as f:
+            json.dump(component_map, f)
+
+    def test_no_stub_when_only_dedup_borrowed_slots_are_referenced(self):
+        """回归（2026-09-16 叶瞬光01 脸部被误插占位事故，同类样本 869976a3-5202-0）。
+
+        只被「借位 canonical 槽位」引用的缺席部件不得判成被吸收。
+
+        复刻真实数据：c28e6303（自属声明段 [167,177)，原顶点 2789）的 VGMap 里
+        既有自属段槽位 168..176，也有借位到 01ef4403 声明段 [0,34) 的全身共享
+        根骨骼槽位 0；载体对象 8c8de427-798-0 只引用了借位槽位 0。
+        旧判据（全量 VGMap 值域 ∩ used）会因槽位 0 命中而注入占位；新判据只看
+        自属声明段 → 判定「未被吸收」→ 不插桩（游戏内保留原版绘制）。
+        """
+        self._write_component_map({"c28e6303": {"0": "c28e6303-7308-0"}})
+        vg_map = {"0": 0}  # 借位：0 属于别的部件声明段
+        for index, slot in enumerate(range(168, 177), start=1):
+            vg_map[str(index)] = slot
+        self._write_vgmap_json_full(
+            "c28e6303-7308-0", vg_map, vg_offset=167, vg_count=10, group=0
+        )
+        # 载体对象引用了借位槽位 0（真实数据里 0 是全身共享的根骨骼）
+        self._register_present_object_with_groups("LOD0.8c8de427-798-0", [0])
+
+        dcm = sys.modules[f"{PKG}.common.draw_call_model"].DrawCallModel
+        ordered = [dcm(obj_name="LOD0.8c8de427-798-0")]
+        exporter = _make_exporter([], merged_vgmap=True, ordered_drawcalls=ordered)
+
+        names = [str(dc.get_workspace_unique_str()) for dc in ordered]
+        self.assertNotIn("LOD0.c28e6303-7308-0", names)
+        self.assertEqual(exporter._zzmi_stub_object_names, [])
+
+    def test_stub_when_absent_drawib_own_segment_slots_are_referenced(self):
+        """R7 ③ 行为保留：真被 join 走的部件仍必须补占位。
+
+        复刻真实数据：4a178546（自属声明段 [209,256)，原顶点 3859）被 join 进
+        载体对象 869976a3-5202-0（16350 顶点）→ 载体的顶点带上了 209..254 的
+        权重（同时它的 VGMap 里还有借位槽位 185）→ 自属段命中 → 补占位。
+        """
+        self._write_component_map({"4a178546": {"0": "4a178546-18468-0"}})
+        vg_map = {str(slot - 209): slot for slot in range(209, 255)}
+        vg_map["45"] = 185  # 借位槽位（3b1b73fe 声明段），与吸收证据无关
+        self._write_vgmap_json_full(
+            "4a178546-18468-0", vg_map, vg_offset=209, vg_count=47, group=2
+        )
+        # 载体对象：既引用借位槽位 185，也引用 4a178546 的自属段槽位 209/210
+        self._register_present_object_with_groups(
+            "LOD0.869976a3-5202-0", [185, 209, 210]
+        )
+
+        dcm = sys.modules[f"{PKG}.common.draw_call_model"].DrawCallModel
+        ordered = [dcm(obj_name="LOD0.869976a3-5202-0")]
+        exporter = _make_exporter([], merged_vgmap=True, ordered_drawcalls=ordered)
+
+        names = [str(dc.get_workspace_unique_str()) for dc in ordered]
+        self.assertIn("LOD0.4a178546-18468-0", names)
+        self.assertEqual(
+            exporter._zzmi_stub_object_names, ["LOD0.4a178546-18468-0"]
+        )
+        exporter._cleanup_stub_objects()
 
     def test_stub_when_absent_drawib_absorbed_into_other_object(self):
         # 84618ee0 全缺，但其 VGMap 全局 id=7 被现存对象（b20f90ea）的顶点引用 = 被合并
@@ -2385,10 +2614,10 @@ class ZZSIMergedMeshRedirectTests(_ZZMIGroup3RedirectFixture, unittest.TestCase)
         self.assertIn("run = CustomShaderZZMIMergedSkeletonAttach_C1_s1", text_b)
         self.assertIn("draw = 3, 0", text_b)
         self.assertIn("draw = 18776, 0", text_b)
-        self.assertIn("so0 = ref ResourceZZRedirectSO_s1", text_b)
+        self.assertIn("so0 = ref ResourceZZRedirectSO_G3_s1", text_b)
         # SO owner = carrier：两个槽各捕获一次
-        self.assertIn("ResourceZZRedirectSO_s1 = ref so0", text_b)
-        self.assertIn("ResourceZZRedirectSO_s2 = ref so0", text_b)
+        self.assertIn("ResourceZZRedirectSO_G3_s1 = ref so0", text_b)
+        self.assertIn("ResourceZZRedirectSO_G3_s2 = ref so0", text_b)
         self.assertNotIn("$zz_ms_redirect_drawn", text_b)
         self.assertNotIn("$zz_ms_group_ready", text_b)
         self.assertNotIn("$zz_ms_group_phase", text_b)
@@ -2402,9 +2631,9 @@ class ZZSIMergedMeshRedirectTests(_ZZMIGroup3RedirectFixture, unittest.TestCase)
         self.assertIn("vb2 = Resourceb20f90eaBlend", text_a)
         self.assertIn("vb0 = Resourceb20f90eaPosition", text_a)
         self.assertIn("draw = 18776, 0", text_a)
-        self.assertIn("so0 = ref ResourceZZRedirectSO_s1", text_a)
-        self.assertIn("so0 = ref ResourceZZRedirectSO_s2", text_a)
-        self.assertNotIn("ResourceZZRedirectSO_s1 = ref so0", text_a)
+        self.assertIn("so0 = ref ResourceZZRedirectSO_G3_s1", text_a)
+        self.assertIn("so0 = ref ResourceZZRedirectSO_G3_s2", text_a)
+        self.assertNotIn("ResourceZZRedirectSO_G3_s1 = ref so0", text_a)
 
         # 同组的第三个部件 b30db54e（布局兼容）：v9 起同样发每槽守卫（触发时机可能
         # 落在它的 deform 段；重复重放同槽是幂等写入），绑定的是 carrier 的 vb0/vb2、
@@ -2415,8 +2644,8 @@ class ZZSIMergedMeshRedirectTests(_ZZMIGroup3RedirectFixture, unittest.TestCase)
         self.assertIn("run = CustomShaderZZMIMergedSkeletonAttach_C2_s1", text_c)
         self.assertIn("draw = 18776, 0", text_c)
         self.assertIn("vb0 = Resourceb20f90eaPosition", text_c)
-        self.assertIn("if $zz_ms_seen_01 == 1 && $zz_ms_seen_11 == 1 && $zz_ms_seen_21 == 1", text_c)
-        self.assertIn("if $zz_ms_seen_02 == 1 && $zz_ms_seen_12 == 1 && $zz_ms_seen_22 == 1", text_c)
+        self.assertIn("if ($zz_ms_seen_11 >= 1) && ($zz_ms_prev_01 == 0 || $zz_ms_seen_01 >= 1) && ($zz_ms_prev_11 == 0 || $zz_ms_seen_11 >= 1) && ($zz_ms_prev_21 == 0 || $zz_ms_seen_21 >= 1)", text_c)
+        self.assertIn("if ($zz_ms_seen_12 >= 1) && ($zz_ms_prev_02 == 0 || $zz_ms_seen_02 >= 1) && ($zz_ms_prev_12 == 0 || $zz_ms_seen_12 >= 1) && ($zz_ms_prev_22 == 0 || $zz_ms_seen_22 >= 1)", text_c)
 
     def test_redirect_draw_waits_for_dependencies_in_both_frame_orders(self):
         """回归 2026-08-26 实测：target 可能在 carrier 前或后到达；两种
@@ -2475,22 +2704,32 @@ class ZZSIMergedMeshRedirectTests(_ZZMIGroup3RedirectFixture, unittest.TestCase)
         builder_target = _FakeIniBuilder()
         exporter.add_unity_vs_texture_override_vb_sections(builder_target, models[1])
         text_target = "\n".join(builder_target.sections[0].SectionLineList)
-        self.assertNotIn("ResourceZZRedirectSO_s1 = ref so0", text_target)
-        # 不兼容宿主不产生重放守卫（也不再有相位/闩锁条件）
-        self.assertNotIn("ResourceZZRedirectSO_s1", text_target)
+        self.assertNotIn("ResourceZZRedirectSO_G3_s1 = ref so0", text_target)
+        # 不兼容宿主不产生 **draw 版** 重放守卫（也不再有相位/闩锁条件）；
+        # 但它仍然发 **蒙皮 CS 发布块**（2026-09-17「闪」修复）：draw 版重放受 IA
+        # 输入布局限制，窄布局必需部件排在最后到达时没有任何锚点能落笔 →
+        # 该槽 SO 整帧不写（FrameAnalysis-025058 实证：SO 与完整骨架仅 ~3100/13671
+        # 行吻合）= 用户实测「一个实例/两个实例都在闪」。CS 绕开 IA 布局，
+        # 因此**任意必需部件都能发布**。
         self.assertNotIn("$zz_ms_group_phase", text_target)
         self.assertNotIn("$zz_ms_redirect_drawn", text_target)
         self.assertNotIn("$zz_ms_group_ready", text_target)
+        self.assertIn("run = CustomShaderZZMISkin_G3_s1", text_target)
+        self.assertIn("run = CustomShaderZZMISkin_G3_s2", text_target)
+        self.assertIn("so0 = null", text_target)
 
         # carrier（b20f90ea）是唯一兼容的重放宿主：它自己承载直连守卫重放合并
         # 几何（同一套槽门控），绝不出现"两个挂点都不画"把合并几何整个丢掉。
         builder_carrier = _FakeIniBuilder()
         exporter.add_unity_vs_texture_override_vb_sections(builder_carrier, models[0])
         text_carrier = "\n".join(builder_carrier.sections[0].SectionLineList)
-        self.assertIn("ResourceZZRedirectSO_s1 = ref so0", text_carrier)
-        self.assertIn("if $zz_ms_seen_01 == 1 && $zz_ms_seen_11 == 1", text_carrier)
+        self.assertIn("ResourceZZRedirectSO_G3_s1 = ref so0", text_carrier)
+        self.assertIn("if ($zz_ms_seen_11 >= 1) && ($zz_ms_prev_01 == 0 || $zz_ms_seen_01 >= 1) && ($zz_ms_prev_11 == 0 || $zz_ms_seen_11 >= 1)", text_carrier)
         self.assertIn("draw = 18776, 0", text_carrier)
-        self.assertNotIn("draw = 3, 0", text_carrier)
+        # 回退路径**必须**写 3 顶点前缀 stub：base_vertex 由
+        # `_redirect_plan_prefix_rows`（纯占位 target = 3）决定，渲染从 SO 第 3 行
+        # 读本段；漏写就整体错位 3 行（2026-09-16 复核修正，旧实现此处漏写）。
+        self.assertIn("draw = 3, 0", text_carrier)
 
     def test_redirect_render_draw_is_unconditional_per_instance(self):
         """渲染段不再有帧闩锁：每个实例的渲染 draw 各画一次本实例的 SO。
@@ -2531,7 +2770,12 @@ class ZZSIMergedMeshRedirectTests(_ZZMIGroup3RedirectFixture, unittest.TestCase)
         )
 
     def test_real_target_with_incompatible_blend_layout_is_not_redirected(self):
-        """真实 target 与 carrier 的 Blend 布局不同，不能把整段重放伪装成兼容。"""
+        """真实 target 的 Blend 布局不是组内多数布局时不能重定向。
+
+        2026-09-16 收紧：锚点集合改为"组内多数布局"，因此这类组合以
+        `target-layout-not-anchor` 显式拒绝（旧口径报 `incompatible-blend-layout`）。
+        前缀行必须与合并行在同一段写出，target 自身不在锚点集合时无法保证顺序。
+        """
         exporter, models = self._group3_exporter(
             target_real_vertices=12314,
             target_registered=True,
@@ -2544,10 +2788,10 @@ class ZZSIMergedMeshRedirectTests(_ZZMIGroup3RedirectFixture, unittest.TestCase)
         self.assertEqual(target_map, {})
         self.assertEqual(
             unredirected["b20f90ea"]["reason"],
-            "incompatible-blend-layout",
+            "target-layout-not-anchor",
         )
         warning = self._capture_stdout(lambda: exporter._warn_merged_mesh_timing(unredirected))
-        self.assertIn("Blend 输入布局不兼容", warning)
+        self.assertIn("不是组内多数布局", warning)
 
     def test_missing_blend_layout_is_not_assumed_compatible(self):
         """布局元数据缺失时必须显式拒绝，不能让换角色后的未知格式静默重放。"""
@@ -2816,11 +3060,16 @@ class ZZMIMultiInstanceLatchRemovalTests(_ZZMIGroup3RedirectFixture, unittest.Te
             "    ResourceZZPalette_b20f90ea_s2 = copy vs-t0 unless_null", vb_text
         )
         self.assertNotIn("ResourceZZPalette_a23aa8a3_s1 = copy vs-t0 unless_null\n    ResourceZZRedirectSO", vb_text)
-        # 4) 每槽守卫条件 = 组内全部部件 seen 相与
+        # 4) 每槽守卫条件 =（SO 别名当帧已由捕获者刷新 b20f90ea=comp1）&&
+        #    （必需部件「上一帧本槽没到」或「本帧本槽已到」相与）。
+        #    **契约变更（2026-09-17，见 reports/zzmi-fix/05-implementation-notes.md）**：
+        #    消费点谓词由 `seen == 1` 改为 `seen >= 1`——`seen` 是帧内单调累加的顶层
+        #    计数，`== 1` 在同帧出现 ≥3 次（occ 回绕 ⇒ seen 到 2）时恒假 ⇒ 守卫集体
+        #    关闭（P-13）。断言强度不变（仍是逐字符的整条守卫），只随语义更新。
         for slot in (1, 2):
             self.assertIn(
-                f"if $zz_ms_seen_0{slot} == 1 && $zz_ms_seen_1{slot} == 1"
-                f" && $zz_ms_seen_2{slot} == 1",
+                f"if ($zz_ms_seen_1{slot} >= 1) && ($zz_ms_prev_0{slot} == 0 || $zz_ms_seen_0{slot} >= 1) && ($zz_ms_prev_1{slot} == 0 || $zz_ms_seen_1{slot} >= 1)"
+                f" && ($zz_ms_prev_2{slot} == 0 || $zz_ms_seen_2{slot} >= 1)",
                 vb_text,
             )
         # 5) attach run 全在顶层（含全部 部件 × 槽）
@@ -2850,7 +3099,7 @@ class ZZMIMultiInstanceLatchRemovalTests(_ZZMIGroup3RedirectFixture, unittest.Te
             lines = vb_text.splitlines()
             start = next(
                 i for i, line in enumerate(lines)
-                if line.startswith(f"if $zz_ms_seen_0{slot} == 1")
+                if f"($zz_ms_prev_01 == 0" in line
             )
             end = lines.index("endif", start)
             body = lines[start + 1 : end]
@@ -2867,8 +3116,8 @@ class ZZMIMultiInstanceLatchRemovalTests(_ZZMIGroup3RedirectFixture, unittest.Te
         # 骨架/资源按槽分份
         self.assertIn("[ResourceZZMergedSkeleton_G3_s1]", skeleton_text)
         self.assertIn("[ResourceZZMergedSkeleton_G3_s2]", skeleton_text)
-        self.assertIn("[ResourceZZRedirectSO_s1]", skeleton_text)
-        self.assertIn("[ResourceZZRedirectSO_s2]", skeleton_text)
+        self.assertIn("[ResourceZZRedirectSO_G3_s1]", skeleton_text)
+        self.assertIn("[ResourceZZRedirectSO_G3_s2]", skeleton_text)
         # 7) 渲染段：无 vb0 覆写、无 if 包装、drawindexed 无条件
         self.assertNotIn("vb0 = ResourceZZRedirectSO", ib_text)
         self.assertIn("drawindexed = 69612,0,3", ib_text)
@@ -2913,7 +3162,7 @@ class ZZMIMultiInstanceLatchRemovalTests(_ZZMIGroup3RedirectFixture, unittest.Te
         # 9) F8 已回退（2026-09 实测：Present 写资源 null 会废掉 [Present] 清场，
         #    导致实例加入/剔除过渡帧错槽重放 → 闪烁卡死）：RedirectSO 资源声明仍在，
         #    但 [Present] 不得再出现任何 RedirectSO 复位语句
-        self.assertIn("[ResourceZZRedirectSO_s1]", skeleton_text)
+        self.assertIn("[ResourceZZRedirectSO_G3_s1]", skeleton_text)
         self.assertNotIn("ResourceZZRedirectSO", present_text)
         self.assertNotIn("ResourceZZPalette", present_text)
         self.assertNotIn("ResourceZZMergedSkeleton", present_text)
@@ -2934,8 +3183,8 @@ class ZZMIMultiInstanceLatchRemovalTests(_ZZMIGroup3RedirectFixture, unittest.Te
         self.assertGreaterEqual(draw_count, 2)
         self.assertEqual(draw_count % 2, 0)
         for slot_cond in (
-            "if $zz_ms_seen_01 == 1 && $zz_ms_seen_11 == 1 && $zz_ms_seen_21 == 1",
-            "if $zz_ms_seen_02 == 1 && $zz_ms_seen_12 == 1 && $zz_ms_seen_22 == 1",
+            "if ($zz_ms_seen_11 >= 1) && ($zz_ms_prev_01 == 0 || $zz_ms_seen_01 >= 1) && ($zz_ms_prev_11 == 0 || $zz_ms_seen_11 >= 1) && ($zz_ms_prev_21 == 0 || $zz_ms_seen_21 >= 1)",
+            "if ($zz_ms_seen_12 >= 1) && ($zz_ms_prev_02 == 0 || $zz_ms_seen_02 >= 1) && ($zz_ms_prev_12 == 0 || $zz_ms_seen_12 >= 1) && ($zz_ms_prev_22 == 0 || $zz_ms_seen_22 >= 1)",
         ):
             self.assertIn(slot_cond, vb_text)
         # SO 引用按槽分别捕获（carrier 段），target 段按槽分别绑定
@@ -2943,16 +3192,130 @@ class ZZMIMultiInstanceLatchRemovalTests(_ZZMIGroup3RedirectFixture, unittest.Te
         builder = _FakeIniBuilder()
         exporter.add_unity_vs_texture_override_vb_sections(builder, group_b)
         b_text = "\n".join(_all_builder_lines(builder))
-        self.assertIn("ResourceZZRedirectSO_s1 = ref so0", b_text)
-        self.assertIn("ResourceZZRedirectSO_s2 = ref so0", b_text)
+        self.assertIn("ResourceZZRedirectSO_G3_s1 = ref so0", b_text)
+        self.assertIn("ResourceZZRedirectSO_G3_s2 = ref so0", b_text)
         # 回归：**载体段也必须发守卫**（只让单挂点持有守卫时，该挂点先 deform 的帧
         # 里守卫永不触发 → 该槽 SO 只剩 3 顶点前缀 → 合并几何整段消失）
         self.assertIn(
-            "if $zz_ms_seen_01 == 1 && $zz_ms_seen_11 == 1 && $zz_ms_seen_21 == 1",
+            "if ($zz_ms_seen_11 >= 1) && ($zz_ms_prev_01 == 0 || $zz_ms_seen_01 >= 1) && ($zz_ms_prev_11 == 0 || $zz_ms_seen_11 >= 1) && ($zz_ms_prev_21 == 0 || $zz_ms_seen_21 >= 1)",
             b_text,
         )
         self.assertIn("    draw = 18776, 0", b_text)
-        self.assertIn("if $zz_ms_seen_02 == 1 && $zz_ms_seen_12 == 1 && $zz_ms_seen_22 == 1", b_text)
+        self.assertIn("if ($zz_ms_seen_12 >= 1) && ($zz_ms_prev_02 == 0 || $zz_ms_seen_02 >= 1) && ($zz_ms_prev_12 == 0 || $zz_ms_seen_12 >= 1) && ($zz_ms_prev_22 == 0 || $zz_ms_seen_22 >= 1)", b_text)
+
+    def test_pose_key_alignment_uses_shared_canonical_bone(self):
+        """双实例对齐（2026-09-17「动画混在一起」修复）：出现次只是位置标签。
+
+        引擎按 mesh+instance 排序提交 deform，两个实例的相对先后**可以逐部件不同**
+        （实测 033520 G2：A 的顺序 c209c22b→3b1b73fe→869976a3→4a178546，
+        B 是 3b1b73fe→c209c22b→…）⇒「第 1 次出现」对某些部件是 A、对另一些是 B，
+        同一槽骨架混进两份姿态 = 用户看到的「两边混在一起、没按实例分开」。
+        修复口径：全组共享 canonical 骨骼（真实导出 = 槽位 0）的当帧矩阵位置当指纹，
+        同实例同帧逐位相同 ⇒ 同槽；不同实例姿态不同 ⇒ 不同槽。
+        """
+        exporter, models = self._group3_exporter()
+        # 先按夹具（无共享骨骼）建计划：Texcoord/VLR 等产物与 vg_map 无关，
+        # 之后再改 vg_map（真实形态：槽位 0 根骨被去重合并 → 三个部件都引用它）
+        # 并补上计划里的 pose_anchor_slot，避免影响重定向计划本身的判定。
+        _carrier_map, target_map, _unredirected = self._build_and_apply_plan(exporter)
+        for component in exporter.merged_skeleton_components:
+            vg_map = dict(component["vg_map"])
+            vg_map[min(vg_map)] = 0
+            component["vg_map"] = vg_map
+        target_map["a23aa8a3"]["pose_anchor_slot"] = 0
+
+        self.assertEqual(target_map["a23aa8a3"]["pose_anchor_slot"], 0)
+
+        carrier = next(m for m in models if m.draw_ib == "b20f90ea")
+        builder = _FakeIniBuilder()
+        exporter.add_unity_vs_texture_override_vb_sections(builder, carrier)
+        text = "\n".join(builder.sections[0].SectionLineList)
+        self.assertIn("ResourceZZPoseKeySrc = ref vs-t0", text)
+        # 共享骨骼平移分量 = 48 字节/骨骼的第 3/7/11 个 float（r0.w/r1.w/r2.w）
+        self.assertIn("->SpatialHash(3, 7, 11, 0.01)", text)
+        self.assertIn("if $zz_ms_pose_key_3 != 0", text)
+        self.assertIn("$PoolZZMISlotOfKey_G3[$zz_ms_pose_key_3] = 1", text)
+        self.assertIn("$PoolZZMIG_Taken_G3[1] = 1", text)
+        # 指纹与出现次不一致时，把刚捕获的 palette / SO 引用搬到正确槽
+        self.assertIn(
+            "ResourceZZPalette_b20f90ea_s1 = copy ResourceZZPalette_b20f90ea_s2", text
+        )
+        self.assertIn("ResourceZZRedirectSO_G3_s1 = ref so0", text)
+
+    def test_pose_alignment_skipped_without_shared_bone_is_diagnosed(self):
+        """**契约变更 C-2 / D3**（captain 裁定 `reports/zzmi-fix/02-captain-decisions.md` §2/§3）。
+
+        旧契约（本测试原名 `test_pose_alignment_skipped_without_shared_bone`）：
+        组内没有共享骨骼（vg_map 值无交集）时**静默**不发指纹块——「静默」本身被
+        固化成契约。
+        新契约：同一行为（不发指纹块）**必须留下导出期显式诊断**，两条不可达路径
+        都不得静默：无共享锚点 → `reason=no_shared_canonical_bone`；
+        有锚点但没有重定向计划 → `reason=no_redirect_plan`（用例见
+        `ZZMIMergedOrderingContractTests::test_pose_alignment_unavailable_is_declared_not_silent`）。
+        断言方向不变（仍**不得**出现 SpatialHash / pose_key），只是把「静默」正名为
+        「已诊断」——不是放宽，是补上缺失的可观测性。
+        """
+        exporter, models = self._group3_exporter()
+        self._build_and_apply_plan(exporter)
+        carrier = next(m for m in models if m.draw_ib == "b20f90ea")
+        builder = _FakeIniBuilder()
+        captured = self._capture_stdout(
+            lambda: exporter.add_unity_vs_texture_override_vb_sections(builder, carrier)
+        )
+        text = "\n".join(builder.sections[0].SectionLineList)
+        # 旧口径保持不变：无共享骨骼 ⇒ 不发姿态指纹块
+        self.assertNotIn("SpatialHash", text)
+        self.assertNotIn("$zz_ms_pose_key_", text)
+        # 新增（C-2）：静默 → 显式诊断
+        self.assertIn("; ZZMI-MERGE-DIAG POSE_ALIGNMENT_UNAVAILABLE", text)
+        self.assertIn("reason=no_shared_canonical_bone", text)
+        self.assertIn("POSE_ALIGNMENT_UNAVAILABLE", captured)
+        codes = [record["code"] for record in exporter._merged_diag_sink()]
+        self.assertIn("POSE_ALIGNMENT_UNAVAILABLE", codes)
+
+    def test_skin_publish_emitted_for_every_required_component(self):
+        """每个必需部件（含不能重放 draw 的窄布局部件）都能发布合并几何。
+
+        回归（2026-09-17「一直闪」）：draw 版重放只能在布局兼容锚点落笔；若
+        required 里的窄布局部件最后到达，则没有锚点能落笔 → 该槽 SO 整帧不写。
+        蒙皮 CS 发布块必须对**所有**部件发（姿态/绑定见上面 test_*_shader_matches）。
+        """
+        exporter, models = self._group3_exporter()
+        self._build_and_apply_plan(exporter)
+
+        for model in models:
+            builder = _FakeIniBuilder()
+            exporter.add_unity_vs_texture_override_vb_sections(builder, model)
+            text = "\n".join(builder.sections[0].SectionLineList)
+            with self.subTest(draw_ib=model.draw_ib):
+                self.assertIn("run = CustomShaderZZMISkin_G3_s1", text)
+                self.assertIn("run = CustomShaderZZMISkin_G3_s2", text)
+                self.assertIn("    so0 = null", text)
+                # 发布块必须排在 draw 版重放之后：CS 按索引写，晚写才作数
+                if "draw = 18776, 0" in text:
+                    self.assertLess(
+                        text.rindex("draw = 18776, 0"),
+                        text.index("run = CustomShaderZZMISkin_G3_s1"),
+                    )
+                # 发布块用与 draw 重放同一套守卫条件（别名就绪门 + 期望集合门）
+                self.assertIn(
+                    "if ($zz_ms_seen_11 >= 1) && ($zz_ms_prev_01 == 0 || $zz_ms_seen_01 >= 1)",
+                    text,
+                )
+
+        _vb, _ib, skeleton_text = self._all_sections_text(exporter, models)
+        self.assertIn("[CustomShaderZZMISkin_G3_s1]", skeleton_text)
+        self.assertIn("[CustomShaderZZMISkin_G3_s2]", skeleton_text)
+        self.assertIn("cs = ./res/zzmi_merged_skin.hlsl", skeleton_text)
+        self.assertIn("x1 = 18776", skeleton_text)
+        self.assertIn("y1 = 3", skeleton_text)
+        self.assertIn("z1 = 3", skeleton_text)
+        self.assertIn("w1 = 10", skeleton_text)
+        self.assertIn("cs-t0 = ref Resourceb20f90eaPosition", skeleton_text)
+        self.assertIn("cs-t1 = ref Resourceb20f90eaBlend", skeleton_text)
+        self.assertIn("cs-t2 = ref ResourceZZMergedSkeleton_G3_s1", skeleton_text)
+        self.assertIn("cs-u0 = ref ResourceZZRedirectSO_G3_s1", skeleton_text)
+        self.assertIn("Dispatch = 294, 1, 1", skeleton_text)
 
     def test_latch_helpers_and_variables_removed_from_generator(self):
         """生成器层面：帧闩锁/相位辅助接口与变量已彻底移除（防止回归）。"""
@@ -2965,6 +3328,1971 @@ class ZZMIMultiInstanceLatchRemovalTests(_ZZMIGroup3RedirectFixture, unittest.Te
         self.assertNotIn("$zz_ms_redirect_drawn", combined)
         self.assertNotIn("$zz_ms_group_ready", combined)
         self.assertNotIn("$zz_ms_group_phase", combined)
+
+
+class ZZMISkinPublishBlendLayoutGuardTests(_ZZMIGroup3RedirectFixture, unittest.TestCase):
+    """B2 守卫：锚点 Blend 行布局 ≠ CS 写死的 32 字节时**不得发蒙皮 CS**。
+
+    真实 dump 实证（`K:\\SSMT-Package-master\\3Dmigoto\\ZZZ\\FrameAnalysis-2026-09-17-184431`
+    与 `...-185933` 的 `deduped/`）：同一个输入布局里 slot 0（Position）= 40 字节，
+    而 slot 2（Blend）有三种形态 ——
+      · layout=d8224520 / 73022f2f → BLENDWEIGHTS R32G32_FLOAT(8B) +
+        BLENDINDICES R32G32_UINT(8B) = **16 字节**（每个 dump 各 2 个文件）；
+      · layout=e4dfea81 → 只有 BLENDINDICES R32_UINT = **4 字节**（各 1 个）；
+      · layout=e805604d 等 5 种 → R32G32B32A32 ×2 = **32 字节**（各 13 个）。
+    `Toolset/zzmi_merged_skin.hlsl` 把 `cs-t1` 声明成 `StructuredBuffer<ZZBlend32>`
+    （结构体 32 字节，SRV 步长由结构体决定、与底层 stride 无关）⇒ 16 字节锚点会被
+    跨行错读权重/索引且**不报错**。守卫 = 只在锚点行布局 32 字节时发 CS。
+    """
+
+    def _narrow_blend_exporter(self):
+        """组 3 全部部件的 Blend 布局改成 16 字节 ⇒ 锚点只可能是 16 字节。"""
+        exporter, models = self._group3_exporter()
+        for model in models:
+            model.d3d11GameType.CategoryStrideDict["Blend"] = 16
+        self._build_and_apply_plan(exporter)
+        return exporter, models
+
+    def _all_sections_text(self, exporter, models):
+        """跑齐三类产段（与 ZZMIMultiInstanceLatchRemovalTests 同口径）。"""
+        for carrier_ib, carrier_info in (exporter._redirect_carrier_map or {}).items():
+            carrier_model = next(
+                (m for m in models if m.draw_ib == carrier_ib), None
+            )
+            if carrier_model is None:
+                continue
+            stride = int(
+                (
+                    getattr(carrier_model.d3d11GameType, "CategoryStrideDict", {})
+                    or {}
+                ).get("Texcoord", 0)
+                or 0
+            )
+            if stride > 0 and not (carrier_model.category_buffer_dict or {}).get(
+                "Texcoord"
+            ):
+                carrier_model.category_buffer_dict["Texcoord"] = bytes(
+                    int(carrier_info.get("vertex_count", 0) or 0) * stride
+                )
+
+        vb_builder = _FakeIniBuilder()
+        for model in models:
+            exporter.add_unity_vs_texture_override_vb_sections(vb_builder, model)
+        vb_text = "\n".join(_all_builder_lines(vb_builder))
+
+        ib_builder = _FakeIniBuilder()
+        for model in models:
+            exporter.add_unity_vs_texture_override_ib_sections(ib_builder, model)
+        ib_text = "\n".join(_all_builder_lines(ib_builder))
+
+        skeleton_builder = _FakeIniBuilder()
+        exporter.add_merged_skeleton_sections(skeleton_builder)
+        skeleton_text = "\n".join(_all_builder_lines(skeleton_builder))
+        return vb_text, ib_text, skeleton_text
+
+    def _generate(self, exporter, models):
+        """跑齐三类产段，返回 (vb_text, ib_text, skeleton_text, stdout)。"""
+        box = {}
+        captured = self._capture_stdout(
+            lambda: box.update(
+                zip(
+                    ("vb", "ib", "skeleton"),
+                    self._all_sections_text(exporter, models),
+                )
+            )
+        )
+        return box["vb"], box["ib"], box["skeleton"], captured
+
+    def test_narrow_fixture_really_lands_on_the_narrow_anchor(self):
+        """先证明夹具真的把锚点推成 16 字节（否则下面的守卫用例毫无意义）。"""
+        exporter, _models = self._narrow_blend_exporter()
+        plan = exporter._merged_group_redirect_plan(3)
+        self.assertIsNotNone(plan, "16 字节布局的组 3 仍应产出重定向计划")
+        self.assertEqual(
+            exporter._blend_layout_width(plan["anchor_layout_key"]), 16
+        )
+        self.assertFalse(exporter._merged_skin_publish_supported(plan))
+        # 对照：32 字节夹具的锚点就是 CS 假设的布局
+        wide_exporter, _wide_models = self._group3_exporter()
+        self._build_and_apply_plan(wide_exporter)
+        wide_plan = wide_exporter._merged_group_redirect_plan(3)
+        self.assertEqual(
+            wide_exporter._blend_layout_width(wide_plan["anchor_layout_key"]), 32
+        )
+        self.assertTrue(wide_exporter._merged_skin_publish_supported(wide_plan))
+
+    def test_narrow_anchor_emits_no_cs_falls_back_to_draw_and_diagnoses(self):
+        exporter, models = self._narrow_blend_exporter()
+        vb_text, ib_text, skeleton_text, captured = self._generate(exporter, models)
+        combined = "\n".join((vb_text, ib_text, skeleton_text))
+
+        # ① 不发 CS：既无 CS 段定义，也无任何 run 引用、无蒙皮 CS 专有的绑定参数
+        #（`cs-t2` = 合并骨架、`w1` = 每行 float 数只有蒙皮 CS 用；骨架 attach CS
+        # 用的是 cs-t0=palette / cs-t1=vgmap，两者不受本守卫影响，不可拿来断言）
+        self.assertNotIn("cs = ./res/zzmi_merged_skin.hlsl", combined)
+        self.assertNotIn("CustomShaderZZMISkin_G3_s1", combined)
+        self.assertNotIn("CustomShaderZZMISkin_G3_s2", combined)
+        self.assertNotIn("cs-t2 = ref ", combined)
+        self.assertNotIn("w1 = ", combined)
+        self.assertNotIn("Dispatch = 294, 1, 1", combined)
+
+        # ② 发出可读诊断（ini 注释行 + stdout + 诊断 sink 三处落点）
+        self.assertIn("; ZZMI-MERGE-DIAG SKIN_LAYOUT_UNSUPPORTED", combined)
+        self.assertIn("anchor_blend_bytes=16", combined)
+        self.assertIn("required_blend_bytes=32", combined)
+        self.assertIn("SKIN_LAYOUT_UNSUPPORTED", captured)
+        codes = [record["code"] for record in exporter._merged_diag_sink()]
+        self.assertIn("SKIN_LAYOUT_UNSUPPORTED", codes)
+
+        # ③ 走回退：既有 draw 版重放（目标挂点守卫内绑定 carrier 的 vb0/vb2 后 draw）
+        self.assertIn("    vb2 = Resourceb20f90eaBlend", vb_text)
+        self.assertIn("    vb0 = Resourceb20f90eaPosition", vb_text)
+        self.assertIn("    draw = 18776, 0", vb_text)
+        self.assertIn("    so0 = ref ResourceZZRedirectSO_G3_s1", vb_text)
+
+    def test_wide_anchor_keeps_the_unchanged_cs_path_and_no_layout_diag(self):
+        """32 字节锚点：CS 段照旧（逐处断言既有参数），且不得出现本守卫的诊断。"""
+        exporter, models = self._group3_exporter()
+        self._build_and_apply_plan(exporter)
+        vb_text, ib_text, skeleton_text, captured = self._generate(exporter, models)
+        combined = "\n".join((vb_text, ib_text, skeleton_text))
+
+        self.assertIn("[CustomShaderZZMISkin_G3_s1]", skeleton_text)
+        self.assertIn("[CustomShaderZZMISkin_G3_s2]", skeleton_text)
+        self.assertIn("cs = ./res/zzmi_merged_skin.hlsl", skeleton_text)
+        self.assertIn("cs-t1 = ref Resourceb20f90eaBlend", skeleton_text)
+        self.assertIn("cs-t0 = ref Resourceb20f90eaPosition", skeleton_text)
+        self.assertIn("cs-t2 = ref ResourceZZMergedSkeleton_G3_s1", skeleton_text)
+        self.assertIn("cs-u0 = ref ResourceZZRedirectSO_G3_s1", skeleton_text)
+        self.assertIn("x1 = 18776", skeleton_text)
+        self.assertIn("y1 = 3", skeleton_text)
+        self.assertIn("z1 = 3", skeleton_text)
+        self.assertIn("w1 = 10", skeleton_text)
+        self.assertIn("Dispatch = 294, 1, 1", skeleton_text)
+        self.assertIn("run = CustomShaderZZMISkin_G3_s1", vb_text)
+        self.assertIn("run = CustomShaderZZMISkin_G3_s2", vb_text)
+        # 守卫本身不得误报：32 字节布局既无诊断行也无 stdout 提示
+        self.assertNotIn("SKIN_LAYOUT_UNSUPPORTED", combined)
+        self.assertNotIn("SKIN_LAYOUT_UNSUPPORTED", captured)
+        self.assertNotIn(
+            "SKIN_LAYOUT_UNSUPPORTED",
+            [record["code"] for record in exporter._merged_diag_sink()],
+        )
+
+
+class ZZMIJoinedObjectIdentityTests(unittest.TestCase):
+    """Joined Blender object identity must survive the ZZMI export front-end.
+
+    A joined object keeps the target IB's workspace identity in
+    ``3DMigoto:WorkspaceUniqueStr`` while its visible Blender name contains the
+    new merged vertex count.  The exporter must use the joined object as the
+    source and must not replace it with a three-vertex missing-part stub.
+    """
+
+    def setUp(self):
+        _fake_bpy_data.objects._items.clear()
+        self.old_workspace_folder = _fake_global_config.path_workspace_folder
+
+    def tearDown(self):
+        _fake_bpy_data.objects._items.clear()
+        _fake_global_config.path_workspace_folder = self.old_workspace_folder
+
+    def _merged_object(self):
+        merged = _fake_bpy_data.objects.new("LOD0.8c8de427-24180-0")
+        merged.props["3DMigoto:WorkspaceUniqueStr"] = "LOD0.8c8de427-798-0"
+        merged.props["ZZMI_MergeSources"] = json.dumps(
+            [
+                {
+                    "name": "LOD0.01ef4403-2286-9846.ZZMI_SOURCE",
+                    "workspace_unique_str": "LOD0.01ef4403-2286-9846",
+                },
+                {
+                    "name": "LOD0.8c8de427-798-0.ZZMI_SOURCE",
+                    "workspace_unique_str": "LOD0.8c8de427-798-0",
+                },
+            ]
+        )
+        _fake_bpy_data.objects.new("LOD0.01ef4403-2286-9846.ZZMI_SOURCE")
+        _fake_bpy_data.objects.new("LOD0.8c8de427-798-0.ZZMI_SOURCE")
+        return merged
+
+    def test_joined_target_rebinds_to_workspace_prefix_and_deduplicates_sources(self):
+        merged = self._merged_object()
+        target = _zzmi_module.DrawCallModel(
+            obj_name="LOD0.8c8de427-24180-0",
+            source_obj_name=merged.name,
+        )
+        source = _zzmi_module.DrawCallModel(
+            obj_name="LOD0.01ef4403-2286-9846",
+            source_obj_name="LOD0.01ef4403-2286-9846.ZZMI_SOURCE",
+        )
+        blueprint = types.SimpleNamespace(
+            ordered_draw_obj_data_model_list=[source, target]
+        )
+        exporter = object.__new__(_zzmi_module.ExportZZMI)
+
+        exporter._normalize_merged_object_drawcalls(blueprint)
+
+        self.assertEqual(blueprint.ordered_draw_obj_data_model_list, [target])
+        self.assertEqual(target.obj_name, "LOD0.8c8de427-798-0")
+        self.assertEqual(target.source_obj_name, merged.name)
+        self.assertEqual(target.get_workspace_unique_str(), "LOD0.8c8de427-798-0")
+        self.assertEqual(target.match_draw_ib, "8c8de427")
+        self.assertEqual(target.match_index_count, "798")
+
+    def test_active_joined_target_marks_all_source_components_present(self):
+        merged = self._merged_object()
+        target = _zzmi_module.DrawCallModel(
+            obj_name="LOD0.8c8de427-24180-0",
+            source_obj_name=merged.name,
+        )
+        blueprint = types.SimpleNamespace(
+            ordered_draw_obj_data_model_list=[target]
+        )
+        exporter = object.__new__(_zzmi_module.ExportZZMI)
+
+        exporter._normalize_merged_object_drawcalls(blueprint)
+
+        with tempfile.TemporaryDirectory() as workspace:
+            lod0 = Path(workspace) / "LOD0"
+            lod0.mkdir()
+            (lod0 / "DrawIB-Component.json").write_text(
+                json.dumps(
+                    {
+                        "8c8de427": {"0": "8c8de427-798-0"},
+                        "01ef4403": {"0": "01ef4403-2286-9846"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            _fake_global_config.path_workspace_folder = lambda: str(workspace)
+
+            created = exporter._ensure_stub_objects_for_missing_parts(blueprint)
+
+        self.assertEqual(created, [])
+        self.assertFalse(
+            any(
+                bool(obj.get("ZZMI_STUB"))
+                for obj in _fake_bpy_data.objects
+            )
+        )
+
+
+class ZZMIMergedOrderingContractTests(_ZZMIGroup3RedirectFixture, unittest.TestCase):
+    """主症①（顺序/延迟错位）与主症②（多实例混用）的**可证伪验收断言**。
+
+    对应契约 `reports/zzmi-fix/01-fix-contract.md` 的 AC-A1 / AC-A2 / AC-A3 /
+    AC-B2 / AC-B5，以及防回归的 AC-A4 / AC-A5。
+
+    断言都针对**生成的 ini 原文**，且不是字符串同义反复：
+    · `_parse_guards` 把生成器真正写出的守卫条件解析成 (槽, 部件) 上的原子，
+      无法解析的原子直接判失败（守卫形态一变就炸）；
+    · 单调性与「帧内最后一次闭合的时机」用解析出来的谓词**推演**（不是另写一份
+      逻辑），因此把消费点改回 `== 1` 会让 n ≥ 3 场景的推演断言失败。
+    """
+
+    SLOTS = (1, 2)
+    CAPTURE_CLAUSE = "copy vs-t0 unless_null"
+
+    def _sections_text(self, exporter, models):
+        """生成 VB 段与骨架段原文（与 `ZZMIMultiInstanceLatchRemovalTests` 同口径）。
+
+        carrier 的 Redirect Texcoord 需要按 stride 补真实缓冲，否则生成器按
+        `_write_redirect_texcoord_resources` 的契约直接抛错（不得静默降级）。
+        """
+        for carrier_ib, carrier_info in (exporter._redirect_carrier_map or {}).items():
+            carrier_model = next((m for m in models if m.draw_ib == carrier_ib), None)
+            if carrier_model is None:
+                continue
+            stride = int(
+                (getattr(carrier_model.d3d11GameType, "CategoryStrideDict", {}) or {}).get(
+                    "Texcoord", 0
+                )
+                or 0
+            )
+            if stride > 0 and not (carrier_model.category_buffer_dict or {}).get(
+                "Texcoord"
+            ):
+                carrier_model.category_buffer_dict["Texcoord"] = bytes(
+                    int(carrier_info.get("vertex_count", 0) or 0) * stride
+                )
+        vb_builder = _FakeIniBuilder()
+        for model in models:
+            exporter.add_unity_vs_texture_override_vb_sections(vb_builder, model)
+        vb_text = "\n".join(_all_builder_lines(vb_builder))
+        skeleton_builder = _FakeIniBuilder()
+        exporter.add_merged_skeleton_sections(skeleton_builder)
+        skeleton_text = "\n".join(_all_builder_lines(skeleton_builder))
+        return vb_text, skeleton_text
+
+    # ------------------------------------------------------------------ 解析
+    def _parse_guards(self, text, component_ids):
+        """把 ini 里每条守卫 `if (...) && (...)` 解析成原子列表。
+
+        原子 = (kind, operator, component_id, slot)，kind ∈ {"gate", "cull"}：
+        · "gate"：`($zz_ms_seen_<c><k> <op> 1)`——SO 别名当帧已由捕获者刷新；
+        · "cull"：`($zz_ms_prev_<c><k> == 0 || $zz_ms_seen_<c><k> <op> 1)`——期望集合门。
+
+        解析器**故意同时接受** `>=` 与 `==` 两种算子：这样把消费点改回 `== 1`
+        时，失败发生在「推演出的真值不单调」这条**语义**断言上，而不是只在
+        「字符串形状变了」上——测试才真正测语义，不是同义反复。
+        任何别的形状（多槽混写、未知算子/变量）都直接判失败。
+        """
+        operators = (">=", "==")
+        gate_body = {
+            (c, s, op): f"$zz_ms_seen_{c}{s} {op} 1"
+            for c in component_ids
+            for s in self.SLOTS
+            for op in operators
+        }
+        cull_body = {
+            (c, s, op): f"($zz_ms_prev_{c}{s} == 0 || $zz_ms_seen_{c}{s} {op} 1)"
+            for c in component_ids
+            for s in self.SLOTS
+            for op in operators
+        }
+        guards = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not (stripped.startswith("if (") and "$zz_ms_seen_" in stripped):
+                continue
+            parts = stripped[len("if ") :].split(" && ")
+            atoms = []
+            for part in parts:
+                part = part.strip()
+                if part.startswith("(") and part.endswith(")") and " || " not in part:
+                    part = part[1:-1]
+                matched_gate = [
+                    key for key, body in gate_body.items() if body == part
+                ]
+                matched_cull = [
+                    key for key, body in cull_body.items() if body == part
+                ]
+                self.assertEqual(
+                    len(matched_gate) + len(matched_cull),
+                    1,
+                    f"守卫原子既不是 SO-ready 门也不是期望集合门: {part!r}",
+                )
+                if matched_gate:
+                    component_id, slot, operator = matched_gate[0]
+                    atoms.append(("gate", operator, component_id, slot))
+                else:
+                    component_id, slot, operator = matched_cull[0]
+                    atoms.append(("cull", operator, component_id, slot))
+            self.assertTrue(atoms, f"空守卫: {stripped!r}")
+            slots = {atom[3] for atom in atoms}
+            self.assertEqual(len(slots), 1, f"一条守卫混了多个槽: {stripped!r}")
+            guards.append({"slot": slots.pop(), "atoms": atoms, "text": stripped})
+        self.assertTrue(guards, "生成结果里没有任何 seen 守卫")
+        return guards
+
+    @staticmethod
+    def _guard_truth(guard, seen, prev):
+        for kind, operator, component_id, slot in guard["atoms"]:
+            seen_value = seen[(component_id, slot)]
+            arrived = seen_value >= 1 if operator == ">=" else seen_value == 1
+            if kind == "gate":
+                if not arrived:
+                    return False
+            else:
+                if not (prev[(component_id, slot)] == 0 or arrived):
+                    return False
+        return True
+
+    def _simulate(self, guards, component_ids, draws, prev):
+        """按状态机逐笔推演守卫真值。
+
+        draws = 部件号序列（每笔 = 该部件的一次 deform draw）。状态机形状与
+        `_append_merged_skeleton_deform_block_body` 步骤 1/2 逐字一致：
+        `occ += 1` → `if occ >= 3: occ = SLOTS[0]` → 每槽 `seen += (occ == slot)`。
+        """
+        occ = {c: 0 for c in component_ids}
+        seen = {(c, s): 0 for c in component_ids for s in self.SLOTS}
+        captures = {(c, s): [] for c in component_ids for s in self.SLOTS}
+        truth = []
+        for draw_index, component_id in enumerate(draws):
+            occ[component_id] += 1
+            if occ[component_id] >= 3:
+                occ[component_id] = 1
+            for slot in self.SLOTS:
+                if occ[component_id] == slot:
+                    seen[(component_id, slot)] += 1
+                    captures[(component_id, slot)].append(draw_index)
+            truth.append([self._guard_truth(g, seen, prev) for g in guards])
+        return truth, captures, seen
+
+    @staticmethod
+    def _order(component_ids, instances, reverse_every_other=False):
+        """实例内提交顺序：偶数实例升序、奇数实例降序（模拟"逐部件先后翻转"）。"""
+        draws = []
+        for instance in range(instances):
+            order = list(component_ids)
+            if reverse_every_other and instance % 2 == 1:
+                order = list(reversed(order))
+            draws.extend(order)
+        return draws
+
+    # ------------------------------------------------------- AC-A2 / AC-A1
+    def test_consumer_predicate_is_frame_monotone(self):
+        """AC-A2：消费点谓词必须是「本帧出现过」语义（`>= 1`），且状态机不变。"""
+        exporter, models = self._group3_exporter()
+        self._build_and_apply_plan(exporter)
+        vb_text, skeleton_text = self._sections_text(exporter, models)
+        component_ids = list(range(len(exporter.merged_skeleton_components)))
+
+        guards = self._parse_guards(vb_text, component_ids)
+        self.assertGreaterEqual(len(guards), 2)
+        # 每条守卫都必须能被解析成两种已知原子形态之一（解析器已在内部断言）。
+        for guard in guards:
+            self.assertTrue(
+                any(atom[0] == "gate" for atom in guard["atoms"]),
+                f"每条守卫都应有 SO-ready 门: {guard['text']}",
+            )
+        # 反向断言：`== 1` 形式在生成器里**彻底消失**（只在 occ 捕获条件里保留 ==）
+        combined = "\n".join((vb_text, skeleton_text))
+        self.assertNotRegex(combined, r"\$zz_ms_seen_\d+=? ?== 1")
+        # SO-ready 门的槽与 guard["slot"] 一致（解析器已断言单槽）。
+        for guard in guards:
+            for kind, operator, _c, slot in guard["atoms"]:
+                if kind == "gate":
+                    self.assertEqual(slot, guard["slot"])
+                # 契约要求：所有消费点都用单调谓词 `>=`
+                self.assertEqual(operator, ">=")
+        # 状态机原样保留（禁止项）：occ 自增 + 回绕 + 每槽顶层 sticky 累加
+        for component_id in component_ids:
+            self.assertIn(f"$zz_ms_occ_{component_id} = $zz_ms_occ_{component_id} + 1", vb_text)
+            self.assertIn(f"if $zz_ms_occ_{component_id} >= 3", vb_text)
+            self.assertIn(f"    $zz_ms_occ_{component_id} = 1", vb_text)
+            for slot in self.SLOTS:
+                self.assertIn(
+                    f"$zz_ms_seen_{component_id}{slot} = $zz_ms_seen_{component_id}{slot}"
+                    f" + ($zz_ms_occ_{component_id} == {slot})",
+                    vb_text,
+                )
+
+    def test_guard_truth_is_monotone_and_last_closure_follows_captures(self):
+        """AC-A1 + AC-A2：守卫真值帧内单调；帧内**最后一次闭合**必在全部必需部件
+        完成该槽捕获之后（⇒ 提前闭合对最终帧内容无害）。
+
+        推演输入取自**生成器真正写出的守卫**（`_parse_guards`），状态机逐字复刻
+        生成器步骤 1/2；场景覆盖 n=1/2/3/6 与「逐部件提交顺序翻转」的混合顺序。
+        """
+        exporter, models = self._group3_exporter()
+        self._build_and_apply_plan(exporter)
+        vb_text, _sk = self._sections_text(exporter, models)
+        component_ids = list(range(len(exporter.merged_skeleton_components)))
+        guards = self._parse_guards(vb_text, component_ids)
+
+        # prev 场景：(a) 上一帧单实例（增长帧）、(b) 上一帧同实例数（稳态）、
+        # (c) 上一帧全缺席/首帧（初值 1 的极端）——按槽预测由 [Present] 抄录决定。
+        prev_scenarios = {
+            "first_frame_all_expected": {
+                (c, s): 1 for c in component_ids for s in self.SLOTS
+            },
+            "prev_single_instance": {
+                (c, s): (1 if s == 1 else 0)
+                for c in component_ids
+                for s in self.SLOTS
+            },
+            "prev_two_instances": {
+                (c, s): 1 for c in component_ids for s in self.SLOTS
+            },
+            "prev_all_absent": {
+                (c, s): 0 for c in component_ids for s in self.SLOTS
+            },
+        }
+        scenarios = []
+        for instances in (1, 2, 3, 6):
+            for mixed in (False, True):
+                scenarios.append((instances, mixed))
+        checked = 0
+        for name, prev in prev_scenarios.items():
+            for instances, mixed in scenarios:
+                draws = self._order(component_ids, instances, reverse_every_other=mixed)
+                truth, captures, _seen = self._simulate(
+                    guards, component_ids, draws, prev
+                )
+                label = f"{name}/n={instances}/mixed={mixed}"
+                for guard_index, guard in enumerate(guards):
+                    series = [frame[guard_index] for frame in truth]
+                    # (i) 帧内单调：真值只可能由假转真
+                    self.assertEqual(
+                        series,
+                        sorted(series),
+                        f"守卫真值帧内转假（谓词非单调）: {label} slot={guard['slot']} "
+                        f"{guard['text']} → {series}",
+                    )
+                    if not any(series):
+                        continue
+                    last_true = max(i for i, value in enumerate(series) if value)
+                    required = {
+                        atom[2] for atom in guard["atoms"] if atom[3] == guard["slot"]
+                    }
+                    # (ii) 最后一次闭合时，该槽的所有必需部件都已当帧捕获过
+                    for component_id in required:
+                        capture_draws = captures[(component_id, guard["slot"])]
+                        if not capture_draws:
+                            continue
+                        self.assertGreaterEqual(
+                            last_true,
+                            max(capture_draws),
+                            f"帧内最后一次闭合早于必需部件的槽捕获: {label} "
+                            f"slot={guard['slot']} component={component_id} "
+                            f"last_true={last_true} captures={capture_draws}",
+                        )
+                    checked += 1
+        self.assertGreater(checked, 0, "至少应有一个守卫在某个场景里闭合")
+
+    def test_required_component_arriving_after_first_closure_is_covered(self):
+        """AC-A1 的原始场景（契约 §3.1 ①a / S2）必须被上面的口径覆盖：
+
+        上一帧单实例、本帧 2 实例的过渡帧里，**首次**闭合确实可能早于某些必需
+        部件的槽 2 捕获（这是 `prev` 预测的固有分辨率）；该判据只要求
+        「帧内最后一次闭合」晚于全部捕获，据此提前闭合对最终帧内容无害。
+        """
+        exporter, models = self._group3_exporter()
+        self._build_and_apply_plan(exporter)
+        vb_text, _sk = self._sections_text(exporter, models)
+        component_ids = list(range(len(exporter.merged_skeleton_components)))
+        guards = self._parse_guards(vb_text, component_ids)
+        prev = {(c, s): (1 if s == 1 else 0) for c in component_ids for s in self.SLOTS}
+        draws = self._order(component_ids, 2)
+        truth, captures, _seen = self._simulate(guards, component_ids, draws, prev)
+        slot2 = [g for g in guards if g["slot"] == 2]
+        self.assertTrue(slot2)
+        guard_index = guards.index(slot2[0])
+        series = [frame[guard_index] for frame in truth]
+        self.assertIn(True, series, "槽 2 守卫在 2 实例帧里必须闭合")
+        first_true = series.index(True)
+        last_true = max(i for i, value in enumerate(series) if value)
+        required = {atom[2] for atom in slot2[0]["atoms"] if atom[3] == 2}
+        # 该场景确实存在"首次闭合时还有必需部件没捕获"的情形（契约所述的机制），
+        # 但最后一次闭合必须已经覆盖全部捕获 —— 这就是「提前闭合无害」的可复现推演。
+        later_captures = [
+            max(captures[(c, 2)]) for c in required if captures[(c, 2)]
+        ]
+        self.assertLessEqual(first_true, max(later_captures))
+        self.assertGreaterEqual(last_true, max(later_captures))
+        self.assertEqual(last_true, len(draws) - 1)
+
+    # ------------------------------------------------------------- AC-A3
+    def test_slot_bound_is_declared_and_runtime_overflow_is_detectable(self):
+        """AC-A3：超出 `SLOTS` 上界不得静默——静态声明 + 运行时探针 + 语义一致。
+
+        探针值与状态机推演必须一致：`x3` 读的 `$zz_ms_seen_<i>1` 恰在
+        「同帧同部件出现次数 = 3」时等于 2，因此帧分析日志里读到 2 就是超界的
+        显式失败标记（不是另写一套判据）。
+        """
+        exporter, models = self._group3_exporter()
+        self._build_and_apply_plan(exporter)
+        captured = self._capture_stdout(
+            lambda: self._sections_text(exporter, models)
+        )
+        _vb_text, skeleton_text = self._sections_text(exporter, models)
+
+        self.assertIn("; ZZMI-MERGE-DIAG SLOT_BOUND", skeleton_text)
+        # D1 强制字段：组号 / 部件数 / 设计上界（逐组声明，不是全局一句）
+        self.assertIn("group=G3", skeleton_text)
+        self.assertIn("components=3", skeleton_text)
+        self.assertIn("slots=1,2", skeleton_text)
+        self.assertIn("occ_wrap=3", skeleton_text)
+        self.assertIn("max_same_frame_occurrences=2", skeleton_text)
+        self.assertIn("overflow=occurrence>2_wraps_to_slot_1", skeleton_text)
+        self.assertIn("SLOT_BOUND", captured)
+        # 运行时探针：槽 1 的 attach 段把 seen 透到 IniParams
+        self.assertIn("x3 = $zz_ms_seen_01", skeleton_text)
+        # 诊断同时进机器可读记录表
+        codes = [record["code"] for record in exporter._merged_diag_sink()]
+        self.assertIn("SLOT_BOUND", codes)
+
+        # 探针值 ↔ 超界语义一致（用状态机推演，不另写判据）
+        prev = {(c, s): 0 for c in (0, 1, 2) for s in self.SLOTS}
+        guards = [
+            {"slot": 1, "atoms": [("gate", ">=", 0, 1), ("cull", ">=", 0, 1)]}
+        ]
+        for instances, expected_probe in ((1, 1), (2, 1), (3, 2), (4, 2)):
+            draws = self._order([0], instances)
+            _truth, _captures, seen = self._simulate(guards, [0], draws, prev)
+            self.assertEqual(
+                seen[(0, 1)],
+                expected_probe,
+                f"n={instances} 时探针值应为 {expected_probe}（= 超界标记）",
+            )
+
+    # -------------------------------------------------------- AC-B2 / AC-B5
+    def test_pose_alignment_unavailable_is_declared_not_silent(self):
+        """AC-B2(b) / AC-B5：姿态对齐不可达的三个分支都必须有**可断言**的输出。
+
+        分支①（有计划的组没有共享锚点 = 契约 §2.5 的 G0 情形）→ 诊断行；
+        分支②（有锚点的组没有重定向计划 = G2 情形）→ 诊断行；
+        分支③（可达）→ 诊断行**必须消失**且对齐块真的发射（证明诊断是条件性的，
+        不是无条件噪声）。
+        """
+        exporter, models = self._group3_exporter()
+        self._build_and_apply_plan(exporter)
+        carrier = next(m for m in models if m.draw_ib == "b20f90ea")
+
+        def _carrier_text(current_exporter):
+            builder = _FakeIniBuilder()
+            current_exporter.add_unity_vs_texture_override_vb_sections(builder, carrier)
+            return "\n".join(builder.sections[0].SectionLineList)
+
+        # 分支①：夹具默认组内无共享骨骼 ⇒ 计划在但没有锚点
+        stdout = self._capture_stdout(lambda: _carrier_text(exporter))
+        text = _carrier_text(exporter)
+        self.assertIn("; ZZMI-MERGE-DIAG POSE_ALIGNMENT_UNAVAILABLE", text)
+        self.assertIn("reason=no_shared_canonical_bone", text)
+        self.assertIn("POSE_ALIGNMENT_UNAVAILABLE", stdout)
+        self.assertNotIn("SpatialHash", text)
+
+        # 分支③：造出共享锚点（同现有 test_pose_key_alignment_* 的形态）⇒ 必须发射
+        for component in exporter.merged_skeleton_components:
+            vg_map = dict(component["vg_map"])
+            vg_map[min(vg_map)] = 0
+            component["vg_map"] = vg_map
+        exporter._redirect_target_map["a23aa8a3"]["pose_anchor_slot"] = 0
+        reachable_text = _carrier_text(exporter)
+        self.assertIn("ResourceZZPoseKeySrc = ref vs-t0", reachable_text)
+        self.assertIn("->SpatialHash(3, 7, 11, 0.01)", reachable_text)
+        self.assertNotIn("POSE_ALIGNMENT_UNAVAILABLE", reachable_text)
+
+        # 分支②：有锚点但本轮没有重定向计划（G2 情形）
+        exporter2, models2 = self._group3_exporter()
+        for component in exporter2.merged_skeleton_components:
+            vg_map = dict(component["vg_map"])
+            vg_map[min(vg_map)] = 0
+            component["vg_map"] = vg_map
+        exporter2._redirect_carrier_map = {}
+        exporter2._redirect_target_map = {}
+        carrier2 = next(m for m in models2 if m.draw_ib == "b20f90ea")
+        builder2 = _FakeIniBuilder()
+        exporter2.add_unity_vs_texture_override_vb_sections(builder2, carrier2)
+        text2 = "\n".join(builder2.sections[0].SectionLineList)
+        self.assertIn("; ZZMI-MERGE-DIAG POSE_ALIGNMENT_UNAVAILABLE", text2)
+        self.assertIn("reason=no_redirect_plan", text2)
+
+    def test_single_component_group_is_not_reported_as_alignment_gap(self):
+        """单部件组没有跨部件混用风险 ⇒ 不得被诊断成缺口（防噪声/防误报）。"""
+        components = [
+            {
+                "draw_ib": "b20f90ea",
+                "unique_str": "LOD0.b20f90ea-19182-0",
+                "vg_offset": 184,
+                "vg_count": 51,
+                "skeleton_group": 3,
+                "vg_map": {i: 184 + i for i in range(51)},
+                "deform_draw": 2,
+            }
+        ]
+        models = [
+            _FakeDrawIBModel(
+                "b20f90ea",
+                [
+                    self._attach_drawcalls(
+                        _FakeSubmesh(
+                            "LOD0.b20f90ea-19182-0", 184, 51, exported_vertex_count=18776
+                        ),
+                        index_count=69612,
+                    )
+                ],
+            )
+        ]
+        exporter = self._make_exporter(models, components)
+        self._build_and_apply_plan(exporter)
+        builder = _FakeIniBuilder()
+        exporter.add_unity_vs_texture_override_vb_sections(builder, models[0])
+        text = "\n".join(builder.sections[0].SectionLineList)
+        self.assertNotIn("POSE_ALIGNMENT_UNAVAILABLE", text)
+
+    # ------------------------------------------------- 防回归（AC-A4 / AC-A5）
+    def test_protected_state_machine_and_present_resets_are_intact(self):
+        """AC-A4 / AC-A5：写序不变量、`[Present]` 三处重置、`prev` 初值 1、
+        禁止项不得回潮（`seen_*` 与 occ 回绕也必须在）。"""
+        exporter, models = self._group3_exporter()
+        self._build_and_apply_plan(exporter)
+        vb_text, skeleton_text = self._sections_text(exporter, models)
+        component_ids = list(range(len(exporter.merged_skeleton_components)))
+
+        constants_text, present_text = skeleton_text.split("[Present]")[0], skeleton_text.split("[Present]")[1]
+
+        # 禁止项不得回潮
+        for forbidden in ("group_ready", "group_phase", "redirect_drawn", "$zz_ms_any_"):
+            self.assertNotIn(forbidden, "\n".join((vb_text, skeleton_text)))
+
+        # prev 初值仍为 1、seen/occ 声明仍在
+        for component_id in component_ids:
+            self.assertIn(f"global $zz_ms_occ_{component_id} = 0", constants_text)
+            for slot in self.SLOTS:
+                self.assertIn(
+                    f"global $zz_ms_seen_{component_id}{slot} = 0", constants_text
+                )
+                self.assertIn(
+                    f"global $zz_ms_prev_{component_id}{slot} = 1", constants_text
+                )
+
+        # [Present]：每个 (i,k) 的 prev = seen 必须早于同 (i,k) 的 seen = 0；
+        # occ = 0 齐全；且不得写任何资源复位
+        present_lines = [line.strip() for line in present_text.splitlines()]
+        for component_id in component_ids:
+            self.assertIn(f"$zz_ms_occ_{component_id} = 0", present_lines)
+            for slot in self.SLOTS:
+                prev_line = f"$zz_ms_prev_{component_id}{slot} = $zz_ms_seen_{component_id}{slot}"
+                seen_line = f"$zz_ms_seen_{component_id}{slot} = 0"
+                self.assertIn(prev_line, present_lines)
+                self.assertIn(seen_line, present_lines)
+                self.assertLess(
+                    present_lines.index(prev_line),
+                    present_lines.index(seen_line),
+                    "[Present] 写序必须 prev = seen 早于 seen = 0",
+                )
+        for resource_prefix in ("ResourceZZRedirectSO", "ResourceZZPalette", "ResourceZZMergedSkeleton"):
+            self.assertNotIn(resource_prefix, present_text)
+
+        # 守卫体内只有绑定与 draw（不得 run、不得给 $ 变量赋值；允许嵌套的
+        # `if $zz_ms_occ_<i> == <k>` 按出现次绑定块）
+        lines = vb_text.splitlines()
+        checked_guards = 0
+        for index, line in enumerate(lines):
+            if not line.strip().startswith("if ($zz_ms_seen_"):
+                continue
+            depth = 1
+            body = []
+            for follower in lines[index + 1 :]:
+                stripped_follower = follower.strip()
+                if stripped_follower.startswith("if "):
+                    depth += 1
+                elif stripped_follower == "endif":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                else:
+                    body.append((depth, stripped_follower))
+            self.assertTrue(body, f"空守卫体: {line!r}")
+            for body_depth, body_line in body:
+                self.assertFalse(body_line.startswith("$"), body_line)
+                # attach 的 run 必须全在段顶层（if 内的 run 在本 fork 上不执行）。
+                # 唯一的例外是**刻意**的蒙皮 CS 发布（`run = CustomShaderZZMISkin_*`
+                # 在守卫体内，官方库同用法，见 `_append_merged_skin_publish_block`）。
+                self.assertFalse(
+                    body_line.startswith("run = CustomShaderZZMIMergedSkeletonAttach_"),
+                    f"attach run 进了 if 体: {body_line!r}",
+                )
+                if body_line.startswith("if "):
+                    self.assertIn("$zz_ms_occ_", body_line)
+                    continue
+                if body_line.startswith("run = CustomShaderZZMISkin_"):
+                    continue
+                self.assertTrue(
+                    body_line.startswith(
+                        ("vs-t0 =", "so0 =", "vb0 =", "vb2 =", "draw =")
+                    ),
+                    f"守卫体内出现非法语句: {body_line!r}",
+                )
+            checked_guards += 1
+        self.assertGreater(checked_guards, 0)
+
+
+class ZZMIReuseDiagnosticsO3Tests(_ZZMIGroup3RedirectFixture, unittest.TestCase):
+    """O3（用户裁定 A：**诊断先行、零行为变更**）的可证伪断言。
+
+    背景（登记册 §59/§61/§64 + t8 块口径结论，代次 `184431` / `log.txt` sha256 `fd6efcc7…a18471`）：
+    该帧 `999bff94` 的**捕获 : 重放 = 1 : 1**（部件口径），组口径 **6 : 1 属设计行为**；
+    §52 的「1 次捕获 : 7 次重放」**不成立**（7 = IB 绑定/渲染绘制，是**消费端**）。
+    ⇒ O3 的交付物是**可数证据**：每个消费点旁落一行 `; ZZMI-MERGE-DIAG REUSE_SITE …` 注释
+    + 导出期一行 `REUSE_RATIO` 结构比汇总；**硬不变量 = 不碰任何 ini 语义**。
+
+    本类逐条断言（全部针对生成 ini **原文**，不读 `K:`）：
+    ① 注释数 == 消费点数，且注释紧跟其守卫行（未侵入块体）；
+    ② `REUSE_RATIO` 汇总存在、`captures/consumers/ratio` 与注释自洽、且**明写"非运行次数"**；
+    ③ **未新增任何 `$zz_ms_*` 状态变量**（变量名集合 == t2 代次集合）；
+    ④ IB 覆盖段**无**诊断注释、**无** `$zz_ms_*`（逐字节不变量在证据脚本里另有 A/B 证明）；
+    ⑤ 重放/发布块的守卫行形态与块体语句集合不变（只有注释新增）。
+    """
+
+    MARKER = "; ZZMI-MERGE-DIAG REUSE_SITE"
+
+    def _sections_text(self, exporter, models):
+        """生成 VB 段与骨架段原文（与 ZZMIMergedOrderingContractTests 同口径：
+        carrier 的 Redirect Texcoord 需按 stride 补真实缓冲，否则生成器按契约抛错）。"""
+        for carrier_ib, carrier_info in (exporter._redirect_carrier_map or {}).items():
+            carrier_model = next((m for m in models if m.draw_ib == carrier_ib), None)
+            if carrier_model is None:
+                continue
+            stride = int(
+                (getattr(carrier_model.d3d11GameType, "CategoryStrideDict", {}) or {}).get(
+                    "Texcoord", 0
+                )
+                or 0
+            )
+            if stride > 0 and not (carrier_model.category_buffer_dict or {}).get("Texcoord"):
+                carrier_model.category_buffer_dict["Texcoord"] = bytes(
+                    int(carrier_info.get("vertex_count", 0) or 0) * stride
+                )
+        vb_builder = _FakeIniBuilder()
+        for model in models:
+            exporter.add_unity_vs_texture_override_vb_sections(vb_builder, model)
+        vb_text = "\n".join(_all_builder_lines(vb_builder))
+        skeleton_builder = _FakeIniBuilder()
+        exporter.add_merged_skeleton_sections(skeleton_builder)
+        skeleton_text = "\n".join(_all_builder_lines(skeleton_builder))
+        return vb_text, skeleton_text
+
+    def _render(self):
+        exporter, models = self._group3_exporter()
+        self._build_and_apply_plan(exporter)
+        captured = self._capture_stdout(
+            lambda: self._sections_text(exporter, models)
+        )
+        vb_text, skeleton_text = self._sections_text(exporter, models)
+        ib_builder = _FakeIniBuilder()
+        for model in models:
+            exporter.add_unity_vs_texture_override_ib_sections(ib_builder, model)
+        ib_text = "\n".join(_all_builder_lines(ib_builder))
+        return exporter, vb_text, ib_text, skeleton_text, captured
+
+    def test_o3_reuse_site_markers_match_consumer_sites(self):
+        """① 注释数 == 消费点数；且每条注释的下一非注释行是守卫 `if (…)`。"""
+        _exporter, vb_text, _ib, _skel, _captured = self._render()
+        lines = vb_text.splitlines()
+        markers = [
+            (index, line.strip())
+            for index, line in enumerate(lines)
+            if line.strip().startswith(self.MARKER)
+        ]
+        consumer_sites = [
+            line for line in lines
+            if line.strip().startswith("so0 = ref ResourceZZRedirectSO_")
+            or line.strip().startswith("run = CustomShaderZZMISkin_")
+        ]
+        self.assertTrue(markers)
+        self.assertEqual(
+            len(markers),
+            len(consumer_sites),
+            f"注释数 {len(markers)} 必须等于消费点数 {len(consumer_sites)}",
+        )
+        for index, marker in markers:
+            self.assertIn("group=G", marker)
+            self.assertIn("slot=", marker)
+            self.assertIn("consumer=", marker)
+            self.assertIn("kind=", marker)
+            follower = lines[index + 1].strip()
+            self.assertTrue(
+                follower.startswith("if ($zz_ms_seen_"),
+                f"注释后必须紧跟守卫行（不得侵入块体）: {follower!r}",
+            )
+
+    def test_o3_reuse_ratio_stdout_matches_markers(self):
+        """② REUSE_RATIO 汇总存在、与注释自洽、且明写口径（非运行次数）。"""
+        _exporter, vb_text, _ib, _skel, captured = self._render()
+        ratio_lines = [line for line in captured.splitlines() if "REUSE_RATIO" in line]
+        self.assertTrue(ratio_lines, "导出期必须打印 REUSE_RATIO 汇总")
+        markers = [line for line in vb_text.splitlines() if line.strip().startswith(self.MARKER)]
+        # 该夹具：组 G3、2 槽、3 个部件节 ⇒ 每槽 consumers = 3(replay-draw) + 3(publish-cs) = 6
+        self.assertEqual(len(markers), 12)
+        for line in ratio_lines:
+            self.assertIn("captures=1", line)
+            self.assertIn("consumers=6", line)
+            self.assertIn("ratio=6:1", line)
+            self.assertIn("非运行次数", line)
+            self.assertIn("不得读成复用次数", line)
+        self.assertEqual(len(ratio_lines), 2, "每 (组,槽) 一行")
+
+    def test_o3_no_new_state_variables(self):
+        """③ 未新增任何 `$zz_ms_*` 状态变量（§61：禁止新状态变量/闩锁/if 体内 `$` 写）。"""
+        _exporter, vb_text, _ib, skeleton_text, _captured = self._render()
+        # 排除诊断注释行（其字段里出现 `$zz_ms_seen_<i>1` 这种**文档占位**，不是变量实例）
+        lines = [
+            line
+            for line in "\n".join((vb_text, skeleton_text)).splitlines()
+            if "ZZMI-MERGE-DIAG" not in line
+        ]
+        names = sorted(set(re.findall(r"\$zz_ms_[A-Za-z0-9_]+", "\n".join(lines))))
+        component_ids = (0, 1, 2)
+        expected = sorted(
+            {f"$zz_ms_occ_{c}" for c in component_ids}
+            | {f"$zz_ms_seen_{c}{s}" for c in component_ids for s in (1, 2)}
+            | {f"$zz_ms_prev_{c}{s}" for c in component_ids for s in (1, 2)}
+        )
+        self.assertEqual(names, expected, "`$zz_ms_*` 变量集合必须与 t2 代次完全相同")
+        for banned in ("consumed", "reuse", "gate", "ready", "phase", "drawn", "any_"):
+            self.assertNotIn(f"$zz_ms_{banned}", "\n".join(lines))
+
+    def test_o3_ib_override_section_is_marker_free(self):
+        """④ IB 覆盖段无诊断注释、无 `$zz_ms_*`（消费端不被诊断化改动）。"""
+        _exporter, _vb, ib_text, _skel, _captured = self._render()
+        self.assertNotIn(self.MARKER, ib_text)
+        self.assertNotIn("$zz_ms_", ib_text)
+        self.assertNotIn("ZZMI-MERGE-DIAG", ib_text)
+        self.assertIn("drawindexed = ", ib_text)
+
+    def test_o3_replay_block_bodies_unchanged(self):
+        """⑤ 每条注释对应的块：守卫行 + 绑定/draw 语句集合不变（只多注释）。"""
+        _exporter, vb_text, _ib, _skel, _captured = self._render()
+        lines = vb_text.splitlines()
+        checked = 0
+        for index, line in enumerate(lines):
+            if not line.strip().startswith(self.MARKER):
+                continue
+            depth = 0
+            guard_seen = False
+            body: list[str] = []
+            for follower in lines[index + 1:]:
+                stripped = follower.strip()
+                if stripped.startswith("if "):
+                    depth += 1
+                    if not guard_seen:
+                        guard_seen = True
+                        self.assertTrue(stripped.startswith("if ($zz_ms_seen_"))
+                    continue
+                if stripped == "endif":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                    continue
+                body.append(stripped)
+            self.assertTrue(guard_seen, f"注释后缺少守卫: {line!r}")
+            for entry in body:
+                self.assertFalse(entry.startswith("$"), entry)
+                self.assertTrue(
+                    entry.startswith(
+                        ("vs-t0 =", "so0 =", "vb0 =", "vb2 =", "draw =", "run = CustomShaderZZMISkin_")
+                    ),
+                    f"块体语句集合被改动: {entry!r}",
+                )
+            checked += 1
+        self.assertEqual(checked, 12)
+
+
+class _StopExportSentinel(RuntimeError):
+    """哨兵：代表「导出已走到第一个落盘点」，用来证明契约判定先于任何写盘。"""
+
+
+class ZZMIMergedContractWiringTests(unittest.TestCase):
+    """B1：合并骨架契约必须**真的接进导出流程**，且 error 在任何写盘之前中止。
+
+    关键点（去掉接线即变红）：
+    - ``_export_impl`` 必须先 ``_collect_merged_skeleton_components()`` 再
+      ``_enforce_merged_skeleton_contract()``，然后才碰第一个落盘点
+      ``generate_buffer_files``；本测试把落盘点换成「会写文件的哨兵」并断言
+      契约 error 时哨兵**从未被调用**、临时输出目录**为空**。
+    - 判定输入来自真实契约模块（按 fake 包前缀登记的真实实现），用
+      ``mock.patch.object`` 包装成间谍记录 kwargs，再交回真函数算 level。
+    """
+
+    def setUp(self):
+        _fake_bpy_data.objects._items.clear()
+        _fake_bpy_data.meshes._items.clear()
+        self._tmp_dir = tempfile.mkdtemp(prefix="zzmi_contract_out_")
+        self._prev_mod_folder = _fake_global_config.path_generate_mod_folder
+        self._prev_import_merged = _fake_global_properties.import_merged_vgmap
+        _fake_global_config.path_generate_mod_folder = lambda: self._tmp_dir
+
+    def tearDown(self):
+        _fake_global_config.path_generate_mod_folder = self._prev_mod_folder
+        _fake_global_properties.import_merged_vgmap = self._prev_import_merged
+        shutil.rmtree(self._tmp_dir, ignore_errors=True)
+
+    # ---- 夹具 -----------------------------------------------------------
+    def _exporter(self, models, merged_vgmap=True):
+        exporter = _make_exporter(models, merged_vgmap=merged_vgmap)
+        exporter.drawib_model_list = models
+        return exporter
+
+    def _data_model(self, draw_ib="b20f90ea", vg_count=51, vg_offset=154,
+                    unique_str=None):
+        return _FakeDrawIBModel(
+            draw_ib,
+            [_FakeSubmesh(unique_str or f"LOD0.{draw_ib}-19182-0", vg_offset, vg_count)],
+        )
+
+    def _stale_version_model(self, draw_ib="8c8de427"):
+        submesh = _FakeSubmesh(f"LOD0.{draw_ib}-19182-0", 0, 2)
+        submesh.vg_map_algorithm_version = 1  # != ZZMI_VG_MAP_ALGORITHM_VERSION
+        return _FakeDrawIBModel(draw_ib, [submesh])
+
+    def _run_export_impl(self, exporter):
+        """跑 ``_export_impl``：记录契约判定 kwargs 与「首个落盘点」是否到达。
+
+        返回 ``(decisions, write_reached, raised, stdout)``。落盘点被替换成「先写一个
+        产物文件、再抛哨兵」——因此哨兵未触发就等于「没有写出任何输出文件」。
+        """
+        decisions = []
+        real_evaluate = _zzmi_contract_module.evaluate_merged_skeleton_contract
+
+        def _spy(**kwargs):
+            decisions.append(kwargs)
+            return real_evaluate(**kwargs)
+
+        marker = os.path.join(self._tmp_dir, "Meshes_first_write.buf")
+
+        def _first_write_point(*_args, **_kwargs):
+            with open(marker, "wb") as handle:
+                handle.write(b"written")
+            raise _StopExportSentinel("已到达第一个落盘点")
+
+        raised = None
+        buf = io.StringIO()
+        with mock.patch.object(
+            _zzmi_contract_module,
+            "evaluate_merged_skeleton_contract",
+            side_effect=_spy,
+        ), mock.patch.object(
+            exporter,
+            "generate_buffer_files",
+            _first_write_point,
+            create=True,  # fake 宿主的 ExportUnity 桩没有该方法，生产实现有
+        ):
+            try:
+                with contextlib.redirect_stdout(buf):
+                    exporter._export_impl()
+            except BaseException as error:  # noqa: BLE001 - 测试要区分 Fatal/哨兵
+                raised = error
+        return decisions, os.path.isfile(marker), raised, buf.getvalue()
+
+    def _function_source(self, name: str) -> str:
+        """取生产实现里某个函数的源码段（AST 权威，避开 PowerShell 行号错位）。"""
+        source = (REPO_ROOT / "ui" / "universal" / "zzmi.py").read_text(
+            encoding="utf-8"
+        )
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == name:
+                return ast.get_source_segment(source, node) or ""
+        self.fail(f"未在 ui/universal/zzmi.py 找到函数 {name}")
+
+    # ---- 1) 真的接线了 ---------------------------------------------------
+    def test_export_path_really_calls_contract_before_any_write(self):
+        # (a) 源码级接线断言：去除接线（删掉 _enforce_* 调用 / 把它挪到落盘点之后）
+        #     本用例必红。
+        body = self._function_source("_export_impl")
+        self.assertIn("self._collect_merged_skeleton_components()", body)
+        self.assertIn("self._enforce_merged_skeleton_contract()", body)
+        self.assertIn("self.generate_buffer_files(", body)
+        self.assertLess(
+            body.index("self._collect_merged_skeleton_components()"),
+            body.index("self._enforce_merged_skeleton_contract()"),
+        )
+        self.assertLess(
+            body.index("self._enforce_merged_skeleton_contract()"),
+            body.index("self.generate_buffer_files("),
+            "契约判定必须发生在第一个落盘点之前",
+        )
+        guard_body = self._function_source("_enforce_merged_skeleton_contract")
+        self.assertIn("evaluate_merged_skeleton_contract(", guard_body)
+        self.assertIn("raise Fatal(", guard_body)
+
+        # (b) 间谍注入：导出确实调用契约，且 kwargs 是真实统计值
+        exporter = self._exporter([self._data_model()], merged_vgmap=True)
+        decisions, write_reached, raised, _stdout = self._run_export_impl(exporter)
+
+        self.assertEqual(len(decisions), 1, "导出流程必须调用一次契约判定")
+        self.assertEqual(
+            decisions[0],
+            {
+                "checkbox_enabled": True,
+                "parts_with_data": 1,
+                "component_count": 1,
+                "skip_reasons": {},
+            },
+        )
+        # 契约在先、落盘点在后：本用例 level=ok 因此确实走到了落盘点；
+        # 「判定发生在写盘之前」由下面两个 error 用例做强断言（落盘点从未到达）。
+        self.assertTrue(write_reached)
+        self.assertIsInstance(raised, _StopExportSentinel)
+
+    # ---- 2) error 场景 A：开关关闭 + 有数据 ⇒ 写盘前中止 ------------------
+    def test_error_disabled_checkbox_with_data_aborts_before_writing(self):
+        exporter = self._exporter([self._data_model()], merged_vgmap=False)
+        decisions, write_reached, raised, _stdout = self._run_export_impl(exporter)
+
+        self.assertEqual(
+            decisions,
+            [{
+                "checkbox_enabled": False,
+                "parts_with_data": 1,
+                "component_count": 0,
+                "skip_reasons": {},
+            }],
+        )
+        self.assertFalse(write_reached, "契约 error 时不得到达任何落盘点")
+        self.assertEqual(os.listdir(self._tmp_dir), [], "不得写出任何输出文件")
+        self.assertIsNotNone(raised)
+        self.assertEqual(type(raised).__name__, "Fatal")
+        text = str(raised)
+        self.assertIn("骨骼合并中止", text)
+        self.assertIn("使用融合统一顶点组", text)      # message（用户可见）
+        self.assertIn("打开", text)                    # hint（用户可见）
+
+    # ---- 3) error 场景 B：有数据但全部被拒 ⇒ 写盘前中止 + 列出原因 --------
+    def test_error_all_parts_rejected_lists_reasons_and_aborts(self):
+        exporter = self._exporter(
+            [self._stale_version_model()], merged_vgmap=True
+        )
+        decisions, write_reached, raised, _stdout = self._run_export_impl(exporter)
+
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0]["parts_with_data"], 1)
+        self.assertEqual(decisions[0]["component_count"], 0)
+        self.assertEqual(
+            decisions[0]["skip_reasons"],
+            {"8c8de427": "VGMap 缓存版本 1 过旧（需重新一键导入）"},
+        )
+        self.assertFalse(write_reached, "契约 error 时不得到达任何落盘点")
+        self.assertEqual(os.listdir(self._tmp_dir), [], "不得写出任何输出文件")
+        self.assertEqual(type(raised).__name__, "Fatal")
+        text = str(raised)
+        self.assertIn("全部被导出器拒绝", text)
+        self.assertIn("8c8de427", text)              # hint 列出被拒部件
+        self.assertIn("缓存版本", text)               # hint 列出被拒原因
+
+    # ---- 4) notice 不打断普通导出 ----------------------------------------
+    def test_notice_does_not_interrupt_normal_export(self):
+        exporter = self._exporter(
+            [_FakeDrawIBModel("b20f90ea", [_FakeSubmesh("LOD0.b20f90ea-19182-0", 0, 0)])],
+            merged_vgmap=False,
+        )
+        decisions, write_reached, raised, _stdout = self._run_export_impl(exporter)
+
+        self.assertEqual(
+            decisions,
+            [{
+                "checkbox_enabled": False,
+                "parts_with_data": 0,
+                "component_count": 0,
+                "skip_reasons": {},
+            }],
+        )
+        self.assertTrue(write_reached, "notice 必须继续导出（要走到落盘点）")
+        self.assertIsInstance(raised, _StopExportSentinel)
+        self.assertEqual(exporter._merged_diag_sink(), [])  # 不新增任何诊断弹窗
+
+    # ---- 5) warning 提示后继续导出 ---------------------------------------
+    def test_warning_continues_export_and_lists_rejected_parts(self):
+        exporter = self._exporter(
+            [self._data_model(), self._stale_version_model()], merged_vgmap=True
+        )
+        decisions, write_reached, raised, stdout = self._run_export_impl(exporter)
+
+        self.assertEqual(len(decisions), 1)
+        self.assertEqual(decisions[0]["parts_with_data"], 2)
+        self.assertEqual(decisions[0]["component_count"], 1)
+        self.assertEqual(decisions[0]["skip_reasons"], {"8c8de427": "VGMap 缓存版本 1 过旧（需重新一键导入）"})
+
+        # 继续导出：确实走到落盘点，且抛的是哨兵而不是 Fatal
+        self.assertTrue(write_reached)
+        self.assertIsInstance(raised, _StopExportSentinel)
+        # 用户可见提示（控制台 + 导出日志），含被拒部件与原因
+        self.assertIn("骨骼合并不完整", stdout)
+        self.assertIn("8c8de427", stdout)
+        self.assertIn("缓存版本", stdout)
+
+
+def _skin_element(category, semantic, index, fmt, byte_width, slot=""):
+    """输入布局元素替身（`D3D11ElementList` 的最小字段集）。"""
+    return types.SimpleNamespace(
+        Category=category,
+        SemanticName=semantic,
+        SemanticIndex=index,
+        Format=fmt,
+        ByteWidth=byte_width,
+        ExtractSlot=slot,
+    )
+
+
+# 与单一事实源一致（真实数据佐证：工作空间 json CategoryBufferList + 抓帧 slot 元素表）
+POSITION_ELEMENTS_40B = [
+    _skin_element("Position", "POSITION", 0, "R32G32B32_FLOAT", 12, "vb0"),
+    _skin_element("Position", "NORMAL", 0, "R32G32B32_FLOAT", 12, "vb0"),
+    _skin_element("Position", "TANGENT", 0, "R32G32B32A32_FLOAT", 16, "vb0"),
+]
+BLEND_ELEMENTS_32B = [
+    _skin_element("Blend", "BLENDWEIGHTS", 0, "R32G32B32A32_FLOAT", 16, "vb2"),
+    _skin_element("Blend", "BLENDINDICES", 0, "R32G32B32A32_UINT", 16, "vb2"),
+]
+
+
+class ZZMISkinRowLayoutElementTests(_ZZMIGroup3RedirectFixture, unittest.TestCase):
+    """t40：蒙皮 CS 行布局的**逐元素**动态识别（旧实现只比总宽度，会放行这些）。
+
+    覆盖 `ui/universal/zzmi.py`：
+    - `_merged_skin_row_layout_mismatches`（逐元素判据：声明 stride + 语义/索引/格式/宽/偏移）
+    - `_merged_skin_layout_mismatches`（Blend 锚点 + 每个 deform_draws 条目的 Position + 目的侧 so_stride）
+    - `_merged_skin_publish_supported`（两道 CS 闸门共用）
+    - `_merged_skin_layout_diag`（诊断点名不匹配的元素）
+    - `_drawib_category_layout`（类目参数化的布局读取，位置侧复用）
+    """
+
+    def _exporter_with_elements(
+        self,
+        *,
+        blend=None,
+        position=None,
+        blend_stride=None,
+        position_stride=None,
+    ):
+        """组 3 夹具 + 注入元素表；`blend`/`position`/`*_stride` 支持按 draw_ib 覆盖。"""
+        exporter, models = self._group3_exporter()
+        for model in models:
+            game_type = model.d3d11GameType
+            position_elements = (
+                position.get(model.draw_ib, POSITION_ELEMENTS_40B)
+                if isinstance(position, dict)
+                else (position or POSITION_ELEMENTS_40B)
+            )
+            blend_elements = (
+                blend.get(model.draw_ib, BLEND_ELEMENTS_32B)
+                if isinstance(blend, dict)
+                else (blend or BLEND_ELEMENTS_32B)
+            )
+            game_type.D3D11ElementList = list(position_elements) + list(blend_elements)
+            for category, override in (
+                ("Position", position_stride),
+                ("Blend", blend_stride),
+            ):
+                if override is None:
+                    continue
+                value = (
+                    override.get(model.draw_ib)
+                    if isinstance(override, dict)
+                    else override
+                )
+                if value is not None:
+                    game_type.CategoryStrideDict[category] = int(value)
+        self._build_and_apply_plan(exporter)
+        return exporter, models
+
+    def _text(self, exporter, models):
+        """生成 vb / ib / skeleton 全文（与 t38 同口径，含 carrier 的 vb1 缓冲预填）。"""
+        for carrier_ib, carrier_info in (exporter._redirect_carrier_map or {}).items():
+            carrier_model = next(
+                (m for m in models if m.draw_ib == carrier_ib), None
+            )
+            if carrier_model is None:
+                continue
+            stride = int(
+                (getattr(carrier_model.d3d11GameType, "CategoryStrideDict", {}) or {})
+                .get("Texcoord", 0)
+                or 0
+            )
+            if stride > 0 and not (carrier_model.category_buffer_dict or {}).get(
+                "Texcoord"
+            ):
+                carrier_model.category_buffer_dict["Texcoord"] = bytes(
+                    int(carrier_info.get("vertex_count", 0) or 0) * stride
+                )
+        vb_builder = _FakeIniBuilder()
+        for model in models:
+            exporter.add_unity_vs_texture_override_vb_sections(vb_builder, model)
+        vb_text = "\n".join(_all_builder_lines(vb_builder))
+        ib_builder = _FakeIniBuilder()
+        for model in models:
+            exporter.add_unity_vs_texture_override_ib_sections(ib_builder, model)
+        ib_text = "\n".join(_all_builder_lines(ib_builder))
+        skeleton_builder = _FakeIniBuilder()
+        exporter.add_merged_skeleton_sections(skeleton_builder)
+        skeleton_text = "\n".join(_all_builder_lines(skeleton_builder))
+        return vb_text, ib_text, skeleton_text
+
+    # ---- 匹配路径 --------------------------------------------------------
+    def test_matching_elements_emit_cs_and_no_layout_diag(self):
+        """元素表与单一事实源一致 ⇒ 发 CS、无布局诊断（旧行为的等价面）。"""
+        exporter, models = self._exporter_with_elements()
+        plan = exporter._merged_group_redirect_plan(3)
+        self.assertEqual(exporter._merged_skin_layout_mismatches(plan), [])
+        self.assertTrue(exporter._merged_skin_publish_supported(plan))
+        vb_text, ib_text, skeleton_text = self._text(exporter, models)
+        combined = "\n".join((vb_text, ib_text, skeleton_text))
+        self.assertIn("cs = ./res/zzmi_merged_skin.hlsl", skeleton_text)
+        self.assertIn("[CustomShaderZZMISkin_G3_s1]", skeleton_text)
+        self.assertIn("run = CustomShaderZZMISkin_G3_s1", vb_text)
+        self.assertNotIn("SKIN_LAYOUT_UNSUPPORTED", combined)
+
+    def test_generated_cs_slots_follow_the_declaration(self):
+        """生成产物里的 cs-t0/cs-t1 绑定必须与声明里的 hlsl_slot 一致。"""
+        exporter, models = self._exporter_with_elements()
+        _vb_text, _ib_text, skeleton_text = self._text(exporter, models)
+        position_slot = _zzmi_module.ZZMI_MERGED_SKIN_ROW_LAYOUT["position"]["hlsl_slot"]
+        blend_slot = _zzmi_module.ZZMI_MERGED_SKIN_ROW_LAYOUT["blend"]["hlsl_slot"]
+        self.assertIn(f"{position_slot} = ref Resourceb20f90eaPosition", skeleton_text)
+        self.assertIn(f"{blend_slot} = ref Resourceb20f90eaBlend", skeleton_text)
+
+    # ---- ① 总宽 32B 但元素顺序/语义不同（旧守卫会放行） --------------------
+    def test_blend_32b_with_swapped_element_order_is_rejected(self):
+        swapped = [
+            _skin_element("Blend", "BLENDINDICES", 0, "R32G32B32A32_UINT", 16, "vb2"),
+            _skin_element("Blend", "BLENDWEIGHTS", 0, "R32G32B32A32_FLOAT", 16, "vb2"),
+        ]
+        exporter, models = self._exporter_with_elements(blend=swapped)
+        plan = exporter._merged_group_redirect_plan(3)
+        # 总宽仍 32B（旧判据会放行）但逐元素不匹配
+        self.assertEqual(
+            exporter._drawib_blend_layout("b20f90ea")["stride"], 32
+        )
+        mismatches = exporter._merged_skin_layout_mismatches(plan)
+        self.assertTrue(
+            any(m.startswith("blend:anchor:elements[0].semantic") for m in mismatches),
+            mismatches,
+        )
+        self.assertFalse(exporter._merged_skin_publish_supported(plan))
+
+        vb_text, ib_text, skeleton_text = self._text(exporter, models)
+        combined = "\n".join((vb_text, ib_text, skeleton_text))
+        # 不发 CS（段定义 + run 引用都没有）
+        self.assertNotIn("cs = ./res/zzmi_merged_skin.hlsl", combined)
+        self.assertNotIn("CustomShaderZZMISkin_G3_s1", combined)
+        # 诊断点名具体元素
+        self.assertIn("; ZZMI-MERGE-DIAG SKIN_LAYOUT_UNSUPPORTED", combined)
+        self.assertIn("blend:anchor:elements[0].semantic", combined)
+        # 退回既有 draw 重放
+        self.assertIn("    draw = 18776, 0", vb_text)
+        self.assertIn("    so0 = ref ResourceZZRedirectSO_G3_s1", vb_text)
+
+    def test_blend_32b_with_indices_recorded_as_float_is_rejected(self):
+        """同一语义/顺序、总宽 32B，但索引格式被记成 FLOAT ⇒ 必须拦。"""
+        wrong_type = [
+            _skin_element("Blend", "BLENDWEIGHTS", 0, "R32G32B32A32_FLOAT", 16, "vb2"),
+            _skin_element("Blend", "BLENDINDICES", 0, "R32G32B32A32_FLOAT", 16, "vb2"),
+        ]
+        exporter, _models = self._exporter_with_elements(blend=wrong_type)
+        plan = exporter._merged_group_redirect_plan(3)
+        mismatches = exporter._merged_skin_layout_mismatches(plan)
+        self.assertTrue(
+            any(
+                m.startswith("blend:anchor:elements[1].format")
+                and "R32G32B32A32_INT" in m
+                and "R32G32B32A32_FLOAT" in m
+                for m in mismatches
+            ),
+            mismatches,
+        )
+        self.assertFalse(exporter._merged_skin_publish_supported(plan))
+
+    # ---- A：声明 stride 才是权威（元素宽度求和不一致时） -------------------
+    def test_declared_stride_wins_over_element_width_sum(self):
+        """元素求和 32B 但**声明 stride 48** ⇒ 必须按声明拦下（旧判据比 Σ 会放行）。"""
+        exporter, _models = self._exporter_with_elements(blend_stride=48)
+        plan = exporter._merged_group_redirect_plan(3)
+        layout = plan.get("anchor_layout")
+        self.assertEqual(sum(e["byte_width"] for e in layout["elements"]), 32)
+        self.assertEqual(layout["stride"], 48)
+        mismatches = exporter._merged_skin_layout_mismatches(plan)
+        self.assertIn("blend:anchor:stride:expected=32:actual=48", mismatches)
+        self.assertFalse(exporter._merged_skin_publish_supported(plan))
+        # 诊断报告的值也必须是声明 stride（不是 Σ）
+        diag = exporter._merged_skin_layout_diag(3, plan)
+        self.assertIn("anchor_blend_bytes=48", diag)
+
+    def test_declared_stride_32b_but_elements_sum_48b_is_rejected(self):
+        """反向分叉：声明 stride 32 而元素求和 48 ⇒ 元素逐项比对必须拦下。"""
+        wide = [
+            _skin_element("Blend", "BLENDWEIGHTS", 0, "R32G32B32A32_FLOAT", 16, "vb2"),
+            _skin_element("Blend", "BLENDINDICES", 0, "R32G32B32A32_UINT", 16, "vb2"),
+            _skin_element("Blend", "BLENDINDICES", 1, "R32G32B32A32_UINT", 16, "vb2"),
+        ]
+        exporter, _models = self._exporter_with_elements(
+            blend=wide, blend_stride=32
+        )
+        plan = exporter._merged_group_redirect_plan(3)
+        mismatches = exporter._merged_skin_layout_mismatches(plan)
+        self.assertTrue(
+            any(m.startswith("blend:anchor:element-count") for m in mismatches),
+            mismatches,
+        )
+        self.assertFalse(exporter._merged_skin_publish_supported(plan))
+
+    # ---- ② Position 侧（同类缺陷第三处） ---------------------------------
+    def test_position_40b_with_different_elements_is_rejected(self):
+        """总宽 40B 但元素构成不同（POSITION 4 分量） ⇒ 必须拦（旧实现无任何 Position 判据）。"""
+        bad_position = [
+            _skin_element("Position", "POSITION", 0, "R32G32B32A32_FLOAT", 16, "vb0"),
+            _skin_element("Position", "NORMAL", 0, "R32G32B32_FLOAT", 12, "vb0"),
+            _skin_element("Position", "TANGENT", 0, "R32G32B32_FLOAT", 12, "vb0"),
+        ]
+        exporter, models = self._exporter_with_elements(
+            position={"b20f90ea": bad_position}
+        )
+        plan = exporter._merged_group_redirect_plan(3)
+        # 载体 Position 总宽仍 40B
+        carrier_layout = exporter._drawib_category_layout("b20f90ea", "Position")
+        self.assertEqual(carrier_layout["stride"], 40)
+        mismatches = exporter._merged_skin_layout_mismatches(plan)
+        self.assertTrue(
+            any(
+                m.startswith("position:b20f90ea:elements[0].format")
+                or m.startswith("position:b20f90ea:elements[0].byte_width")
+                for m in mismatches
+            ),
+            mismatches,
+        )
+        vb_text, ib_text, skeleton_text = self._text(exporter, models)
+        combined = "\n".join((vb_text, ib_text, skeleton_text))
+        self.assertNotIn("cs = ./res/zzmi_merged_skin.hlsl", combined)
+        self.assertIn("position:b20f90ea:elements[0]", combined)
+        self.assertIn("    draw = 18776, 0", vb_text)
+
+    def test_position_stride_mismatch_is_rejected(self):
+        """Position 声明 stride ≠ 40（元素表仍是 40B 构成）⇒ 拦。"""
+        exporter, _models = self._exporter_with_elements(position_stride=48)
+        plan = exporter._merged_group_redirect_plan(3)
+        mismatches = exporter._merged_skin_layout_mismatches(plan)
+        self.assertTrue(
+            any(
+                m.startswith("position:b20f90ea:stride:expected=40:actual=48")
+                for m in mismatches
+            ),
+            mismatches,
+        )
+        self.assertFalse(exporter._merged_skin_publish_supported(plan))
+
+    def test_destination_so_stride_mismatch_is_rejected(self):
+        """目的侧行宽（CS 的 w1*4 / RedirectSO 声明 stride）同样纳入判据。
+
+        target（纯占位）自身不产生前缀 draw ⇒ 只会在目的侧暴露；
+        载体 Position 仍 40B，故这是纯粹的"目的行宽"用例。
+        """
+        exporter, _models = self._exporter_with_elements(
+            position_stride={"a23aa8a3": 48}
+        )
+        plan = exporter._merged_group_redirect_plan(3)
+        self.assertEqual(int(plan["so_stride"]), 48)
+        mismatches = exporter._merged_skin_layout_mismatches(plan)
+        self.assertIn("dest:so_stride:expected=40:actual=48", mismatches)
+        self.assertFalse(exporter._merged_skin_publish_supported(plan))
+
+    # ---- ④ ExtractSlot 溯源（F3）：同偏移/同语义但 slot 漂移也必须拦 --------
+    def test_blend_anchor_extract_slot_drift_is_rejected(self):
+        """Blend 锚点 slot 由 vb2 漂到 vb9（其余全同）⇒ 报 extract_slot 且停发 CS。
+
+        这是「同偏移不同 slot」的判据面：总宽/语义/格式/字节宽/偏移**全部相同**，
+        旧判据会放行；Slot 是唯一差异 ⇒ 不匹配列表必须**恰好**只有这一条。
+        """
+        drifted = [
+            _skin_element("Blend", "BLENDWEIGHTS", 0, "R32G32B32A32_FLOAT", 16, "vb9"),
+            _skin_element("Blend", "BLENDINDICES", 0, "R32G32B32A32_UINT", 16, "vb2"),
+        ]
+        exporter, models = self._exporter_with_elements(blend=drifted)
+        plan = exporter._merged_group_redirect_plan(3)
+        mismatches = exporter._merged_skin_layout_mismatches(plan)
+        self.assertEqual(
+            mismatches,
+            ["blend:anchor:elements[0].extract_slot:expected=VB2:actual=VB9"],
+        )
+        self.assertFalse(exporter._merged_skin_publish_supported(plan))
+
+        vb_text, ib_text, skeleton_text = self._text(exporter, models)
+        combined = "\n".join((vb_text, ib_text, skeleton_text))
+        # 不发 CS（段定义 + run 引用都没有），落具名诊断并点名 slot
+        self.assertNotIn("cs = ./res/zzmi_merged_skin.hlsl", combined)
+        self.assertNotIn("CustomShaderZZMISkin_G3_s1", combined)
+        self.assertIn("; ZZMI-MERGE-DIAG SKIN_LAYOUT_UNSUPPORTED", combined)
+        self.assertIn("blend:anchor:elements[0].extract_slot", combined)
+        # 回退到既有 draw 版重放
+        self.assertIn("    draw = 18776, 0", vb_text)
+        self.assertIn("    so0 = ref ResourceZZRedirectSO_G3_s1", vb_text)
+
+    def test_position_extract_slot_drift_is_rejected(self):
+        """Position 侧 slot 由 vb0 漂到 vb9 ⇒ 同样被拦（同偏移不同 slot）。"""
+        drifted = [
+            _skin_element("Position", "POSITION", 0, "R32G32B32_FLOAT", 12, "vb0"),
+            _skin_element("Position", "NORMAL", 0, "R32G32B32_FLOAT", 12, "vb9"),
+            _skin_element("Position", "TANGENT", 0, "R32G32B32A32_FLOAT", 16, "vb0"),
+        ]
+        exporter, _models = self._exporter_with_elements(
+            position={"b20f90ea": drifted}
+        )
+        plan = exporter._merged_group_redirect_plan(3)
+        mismatches = exporter._merged_skin_layout_mismatches(plan)
+        self.assertEqual(
+            mismatches,
+            ["position:b20f90ea:elements[1].extract_slot:expected=VB0:actual=VB9"],
+        )
+        self.assertFalse(exporter._merged_skin_publish_supported(plan))
+
+    def test_empty_or_missing_extract_slot_is_conservatively_allowed(self):
+        """实际 ExtractSlot 为空/缺失（旧缓存不带 slot 溯源）⇒ 不算不匹配，仍发 CS。"""
+        untracked = [
+            _skin_element("Blend", "BLENDWEIGHTS", 0, "R32G32B32A32_FLOAT", 16, ""),
+            _skin_element("Blend", "BLENDINDICES", 0, "R32G32B32A32_UINT", 16, ""),
+        ]
+        exporter, models = self._exporter_with_elements(blend=untracked)
+        plan = exporter._merged_group_redirect_plan(3)
+        mismatches = exporter._merged_skin_layout_mismatches(plan)
+        self.assertEqual(mismatches, [])
+        self.assertTrue(exporter._merged_skin_publish_supported(plan))
+        _vb_text, _ib_text, skeleton_text = self._text(exporter, models)
+        self.assertIn("cs = ./res/zzmi_merged_skin.hlsl", skeleton_text)
+
+        # 「缺失」路径（元素表里**没有**该键）与空串同口径：保守放行
+        missing_key = exporter._merged_skin_row_layout_mismatches(
+            "blend",
+            {
+                "stride": 32,
+                "elements": [
+                    {
+                        "semantic": "BLENDWEIGHTS",
+                        "index": 0,
+                        "format": "R32G32B32A32_FLOAT",
+                        "byte_width": 16,
+                        "offset": 0,
+                    },
+                    {
+                        "semantic": "BLENDINDICES",
+                        "index": 0,
+                        "format": "R32G32B32A32_UINT",
+                        "byte_width": 16,
+                        "offset": 16,
+                    },
+                ],
+            },
+            "blend:anchor",
+        )
+        self.assertEqual(missing_key, [])
+
+    def test_extract_slot_comparison_ignores_case_and_whitespace(self):
+        """`VB2` / `Vb2` / ` vb2 ` 与 `vb2` 等价 ⇒ 不得误报（大小写/空白归一）。"""
+        for slot in ("VB2", "Vb2", " vb2 ", "vb2"):
+            with self.subTest(slot=slot):
+                noisy = [
+                    _skin_element(
+                        "Blend", "BLENDWEIGHTS", 0, "R32G32B32A32_FLOAT", 16, slot
+                    ),
+                    _skin_element(
+                        "Blend", "BLENDINDICES", 0, "R32G32B32A32_UINT", 16, slot
+                    ),
+                ]
+                exporter, _models = self._exporter_with_elements(blend=noisy)
+                plan = exporter._merged_group_redirect_plan(3)
+                self.assertEqual(exporter._merged_skin_layout_mismatches(plan), [])
+                self.assertTrue(exporter._merged_skin_publish_supported(plan))
+
+    def test_declared_extract_slots_match_generated_bindings(self):
+        """反向对照：期望 slot 与生成端绑定源一致（Position→vb0 / Blend→vb2）⇒ 比对为空。
+
+        断言的期望值不是凭空写的：CS 段把 `cs-t0` 绑到该部件的 **vb0** 资源、
+        `cs-t1` 绑到 **vb2** 资源（真实 ZZMI 工作空间 10/10 部件的 `ExtractSlot`
+        也正是 vb0 / vb2）。
+        """
+        layout = _zzmi_module.ZZMI_MERGED_SKIN_ROW_LAYOUT
+        self.assertEqual(
+            [e["extract_slot"] for e in layout["position"]["elements"]],
+            ["vb0"] * 3,
+        )
+        self.assertEqual(
+            [e["extract_slot"] for e in layout["blend"]["elements"]],
+            ["vb2"] * 2,
+        )
+        exporter, _models = self._exporter_with_elements()
+        plan = exporter._merged_group_redirect_plan(3)
+        self.assertEqual(exporter._merged_skin_layout_mismatches(plan), [])
+        self.assertTrue(exporter._merged_skin_publish_supported(plan))
+
+
+class ZZMISkinRowLayoutContractTests(unittest.TestCase):
+    """t40 ③：HLSL ↔ Python 期望布局的**一致性测试**（禁止将来任一侧静默漂移）。
+
+    解析 `Toolset/zzmi_merged_skin.hlsl` 的结构体与 SRV 声明，与
+    `zzmi.py` 的单一事实源 `ZZMI_MERGED_SKIN_ROW_LAYOUT` 逐字段比对：
+    改 HLSL（字段类型/数量/顺序/结构体名/SRV/寄存器）或改 Python 声明（元素
+    语义/格式/宽度/偏移/读取区间）**都会让本类变红**。
+    """
+
+    HLSL_TYPE_BYTES = {
+        "float": 4, "float2": 8, "float3": 12, "float4": 16,
+        "uint": 4, "uint2": 8, "uint3": 12, "uint4": 16,
+        "int": 4, "int2": 8, "int3": 12, "int4": 16,
+    }
+    # HLSL 字段类型 ↔ 期望元素的 (格式, 分量数) 耦合（仅 1:1 的 blend 行成立）
+    HLSL_TYPE_TO_FORMAT = {
+        "float4": ("R32G32B32A32_FLOAT", 4),
+        "uint4": ("R32G32B32A32_UINT", 4),
+    }
+
+    def _hlsl_source(self):
+        return (REPO_ROOT / "Toolset" / "zzmi_merged_skin.hlsl").read_text(
+            encoding="utf-8"
+        )
+
+    def _parse_struct(self, source, struct_name):
+        match = re.search(
+            rf"struct\s+{re.escape(struct_name)}\s*\{{(?P<body>.*?)\}}\s*;",
+            source,
+            re.S,
+        )
+        self.assertIsNotNone(
+            match, f"HLSL 中找不到结构体 {struct_name}（改名/删除都会红）"
+        )
+        fields = []
+        offset = 0
+        for line in match.group("body").splitlines():
+            field = re.match(
+                r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s+([A-Za-z_][A-Za-z0-9_]*)\s*;", line
+            )
+            if not field:
+                continue
+            hlsl_type, hlsl_name = field.group(1), field.group(2)
+            self.assertIn(
+                hlsl_type,
+                self.HLSL_TYPE_BYTES,
+                f"{struct_name}.{hlsl_name} 的类型 {hlsl_type} 不在已知宽度表",
+            )
+            width = self.HLSL_TYPE_BYTES[hlsl_type]
+            fields.append(
+                {
+                    "hlsl_type": hlsl_type,
+                    "hlsl_name": hlsl_name,
+                    "byte_width": width,
+                    "offset": offset,
+                }
+            )
+            offset += width
+        return fields, offset
+
+    def _spec(self, kind):
+        return _zzmi_module.ZZMI_MERGED_SKIN_ROW_LAYOUT[kind]
+
+    def test_hlsl_structs_match_the_declared_row_layout(self):
+        source = self._hlsl_source()
+        for kind in ("position", "blend"):
+            spec = self._spec(kind)
+            with self.subTest(kind=kind):
+                fields, size = self._parse_struct(source, spec["hlsl_struct"])
+                self.assertEqual(
+                    fields,
+                    list(spec["hlsl_fields"]),
+                    f"{kind}: HLSL 结构体字段与 Python 声明不一致",
+                )
+                self.assertEqual(size, _zzmi_module._zzmi_skin_row_bytes(kind))
+                self.assertIn(
+                    f"StructuredBuffer<{spec['hlsl_struct']}> {spec['hlsl_srv']}"
+                    f" : register({spec['hlsl_register']});",
+                    source,
+                    "SRV/结构体/寄存器绑定与声明不一致",
+                )
+
+    def test_hlsl_reads_cover_the_declared_elements(self):
+        source = self._hlsl_source()
+        for kind in ("position", "blend"):
+            spec = self._spec(kind)
+            with self.subTest(kind=kind):
+                reads = list(spec["hlsl_reads"])
+                for read in reads:
+                    self.assertIn(
+                        read["expr"],
+                        source,
+                        f"{kind}: CS 读取表达式被改动/删除: {read['expr']}",
+                    )
+                self.assertEqual(
+                    [(r["offset"], r["byte_width"]) for r in reads],
+                    [(e["offset"], e["byte_width"]) for e in spec["elements"]],
+                    f"{kind}: 读取字节区间与期望元素区间不一致",
+                )
+                # 元素按声明顺序**紧凑铺满**整行（对齐规则：类目内偏移 = 累加 ByteWidth）
+                running = 0
+                for element in spec["elements"]:
+                    self.assertEqual(element["offset"], running)
+                    running += int(element["byte_width"])
+                self.assertEqual(running, _zzmi_module._zzmi_skin_row_bytes(kind))
+
+    def test_blend_field_types_match_element_formats(self):
+        spec = self._spec("blend")
+        fields = list(spec["hlsl_fields"])
+        elements = list(spec["elements"])
+        self.assertEqual(len(fields), len(elements))
+        for field, element in zip(fields, elements):
+            with self.subTest(field=field["hlsl_name"]):
+                expected_format, components = self.HLSL_TYPE_TO_FORMAT[field["hlsl_type"]]
+                self.assertEqual(element["format"], expected_format)
+                self.assertEqual(int(field["byte_width"]), int(element["byte_width"]))
+                self.assertEqual(4, components)
+                # 语义名与分量数一致：BLENDWEIGHTS/4 通道、BLENDINDICES/4 通道
+                self.assertIn(
+                    element["semantic"], ("BLENDWEIGHTS", "BLENDINDICES")
+                )
+
+    def test_row_bytes_are_derived_not_hardcoded(self):
+        """派生量：常量必须等于声明求和（改声明而忘了改常量会被这里拦住）。"""
+        self.assertEqual(
+            _zzmi_module.ZZMI_MERGED_SKIN_BLEND_ROW_BYTES,
+            sum(int(e["byte_width"]) for e in self._spec("blend")["elements"]),
+        )
+        self.assertEqual(
+            _zzmi_module.ZZMI_MERGED_SKIN_POSITION_ROW_BYTES,
+            sum(int(e["byte_width"]) for e in self._spec("position")["elements"]),
+        )
+        self.assertEqual(_zzmi_module.ZZMI_MERGED_SKIN_BLEND_ROW_BYTES, 32)
+        self.assertEqual(_zzmi_module.ZZMI_MERGED_SKIN_POSITION_ROW_BYTES, 40)
+
+
+class ZZMISkinGuardFallbackCoverageTests(_ZZMIGroup3RedirectFixture, unittest.TestCase):
+    """FR-2：守卫拦下 CS 时，发布覆盖面必须**如实分档**报告（不能说"已退回 draw 重放"）。
+
+    本类内实测的事实（夹具断言，非推断）：
+    - CS 发布块（`_append_merged_skin_publish_block`）是「Blend 布局与锚点不一致、完全不能
+      重放 draw 的必需部件」**唯一**的发布者（计划书 §7 修复链 10）；
+    - draw 版重放只在 `compatible_component_ids`（Blend 布局签名 == 锚点布局）的挂点落笔
+      （`_merged_component_layout_compatible` / `_merged_component_can_host_replay`）；
+    - ⇒ 守卫拦下 CS 后：锚点布局内的必需部件仍有人发布（每个兼容挂点都发同一条宿主重放）；
+      **不在锚点布局内的必需部件本帧没有自己的发布点**（既无 draw 重放、也无 CS）——
+      若它排在最后一个到达，该槽 SO 本帧可能不写 ⇒ 闪烁/缺失可能复现。
+
+    `_merged_skin_replay_coverage` 的四态在这里各自有实测用例：
+    `gap`（混合布局）/ `complete`（全部同锚点）/ `legacy`（锚点签名与全部必需部件都不符）/
+    `unknown`（计划缺必需部件集合或锚点签名）。
+    """
+
+    BLEND_16B = [
+        _skin_element("Blend", "BLENDWEIGHTS", 0, "R32G32_FLOAT", 8, "vb2"),
+        _skin_element("Blend", "BLENDINDICES", 0, "R32G32_UINT", 8, "vb2"),
+    ]
+
+    def _fixture(self, blend_by_ib, stride_by_ib):
+        exporter, models = self._group3_exporter()
+        for model in models:
+            game_type = model.d3d11GameType
+            game_type.D3D11ElementList = list(POSITION_ELEMENTS_40B) + list(
+                blend_by_ib[model.draw_ib]
+            )
+            game_type.CategoryStrideDict["Blend"] = int(stride_by_ib[model.draw_ib])
+        self._build_and_apply_plan(exporter)
+        return exporter, models
+
+    def _mixed(self):
+        """carrier + sibling = 16B（多数派）；target = 32B（必需，但不在锚点布局内）。"""
+        return self._fixture(
+            blend_by_ib={
+                "b20f90ea": self.BLEND_16B,
+                "b30db54e": self.BLEND_16B,
+                "a23aa8a3": BLEND_ELEMENTS_32B,
+            },
+            stride_by_ib={"b20f90ea": 16, "b30db54e": 16, "a23aa8a3": 32},
+        )
+
+    def _all_narrow(self):
+        return self._fixture(
+            blend_by_ib={
+                "b20f90ea": self.BLEND_16B,
+                "b30db54e": self.BLEND_16B,
+                "a23aa8a3": self.BLEND_16B,
+            },
+            stride_by_ib={"b20f90ea": 16, "b30db54e": 16, "a23aa8a3": 16},
+        )
+
+    @staticmethod
+    def _per_model_text(exporter, models):
+        """逐部件 VB 段文本（发布者 / 非发布者事实只能按段判）。"""
+        text_by_ib = {}
+        for model in models:
+            builder = _FakeIniBuilder()
+            exporter.add_unity_vs_texture_override_vb_sections(builder, model)
+            text_by_ib[model.draw_ib] = "\n".join(_all_builder_lines(builder))
+        return text_by_ib
+
+    @staticmethod
+    def _skeleton_text(exporter, models):
+        for carrier_ib, carrier_info in (exporter._redirect_carrier_map or {}).items():
+            carrier_model = next(
+                (m for m in models if m.draw_ib == carrier_ib), None
+            )
+            if carrier_model is None:
+                continue
+            stride = int(
+                (getattr(carrier_model.d3d11GameType, "CategoryStrideDict", {}) or {})
+                .get("Texcoord", 0)
+                or 0
+            )
+            if stride > 0 and not (carrier_model.category_buffer_dict or {}).get(
+                "Texcoord"
+            ):
+                carrier_model.category_buffer_dict["Texcoord"] = bytes(
+                    int(carrier_info.get("vertex_count", 0) or 0) * stride
+                )
+        builder = _FakeIniBuilder()
+        exporter.add_merged_skeleton_sections(builder)
+        return "\n".join(_all_builder_lines(builder))
+
+    # ---- 事实：非锚点布局的必需部件没有任何发布者 -------------------------
+    def test_blocked_required_part_has_no_publisher_when_guard_fires(self):
+        exporter, models = self._mixed()
+        plan = exporter._merged_group_redirect_plan(3)
+        # 锚点 = 16B 多数派 ⇒ 守卫拦下（CS 期望 32B Blend）
+        self.assertFalse(exporter._merged_skin_publish_supported(plan))
+        self.assertEqual(plan["required_component_ids"], [0, 1, 2])
+        self.assertEqual(plan["compatible_component_ids"], [1, 2])
+        self.assertEqual(
+            exporter._merged_skin_replay_coverage(3, plan), (["a23aa8a3"], "gap")
+        )
+        # 反例保护：把判据换成「已存 compatible 集合差」也要给出同一答案
+        plan_without_anchor = dict(plan)
+        plan_without_anchor.pop("anchor_layout_key")
+        self.assertEqual(
+            exporter._merged_skin_replay_coverage(3, plan_without_anchor),
+            (["a23aa8a3"], "gap"),
+        )
+
+        text_by_ib = self._per_model_text(exporter, models)
+        # 锚点布局内的必需部件：draw 版重放照常发布
+        self.assertIn("draw = 18776, 0", text_by_ib["b20f90ea"])
+        self.assertIn("draw = 18776, 0", text_by_ib["b30db54e"])
+        # 非锚点布局的必需部件：自己段里既没有 draw 重放、也没有 CS 发布 ⇒ 本帧无人发布
+        self.assertNotIn("draw = 18776, 0", text_by_ib["a23aa8a3"])
+        self.assertNotIn("CustomShaderZZMISkin", text_by_ib["a23aa8a3"])
+        # 且整个产物的 CS 段定义确实没发
+        skeleton_text = self._skeleton_text(exporter, models)
+        self.assertNotIn("cs = ./res/zzmi_merged_skin.hlsl", skeleton_text)
+
+    # ---- 文案：如实分档（缺口 vs 完整覆盖） -------------------------------
+    def test_diag_reports_the_publish_gap_and_names_the_blocked_part(self):
+        exporter, models = self._mixed()
+        captured = self._capture_stdout(
+            lambda: (
+                self._per_model_text(exporter, models),
+                self._skeleton_text(exporter, models),
+            )
+        )
+        text_by_ib = self._per_model_text(exporter, models)
+        combined = "\n".join(text_by_ib.values()) + "\n" + self._skeleton_text(
+            exporter, models
+        )
+
+        self.assertIn("; ZZMI-MERGE-DIAG SKIN_LAYOUT_UNSUPPORTED", combined)
+        self.assertIn("replay_coverage=gap", combined)
+        self.assertIn("blocked_required=a23aa8a3", combined)
+        self.assertIn("publish_gap=1", combined)
+        # 人读文案必须如实说明缺口与后果 + 给指引
+        self.assertIn("本组有 1 个必需部件的 Blend 布局不在锚点布局内", captured)
+        self.assertIn("这些部件本帧不发布合并几何（自身不是重放挂点）", captured)
+        self.assertIn("仅当最后一个到达的必需部件属于锚点布局时", captured)
+        self.assertIn("该槽 SO 本帧可能不写", captured)
+        self.assertIn("闪烁/缺失可能复现", captured)
+        self.assertIn("计划书 §7 修复链 10", captured)
+        # 不得把「跳过 CS」说成完整回退
+        self.assertNotIn("覆盖完整", captured)
+        # FR-2 核心：不得再有"已退回 draw 版重放"这种过度承诺
+        for text in (combined, captured):
+            self.assertNotIn("退回 draw 版重放", text)
+            self.assertNotIn("退回既有 draw", text)
+
+    def test_all_compatible_group_reports_no_publish_gap(self):
+        exporter, models = self._all_narrow()
+        plan = exporter._merged_group_redirect_plan(3)
+        self.assertFalse(exporter._merged_skin_publish_supported(plan))
+        self.assertEqual(plan["compatible_component_ids"], [0, 1, 2])
+        self.assertEqual(
+            exporter._merged_skin_replay_coverage(3, plan), ([], "complete")
+        )
+
+        # 诊断只打一次（sink 按 code+字段去重）⇒ 捕获必须包住**第一次**触发发射的调用
+        packed = {}
+        captured = self._capture_stdout(
+            lambda: (
+                packed.update({"vb": self._per_model_text(exporter, models)}),
+                packed.update({"skeleton": self._skeleton_text(exporter, models)}),
+            )
+        )
+        text_by_ib = packed["vb"]
+        for draw_ib, text in text_by_ib.items():
+            with self.subTest(draw_ib=draw_ib):
+                self.assertIn("draw = 18776, 0", text)
+        combined = "\n".join(text_by_ib.values()) + "\n" + packed["skeleton"]
+        self.assertIn("replay_coverage=complete", combined)
+        self.assertIn("publish_gap=0", combined)
+        self.assertIn("blocked_required=-", combined)
+        self.assertIn("本组全部必需部件的 Blend 布局都在锚点布局内", captured)
+        self.assertIn("draw 版重放覆盖完整", captured)
+        self.assertNotIn("本帧不发布合并几何", captured)
+
+    def test_diag_three_landing_points_agree(self):
+        exporter, models = self._mixed()
+        packed = {}
+        captured = self._capture_stdout(
+            lambda: packed.update(
+                {"skeleton": self._skeleton_text(exporter, models)}
+            )
+        )
+        combined = "\n".join(self._per_model_text(exporter, models).values())
+        combined += "\n" + packed["skeleton"]
+
+        records = [
+            record
+            for record in exporter._merged_diag_sink()
+            if record.get("code") == "SKIN_LAYOUT_UNSUPPORTED"
+        ]
+        self.assertEqual(len(records), 1, records)
+        # 三落点：产物 ini 注释 / stdout / sink 的机器可读字段一致
+        for text in (combined, captured):
+            self.assertIn("SKIN_LAYOUT_UNSUPPORTED", text)
+            self.assertIn("replay_coverage=gap", text)
+            self.assertIn("blocked_required=a23aa8a3", text)
+            self.assertIn("publish_gap=1", text)
+        sink_record = records[0]
+        self.assertEqual(sink_record["replay_coverage"], "gap")
+        self.assertEqual(sink_record["blocked_required"], "a23aa8a3")
+        self.assertEqual(sink_record["publish_gap"], "1")
+        self.assertEqual(sink_record["group"], "G3")
+        # 人读结论只在 stdout（既有 DIAG 机制：注释行只带 code+字段）
+        self.assertIn("本帧不发布合并几何", captured)
+
+    # ---- 边界态：legacy（空集回退）与 unknown 都不能写成「覆盖完整」 ------
+    def test_legacy_fallback_state_does_not_claim_complete_coverage(self):
+        exporter, models = self._mixed()
+        plan = dict(exporter._merged_group_redirect_plan(3))
+        # 构造 legacy：锚点签名与**全部**必需部件都不一致（空集回退已把
+        # compatible 写成 required），且必须满足 `_merged_skin_publish_supported` 为假
+        plan["anchor_layout_key"] = ("stride", 48)
+        plan["anchor_layout"] = {"stride": 48, "elements": []}
+        plan["so_stride"] = 0
+        plan["deform_draw_ibs"] = list(plan.get("deform_draw_ibs") or [])
+        # 空集回退的痕迹：compatible 被写成 required（否则计划会直接把不兼容部件排除）
+        plan["compatible_component_ids"] = [0, 1, 2]
+        self.assertFalse(exporter._merged_skin_publish_supported(plan))
+        self.assertEqual(
+            exporter._merged_skin_replay_coverage(3, plan),
+            (["a23aa8a3", "b20f90ea", "b30db54e"], "legacy"),
+        )
+        captured = self._capture_stdout(
+            lambda: exporter._merged_skin_layout_diag(3, plan)
+        )
+        self.assertIn("replay_coverage=legacy", self._last_diag_line(exporter))
+        self.assertIn("计划已按旧行为把全部必需部件都当重放挂点", captured)
+        # 不得声称「全部都在锚点布局内 / 覆盖完整」（那正是 FR-2 要消灭的过度承诺）
+        self.assertNotIn("全部必需部件的 Blend 布局都在锚点布局内", captured)
+        self.assertNotIn("覆盖完整", captured)
+        self.assertIn("计划书 §7 修复链 10", captured)
+
+    def test_unknown_coverage_state_does_not_claim_complete_coverage(self):
+        exporter, models = self._mixed()
+        plan = dict(exporter._merged_group_redirect_plan(3))
+        plan.pop("anchor_layout_key", None)
+        plan.pop("compatible_component_ids", None)
+        self.assertEqual(exporter._merged_skin_replay_coverage(3, plan), ([], "unknown"))
+        captured = self._capture_stdout(
+            lambda: exporter._merged_skin_layout_diag(3, plan)
+        )
+        self.assertIn("replay_coverage=unknown", self._last_diag_line(exporter))
+        self.assertIn("发布覆盖面无法判定", captured)
+        self.assertNotIn("覆盖完整", captured)
+        # 无必需部件集合也要落到 unknown，而不是「完整覆盖」
+        self.assertEqual(
+            exporter._merged_skin_replay_coverage(
+                3, {"required_component_ids": [], "compatible_component_ids": []}
+            ),
+            ([], "unknown"),
+        )
+
+    @staticmethod
+    def _last_diag_line(exporter):
+        """sink 里 SKIN_LAYOUT_UNSUPPORTED 记录 → 机器可读字段行（= ini 注释内容）。"""
+        records = [
+            record
+            for record in exporter._merged_diag_sink()
+            if record.get("code") == "SKIN_LAYOUT_UNSUPPORTED"
+        ]
+        assert records, "no SKIN_LAYOUT_UNSUPPORTED record"
+        record = records[-1]
+        fields = " ".join(
+            f"{key}={value}" for key, value in record.items() if key != "code"
+        )
+        return f"{record['code']} {fields}"
 
 
 if __name__ == "__main__":

@@ -205,6 +205,23 @@ class GlobalProterties(bpy.types.PropertyGroup):
         default=True,
     ) # type: ignore
 
+    cross_group_merged_vgmap_test: bpy.props.BoolProperty(
+        name="跨组融合统一顶点组测试",
+        description="【实验开关，仅 ZZMI】跨 SkeletonGroup 的融合统一顶点组测试：允许把对象变换（渲染 vs-cb1 对象空间）不同的部件合并进同一个对象。与已验证可用的合并骨骼（使用融合统一顶点组）完全分离，开启不会改变后者的既有行为；跨组部件需要一个逐帧的对象空间换算，未完成前本开关不参与导入/导出决策",
+        default=False,
+    ) # type: ignore
+
+    zzmi_merged_redirect_enabled: bpy.props.BoolProperty(
+        name="启用合并网格自动重定向（实验）",
+        description=(
+            "ZZMI 合并骨架实验开关。关闭（默认）时保留每个合并物体的原始 IB/"
+            "Blend 输入布局，在组内宿主完成当帧重放；开启时才使用跨 DrawIB 的"
+            "RedirectSO 自动重定向。自动重定向在部分游戏帧序下会丢失整块几何，"
+            "只有在需要专门复核该路径时才开启。"
+        ),
+        default=False,
+    ) # type: ignore
+
     efmi_lod_group_projection: bpy.props.BoolProperty(
         name="EFMI LOD 分组投影",
         description="EFMI 多 LOD 时，以 LOD0 的去重分组关系约束 LOD1：LOD0 已合并的对应组在 LOD1 也合并、未合并的组不互并；两侧仍使用互不重叠的独立槽位段。开启时还会过滤几何未匹配的 LOD1 物体并自动创建匹配链；关闭后双侧完全独立去重、不过滤、不建链",
@@ -487,6 +504,25 @@ class GlobalProterties(bpy.types.PropertyGroup):
     def set_import_merged_vgmap(cls, value: bool):
         """显式切换合并 VGMap；预生成失败时用于保持导入与后续导出同一模式。"""
         setattr(cls._instance(), "import_merged_vgmap", bool(value))
+
+    @classmethod
+    def cross_group_merged_vgmap_test(cls):
+        """跨组融合统一顶点组测试开关（仅 ZZMI，实验用，默认关闭）。
+
+        与 `import_merged_vgmap`（已验证可用的合并骨骼）**完全分离**：互不影响，
+        关闭本开关时任何既有行为都不变。跨组功能未实现前读取本开关不产生行为。
+        """
+        return cls._bool_attr("cross_group_merged_vgmap_test", False)
+
+    @classmethod
+    def set_cross_group_merged_vgmap_test(cls, value: bool):
+        """显式切换跨组测试开关（实验/测试用）。"""
+        setattr(cls._instance(), "cross_group_merged_vgmap_test", bool(value))
+
+    @classmethod
+    def zzmi_merged_redirect_enabled(cls) -> bool:
+        """Whether to use the experimental cross-DrawIB RedirectSO path."""
+        return cls._bool_attr("zzmi_merged_redirect_enabled", False)
 
     @classmethod
     def efmi_lod_group_projection(cls):

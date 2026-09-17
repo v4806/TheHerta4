@@ -561,6 +561,14 @@ class PanelBasicInformation(bpy.types.Panel):
         # 勾选 = 导入全局顶点组、导出走合并骨架；不勾选 = 完全维持原路线（见 ZZMI骨骼合并计划书.md §5.1）。
         if GlobalConfig.logic_name in (LogicName.WWMI, LogicName.ZZMI, LogicName.EFMI):
             layout.prop(global_properties, "import_merged_vgmap")
+        # ZZMI 专用实验开关：跨组融合统一顶点组测试。
+        # 与上面已验证可用的合并骨骼**完全分离**（同组内合并不受影响、关闭本开关
+        # 行为不变），仅用于跨 SkeletonGroup（对象变换不同）合并的实验与测试。
+        if GlobalConfig.logic_name == LogicName.ZZMI:
+            layout.prop(global_properties, "cross_group_merged_vgmap_test")
+            # RedirectSO 跨 DrawIB 重定向在部分运行时顺序下会丢失合并几何，默认
+            # 关闭；保留显式开关仅用于对照测试。关闭时仍使用合并骨架与单一合并对象。
+            layout.prop(global_properties, "zzmi_merged_redirect_enabled")
         # EFMI 专用：多 LOD 使用 LOD0 分组投影，关闭则两侧独立去重。
         if GlobalConfig.logic_name == LogicName.EFMI:
             layout.prop(global_properties, "efmi_lod_group_projection")

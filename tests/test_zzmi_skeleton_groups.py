@@ -4,7 +4,8 @@
 - 变换逐位相同的部件同组（共享对象空间，palette/cb1 逐物体 1:1 配对）；
 - 无变换数据的部件独立成组（不共享 = 安全方向）；
 - 组索引按组内最小 draw_ib 排序分配（导入/导出确定性一致）；
-- cb1 解析只接受 ≤512B 逐部件块（>512B 是多对象共享变换数组，排除）。
+- cb1 窗口：dump 是整块资源，本 draw 的对象变换在绑定窗口 first_constant 处
+  （>512B 的多对象共享数组必须按窗口取，不能读 float 0——那会读到别的对象）。
 """
 
 import importlib.util
@@ -68,6 +69,21 @@ def _write_cb1(path, transform=None, total_float4=16):
     rows.tofile(path)
 
 
+def _write_cb1_windowed(path, windows, total_constants=256):
+    """写一个多对象共享 cb1 buf：{first_constant: transform}，其余填零。
+
+    ``first_constant`` 单位 = 16 字节常量 = 1 个 float4，与 log 的
+    ``VSSetConstantBuffers1(first_constant=N)`` 同口径；本 draw 的对象变换
+    位于第 N 个 float4（实测 FrameAnalysis-2026-09-16-014450：窗口 64 →
+    float 偏移 256）。
+    """
+    rows = numpy.zeros((int(total_constants), 4), dtype=numpy.float32)
+    for first_constant, transform in windows.items():
+        start = int(first_constant)
+        rows[start:start + 4] = numpy.array(transform, dtype=numpy.float32).reshape(4, 4)
+    rows.tofile(path)
+
+
 class ParseObjectTransformTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="zzmi_tf_")
@@ -82,11 +98,59 @@ class ParseObjectTransformTests(unittest.TestCase):
         )
         self.assertEqual(result, expected)
 
-    def test_oversized_buffer_rejected(self):
-        """2048B 多对象共享数组必须排除（rows 0-3 未必是本 draw 的对象）。"""
-        path = os.path.join(self.tmp, "cb1_big.buf")
-        _write_cb1(path, TF_BODY, total_float4=128)  # 2048B
-        self.assertIsNone(ZZMIBoneMapBuilder.parse_object_transform(path))
+    def test_shared_array_window_selects_own_object(self):
+        """多对象共享数组：按 first_constant 窗口取，读到的是本 draw 的对象。
+
+        回归 FrameAnalysis-2026-09-16-014450：同一 4096B 资源被 draw 64/65/66
+        按 first_constant=0/32/64 切片，窗口 64 处才是 draw 66 的对象变换；
+        旧实现读 float 0 会读到 draw 64 的对象，把同对象空间的部件拆成两组。
+        """
+        path = os.path.join(self.tmp, "cb1_shared.buf")
+        _write_cb1_windowed(path, {0: TF_BODY, 64: TF_HEAD})
+        self.assertEqual(
+            ZZMIBoneMapBuilder.parse_object_transform(path, first_constant=64),
+            tuple(float(x) for x in numpy.array(TF_HEAD, dtype=numpy.float32)),
+        )
+        # 不传窗口 = 0，语义仍是"读本 draw 的窗口起点"
+        self.assertEqual(
+            ZZMIBoneMapBuilder.parse_object_transform(path),
+            tuple(float(x) for x in numpy.array(TF_BODY, dtype=numpy.float32)),
+        )
+
+    def test_window_and_per_object_dump_agree(self):
+        """同一对象空间：共享数组窗口 64 与逐部件 512B dump 必须逐位相同。"""
+        shared = os.path.join(self.tmp, "cb1_shared.buf")
+        per_object = os.path.join(self.tmp, "cb1_single.buf")
+        _write_cb1_windowed(shared, {0: TF_BODY, 64: TF_HEAD})
+        _write_cb1(per_object, TF_HEAD)  # first_constant=0 的逐部件块
+        self.assertEqual(
+            ZZMIBoneMapBuilder.parse_object_transform(shared, first_constant=64),
+            ZZMIBoneMapBuilder.parse_object_transform(per_object, first_constant=0),
+        )
+        groups = assign_skeleton_groups({
+            "aaaa1111": ZZMIBoneMapBuilder.parse_object_transform(
+                shared, first_constant=64
+            ),
+            "bbbb2222": ZZMIBoneMapBuilder.parse_object_transform(
+                per_object, first_constant=0
+            ),
+        })
+        self.assertEqual(groups["aaaa1111"], groups["bbbb2222"])
+
+    def test_window_out_of_range_returns_none(self):
+        """窗口越界（dump 没覆盖该窗口）必须 None，不得回退到 float 0。"""
+        path = os.path.join(self.tmp, "cb1_short.buf")
+        _write_cb1(path, TF_BODY)  # 256B = 16 float4；first_constant=64 需要 64*16B
+        self.assertIsNone(
+            ZZMIBoneMapBuilder.parse_object_transform(path, first_constant=64)
+        )
+
+    def test_negative_first_constant_rejected(self):
+        path = os.path.join(self.tmp, "cb1.buf")
+        _write_cb1(path, TF_BODY)
+        self.assertIsNone(
+            ZZMIBoneMapBuilder.parse_object_transform(path, first_constant=-1)
+        )
 
     def test_non_transform_rejected(self):
         """w 列形态不符（平移行 w != 1）的参数块拒绝。"""

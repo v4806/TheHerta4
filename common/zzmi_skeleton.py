@@ -55,7 +55,10 @@ _BONE_MATRIX_FLOATS = 12
 # 必须整批重建以清除污染。
 # v3：拒绝同一 DrawIB 对应多个对象 CB1 实例的歧义缓存；这类 IB 可能同时被
 # 多个相似模型绘制，继续共用一套全局骨架会把修改写入其它实例。
-_ZZMI_VG_MAP_ALGORITHM_VERSION = 3
+# v4：对象变换按绑定窗口（first_constant）解析。旧实现无视窗口读 float 0，把
+# 多对象共享 cb1 数组里**别的对象**的矩阵当分组键，导致同对象空间的部件被拆进
+# 不同 SkeletonGroup/合集（FrameAnalysis-2026-09-16-014450 实证）；必须整批重建。
+_ZZMI_VG_MAP_ALGORITHM_VERSION = 4
 # 导出侧也需要知道当前缓存口径，不能只依赖导入阶段的幂等门控。
 ZZMI_VG_MAP_ALGORITHM_VERSION = _ZZMI_VG_MAP_ALGORITHM_VERSION
 
@@ -83,6 +86,11 @@ class ZZMILogParser:
         r"BaseVertexLocation:(\d+)\)$"
     )
     _IA_VB_RE = re.compile(r"^IASetVertexBuffers\(StartSlot:(\d+), NumBuffers:(\d+),")
+    # 常量缓冲绑定行（对象变换 CB1 靠 first_constant 窗口定位）
+    _CB_BIND_RE = re.compile(
+        r"^(\d+): resource=0x[0-9A-Fa-f]+ hash=([0-9a-f]{8}) "
+        r"first_constant=(\d+) num_constants=(\d+)$"
+    )
     _IA_IB_RE = re.compile(r"^IASetIndexBuffer\(.*\) hash=([0-9a-f]{8})$")
     _SO_RE = re.compile(r"^SOSetTargets\(NumBuffers:(\d+),")
     _SRV_RE = re.compile(r"^(V|P|C|G|H|D)SSetShaderResources\(StartSlot:(\d+), NumViews:(\d+),")
@@ -102,6 +110,10 @@ class ZZMILogParser:
         # 记录路径在 dump 被搬走后会失效，因此始终保存逻辑名并延迟解析
         # （get_render_cb1_path 按候选路径逐一回退）。
         self.render_cb1_dumps: dict[str, tuple[str, str]] = {}
+        # 常量缓冲绑定窗口：draw_index -> {stage: {slot: {hash, first_constant,
+        # num_constants}}}。对象变换 CB1 可能来自多对象共享数组，必须用绑定窗口
+        # 才能定位本 draw 的对象矩阵（见 ZZMIBoneMapBuilder.parse_object_transform）。
+        self.cb_bindings: dict[str, dict] = {}
         # 逻辑文件名（根目录 dump 文件名）-> deduped 实际路径
         self.dump_map: dict[str, str] = {}
         self._parse()
@@ -156,6 +168,17 @@ class ZZMILogParser:
                                 info["so"][slot] = res_hash
                             elif kind == "srv" and pending[1] == "V" and slot == 0:
                                 info["vs_t0"] = res_hash
+                            elif kind == "cb":
+                                desc_cb = self._CB_BIND_RE.match(stripped)
+                                if desc_cb:
+                                    stage_slot = self.cb_bindings.setdefault(
+                                        pending_draw, {}
+                                    ).setdefault(pending[1], {})
+                                    stage_slot[int(desc_cb.group(1))] = {
+                                        "hash": desc_cb.group(2),
+                                        "first_constant": int(desc_cb.group(3)),
+                                        "num_constants": int(desc_cb.group(4)),
+                                    }
                         # 注意：不在这里清空 pending——多槽资源描述是连续多行，
                         # 由下一行（无论有无前缀）继续消费或重设。
                     continue
@@ -187,6 +210,14 @@ class ZZMILogParser:
                 srv_match = self._SRV_RE.match(payload)
                 if srv_match:
                     pending = ("srv", srv_match.group(1))
+                    continue
+
+                # 常量缓冲绑定（对象变换 CB1 的窗口起点，单位 = 16 字节常量）
+                cb_match = re.match(
+                    r"^(V|P|C|G|H|D)SSetConstantBuffers1\(StartSlot:(\d+),", payload
+                )
+                if cb_match:
+                    pending = ("cb", cb_match.group(1))
                     continue
 
                 # VS hash
@@ -299,6 +330,21 @@ class ZZMILogParser:
             if os.path.isfile(candidate):
                 return candidate
         return None
+
+    def get_vs_cb_first_constant(self, draw_index: str, slot: int) -> int:
+        """返回该渲染 draw 在 VS 常量缓冲 slot 上的绑定窗口起点（单位 16 字节常量）。
+
+        未记录绑定时返回 0（等价于整块从 0 起，与逐部件 512B dump 的语义一致）。
+        """
+        stage_slots = self.cb_bindings.get(draw_index, {}).get("V", {})
+        binding = stage_slots.get(int(slot)) if stage_slots else None
+        if not binding:
+            return 0
+        try:
+            value = int(binding.get("first_constant", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+        return value if value >= 0 else 0
 
     def get_deform_passes(self) -> dict[str, dict]:
         """识别全部 deform pass（pointlist Draw + SO 输出 + vs-t0 palette + vb0）。
@@ -439,7 +485,10 @@ class ZZMIBoneMapBuilder:
         return data.reshape(-1, _BONE_MATRIX_FLOATS)
 
     @staticmethod
-    def parse_object_transform(cb1_path: str) -> tuple[float, ...] | None:
+    def parse_object_transform(
+        cb1_path: str,
+        first_constant: int = 0,
+    ) -> tuple[float, ...] | None:
         """从渲染 draw 的 vs-cb1 dump 解析对象→世界矩阵，返回 16 floats 元组（分组键）。
 
         实测布局（FrameAnalysis-2026-08-19-122152 逆向）：逐部件 cb1 块的前 4 个
@@ -447,19 +496,30 @@ class ZZMIBoneMapBuilder:
         palette 矩阵把顶点蒙皮到该对象空间，渲染 VS 再用本矩阵摆到世界——
         两者逐物体 1:1 配对，共享同一份变换的部件才共享同一对象空间。
 
-        只接受 ≤512 字节的逐部件块（实测 176/256/464/512B）：>512B 的 cb1 是
-        **多对象共享变换数组**（draw 用 first_constant 窗口索引），rows 0-3 未必是
-        本 draw 的对象，排除。解析失败返回 None（调用方按独立组兜底 = 不共享，安全方向）。
+        ``first_constant`` 是该 draw 绑定 cb1 时的窗口起点（log 的
+        ``VSSetConstantBuffers1(first_constant=N)``，单位 = 16 字节常量；
+        实测 FrameAnalysis-2026-09-16-014450：同一 4096B 资源被 draw 64/65/66
+        按 first_constant=0/32/64 逐 512B 一窗切给三个不同对象）。**dump 是整块
+        资源**，本 draw 的对象变换只在该窗口内——忽略窗口就会读到别的对象的矩阵
+        （实测 draw 66 在窗口 64 处与 draw 69 逐位同空间，而 float 0 处是 draw 64
+        的对象），把同空间部件误拆成不同 SkeletonGroup。
+
+        窗口取不到（越界/缺文件）返回 None（调用方按独立组兜底 = 不共享，安全方向）；
+        窗口内形态不合法（w 列/行范数 sanity 不过）同样返回 None。
         """
         try:
-            if os.path.getsize(cb1_path) > 512:
-                return None
             data = numpy.fromfile(cb1_path, dtype=numpy.float32)
         except (OSError, ValueError):
             return None
-        if len(data) < 16:
+        try:
+            offset = int(first_constant) * 4
+        except (TypeError, ValueError):
             return None
-        m = data[:16].reshape(4, 4)
+        if offset < 0 or offset + 16 > len(data):
+            # 窗口越界：dump 缺该窗口（旧版只 dump 了逐部件 512B 块）或绑定值异常。
+            # 不得回退到 float 0——那会静默读成其它对象的矩阵。
+            return None
+        m = data[offset:offset + 16].reshape(4, 4)
         # w 列形态：旋转行 w=0、平移行 w=1
         if abs(float(m[3, 3]) - 1.0) > 1e-3:
             return None
@@ -469,7 +529,7 @@ class ZZMIBoneMapBuilder:
         row_norms = numpy.linalg.norm(m[:3, :3].astype(numpy.float64), axis=1)
         if numpy.any((row_norms < 0.05) | (row_norms > 20.0)):
             return None
-        return tuple(float(x) for x in data[:16])
+        return tuple(float(x) for x in data[offset:offset + 16])
 
     @staticmethod
     def build_vg_maps(
@@ -741,6 +801,17 @@ class ZZMISkeletonMergeHelper:
         submesh_dir = os.path.dirname(os.path.dirname(json_path))
         return os.path.join(submesh_dir, "ModImpRuntime", file_name)
 
+    @staticmethod
+    def _parse_first_constant(value) -> int:
+        """解析写回 json 的 CB1 窗口起点；非法值按 0 处理（旧版缓存语义）。"""
+        if isinstance(value, bool):
+            return 0
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return 0
+        return parsed if parsed >= 0 else 0
+
     @classmethod
     def _zzmi_cache_intact(cls, submesh_json: dict, json_path: str, unique_str: str) -> bool:
         """ZZMI 缓存快路径完整性校验（schema + 算法版本 + 映射覆盖 + 缓存文件）。
@@ -864,7 +935,12 @@ class ZZMISkeletonMergeHelper:
         )
         return bool(
             os.path.isfile(cb1_path)
-            and ZZMIBoneMapBuilder.parse_object_transform(cb1_path) is not None
+            and ZZMIBoneMapBuilder.parse_object_transform(
+                cb1_path,
+                first_constant=cls._parse_first_constant(
+                    submesh_json.get("ObjectCB1FirstConstant", 0)
+                ),
+            ) is not None
         )
 
     @classmethod
@@ -1242,6 +1318,7 @@ class ZZMISkeletonMergeHelper:
             # ObjectCB1 缓存（dump 已删除时仍能重建出相同的骨架分组）。同 DrawIB
             # 成员共享同一对象变换，代表子网格缓存缺失时遍历兄弟子网格。
             cb1_cache_paths = []
+            cb1_cache_first_constants: dict[str, int] = {}
             cb1_cache_required = False
             cb1_cache_contract_unknown = False
             for member in group["members"]:
@@ -1271,6 +1348,9 @@ class ZZMISkeletonMergeHelper:
                 )
                 if os.path.isfile(member_cb1):
                     cb1_cache_paths.append(member_cb1)
+                    cb1_cache_first_constants[member_cb1] = cls._parse_first_constant(
+                        member_json.get("ObjectCB1FirstConstant", 0)
+                    )
             cb1_path = ""
             dump_cb1_seen = False
             first_dump_cb1_path = ""
@@ -1286,17 +1366,32 @@ class ZZMISkeletonMergeHelper:
                     dump_cb1_seen = True
                     if not first_dump_cb1_path:
                         first_dump_cb1_path = candidate
-                    transform = ZZMIBoneMapBuilder.parse_object_transform(candidate)
+                    # dump 是整块资源：本 draw 的对象变换在它绑定的 first_constant
+                    # 窗口内。多对象共享数组里 float 0 处是别的对象的矩阵，必须
+                    # 按窗口取，否则同对象空间的部件会被误拆成不同 SkeletonGroup。
+                    first_constant = (
+                        parser.get_vs_cb_first_constant(render_draw, 1)
+                        if parser is not None
+                        else 0
+                    )
+                    transform = ZZMIBoneMapBuilder.parse_object_transform(
+                        candidate,
+                        first_constant=first_constant,
+                    )
                     if transform is not None:
-                        dump_transform_candidates.append((transform, candidate))
+                        dump_transform_candidates.append(
+                            (transform, candidate, first_constant)
+                        )
 
             # 一个 DrawIB 可能在同一帧被多个实例绘制；它们的 IB/VB hash 相同，
             # 但对象 CB1 不同。旧实现无条件取第一个 CB1，随后把所有实例当成
             # 一个 SkeletonGroup，导出时修改其中一个实例会污染另一个。没有额外
             # 的实例选择键时，安全策略是拒绝该 DrawIB 的合并缓存，而不是猜一个。
             unique_dump_transforms = {}
-            for transform, candidate in dump_transform_candidates:
-                unique_dump_transforms.setdefault(transform, candidate)
+            for transform, candidate, candidate_first_constant in dump_transform_candidates:
+                unique_dump_transforms.setdefault(
+                    transform, (candidate, candidate_first_constant)
+                )
             if len(unique_dump_transforms) > 1:
                 group["skip_reason"] = (
                     f"同一 DrawIB 对应 {len(unique_dump_transforms)} 个不同对象 CB1 实例，"
@@ -1310,7 +1405,10 @@ class ZZMISkeletonMergeHelper:
             if unique_dump_transforms:
                 # 必须缓存“实际用于分组”的同一个有效 CB1。旧实现先记住首个
                 # 候选，即使后续候选才有效，也会把错误实例的 CB1 发布到工作空间。
-                group["transform"], cb1_path = next(iter(unique_dump_transforms.items()))
+                # 同时记下该候选的窗口起点：ObjectCB1 缓存保存的是 dump 原始字节，
+                # 无 dump 重建时必须按同一窗口还原同一个对象变换。
+                group["transform"], cb1_pick = next(iter(unique_dump_transforms.items()))
+                cb1_path, group["cb1_first_constant"] = cb1_pick
                 group["cb1_cache_valid"] = True
             if (
                 group["transform"] is None
@@ -1328,7 +1426,14 @@ class ZZMISkeletonMergeHelper:
                 continue
             if group["transform"] is None and not dump_cb1_seen and parser is None:
                 for member_cb1 in cb1_cache_paths:
-                    transform = ZZMIBoneMapBuilder.parse_object_transform(member_cb1)
+                    # ObjectCB1 缓存保存的是 dump 原始字节（整块资源），窗口起点由
+                    # 生成时写回的 ObjectCB1FirstConstant 还原；缺失时按 0 处理
+                    # （旧版缓存来自逐部件 512B 块，窗口恒为 0）。
+                    cache_first_constant = cb1_cache_first_constants.get(member_cb1, 0)
+                    transform = ZZMIBoneMapBuilder.parse_object_transform(
+                        member_cb1,
+                        first_constant=cache_first_constant,
+                    )
                     if transform is not None:
                         group["transform"] = transform
                         group["cb1_cache_valid"] = True
@@ -1500,10 +1605,17 @@ class ZZMISkeletonMergeHelper:
                         submesh_json["ObjectCB1CacheValid"] = bool(
                             group.get("cb1_cache_valid", False)
                         )
+                        # 窗口起点随缓存一起写回：ObjectCB1 保存的是 dump 原始字节
+                        # （可能是多对象共享数组），无 dump 重建时必须按同一窗口
+                        # 还原同一个对象变换，否则分组会在重建后漂移。
+                        submesh_json["ObjectCB1FirstConstant"] = int(
+                            group.get("cb1_first_constant", 0) or 0
+                        )
                     else:
                         # 显式沉淀“本次没有有效 CB1”；缓存读取必须忽略可能残留的
                         # 旧文件，才能复现 dump 路径的独立分组语义。
                         submesh_json.pop("ObjectCB1FileName", None)
+                        submesh_json.pop("ObjectCB1FirstConstant", None)
                         submesh_json["ObjectCB1CacheValid"] = False
                     EFMISkeletonMergeHelper._atomic_publish_skeleton_transaction(
                         cache_entries,
