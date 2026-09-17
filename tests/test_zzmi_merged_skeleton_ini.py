@@ -4515,7 +4515,7 @@ class ZZMISkinRowLayoutElementTests(_ZZMIGroup3RedirectFixture, unittest.TestCas
     """t40：蒙皮 CS 行布局的**逐元素**动态识别（旧实现只比总宽度，会放行这些）。
 
     覆盖 `ui/universal/zzmi.py`：
-    - `_merged_skin_row_layout_mismatches`（逐元素判据：声明 stride + 语义/索引/格式/宽/偏移）
+    - `_merged_skin_row_layout_mismatches`（逐元素判据：声明 stride + 语义/索引/格式/宽/偏移/extract_slot）
     - `_merged_skin_layout_mismatches`（Blend 锚点 + 每个 deform_draws 条目的 Position + 目的侧 so_stride）
     - `_merged_skin_publish_supported`（两道 CS 闸门共用）
     - `_merged_skin_layout_diag`（诊断点名不匹配的元素）
@@ -4869,8 +4869,8 @@ class ZZMISkinRowLayoutElementTests(_ZZMIGroup3RedirectFixture, unittest.TestCas
         """反向对照：期望 slot 与生成端绑定源一致（Position→vb0 / Blend→vb2）⇒ 比对为空。
 
         断言的期望值不是凭空写的：CS 段把 `cs-t0` 绑到该部件的 **vb0** 资源、
-        `cs-t1` 绑到 **vb2** 资源（真实 ZZMI 工作空间 10/10 部件的 `ExtractSlot`
-        也正是 vb0 / vb2）。
+        `cs-t1` 绑到 **vb2** 资源（工作空间复核口径见 `ui/universal/zzmi.py` 模块头
+        「对齐规则依据」：`主角` 12 + `叶瞬光01` 20 个部件的 `ExtractSlot` 全为 vb0/vb2）。
         """
         layout = _zzmi_module.ZZMI_MERGED_SKIN_ROW_LAYOUT
         self.assertEqual(

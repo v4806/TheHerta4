@@ -176,18 +176,24 @@ ZZMI_MERGED_POSE_KEY_CELL = 0.01
 #   · 管线元数据 `D3D11ElementList` 每个元素带 ByteWidth，类目 stride = 该类别 ByteWidth
 #     之和（`common/d3d11_gametype.py:71-93`）；`AlignedByteOffset` 是**跨类别**的全局累加值
 #     （同文件 :70-82），**不是**每类别缓冲内的偏移 —— 因此类别内偏移按声明顺序**紧凑累加**。
-#   · 真实 SSMT 工作空间 json（只读复查 `K:\SSMT-Package-master\WorkSpace\ZZMI\主角\LOD0\*`，
-#     **10/10 部件**一致）：Position = POSITION R32G32B32_FLOAT 12 + NORMAL R32G32B32_FLOAT 12
-#     + TANGENT R32G32B32A32_FLOAT 16 = 40B（偏移 0/12/24）、`ExtractSlot` 全为 **vb0**；
-#     Blend = BLENDWEIGHTS R32G32B32A32_FLOAT 16 + BLENDINDICES R32G32B32A32_UINT 16 = 32B
-#     （偏移 0/16）、`ExtractSlot` 全为 **vb2**；窄布局实测 BW8_BI8 = 8+8、BI4 = 单
-#     BLENDINDICES R32_UINT 4（另有 BLENDINDICES 记成 SINT 的等价形态，见格式归并）。
-#   · 3DMigoto 抓帧的 deduped 缓冲（文件名形如 `...-vb2-layout=<布局签名>-stride=<N>.txt`）
+#   · 真实 SSMT 工作空间 json（只读复核 `K:\SSMT-Package-master\WorkSpace\ZZMI`，
+#     按 `<部件>\TYPE_GPU_*\tmp.json` 统计）：`主角` 12 个 + `叶瞬光01` 20 个部件的
+#     `Position` / `Blend` `ExtractSlot` **全为 vb0 / vb2**，无一例外。
+#     （另一层 `LOD0\<部件>-*` 目录里同值 10 + 19 个，未计入上面的部件数。）据此：
+#     Position = POSITION R32G32B32_FLOAT 12 +
+#     NORMAL R32G32B32_FLOAT 12 + TANGENT R32G32B32A32_FLOAT 16 = 40B（偏移 0/12/24）；
+#     Blend = BLENDWEIGHTS R32G32B32A32_FLOAT 16 + BLENDINDICES R32G32B32A32_UINT 16
+#     = 32B（偏移 0/16）；窄布局实测 BW8_BI8 = 8+8、BI4 = 单 BLENDINDICES R32_UINT 4
+#     （另有 BLENDINDICES 记成 SINT 的等价形态，见格式归并）。
+#   · 3DMigoto 抓帧的 deduped 缓冲（文件名形如
+#     `146c0784-vb0-layout=34c1b144-topology=trianglelist-stride=28-count=244-inst_count=2.txt`）
 #     与 HLSL 结构体注释（"位置 = 0..2，法线 = 3..5，切线 = 6..9"）给出同一组偏移。
-#     ⚠️ **该文件名只带 `layout=`（布局签名）、不带 slot 名** —— 同偏移不同 slot 也会命中，
-#     所以抓帧这一路只把「偏移 / 语义构成」当证据，**不能**当 slot 溯源的独立证据；
-#     slot 由 `elements[*]["extract_slot"]` 的逐元素比对单独把关（与生成端 `cs-t0`→vb0 /
-#     `cs-t1`→vb2 的绑定源一致；实际值空 = 旧缓存不带 slot 溯源 ⇒ 保守放行）。
+#     ⚠️ `layout=<签名>` 这个 token 本身**不含 slot**；文件名带 `vbN-` 前缀（本机复核：
+#     184431 的 444 个、185933 的 216 个含 `layout=` 的 dedup 文件名**全部**带该前缀），
+#     而该前缀与工作空间 `ExtractSlot` **同源**（都来自 ini / 导入声明）⇒ 可作佐证，
+#     **不能**当独立证据；slot 溯源由 `elements[*]["extract_slot"]` 的逐元素比对把关
+#     （与生成端 `cs-t0`→vb0 / `cs-t1`→vb2 的绑定源一致；实际值空 = 旧缓存不带 slot
+#     溯源 ⇒ 保守放行）。
 # 不满足判据时**不发 CS**、落具名诊断（指出具体哪个元素不匹配），并把发布退回给 draw 版重放。
 # ⚠️ 该退回**不是无损的**（FR-2 如实化）：draw 版重放只能在「Blend 布局 == 锚点布局」的挂点落笔，
 # 而 CS 发布块正是为「布局与锚点不一致、完全不能重放 draw」的必需部件准备的（见
@@ -226,8 +232,8 @@ ZZMI_MERGED_SKIN_ROW_LAYOUT: dict = {
                 "byte_width": 12,
                 "offset": 0,
                 # 生成端把 `cs-t0` 绑到该部件的 vb0 资源（`cs-t0 = ref <vb0>`）⇒
-                # 语义期望也带上 slot 溯源：真实 ZZMI 工作空间 10/10 部件 Position
-                # 的 `ExtractSlot` = "vb0"（见模块头「对齐规则依据」）。
+                # 语义期望也带上 slot 溯源：工作空间复核的 `Position` `ExtractSlot`
+                # 全为 "vb0"（口径见模块头「对齐规则依据」）。
                 "extract_slot": "vb0",
             },
             {
@@ -270,7 +276,7 @@ ZZMI_MERGED_SKIN_ROW_LAYOUT: dict = {
                 "byte_width": 16,
                 "offset": 0,
                 # 生成端把 `cs-t1` 绑到该部件的 vb2 资源（`cs-t1 = ref <vb2>`）⇒
-                # 真实 ZZMI 工作空间 10/10 部件 Blend 的 `ExtractSlot` = "vb2"。
+                # 工作空间复核的 `Blend` `ExtractSlot` 全为 "vb2"（同上）。
                 "extract_slot": "vb2",
             },
             {
@@ -3694,8 +3700,10 @@ class ExportZZMI(ExportUnity):
         `D3D11ElementList` 顺序累加 `ByteWidth` 得到**类别内**偏移（每个 Category
         单独一个缓冲 ⇒ 偏移在 Category 内累加；元数据的 `AlignedByteOffset` 是
         **跨类别**的全局累加值，不能当缓冲内偏移用，见 `common/d3d11_gametype.py:70-93`）。
-        无该类目元素时退化为 ``{"stride": 类目 stride, "elements": []}``；两者都取不到
-        则 None。
+        `stride` 优先取该类目的**声明 stride**；**声明缺失**（取不到或为 0）而元素存在时，
+        **回退为元素 `ByteWidth` 之和**（即 `category_stride or offset`）—— 不是永远以
+        声明为准。无该类目元素时退化为 ``{"stride": 类目 stride, "elements": []}``；
+        两者都取不到则 None。
         """
         for drawib_model in self.drawib_model_list:
             if drawib_model.draw_ib != draw_ib:
