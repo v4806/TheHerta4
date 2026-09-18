@@ -73,11 +73,24 @@ _install_module(
         parse_prefix_parts=lambda _prefix: {},
     ),
 )
+def _stub_ensure_anim_driver_frame_variable_name(node, context=None):
+    """运行时间节点的预分配帧变量（与生产分配器同契约：写回并返回名字）。"""
+    name = str(getattr(node, "assigned_frame_variable_name", "") or "").strip()
+    if not name:
+        name = f"swapvar{int(getattr(node, 'auto_index', 0) or 0)}"
+        try:
+            node.assigned_frame_variable_name = name
+        except Exception:
+            pass
+    return name
+
+
 _install_module(
     f"{PKG}.blueprint.variable_registry",
     allocate_continuous_shapekey_index_variable_name=lambda **_kwargs: "continuous_shapekey_frame1",
     mark_variable_name_used=lambda *_args, **_kwargs: None,
     normalize_variable_name=lambda value: str(value or "").strip().lstrip("$"),
+    ensure_anim_driver_frame_variable_name=_stub_ensure_anim_driver_frame_variable_name,
 )
 
 
@@ -1678,6 +1691,101 @@ class AnimDriverBaseTests(unittest.TestCase):
         random_entry = next(call for call in calls if call[0] == "node.add_node" and call[1] == "随机驱动")
         self.assertEqual(random_entry[2], "RNDCURVE")
         self.assertEqual(random_entry[3].type, "SSMTNode_AnimDriver_Random")
+
+
+class RuntimeFrameVariablePreallocationTests(unittest.TestCase):
+    """运行时间节点的帧变量预分配（取代硬编码共享的 $swapvar）。"""
+
+    def _make_runtime(self, name, auto_index, tree):
+        node = runtime_module.SSMTNode_AnimDriver_Runtime()
+        node.name = name
+        node.auto_index = auto_index
+        node.id_data = tree
+        node.fps = 30
+        node.playback_rate = 1
+        node.assigned_frame_variable_name = ""
+        node.custom_frame_variable_name = ""
+        node.ensure_frame_variable_name()
+        tree.nodes.append(node)
+        return node
+
+    def test_two_runtime_nodes_get_distinct_preallocated_variables(self):
+        tree = types.SimpleNamespace(name="动画驱动蓝图", bl_idname='SSMTBlueprintTreeType', nodes=[], links=[])
+        first = self._make_runtime("运行时间", 1, tree)
+        second = self._make_runtime("运行时间.001", 2, tree)
+
+        self.assertEqual(first.frame_variable_name(), "swapvar1")
+        self.assertEqual(second.frame_variable_name(), "swapvar2")
+
+    def test_custom_frame_variable_wins_over_preallocated(self):
+        tree = types.SimpleNamespace(name="动画驱动蓝图", bl_idname='SSMTBlueprintTreeType', nodes=[], links=[])
+        node = self._make_runtime("运行时间", 3, tree)
+
+        node.custom_frame_variable_name = "$my_frame"
+
+        self.assertEqual(node.frame_variable_name(), "my_frame")
+
+    def test_only_smallest_index_runtime_emits_compat_alias(self):
+        tree = types.SimpleNamespace(name="动画驱动蓝图", bl_idname='SSMTBlueprintTreeType', nodes=[], links=[])
+        owner = self._make_runtime("运行时间", 1, tree)
+        other = self._make_runtime("运行时间.001", 2, tree)
+
+        owner_segment = owner.generate_ini_segment()
+        other_segment = other.generate_ini_segment()
+
+        self.assertTrue(owner.is_compat_alias_owner())
+        self.assertFalse(other.is_compat_alias_owner())
+        # 各自声明自己的帧变量，互不重名
+        self.assertIn("global persist $swapvar1 = 0", owner_segment)
+        self.assertIn("$swapvar1 = (time * 30) // 1", owner_segment)
+        self.assertIn("global persist $swapvar2 = 0", other_segment)
+        self.assertIn("$swapvar2 = (time * 30) // 1", other_segment)
+        # 兼容别名只出现一次（$swapvar / $fps 不再被 N 个节点重复声明）
+        self.assertIn("global persist $swapvar = 0", owner_segment)
+        self.assertIn("$swapvar = $swapvar1", owner_segment)
+        self.assertNotIn("global persist $swapvar = 0", other_segment)
+        self.assertNotIn("global persist $fps", other_segment)
+        self.assertEqual(
+            (owner_segment + other_segment).count("global persist $swapvar = 0"), 1
+        )
+        self.assertEqual((owner_segment + other_segment).count("global persist $fps"), 1)
+
+    def test_frame_variable_of_falls_back_to_shared_swapvar(self):
+        self.assertEqual(anim_driver_base.SSMTNode_AnimDriver_Base._frame_variable_of(None), "$swapvar")
+        self.assertEqual(
+            anim_driver_base.SSMTNode_AnimDriver_Base._frame_variable_of(
+                types.SimpleNamespace(custom_frame_variable_name="", assigned_frame_variable_name="")
+            ),
+            "$swapvar",
+        )
+        self.assertEqual(
+            anim_driver_base.SSMTNode_AnimDriver_Base._frame_variable_of(
+                types.SimpleNamespace(custom_frame_variable_name="", assigned_frame_variable_name="swapvar2")
+            ),
+            "$swapvar2",
+        )
+
+    def test_consumer_uses_upstream_runtime_preallocated_variable(self):
+        node = accumulative_trigger_module.SSMTNode_AnimDriver_AccumulativeTrigger()
+        node.name = "AccumulativeTrigger"
+        node.auto_index = 1
+        node.id_data = types.SimpleNamespace(nodes=[node], links=[])
+        node.default_paused = True
+        node.custom_paused_var = "$acc_paused"
+        node.accumulator_variable = "$progress"
+        node.condition_list = []
+        node.target_list = []
+        node._find_runtime_node = lambda: types.SimpleNamespace(
+            fps=30,
+            playback_rate=2,
+            assigned_frame_variable_name="swapvar2",
+            custom_frame_variable_name="",
+        )
+
+        ini = node.generate_ini_segment()
+
+        self.assertIn("if $swapvar2 % $speed_auto1 == 0", ini)
+        self.assertNotIn("if $swapvar % $speed_auto1 == 0", ini)
 
 
 if __name__ == "__main__":

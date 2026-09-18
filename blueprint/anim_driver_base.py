@@ -844,6 +844,26 @@ class SSMTNode_AnimDriver_Base(SSMTNodeBase):
         """判断节点是否为播放节点（索引播放、往返播放、形态键动画序列等）"""
         return (hasattr(node, 'driven_variable') or hasattr(node, 'driven_variable_list')) and hasattr(node, 'custom_paused_var')
 
+    @staticmethod
+    def _frame_variable_of(runtime_node) -> str:
+        """取运行时间节点的帧变量名（含 ``$``）。
+
+        运行时间节点不再硬编码共享的 ``$swapvar``，而是每节点一个预分配名
+        （``$swapvar{auto_index}``）—— N 个节点不再产出 N 份同名声明。这里按
+        ``_find_runtime_node()`` 找到的那个节点取名。
+
+        找不到运行时间节点时回退共享的 ``$swapvar``：它由 ``auto_index`` 最小的
+        运行时间节点作为**兼容别名**声明并每帧赋值，手写在自定义文本里的
+        ``$swapvar`` 仍然有效。
+        """
+        if runtime_node is None:
+            return "$swapvar"
+        name = normalize_variable_name(
+            getattr(runtime_node, "custom_frame_variable_name", "")
+            or getattr(runtime_node, "assigned_frame_variable_name", "")
+        )
+        return f"${name}" if name else "$swapvar"
+
     def _collect_upstream_play_pause_vars(self):
         tree = self.id_data
         if not tree:

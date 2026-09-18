@@ -378,6 +378,7 @@ class SSMTNode_AnimDriver_ShapeKeySequence(SSMTNode_AnimDriver_Base):
 
         runtime = self._find_runtime_node()
         playback_rate = runtime.playback_rate if runtime else 1
+        frame_var = self._frame_variable_of(runtime)
 
         paused_state = self._resolve_default_play_state(self.default_paused)
         paused_var = self.custom_paused_var.strip()
@@ -430,7 +431,7 @@ class SSMTNode_AnimDriver_ShapeKeySequence(SSMTNode_AnimDriver_Base):
             "[Present]",
             f"; 形态键动画序列 - 自驱动 {drv}",
             f"if {paused_var} == 1",
-            f"    if $swapvar % $speed_auto{idx} == 0",
+            f"    if {frame_var} % $speed_auto{idx} == 0",
             f"        {drv} = {drv} + 1.0",
         ]
 

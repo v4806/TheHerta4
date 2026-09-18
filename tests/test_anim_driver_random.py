@@ -67,11 +67,24 @@ _install_module(
     f"{PKG}.common.logic_name",
     LogicName=types.SimpleNamespace(NTEMI="NTEMI"),
 )
+def _stub_ensure_anim_driver_frame_variable_name(node, context=None):
+    """运行时间节点的预分配帧变量（与生产分配器同契约：写回并返回名字）。"""
+    name = str(getattr(node, "assigned_frame_variable_name", "") or "").strip()
+    if not name:
+        name = f"swapvar{int(getattr(node, 'auto_index', 0) or 0)}"
+        try:
+            node.assigned_frame_variable_name = name
+        except Exception:
+            pass
+    return name
+
+
 _install_module(
     f"{PKG}.blueprint.variable_registry",
     allocate_continuous_shapekey_index_variable_name=lambda **_kwargs: "continuous_shapekey_frame1",
     mark_variable_name_used=lambda *_args, **_kwargs: None,
     normalize_variable_name=lambda value: str(value or "").strip().lstrip("$"),
+    ensure_anim_driver_frame_variable_name=_stub_ensure_anim_driver_frame_variable_name,
 )
 
 

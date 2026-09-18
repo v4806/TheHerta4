@@ -9,6 +9,8 @@ OBJECT_SWAP_PREFIX = "swapkey"
 SHAPEKEY_PREFIX = "Freq_"
 CONTINUOUS_SHAPEKEY_INDEX_PREFIX = "continuous_shapekey_frame"
 UV_OFFSET_PREFIX = "uv_offset"
+#: 「运行时间」动画驱动节点的帧计数器变量前缀（按节点 auto_index 命名）
+ANIM_DRIVER_FRAME_PREFIX = "swapvar"
 
 _SAFE_NAME_RE = re.compile(r"[^a-zA-Z0-9_]")
 
@@ -195,6 +197,8 @@ _OWNER_SCALAR_VARIABLE_FIELDS = (
     "custom_continuous_index_variable_name",
     "assigned_continuous_index_variable_name",
     "custom_paused_var",
+    "custom_frame_variable_name",
+    "assigned_frame_variable_name",
     "accumulator_variable",
     "drag_mode_variable_name",
     "ui_detected_variable_name",
@@ -463,6 +467,33 @@ def ensure_object_swap_variable_name(node, context=None) -> str:
         used_counts[candidate] += 1
         _sync_variable_usage_cache(used_counts, context=context)
         return candidate
+
+
+def ensure_anim_driver_frame_variable_name(node, context=None) -> str:
+    """「运行时间」动画驱动节点的帧计数器变量名（预分配，按 auto_index 命名）。
+
+    为什么要预分配：运行时间节点此前硬编码 ``global persist $swapvar``，N 个节点
+    就 N 份同名声明 —— 同值要靠归并、异值要靠分叉（分叉还要段内改名，极易出错）。
+    改成每节点一个预分配名后，同名声明从源头消失，归一逻辑对这类重复不再触发。
+
+    名字已存在时直接返回（**不重新分配**）；新分配时避开其它 owner 已占用的名字。
+    """
+    current = normalize_variable_name(getattr(node, "assigned_frame_variable_name", "") or "")
+    if current:
+        _collect_used_variable_name_counts(context)
+        return current
+
+    used_counts = _collect_owner_variable_name_counts(context)
+    base = f"{ANIM_DRIVER_FRAME_PREFIX}{int(getattr(node, 'auto_index', 0) or 0)}"
+    candidate = base
+    suffix = 1
+    while _is_name_used_by_other_owner(candidate, used_counts):
+        candidate = f"{base}_{suffix}"
+        suffix += 1
+    node.assigned_frame_variable_name = candidate
+    used_counts[candidate] += 1
+    _sync_variable_usage_cache(used_counts, context=context)
+    return candidate
 
 
 def validate_unique_object_swap_variable_names(nodes, context=None) -> None:

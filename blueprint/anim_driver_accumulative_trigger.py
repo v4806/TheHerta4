@@ -351,6 +351,7 @@ class SSMTNode_AnimDriver_AccumulativeTrigger(SSMTNode_AnimDriver_Base):
         idx = self._read_safe_index()
         runtime = self._find_runtime_node()
         playback_rate = runtime.playback_rate if runtime else 1
+        frame_var = self._frame_variable_of(runtime)
         paused_var = self._normalize_variable_name(
             self.custom_paused_var, f"$accumulative_trigger_paused{idx}"
         )
@@ -393,7 +394,7 @@ class SSMTNode_AnimDriver_AccumulativeTrigger(SSMTNode_AnimDriver_Base):
         lines.extend([
             "[Present]",
             f"if {paused_var} == 1",
-            f"    if $swapvar % $speed_auto{idx} == 0",
+            f"    if {frame_var} % $speed_auto{idx} == 0",
         ])
 
         for variable_name, comparison_op, compare_value, increment_value in conditions:
