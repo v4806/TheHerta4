@@ -266,6 +266,12 @@ _zzmi_module = importlib.util.module_from_spec(_spec)
 sys.modules[_spec.name] = _zzmi_module
 _spec.loader.exec_module(_zzmi_module)
 
+# t149：`; ZZMI-MERGE-DIAG …` / `; channel_slot=…` / `; --- 实例对齐 … ---` 这些
+# **开发者诊断注释**已改为默认不写进配置表（`ZZMI_MERGE_DIAG_EMIT`）。本文件的
+# 契约正是"产物里必须留有这些可数证据"，所以在**本模块自己的 zzmi 副本**上打开
+# 开关（不动环境变量，避免影响其它测试文件）。开关关闭时旧输出可逐字节复现。
+_zzmi_module.ZZMI_MERGE_DIAG_EMIT = True
+
 
 class _FakeGameType:
     OrderedCategoryNameList = ["Position", "Texcoord", "Blend"]
@@ -1333,8 +1339,12 @@ class ZZSIMultiInstanceGuardTests(unittest.TestCase):
         for chunk in (text, text_carrier):
             self.assertIn("$zz_ms_prev_01 == 0 || $zz_ms_seen_01 >= 1", chunk)
             self.assertIn("$zz_ms_prev_02 == 0 || $zz_ms_seen_02 >= 1", chunk)
-            self.assertIn("$zz_ms_prev_11 == 0 || $zz_ms_seen_11 >= 1", chunk)
-            self.assertIn("$zz_ms_prev_12 == 0 || $zz_ms_seen_12 >= 1", chunk)
+            # t149：捕获者 comp 1 自己的 cull_aware 子句被**布尔吸收**删除——
+            # SO 别名就绪门 `($zz_ms_seen_11 >= 1)` 已经断言了它（`A && (P||A) ≡ A`），
+            # 该子句恒真。非捕获者部件（0/2）的「上一帧本槽没到」豁免原样保留。
+            self.assertIn("($zz_ms_seen_11 >= 1)", chunk)
+            self.assertNotIn("$zz_ms_prev_11 == 0 || $zz_ms_seen_11 >= 1", chunk)
+            self.assertNotIn("$zz_ms_prev_12 == 0 || $zz_ms_seen_12 >= 1", chunk)
 
     def test_all_attach_runs_are_top_level(self):
         """v9 硬约束：所有 attach run 必须在 deform 段**顶层**（if 内 run 不执行）。
@@ -1705,13 +1715,11 @@ class ZZSIDirectPathGuardTests(unittest.TestCase):
         text = self._vb_text(exporter, exporter.drawib_model_list[1])
 
         self.assertIn(
-            "if ($zz_ms_seen_11 >= 1) && ($zz_ms_prev_01 == 0 || $zz_ms_seen_01 >= 1)"
-            " && ($zz_ms_prev_11 == 0 || $zz_ms_seen_11 >= 1)",
+            'if ($zz_ms_seen_11 >= 1) && ($zz_ms_prev_01 == 0 || $zz_ms_seen_01 >= 1)',
             text,
         )
         self.assertIn(
-            "if ($zz_ms_seen_12 >= 1) && ($zz_ms_prev_02 == 0 || $zz_ms_seen_02 >= 1)"
-            " && ($zz_ms_prev_12 == 0 || $zz_ms_seen_12 >= 1)",
+            'if ($zz_ms_seen_12 >= 1) && ($zz_ms_prev_02 == 0 || $zz_ms_seen_02 >= 1)',
             text,
         )
         self.assertNotIn("if $zz_ms_occ_1 == 1\n    vs-t0 = ResourceZZMergedSkeleton", text)
@@ -1974,16 +1982,7 @@ class ZZSIMergedHostDirectPathTests(unittest.TestCase):
         self.assertEqual(text.count("    ResourceZZRedirectSO_G0_s2 = ref so0"), 1)
         # 组级守卫 + 显式绑定 SO/宿主的 vb0/vb2 + 宿主导出顶点数
         self.assertIn(
-            "if ($zz_ms_seen_01 >= 1) && ($zz_ms_prev_01 == 0 || $zz_ms_seen_01 >= 1)"
-            " && ($zz_ms_prev_11 == 0 || $zz_ms_seen_11 >= 1)"
-            " && ($zz_ms_prev_21 == 0 || $zz_ms_seen_21 >= 1)\n"
-            "    vs-t0 = ResourceZZMergedSkeleton_G0_s1\n"
-            "    so0 = ref ResourceZZRedirectSO_G0_s1\n"
-            "    vb2 = Resourcea23aa8a3Blend\n"
-            "    vb0 = Resourcea23aa8a3Position\n"
-            "    draw = 12482, 0\n"
-            "    so0 = null\n"
-            "endif",
+            'if ($zz_ms_seen_01 >= 1) && ($zz_ms_prev_11 == 0 || $zz_ms_seen_11 >= 1) && ($zz_ms_prev_21 == 0 || $zz_ms_seen_21 >= 1)\n    vs-t0 = ResourceZZMergedSkeleton_G0_s1\n    so0 = ref ResourceZZRedirectSO_G0_s1\n    vb2 = Resourcea23aa8a3Blend\n    vb0 = Resourcea23aa8a3Position\n    draw = 12482, 0\n    so0 = null\nendif',
             text,
         )
         # 宿主的几何**不得**自足绘制（它跨部件、必须等全组到位）
@@ -2005,16 +2004,7 @@ class ZZSIMergedHostDirectPathTests(unittest.TestCase):
         )
         # ……再发宿主合并几何的组级守卫重放（宿主排在前面的帧由它闭合）
         self.assertIn(
-            "if ($zz_ms_seen_01 >= 1) && ($zz_ms_prev_01 == 0 || $zz_ms_seen_01 >= 1)"
-            " && ($zz_ms_prev_11 == 0 || $zz_ms_seen_11 >= 1)"
-            " && ($zz_ms_prev_21 == 0 || $zz_ms_seen_21 >= 1)\n"
-            "    vs-t0 = ResourceZZMergedSkeleton_G0_s1\n"
-            "    so0 = ref ResourceZZRedirectSO_G0_s1\n"
-            "    vb2 = Resourcea23aa8a3Blend\n"
-            "    vb0 = Resourcea23aa8a3Position\n"
-            "    draw = 12482, 0\n"
-            "    so0 = null\n"
-            "endif",
+            'if ($zz_ms_seen_01 >= 1) && ($zz_ms_prev_11 == 0 || $zz_ms_seen_11 >= 1) && ($zz_ms_prev_21 == 0 || $zz_ms_seen_21 >= 1)\n    vs-t0 = ResourceZZMergedSkeleton_G0_s1\n    so0 = ref ResourceZZRedirectSO_G0_s1\n    vb2 = Resourcea23aa8a3Blend\n    vb0 = Resourcea23aa8a3Position\n    draw = 12482, 0\n    so0 = null\nendif',
             sib_text,
         )
         self.assertIn("so0 = ref ResourceZZRedirectSO_G0_s2", sib_text)
@@ -2819,8 +2809,8 @@ class ZZSIMergedMeshRedirectTests(_ZZMIGroup3RedirectFixture, unittest.TestCase)
         self.assertIn("run = CustomShaderZZMIMergedSkeletonAttach_C2_s1", text_c)
         self.assertIn("draw = 18776, 0", text_c)
         self.assertIn("vb0 = Resourceb20f90eaPosition", text_c)
-        self.assertIn("if ($zz_ms_seen_11 >= 1) && ($zz_ms_prev_01 == 0 || $zz_ms_seen_01 >= 1) && ($zz_ms_prev_11 == 0 || $zz_ms_seen_11 >= 1) && ($zz_ms_prev_21 == 0 || $zz_ms_seen_21 >= 1)", text_c)
-        self.assertIn("if ($zz_ms_seen_12 >= 1) && ($zz_ms_prev_02 == 0 || $zz_ms_seen_02 >= 1) && ($zz_ms_prev_12 == 0 || $zz_ms_seen_12 >= 1) && ($zz_ms_prev_22 == 0 || $zz_ms_seen_22 >= 1)", text_c)
+        self.assertIn('if ($zz_ms_seen_11 >= 1) && ($zz_ms_prev_01 == 0 || $zz_ms_seen_01 >= 1) && ($zz_ms_prev_21 == 0 || $zz_ms_seen_21 >= 1)', text_c)
+        self.assertIn('if ($zz_ms_seen_12 >= 1) && ($zz_ms_prev_02 == 0 || $zz_ms_seen_02 >= 1) && ($zz_ms_prev_22 == 0 || $zz_ms_seen_22 >= 1)', text_c)
 
     def test_redirect_draw_waits_for_dependencies_in_both_frame_orders(self):
         """回归 2026-08-26 实测：target 可能在 carrier 前或后到达；两种
@@ -2899,7 +2889,7 @@ class ZZSIMergedMeshRedirectTests(_ZZMIGroup3RedirectFixture, unittest.TestCase)
         exporter.add_unity_vs_texture_override_vb_sections(builder_carrier, models[0])
         text_carrier = "\n".join(builder_carrier.sections[0].SectionLineList)
         self.assertIn("ResourceZZRedirectSO_G3_s1 = ref so0", text_carrier)
-        self.assertIn("if ($zz_ms_seen_11 >= 1) && ($zz_ms_prev_01 == 0 || $zz_ms_seen_01 >= 1) && ($zz_ms_prev_11 == 0 || $zz_ms_seen_11 >= 1)", text_carrier)
+        self.assertIn('if ($zz_ms_seen_11 >= 1) && ($zz_ms_prev_01 == 0 || $zz_ms_seen_01 >= 1)', text_carrier)
         self.assertIn("draw = 18776, 0", text_carrier)
         # 回退路径**必须**写 3 顶点前缀 stub：base_vertex 由
         # `_redirect_plan_prefix_rows`（纯占位 target = 3）决定，渲染从 SO 第 3 行
@@ -3242,8 +3232,11 @@ class ZZMIMultiInstanceLatchRemovalTests(_ZZMIGroup3RedirectFixture, unittest.Te
         #    计数，`== 1` 在同帧出现 ≥3 次（occ 回绕 ⇒ seen 到 2）时恒假 ⇒ 守卫集体
         #    关闭（P-13）。断言强度不变（仍是逐字符的整条守卫），只随语义更新。
         for slot in (1, 2):
+            # t149：捕获者 comp 1 自己的 cull_aware 子句 `(prev_1{slot} == 0 ||
+            # seen_1{slot} >= 1)` 被布尔吸收删除（SO 就绪门已断言 `seen_1{slot} >= 1`）；
+            # 其余部件的豁免项逐字符不变。
             self.assertIn(
-                f"if ($zz_ms_seen_1{slot} >= 1) && ($zz_ms_prev_0{slot} == 0 || $zz_ms_seen_0{slot} >= 1) && ($zz_ms_prev_1{slot} == 0 || $zz_ms_seen_1{slot} >= 1)"
+                f"if ($zz_ms_seen_1{slot} >= 1) && ($zz_ms_prev_0{slot} == 0 || $zz_ms_seen_0{slot} >= 1)"
                 f" && ($zz_ms_prev_2{slot} == 0 || $zz_ms_seen_2{slot} >= 1)",
                 vb_text,
             )
@@ -3358,8 +3351,8 @@ class ZZMIMultiInstanceLatchRemovalTests(_ZZMIGroup3RedirectFixture, unittest.Te
         self.assertGreaterEqual(draw_count, 2)
         self.assertEqual(draw_count % 2, 0)
         for slot_cond in (
-            "if ($zz_ms_seen_11 >= 1) && ($zz_ms_prev_01 == 0 || $zz_ms_seen_01 >= 1) && ($zz_ms_prev_11 == 0 || $zz_ms_seen_11 >= 1) && ($zz_ms_prev_21 == 0 || $zz_ms_seen_21 >= 1)",
-            "if ($zz_ms_seen_12 >= 1) && ($zz_ms_prev_02 == 0 || $zz_ms_seen_02 >= 1) && ($zz_ms_prev_12 == 0 || $zz_ms_seen_12 >= 1) && ($zz_ms_prev_22 == 0 || $zz_ms_seen_22 >= 1)",
+            'if ($zz_ms_seen_11 >= 1) && ($zz_ms_prev_01 == 0 || $zz_ms_seen_01 >= 1) && ($zz_ms_prev_21 == 0 || $zz_ms_seen_21 >= 1)',
+            'if ($zz_ms_seen_12 >= 1) && ($zz_ms_prev_02 == 0 || $zz_ms_seen_02 >= 1) && ($zz_ms_prev_22 == 0 || $zz_ms_seen_22 >= 1)',
         ):
             self.assertIn(slot_cond, vb_text)
         # SO 引用按槽分别捕获（carrier 段），target 段按槽分别绑定
@@ -3372,11 +3365,11 @@ class ZZMIMultiInstanceLatchRemovalTests(_ZZMIGroup3RedirectFixture, unittest.Te
         # 回归：**载体段也必须发守卫**（只让单挂点持有守卫时，该挂点先 deform 的帧
         # 里守卫永不触发 → 该槽 SO 只剩 3 顶点前缀 → 合并几何整段消失）
         self.assertIn(
-            "if ($zz_ms_seen_11 >= 1) && ($zz_ms_prev_01 == 0 || $zz_ms_seen_01 >= 1) && ($zz_ms_prev_11 == 0 || $zz_ms_seen_11 >= 1) && ($zz_ms_prev_21 == 0 || $zz_ms_seen_21 >= 1)",
+            'if ($zz_ms_seen_11 >= 1) && ($zz_ms_prev_01 == 0 || $zz_ms_seen_01 >= 1) && ($zz_ms_prev_21 == 0 || $zz_ms_seen_21 >= 1)',
             b_text,
         )
         self.assertIn("    draw = 18776, 0", b_text)
-        self.assertIn("if ($zz_ms_seen_12 >= 1) && ($zz_ms_prev_02 == 0 || $zz_ms_seen_02 >= 1) && ($zz_ms_prev_12 == 0 || $zz_ms_seen_12 >= 1) && ($zz_ms_prev_22 == 0 || $zz_ms_seen_22 >= 1)", b_text)
+        self.assertIn('if ($zz_ms_seen_12 >= 1) && ($zz_ms_prev_02 == 0 || $zz_ms_seen_02 >= 1) && ($zz_ms_prev_22 == 0 || $zz_ms_seen_22 >= 1)', b_text)
 
     def test_pose_key_alignment_uses_shared_canonical_bone(self):
         """双实例对齐（2026-09-17「动画混在一起」修复）：出现次只是位置标签。
@@ -5515,6 +5508,100 @@ class ZZMISkinGuardFallbackCoverageTests(_ZZMIGroup3RedirectFixture, unittest.Te
             f"{key}={value}" for key, value in record.items() if key != "code"
         )
         return f"{record['code']} {fields}"
+
+
+class ZZMIDevCommentGatingTests(unittest.TestCase):
+    """t149：开发者诊断注释默认不发射 + cull_aware 子句布尔吸收（行为等价）。
+
+    两条不变量：
+    1. 配置表默认**不含**开发者诊断注释（开关关闭时 `_merged_diag` /
+       `_merged_reuse_site` 返回空串，`_append_merged_diag` 连空行都不追加）；
+    2. `_merged_absorb_redundant_seen_clauses` 只删**恒真**的 cull_aware 子句
+       （`A && (P || A) ≡ A`），真值表逐点不变。
+    """
+
+    def setUp(self):
+        self._saved_emit = _zzmi_module.ZZMI_MERGE_DIAG_EMIT
+
+    def tearDown(self):
+        _zzmi_module.ZZMI_MERGE_DIAG_EMIT = self._saved_emit
+
+    def _bare_exporter(self):
+        return _zzmi_module.ExportZZMI.__new__(_zzmi_module.ExportZZMI)
+
+    def test_default_is_off_when_env_unset(self):
+        """开关默认值必须由环境变量决定，且未设时为空集判定 ⇒ 默认关闭。"""
+        source = (REPO_ROOT / "ui" / "universal" / "zzmi.py").read_text(
+            encoding="utf-8"
+        )
+        assert 'os.environ.get("ZZMI_MERGE_DIAG", "")' in source, (
+            "ZZMI_MERGE_DIAG_EMIT 必须由环境变量 ZZMI_MERGE_DIAG 决定"
+        )
+        assert "ZZMI_MERGE_DIAG_EMIT = " in source
+
+    def test_diag_off_returns_empty_and_appends_nothing(self):
+        _zzmi_module.ZZMI_MERGE_DIAG_EMIT = False
+        exporter = self._bare_exporter()
+        assert exporter._merged_diag("CODE", "msg", group="G0") == ""
+        assert exporter._merged_reuse_site("ib", 0, 1, "publish-cs") == ""
+        sink = []
+        exporter._append_merged_diag(sink, "")
+        exporter._append_merged_diag(sink, "", indent="    ")
+        assert sink == [], "开关关闭时不得追加任何行（含空行）"
+
+    def test_diag_on_restores_old_output(self):
+        _zzmi_module.ZZMI_MERGE_DIAG_EMIT = True
+        exporter = self._bare_exporter()
+        line = exporter._merged_diag("CODE", "msg", group="G0")
+        assert line.startswith("; ZZMI-MERGE-DIAG CODE"), line
+        assert line.endswith("group=G0"), line
+        sink = []
+        exporter._append_merged_diag(sink, line, indent="    ")
+        assert sink == ["    " + line]
+
+    def test_absorb_drops_only_implied_clause(self):
+        absorb = _zzmi_module.ExportZZMI._merged_absorb_redundant_seen_clauses
+        cond = (
+            '($zz_ms_seen_71 >= 1) && ($zz_ms_prev_81 == 0 || $zz_ms_seen_81 >= 1)'
+        )
+        assert absorb(cond) == (
+            "($zz_ms_seen_71 >= 1) && ($zz_ms_prev_81 == 0 || $zz_ms_seen_81 >= 1)"
+        )
+        # 没有任何原子被断言 ⇒ 一字不改
+        lone = "($zz_ms_prev_71 == 0 || $zz_ms_seen_71 >= 1)"
+        assert absorb(lone) == lone
+        # 单合取项 / 空串 ⇒ 原样返回
+        assert absorb("($zz_ms_seen_71 >= 1)") == "($zz_ms_seen_71 >= 1)"
+        assert absorb("") == ""
+
+    def test_absorb_is_truth_preserving_exhaustively(self):
+        """穷举三变量真值表：吸收前后逐点同值（纯比较，无副作用）。"""
+        import itertools
+
+        absorb = _zzmi_module.ExportZZMI._merged_absorb_redundant_seen_clauses
+        cond = "($a >= 1) && ($b == 0 || $a >= 1) && ($c == 0 || $b >= 1)"
+        new = absorb(cond)
+        assert new != cond, "该样例应当发生吸收"
+        assert new == "($a >= 1) && ($c == 0 || $b >= 1)"
+
+        def evaluate(expr, env):
+            for part in [p.strip() for p in expr.split(" && ")]:
+                core = part[1:-1] if part.startswith("(") and part.endswith(")") else part
+                ok = False
+                for disjunct in [d.strip() for d in core.split(" || ")]:
+                    if disjunct.endswith(" >= 1"):
+                        ok = ok or env[disjunct[:-5].strip()] >= 1
+                    elif disjunct.endswith(" == 0"):
+                        ok = ok or env[disjunct[:-5].strip()] == 0
+                    else:  # pragma: no cover - 形态受控
+                        raise AssertionError(disjunct)
+                if not ok:
+                    return False
+            return True
+
+        for a, b, c in itertools.product([0, 1, 2], repeat=3):
+            env = {"$a": a, "$b": b, "$c": c}
+            assert evaluate(cond, env) == evaluate(new, env), (a, b, c)
 
 
 if __name__ == "__main__":

@@ -219,6 +219,26 @@ ZZMI_CHANNEL_HASH_BYTES = 48
 ZZMI_MERGE_DIAG_POSE_KEY_UNAVAILABLE = "POSE_KEY_HASH_UNAVAILABLE"
 
 # ---------------------------------------------------------------------------
+# t149：**开发者诊断注释默认不写进配置表**
+# ---------------------------------------------------------------------------
+# 下面这一族注释（`; ZZMI-MERGE-DIAG …`、`; channel_slot=… identity_basis=…`、
+# `; --- 实例对齐：… ---`、以及 else 分支里的中文解释）只服务于生成器开发者与
+# 回归测试：它们是"可数证据"，不是使用者需要的信息，却占了产物注释量的近一半。
+# 因此默认**不发射**（连空行都不留）；需要复核时打开开关即可恢复**逐字节等价**
+# 的旧输出：
+#     · 环境变量 `ZZMI_MERGE_DIAG=1`（或 true/yes/on），在**导入前**设置；
+#     · 或在测试里直接给本模块的 `ZZMI_MERGE_DIAG_EMIT` 赋 True（发射点按调用时
+#       读模块全局，因此 monkeypatch 立即生效）。
+# 注意：`_zzmi_merge_diagnostics` 记录表与 `⚠️ [ZZMI骨骼合并]` stdout 提示**不受**
+# 本开关影响 —— 它们是开发/测试面，不是配置表内容，永远照发。
+ZZMI_MERGE_DIAG_EMIT = str(os.environ.get("ZZMI_MERGE_DIAG", "")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+# ---------------------------------------------------------------------------
 # 蒙皮 CS 的**行布局单一事实源**（t40：动态逐元素识别，消除写死 magic number）
 # ---------------------------------------------------------------------------
 # 背景（B2 高危项 + 两处同类残余）：
@@ -2007,6 +2027,11 @@ class ExportZZMI(ExportUnity):
             detail = " ".join(f"{key}={value}" for key, value in fields.items())
             print(f"⚠️ [ZZMI骨骼合并] {ZZMI_MERGE_DIAG_PREFIX} {code} {detail} {message}")
         detail = " ".join(f"{key}={value}" for key, value in fields.items())
+        if not ZZMI_MERGE_DIAG_EMIT:
+            # t149：诊断记录表与 stdout 提示已在上方落盘（开发/测试面），
+            # 但配置表里**不写**这行注释。返回空串，由 `_append_merged_diag`
+            # 负责"空串 = 连行都不追加"。
+            return ""
         return f"{ZZMI_MERGE_DIAG_PREFIX} {code} {detail}"
 
     def _merged_reuse_site(
@@ -2028,11 +2053,25 @@ class ExportZZMI(ExportUnity):
         entry = f"{draw_ib}|{kind}"
         if entry not in counts[key]:
             counts[key].append(entry)
+        if not ZZMI_MERGE_DIAG_EMIT:
+            # t149：消费点计数照旧登记（`_merged_reuse_ratio_records` 与测试要用），
+            # 只是不再往配置表写这行注释。
+            return ""
         return (
             f"{ZZMI_MERGE_DIAG_PREFIX} {ZZMI_MERGE_DIAG_REUSE_SITE}"
             f" group=G{int(skeleton_group)} slot={int(slot)}"
             f" consumer={draw_ib} kind={kind}"
         )
+
+    @staticmethod
+    def _append_merged_diag(section, line: str, indent: str = "") -> None:
+        """把一条**开发者诊断注释**追加进段；空串（= 开关关闭）时连空行都不追加。
+
+        开关默认关闭 ⇒ 配置表里既没有注释行、也没有被顶出来的空行，
+        与非注释行/空行计数保持不变（t149 验收：非注释非门控行数变化为 0）。
+        """
+        if line:
+            section.append(indent + line)
 
     def _merged_reuse_capture_site(self, skeleton_group: int, slot: int) -> None:
         """O3：登记一个 referent 捕获点（`ResourceZZRedirectSO_G<g>_s<k> = ref so0`）。"""
@@ -2477,7 +2516,9 @@ class ExportZZMI(ExportUnity):
             # 权重/索引）。发布改由 draw 版重放承担，但它**只覆盖锚点布局内的必需
             # 部件**（FR-2）：锚点布局之外的必需部件本帧没有任何发布者 ——
             # 覆盖面由 `_merged_skin_replay_coverage` 如实分档进诊断行。
-            section.append(self._merged_skin_layout_diag(skeleton_group, group_plan))
+            self._append_merged_diag(
+                section, self._merged_skin_layout_diag(skeleton_group, group_plan)
+            )
             return
         slots = self._merged_skeleton_slots()
         guard_component_ids = group_plan.get("required_component_ids") or (
@@ -2489,11 +2530,12 @@ class ExportZZMI(ExportUnity):
         ]
         for slot in slots:
             # O3：消费点标记（注释行；块体与守卫条件一字不改 ⇒ 逐字节不变量）
-            section.append(
-                "    "
-                + self._merged_reuse_site(
+            self._append_merged_diag(
+                section,
+                self._merged_reuse_site(
                     consumer_ib or "-", skeleton_group, slot, "publish-cs"
-                )
+                ),
+                indent="    ",
             )
             section.append(
                 f"if {self._merged_slot_guard_condition(guard_component_ids, skeleton_group, slot)}"
@@ -2690,6 +2732,56 @@ class ExportZZMI(ExportUnity):
             self._merged_seen_arrived_condition(int(component_id), slot)
             for component_id in component_ids
         )
+
+    @staticmethod
+    def _merged_absorb_redundant_seen_clauses(condition: str) -> str:
+        """布尔吸收：删掉被同一条件里其它合取项蕴含的 cull_aware 子句。
+
+        唯一会被删的形态（`_merged_slot_seen_condition(cull_aware=True)` 的产出）::
+
+            (A) && (P || A) && ...
+
+        其中 ``A`` = ``<seen> >= 1``（`_merged_seen_arrived_condition`，单一来源），
+        来自 SO 别名就绪门 `_merged_so_ready_condition` —— **单捕获者**时它恰好包成
+        ``(A)``。由布尔吸收 ``A && (P || A) ≡ A`` 可知该 cull_aware 子句恒真，属
+        **可证明冗余**：守卫本来就要等这个捕获者到达，"被 LOD/视锥整帧剔除"的豁免
+        对**它自己**没有意义（它不来守卫就不该闭合）。
+
+        为什么不改变运行时行为：
+          · 全部合取项都是纯变量比较（无赋值、无副作用）⇒ `&&` 短路顺序不影响结果；
+          · 只在 ``A`` 已被**同一条件**断言时才删该子句，此刻它恒为真；
+          · 其它部件的 cull_aware 子句（其 ``A`` 未被断言）**原样保留**，豁免语义不变。
+
+        只做删除，不重排、不做其它代数改写；不匹配该形态的合取项一律原样保留。
+        """
+        parts = [p.strip() for p in str(condition or "").split(" && ") if p.strip()]
+        if len(parts) < 2:
+            return condition
+
+        def _core(part: str) -> str:
+            if part.startswith("(") and part.endswith(")"):
+                return part[1:-1].strip()
+            return part
+
+        asserted = set()
+        for part in parts:
+            core = _core(part)
+            if core.endswith(" >= 1") and " " not in core[:-5].strip():
+                asserted.add(core)
+        if not asserted:
+            return condition
+
+        kept = []
+        for part in parts:
+            disjuncts = [d.strip() for d in _core(part).split(" || ")]
+            if (
+                len(disjuncts) == 2
+                and disjuncts[0].endswith(" == 0")
+                and disjuncts[1] in asserted
+            ):
+                continue
+            kept.append(part)
+        return " && ".join(kept)
 
     @staticmethod
     def _merged_pose_key_pool_prefix(skeleton_group: int) -> str:
@@ -2994,19 +3086,22 @@ class ExportZZMI(ExportUnity):
                 self._merged_reuse_capture_site(skeleton_group, target_slot)
 
         section.append("")
-        section.append(
-            "; --- 实例对齐：通道骨精确哈希键（唯一判定口径）→ 槽位 ---"
-        )
-        # F5（复核发现）：身份口径必须**在产物里可见**——只读 ini 的人必须能一眼看到
-        # 这条判定用的是骨名身份还是 `local_slot_map` 弱代理（槽位号 ≠ 骨头身份）。
-        section.append(
-            f"; channel_slot={int(record['channel_slot'])} channel_local={local} "
-            f"hash_region={offset},{ZZMI_CHANNEL_HASH_BYTES} shared_components={shared} "
-            f"shared_weight={weight} reason={reason} "
-            f"identity_basis={record.get('channel_identity_basis') or 'unknown'} "
-            f"identity_token={record.get('channel_identity_token') or ''} "
-            "逐字节精确匹配（无容差）"
-        )
+        # t149：下面两条是**开发者诊断注释**（身份口径说明），默认不写进配置表。
+        # 它们不是锚点：没有任何重导出逻辑 re-parse 它们（唯一消费者是回归测试）。
+        if ZZMI_MERGE_DIAG_EMIT:
+            section.append(
+                "; --- 实例对齐：通道骨精确哈希键（唯一判定口径）→ 槽位 ---"
+            )
+            # F5（复核发现）：身份口径必须**在产物里可见**——只读 ini 的人必须能一眼看到
+            # 这条判定用的是骨名身份还是 `local_slot_map` 弱代理（槽位号 ≠ 骨头身份）。
+            section.append(
+                f"; channel_slot={int(record['channel_slot'])} channel_local={local} "
+                f"hash_region={offset},{ZZMI_CHANNEL_HASH_BYTES} shared_components={shared} "
+                f"shared_weight={weight} reason={reason} "
+                f"identity_basis={record.get('channel_identity_basis') or 'unknown'} "
+                f"identity_token={record.get('channel_identity_token') or ''} "
+                "逐字节精确匹配（无容差）"
+            )
         section.append("ResourceZZPoseKeySrc = ref vs-t0")
         section.append(
             f"{key_var} = ResourceZZPoseKeySrc->HashRegion("
@@ -3029,15 +3124,18 @@ class ExportZZMI(ExportUnity):
         emit_capture(slot_first)
         section.append("    endif")
         section.append("else")
-        section.append(
-            "    ; 键 <= 0：HashRegion 失败（-1/-2/-3）。判定**不退回出现次判定**"
-            "（唯一判据仍是键），但本 pass 的"
-        )
-        section.append(
-            "    ; palette / SO 引用**必须照发**：写不能只存在于上面的 if 体内"
-            "（无条件读取它的 attach / 重放守卫会读走空骨架）"
-        )
-        section.append("    ; → 落点改用出现次位置标签（只定落点，不参与判定）。")
+        # t149：这三行是解释 else 分支为何"照发 palette / SO 引用"的**开发者说明**，
+        # 默认不写进配置表。else 分支的**功能行**（下面的 occ 落点循环）照旧发射。
+        if ZZMI_MERGE_DIAG_EMIT:
+            section.append(
+                "    ; 键 <= 0：HashRegion 失败（-1/-2/-3）。判定**不退回出现次判定**"
+                "（唯一判据仍是键），但本 pass 的"
+            )
+            section.append(
+                "    ; palette / SO 引用**必须照发**：写不能只存在于上面的 if 体内"
+                "（无条件读取它的 attach / 重放守卫会读走空骨架）"
+            )
+            section.append("    ; → 落点改用出现次位置标签（只定落点，不参与判定）。")
         for index, slot in enumerate(slots):
             section.append(f"    if {occ_var} == {slot}" if index == 0 else "    else")
             emit_capture(slot, indent="        ")
@@ -3138,7 +3236,12 @@ class ExportZZMI(ExportUnity):
                 cull_aware=cull_aware,
             ),
         ]
-        return " && ".join(part for part in parts if part)
+        # t149：SO 就绪门断言了捕获者的 `seen >= 1` ⇒ 该捕获者自己的 cull_aware
+        # 子句 `(prev == 0 || seen >= 1)` 恒真，按布尔吸收删除（行为等价，见
+        # `_merged_absorb_redundant_seen_clauses`）。
+        return self._merged_absorb_redundant_seen_clauses(
+            " && ".join(part for part in parts if part)
+        )
 
     def _append_merged_skeleton_deform_block(
         self, texture_override_vb_section, drawib_model
@@ -3307,7 +3410,8 @@ class ExportZZMI(ExportUnity):
             # **SO 别名就绪项**里（`_merged_so_ready_capturer_ids` 判据是「有没有
             # 通道记录」，不是「参不参与判定」）——现状 = 允许（理由见该函数
             # docstring 与复核报告 F9/判定 2），本修复**不改语义**，仅标注待裁定。
-            texture_override_vb_section.append(
+            self._append_merged_diag(
+                texture_override_vb_section,
                 self._merged_diag(
                     ZZMI_MERGE_DIAG_POSE_UNAVAILABLE,
                     "通道骨判定不可达：本部件不参与跨部件实例判定（不做键驱动捕获），"
@@ -3321,14 +3425,15 @@ class ExportZZMI(ExportUnity):
                     draw_ib=draw_ib,
                     reason=unavailable_reason,
                     slots=",".join(str(int(slot)) for slot in slots),
-                )
+                ),
             )
         elif channel_record is not None:
             # 通道骨**退化**（分量内没有全体成员可比的共享骨，例如叶瞬光01 G0 的
             # `8c8de427`）：键只区分本部件自己的两个实例，不能当跨部件判定输入，
             # 因此本部件按「只供骨、不参与判定」处置 —— 必须显式点名（绝不静默）。
             channel_diag = str(channel_record.get("channel_diagnostic") or "")
-            texture_override_vb_section.append(
+            self._append_merged_diag(
+                texture_override_vb_section,
                 self._merged_diag(
                     ZZMI_MERGE_DIAG_POSE_KEY_UNAVAILABLE,
                     channel_diag
@@ -3338,7 +3443,7 @@ class ExportZZMI(ExportUnity):
                     channel_slot=int(channel_record["channel_slot"]),
                     channel_local=int(channel_record["channel_local"]),
                     reason=str(channel_record.get("channel_reason") or ""),
-                )
+                ),
             )
 
         # 4) 顶层无条件 attach（每个 (部件, 槽) 一条 run；run 绝不进 if）
@@ -3718,10 +3823,11 @@ class ExportZZMI(ExportUnity):
             # 部件在该槽都已当帧到达（或按上一帧预测本槽不会到）才重放；if 内只有
             # 绑定与 draw（说明留源码，不写进配置表）
             # O3：消费点标记（注释行；守卫条件与块体一字不改 ⇒ 逐字节不变量）
-            section.append(
+            self._append_merged_diag(
+                section,
                 self._merged_reuse_site(
                     consumer_ib or target_ib, skeleton_group, slot, "replay-draw"
-                )
+                ),
             )
             section.append(
                 f"if {self._merged_slot_guard_condition(guard_component_ids, skeleton_group, slot)}"
@@ -3810,12 +3916,15 @@ class ExportZZMI(ExportUnity):
             self._merged_group_component_ids(skeleton_group), slot, cull_aware=True
         )
         # O3：消费点标记（注释行；守卫条件与块体一字不改 ⇒ 逐字节不变量）
-        section.append(
+        self._append_merged_diag(
+            section,
             self._merged_reuse_site(
                 consumer_ib or str(host["draw_ib"]), skeleton_group, slot, "replay-absorbed"
-            )
+            ),
         )
-        section.append(f"if {' && '.join(p for p in (gate, clauses) if p)}")
+        section.append(
+            f"if {self._merged_absorb_redundant_seen_clauses(' && '.join(p for p in (gate, clauses) if p))}"
+        )
         section.append(f"    vs-t0 = {self._merged_skeleton_name(skeleton_group, slot)}")
         section.append(
             f"    so0 = ref {self._merged_redirect_so_name(skeleton_group, slot)}"
@@ -5382,7 +5491,8 @@ class ExportZZMI(ExportUnity):
         # 注意：运行期实例数在导出期不可知（同一 DrawIB 的多次实例不在导出数据里），
         # 因此这里声明的是**上界**与**超界形态**，不是「已检测到超界」。
         for skeleton_group in groups:
-            section.append(
+            self._append_merged_diag(
+                section,
                 self._merged_diag(
                     ZZMI_MERGE_DIAG_SLOT_BOUND,
                     "超过该次数的同帧实例会回绕复用槽位（槽内混实例）。",
@@ -5393,7 +5503,7 @@ class ExportZZMI(ExportUnity):
                     max_same_frame_occurrences=len(slots),
                     overflow=f"occurrence>{len(slots)}_wraps_to_slot_{slots[0]}",
                     runtime_probe="x3=$zz_ms_seen_<i>" + str(slots[0]),
-                )
+                ),
             )
         for skeleton_group in groups:
             for slot in slots:
@@ -5506,8 +5616,9 @@ class ExportZZMI(ExportUnity):
                 # B2：锚点行布局 ≠ CS 写死的行布局 ⇒ 不发 CS 段定义（发布点也已
                 # 按同一守卫跳过，产物里不会留下任何 CS 引用）。诊断在此也留一条，
                 # 与 `_append_merged_skin_publish_block` 的同一记录去重后只打一行。
-                section.append(
-                    self._merged_skin_layout_diag(skeleton_group, group_plan)
+                self._append_merged_diag(
+                    section,
+                    self._merged_skin_layout_diag(skeleton_group, group_plan),
                 )
                 continue
             so_prefix_rows = int(group_plan.get("so_prefix_rows", 0) or 0)

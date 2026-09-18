@@ -220,6 +220,10 @@ _zzmi_module = importlib.util.module_from_spec(_spec)
 sys.modules[_spec.name] = _zzmi_module
 _spec.loader.exec_module(_zzmi_module)
 
+# t149：开发者诊断注释默认不再写进配置表；本文件断言 `; ZZMI-MERGE-DIAG …`
+# 的**存在**，故在本模块自己的 zzmi 副本上打开开关（见 zzmi.ZZMI_MERGE_DIAG_EMIT）。
+_zzmi_module.ZZMI_MERGE_DIAG_EMIT = True
+
 ExportZZMI = _zzmi_module.ExportZZMI
 CHANNEL = sys.modules[f"{PKG}.common.zzmi_channel"]
 
