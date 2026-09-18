@@ -220,6 +220,72 @@ class ModelShaderReplaceMappingTests(unittest.TestCase):
 
         model_module.validate_postprocess_node_constraints(nodes)
 
+    def test_blueprint_validation_rejects_duplicate_text_append_nodes(self):
+        nodes = [
+            types.SimpleNamespace(
+                bl_idname="SSMTNode_PostProcess_TextAppend",
+                name="Text A",
+                mute=False,
+            ),
+            types.SimpleNamespace(
+                bl_idname="SSMTNode_PostProcess_TextAppend",
+                name="Text B",
+                mute=False,
+            ),
+        ]
+
+        with self.assertRaisesRegex(ValueError, "文本追加.*只能存在一个"):
+            model_module.validate_postprocess_node_constraints(nodes)
+
+    def test_blueprint_validation_requires_text_append_to_run_last(self):
+        nodes = [
+            types.SimpleNamespace(
+                bl_idname="SSMTNode_PostProcess_TextAppend",
+                name="Text",
+                mute=False,
+            ),
+            types.SimpleNamespace(
+                bl_idname="SSMTNode_PostProcess_PSBinding",
+                name="Binding",
+                mute=False,
+            ),
+        ]
+
+        with self.assertRaisesRegex(ValueError, "文本追加.*最后"):
+            model_module.validate_postprocess_node_constraints(nodes)
+
+    def test_blueprint_validation_allows_text_append_to_run_last(self):
+        nodes = [
+            types.SimpleNamespace(
+                bl_idname="SSMTNode_PostProcess_PSBinding",
+                name="Binding",
+                mute=False,
+            ),
+            types.SimpleNamespace(
+                bl_idname="SSMTNode_PostProcess_TextAppend",
+                name="Text",
+                mute=False,
+            ),
+        ]
+
+        model_module.validate_postprocess_node_constraints(nodes)
+
+    def test_blueprint_validation_ignores_muted_text_append_position(self):
+        nodes = [
+            types.SimpleNamespace(
+                bl_idname="SSMTNode_PostProcess_TextAppend",
+                name="Text",
+                mute=True,
+            ),
+            types.SimpleNamespace(
+                bl_idname="SSMTNode_PostProcess_PSBinding",
+                name="Binding",
+                mute=False,
+            ),
+        ]
+
+        model_module.validate_postprocess_node_constraints(nodes)
+
     def test_traverse_postprocess_chain_rejects_export_chain_node(self):
         tree = types.SimpleNamespace(name="Main")
         bad_node = types.SimpleNamespace(

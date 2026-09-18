@@ -17,6 +17,8 @@ class SSMTNode_PostProcess_Base(SSMTNodeBase):
     )
     AUTO_APPENDED_SECTION_MARKER_PREFIXES = (
         "; --- AUTO-APPENDED UI PANEL ",
+        # 文本追加节点（node_postprocess_text_append）写在配置表最下方的块。
+        "; --- AUTO-APPENDED CUSTOM TEXT ",
     )
 
     ANIM_DRIVER_SECTION_MARKER_START = "; --- ANIMATION DRIVER SECTION ---"

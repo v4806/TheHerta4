@@ -37,6 +37,7 @@ class SSMTNode_Blueprint_Nest(SSMTNodeBase):
         'SSMTNode_PostProcess_CustomMaterialAssign': '材质转资源pro',
         'SSMTNode_PostProcess_DiffuseSwitch': '贴图切换 V5.1',
         'SSMTNode_PostProcess_SwapPanel': '物体切换面板',
+        'SSMTNode_PostProcess_TextAppend': '文本追加',
     }
 
     def update_blueprint_name(self, context):

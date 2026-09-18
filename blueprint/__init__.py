@@ -115,6 +115,7 @@ _MODULE_REGISTRY = [
     {"name": "node_postprocess_diffuse_switch", "required": False},
     {"name": "node_postprocess_object_texture", "required": False},
     {"name": "node_postprocess_swap_panel", "required": False},
+    {"name": "node_postprocess_text_append", "required": False},
 ]
 
 _MODULE_AVAILABLE = {}

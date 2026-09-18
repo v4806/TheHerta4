@@ -1389,6 +1389,9 @@ class SSMT_MT_NodeMenu_PostProcess(bpy.types.Menu):
         layout.menu("SSMT_MT_NodeMenu_PostProcess_Panel", text="面板相关", icon='WINDOW')
         layout.menu("SSMT_MT_NodeMenu_PostProcess_AnimDriver", text="动画驱动相关", icon='ACTION')
         layout.menu("SSMT_MT_NodeMenu_PostProcess_Creative", text="创意", icon='LIGHT')
+        # 文本追加与「创意」同级：它没有输出口，只能挂在链尾，单独成项更好找。
+        layout.separator()
+        _add_node_entry(layout, "文本追加", 'TEXT', "SSMTNode_PostProcess_TextAppend")
 
 
 class SSMT_MT_NodeMenu_PostProcess_Dynamic(bpy.types.Menu):
