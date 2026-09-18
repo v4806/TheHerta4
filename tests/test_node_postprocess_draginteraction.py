@@ -4959,5 +4959,115 @@ class DragCollisionTests(unittest.TestCase):
             self.assertNotIn("collision_grid", comp)
 
 
+class DragMergedSkeletonDiagnosticLevelTests(unittest.TestCase):
+    """R-C：合并骨架上两条「必然且良性」的诊断降级为 INFO（非合并骨架仍是 WARNING）。
+
+    依据 review-reports/t82-shapekey-drag-retest.md §2.3/§3.3 R-C：
+    - `多个 base vertex`：合并骨架给被吸收件补了 3 行前缀 stub，同一 DrawIB 的多个 part
+      天然有不同 base vertex（实测 {0,3}）；
+    - `Position.buf 顶点数 != VLR`：VLR 是合并 SO 总行数，Position.buf 只有本件导出行数
+      （实测差 3 行）。
+    两条都**不许删**：`3b1b73fe` 的 `vertex_base=3` 分支与「以 buf 为准」兜底都靠它们。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_drag_module()
+
+    @staticmethod
+    def _sections_with_split_base_vertices():
+        sections = _base_sections()
+        # part A base=3 / part B base=0 ⇒ 触发「多个 base vertex」分支（t82 实测 {0,3}）
+        sections["[TextureOverride_abc123_abc123-43191A]"][-1] = "drawindexed = 52688, 0, 3"
+        sections["[TextureOverride_abc123_abc123-43191B]"][-1] = "drawindexed = 12000, 0, 0"
+        return sections
+
+    def _locate_stdout(self, sections):
+        import contextlib
+        import io
+
+        node = _make_node(self.mod)
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            comp = node._locate_components(sections, ["abc123"])[0]
+        return comp, buffer.getvalue()
+
+    def _read_position_buf_stdout(self, sections):
+        import contextlib
+        import io
+        import tempfile
+
+        node = _make_node(self.mod)
+        res_name = "Resource_abc123_Position"
+        self.assertIn(f"[{res_name}]", sections)
+        comp = {"base_resource": res_name}
+        buffer = io.StringIO()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            meshes_dir = os.path.join(temp_dir, "Meshes")
+            os.makedirs(meshes_dir, exist_ok=True)
+            # 20 行 × stride 40（= 800 字节）≠ VLR 14078 ⇒ 触发 buf/VLR 不一致分支
+            with open(os.path.join(meshes_dir, "abc123-43191-Position.buf"), "wb") as file:
+                file.write(b"\x00" * (20 * 40))
+            with contextlib.redirect_stdout(buffer):
+                values = node._read_position_buf(temp_dir, sections, comp, 14078)
+        return values, buffer.getvalue()
+
+    @staticmethod
+    def _add_merged_skeleton_marker(sections):
+        sections["[Constants]"].append("global $zz_ms_seen_10 = 0")
+
+    def test_detects_merged_skeleton_product_by_variable_marker(self):
+        sections = _base_sections()
+        detector = self.mod.SSMTNode_PostProcess_DragInteraction._is_merged_skeleton_product
+
+        self.assertFalse(detector(sections))
+        self._add_merged_skeleton_marker(sections)
+        self.assertTrue(detector(sections))
+
+    def test_detects_merged_skeleton_product_by_section_name(self):
+        sections = _base_sections()
+        detector = self.mod.SSMTNode_PostProcess_DragInteraction._is_merged_skeleton_product
+        sections["[CustomShaderZZMIMergedSkeletonAttach_C1_s0]"] = ["cs = ./res/x.hlsl"]
+        self.assertTrue(detector(sections))
+
+    def test_detects_merged_skeleton_product_by_resource_marker(self):
+        sections = _base_sections()
+        detector = self.mod.SSMTNode_PostProcess_DragInteraction._is_merged_skeleton_product
+        sections["[ResourceZZMergedSkeleton_G0_s0]"] = ["type = RWStructuredBuffer"]
+        self.assertTrue(detector(sections))
+
+    def test_plain_product_keeps_multiple_base_vertices_warning(self):
+        _, out = self._locate_stdout(self._sections_with_split_base_vertices())
+        self.assertIn("[DragInteraction][WARNING]", out)
+        self.assertIn("base vertex", out)
+
+    def test_merged_skeleton_downgrades_multiple_base_vertices_to_info(self):
+        sections = self._sections_with_split_base_vertices()
+        self._add_merged_skeleton_marker(sections)
+
+        _, out = self._locate_stdout(sections)
+
+        self.assertNotIn("[DragInteraction][WARNING] hash abc123 的绘制段使用多个", out)
+        self.assertIn("[DragInteraction][INFO] hash abc123 的绘制段使用多个", out)
+        self.assertIn("合并骨架场景下必然出现且良性", out)
+
+    def test_plain_product_keeps_buf_vertex_count_mismatch_warning(self):
+        values, out = self._read_position_buf_stdout(_base_sections())
+        self.assertIsNotNone(values)
+        self.assertEqual(len(values), 20)
+        self.assertIn("[DragInteraction][WARNING] Position.buf 顶点数 20 与 VLR 14078", out)
+
+    def test_merged_skeleton_downgrades_buf_mismatch_to_info(self):
+        sections = _base_sections()
+        self._add_merged_skeleton_marker(sections)
+
+        values, out = self._read_position_buf_stdout(sections)
+
+        self.assertIsNotNone(values)
+        self.assertNotIn("[DragInteraction][WARNING] Position.buf 顶点数", out)
+        self.assertIn("[DragInteraction][INFO] Position.buf 顶点数 20 与 VLR 14078", out)
+        self.assertIn("合并骨架场景下必然出现且良性", out)
+
+
 if __name__ == "__main__":
     unittest.main()

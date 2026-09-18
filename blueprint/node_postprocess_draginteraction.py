@@ -43,6 +43,19 @@ INVALID_ZONE_ID = 0xFFFFFFFF
 ZONES_PER_PAGE = 1
 VAR_SYNC_VALUE_BASE = 81
 VAR_SYNC_MODE_BASE = 90
+
+# 合并骨架（ZZMI MergedSkeleton）在产物 ini 里的稳定标记：R-C 用它把「合并骨架上必然出现
+# 且良性」的两条诊断从 WARNING 降级为 INFO（`多个 base vertex` / `buf 与 VLR 不一致`）。
+# 依据 review-reports/t82-shapekey-drag-retest.md §2.3：合并骨架给被吸收件补了 3 行前缀
+# stub，于是同一 DrawIB 的多个 part 有不同 base vertex（实测 {0,3}），且
+# `override_vertex_count = 合并 SO 总行数` 而 `Position.buf = 本件导出行数`（实测差 3 行）。
+MERGED_SKELETON_PRODUCT_MARKERS = (
+    "ZZMIMergedSkeleton",
+    "ResourceZZMergedSkeleton",
+    "zz_ms_seen_",
+    "zz_ms_prev_",
+    "ResourceZZRedirectSO",
+)
 VAR_SYNC_FLOAT4_CAPACITY = 9
 VAR_SYNC_MAX_BINDINGS = VAR_SYNC_FLOAT4_CAPACITY * 4
 
@@ -1344,6 +1357,30 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         return sections, preserved_tail_content, preserved_driver_content
 
     @staticmethod
+    def _is_merged_skeleton_product(sections) -> bool:
+        """产物 ini 是否带 ZZMI 合并骨架（MergedSkeleton）痕迹。
+
+        判据只依赖产物内容（段名 + 行文本），因此在导出后处理阶段对任何来源的 ini 都成立。
+        合并骨架确实存在时，下面两条拖拽诊断在合并骨架上**必然出现且良性**，应当降级为
+        INFO（勿删：`3b1b73fe` 的 `vertex_base=3` 分支依赖这些兜底逻辑）。
+        """
+        if not sections:
+            return False
+        for section_name, lines in sections.items():
+            if any(marker in str(section_name) for marker in MERGED_SKELETON_PRODUCT_MARKERS):
+                return True
+            for line in lines or ():
+                if any(marker in str(line) for marker in MERGED_SKELETON_PRODUCT_MARKERS):
+                    return True
+        return False
+
+    def _diagnostic_level(self, sections, *, merged_skeleton_suffix: str = "") -> tuple:
+        """返回 (级别标签, 附加说明)：合并骨架上降级为 INFO，其余保持 WARNING。"""
+        if self._is_merged_skeleton_product(sections):
+            return "INFO", merged_skeleton_suffix
+        return "WARNING", ""
+
+    @staticmethod
     def _strip_legacy_help_mode_block(text):
         """Remove every old help-gated drag-mode override from UI tails."""
         lines = str(text or "").splitlines(keepends=True)
@@ -1686,9 +1723,15 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 for part in parts
             }
             if len(vertex_bases) > 1:
+                # 合并骨架下同一 DrawIB 的多个 part 天然有不同 base vertex（实测 {0,3}：
+                # 宿主前缀 stub + 各 part 偏移）⇒ 必然出现且良性，降级 INFO；勿删，逐
+                # part 的 vertex_base 兜底正是靠这条信息。
+                _level, _suffix = self._diagnostic_level(
+                    sections, merged_skeleton_suffix="（合并骨架场景下必然出现且良性）"
+                )
                 print(
-                    f"[DragInteraction][WARNING] hash {hash_value} 的绘制段使用多个 "
-                    f"base vertex {sorted(vertex_bases)}；逐顶点资源暂按最小值对齐"
+                    f"[DragInteraction][{_level}] hash {hash_value} 的绘制段使用多个 "
+                    f"base vertex {sorted(vertex_bases)}；逐顶点资源暂按最小值对齐{_suffix}"
                 )
             vertex_base = min(vertex_bases) if vertex_bases else 0
             # 物体显隐：按记录稳定分配全局物体编号（mesh 注释名 → id；跨组件连续），
@@ -2818,7 +2861,17 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 return None
             n = len(data) // stride
             if vertex_count and n != vertex_count:
-                print(f"[DragInteraction][WARNING] Position.buf 顶点数 {n} 与 VLR {vertex_count} 不一致，以 buf 为准")
+                # 合并骨架上 `override_vertex_count` 是合并 SO 总行数（含被吸收件的 3 行前缀），
+                # 而 Position.buf 只有本件的导出行数 ⇒ 差 3 行必然出现且良性，降级 INFO。
+                # 勿删：以 buf 为准的兜底与下面的补前缀逻辑都依赖这条判断。
+                _level, _suffix = self._diagnostic_level(
+                    sections,
+                    merged_skeleton_suffix="（合并骨架场景下必然出现且良性：VLR=合并 SO 总行数）",
+                )
+                print(
+                    f"[DragInteraction][{_level}] Position.buf 顶点数 {n} 与 VLR {vertex_count} "
+                    f"不一致，以 buf 为准{_suffix}"
+                )
             arr = data[:n * stride].reshape(n, stride)
             attribute_bytes = arr[:, position_offset:position_offset + attribute_size].copy()
             values = attribute_bytes.view(scalar_type).reshape(n, component_count)
