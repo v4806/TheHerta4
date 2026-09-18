@@ -849,7 +849,7 @@ class SSMTNode_AnimDriver_Base(SSMTNodeBase):
         """取运行时间节点的帧变量名（含 ``$``）。
 
         运行时间节点不再硬编码共享的 ``$swapvar``，而是每节点一个预分配名
-        （``$swapvar{auto_index}``）—— N 个节点不再产出 N 份同名声明。这里按
+        （``$anim_frame{auto_index}``）—— N 个节点不再产出 N 份同名声明。这里按
         ``_find_runtime_node()`` 找到的那个节点取名。
 
         找不到运行时间节点时回退共享的 ``$swapvar``：它由 ``auto_index`` 最小的

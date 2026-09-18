@@ -70,7 +70,7 @@ sys.modules[_spec.name] = collector_module
 _spec.loader.exec_module(collector_module)
 
 
-def _runtime_segment(fps, frame_var="swapvar1", alias_owner=False):
+def _runtime_segment(fps, frame_var="anim_frame1", alias_owner=False):
     """与生产实现（anim_driver_runtime.generate_ini_segment）同形。
 
     每个运行时间节点只声明**自己的**预分配帧变量；``auto_index`` 最小的那个
@@ -116,7 +116,7 @@ class _FakeRuntimeNode:
         return (
             str(self.custom_frame_variable_name or "").strip().lstrip("$")
             or str(self.assigned_frame_variable_name or "").strip().lstrip("$")
-            or f"swapvar{self.auto_index}"
+            or f"anim_frame{self.auto_index}"
         )
 
     def is_compat_alias_owner(self):
@@ -344,8 +344,8 @@ class RuntimeDriverDedupIntegrationTests(unittest.TestCase):
 
         joined = "\n".join(p["ini_content"] for p in paragraphs)
         for index in range(1, 5):
-            self.assertEqual(joined.count(f"global persist $swapvar{index} = 0"), 1)
-            self.assertEqual(joined.count(f"$swapvar{index} = (time * 60) // 1"), 1)
+            self.assertEqual(joined.count(f"global persist $anim_frame{index} = 0"), 1)
+            self.assertEqual(joined.count(f"$anim_frame{index} = (time * 60) // 1"), 1)
         # 兼容别名只有一份（auto_index 最小的那个节点发），手写 $swapvar/$fps 仍可用
         self.assertEqual(joined.count("global persist $swapvar = 0"), 1)
         self.assertEqual(joined.count("global persist $fps = 60"), 1)
@@ -360,10 +360,10 @@ class RuntimeDriverDedupIntegrationTests(unittest.TestCase):
 
         self.assertEqual(len(paragraphs), 2)
         first, second = paragraphs[0]["ini_content"], paragraphs[1]["ini_content"]
-        self.assertIn("global persist $swapvar1 = 0", first)
-        self.assertIn("$swapvar1 = (time * 60) // 1", first)
-        self.assertIn("global persist $swapvar2 = 0", second)
-        self.assertIn("$swapvar2 = (time * 30) // 1", second)
+        self.assertIn("global persist $anim_frame1 = 0", first)
+        self.assertIn("$anim_frame1 = (time * 60) // 1", first)
+        self.assertIn("global persist $anim_frame2 = 0", second)
+        self.assertIn("$anim_frame2 = (time * 30) // 1", second)
         self.assertEqual(collector.last_normalization["renames"], [])
         self.assertEqual(collector.last_normalization["merges"], [])
 

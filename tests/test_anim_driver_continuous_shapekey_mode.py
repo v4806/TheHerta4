@@ -73,7 +73,7 @@ def _stub_ensure_anim_driver_frame_variable_name(node, context=None):
     """运行时间节点的预分配帧变量（与生产分配器同契约：写回并返回名字）。"""
     name = str(getattr(node, "assigned_frame_variable_name", "") or "").strip()
     if not name:
-        name = f"swapvar{int(getattr(node, 'auto_index', 0) or 0)}"
+        name = f"anim_frame{int(getattr(node, 'auto_index', 0) or 0)}"
         try:
             node.assigned_frame_variable_name = name
         except Exception:

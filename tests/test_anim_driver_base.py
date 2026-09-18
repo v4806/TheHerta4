@@ -77,7 +77,7 @@ def _stub_ensure_anim_driver_frame_variable_name(node, context=None):
     """运行时间节点的预分配帧变量（与生产分配器同契约：写回并返回名字）。"""
     name = str(getattr(node, "assigned_frame_variable_name", "") or "").strip()
     if not name:
-        name = f"swapvar{int(getattr(node, 'auto_index', 0) or 0)}"
+        name = f"anim_frame{int(getattr(node, 'auto_index', 0) or 0)}"
         try:
             node.assigned_frame_variable_name = name
         except Exception:
@@ -1714,8 +1714,8 @@ class RuntimeFrameVariablePreallocationTests(unittest.TestCase):
         first = self._make_runtime("运行时间", 1, tree)
         second = self._make_runtime("运行时间.001", 2, tree)
 
-        self.assertEqual(first.frame_variable_name(), "swapvar1")
-        self.assertEqual(second.frame_variable_name(), "swapvar2")
+        self.assertEqual(first.frame_variable_name(), "anim_frame1")
+        self.assertEqual(second.frame_variable_name(), "anim_frame2")
 
     def test_custom_frame_variable_wins_over_preallocated(self):
         tree = types.SimpleNamespace(name="动画驱动蓝图", bl_idname='SSMTBlueprintTreeType', nodes=[], links=[])
@@ -1736,13 +1736,13 @@ class RuntimeFrameVariablePreallocationTests(unittest.TestCase):
         self.assertTrue(owner.is_compat_alias_owner())
         self.assertFalse(other.is_compat_alias_owner())
         # 各自声明自己的帧变量，互不重名
-        self.assertIn("global persist $swapvar1 = 0", owner_segment)
-        self.assertIn("$swapvar1 = (time * 30) // 1", owner_segment)
-        self.assertIn("global persist $swapvar2 = 0", other_segment)
-        self.assertIn("$swapvar2 = (time * 30) // 1", other_segment)
+        self.assertIn("global persist $anim_frame1 = 0", owner_segment)
+        self.assertIn("$anim_frame1 = (time * 30) // 1", owner_segment)
+        self.assertIn("global persist $anim_frame2 = 0", other_segment)
+        self.assertIn("$anim_frame2 = (time * 30) // 1", other_segment)
         # 兼容别名只出现一次（$swapvar / $fps 不再被 N 个节点重复声明）
         self.assertIn("global persist $swapvar = 0", owner_segment)
-        self.assertIn("$swapvar = $swapvar1", owner_segment)
+        self.assertIn("$swapvar = $anim_frame1", owner_segment)
         self.assertNotIn("global persist $swapvar = 0", other_segment)
         self.assertNotIn("global persist $fps", other_segment)
         self.assertEqual(
@@ -1760,9 +1760,9 @@ class RuntimeFrameVariablePreallocationTests(unittest.TestCase):
         )
         self.assertEqual(
             anim_driver_base.SSMTNode_AnimDriver_Base._frame_variable_of(
-                types.SimpleNamespace(custom_frame_variable_name="", assigned_frame_variable_name="swapvar2")
+                types.SimpleNamespace(custom_frame_variable_name="", assigned_frame_variable_name="anim_frame2")
             ),
-            "$swapvar2",
+            "$anim_frame2",
         )
 
     def test_consumer_uses_upstream_runtime_preallocated_variable(self):
@@ -1778,13 +1778,13 @@ class RuntimeFrameVariablePreallocationTests(unittest.TestCase):
         node._find_runtime_node = lambda: types.SimpleNamespace(
             fps=30,
             playback_rate=2,
-            assigned_frame_variable_name="swapvar2",
+            assigned_frame_variable_name="anim_frame2",
             custom_frame_variable_name="",
         )
 
         ini = node.generate_ini_segment()
 
-        self.assertIn("if $swapvar2 % $speed_auto1 == 0", ini)
+        self.assertIn("if $anim_frame2 % $speed_auto1 == 0", ini)
         self.assertNotIn("if $swapvar % $speed_auto1 == 0", ini)
 
 
@@ -1807,12 +1807,12 @@ class RuntimeFrameVariablePreallocationTests(unittest.TestCase):
 
         node.init(None)
 
-        self.assertEqual(node.assigned_frame_variable_name, "swapvar1")
+        self.assertEqual(node.assigned_frame_variable_name, "anim_frame1")
         self.assertEqual(
-            node.custom_frame_variable_name, "swapvar1",
+            node.custom_frame_variable_name, "anim_frame1",
             "预分配帧变量名必须填入输入框（与暂停变量/连续索引变量同规则）",
         )
-        self.assertEqual(node.frame_variable_name(), "swapvar1")
+        self.assertEqual(node.frame_variable_name(), "anim_frame1")
 
     def test_copy_reallocates_frame_variable(self):
         tree = types.SimpleNamespace(

@@ -69,8 +69,8 @@ class AnimDriverFrameVariableAllocationTests(unittest.TestCase):
 
         name = registry.ensure_anim_driver_frame_variable_name(node)
 
-        self.assertEqual(name, "swapvar1")
-        self.assertEqual(node.assigned_frame_variable_name, "swapvar1")
+        self.assertEqual(name, "anim_frame1")
+        self.assertEqual(node.assigned_frame_variable_name, "anim_frame1")
 
     def test_repeated_calls_do_not_reallocate(self):
         node = _FakeRuntimeNode("运行时间", auto_index=2)
@@ -81,26 +81,26 @@ class AnimDriverFrameVariableAllocationTests(unittest.TestCase):
         node.auto_index = 7
         second = registry.ensure_anim_driver_frame_variable_name(node)
 
-        self.assertEqual(first, "swapvar2")
-        self.assertEqual(second, "swapvar2")
+        self.assertEqual(first, "anim_frame2")
+        self.assertEqual(second, "anim_frame2")
 
     def test_two_runtime_nodes_get_distinct_names(self):
         first = _FakeRuntimeNode("运行时间", auto_index=1)
         second = _FakeRuntimeNode("运行时间.001", auto_index=2)
         _fake_bpy.data.node_groups = [_FakeTree([first, second])]
 
-        self.assertEqual(registry.ensure_anim_driver_frame_variable_name(first), "swapvar1")
-        self.assertEqual(registry.ensure_anim_driver_frame_variable_name(second), "swapvar2")
+        self.assertEqual(registry.ensure_anim_driver_frame_variable_name(first), "anim_frame1")
+        self.assertEqual(registry.ensure_anim_driver_frame_variable_name(second), "anim_frame2")
 
     def test_allocation_avoids_name_taken_by_another_owner(self):
-        occupied = _FakeRuntimeNode("运行时间", auto_index=2, assigned="swapvar2")
+        occupied = _FakeRuntimeNode("运行时间", auto_index=2, assigned="anim_frame2")
         newcomer = _FakeRuntimeNode("运行时间.001", auto_index=2)
         _fake_bpy.data.node_groups = [_FakeTree([occupied, newcomer])]
 
         name = registry.ensure_anim_driver_frame_variable_name(newcomer)
 
-        self.assertEqual(name, "swapvar2_1")
-        self.assertEqual(newcomer.assigned_frame_variable_name, "swapvar2_1")
+        self.assertEqual(name, "anim_frame2_1")
+        self.assertEqual(newcomer.assigned_frame_variable_name, "anim_frame2_1")
 
     def test_user_custom_name_is_not_touched_by_allocator(self):
         node = _FakeRuntimeNode("运行时间", auto_index=1, custom="my_frame")
@@ -109,7 +109,7 @@ class AnimDriverFrameVariableAllocationTests(unittest.TestCase):
         name = registry.ensure_anim_driver_frame_variable_name(node)
 
         # 分配器只负责预分配名；手改名由节点侧 frame_variable_name() 优先使用
-        self.assertEqual(name, "swapvar1")
+        self.assertEqual(name, "anim_frame1")
         self.assertEqual(node.custom_frame_variable_name, "my_frame")
 
 

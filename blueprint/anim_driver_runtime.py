@@ -22,7 +22,7 @@ class SSMTNode_AnimDriver_Runtime(SSMTNode_AnimDriver_Base):
     bl_label = '运行时间'
     bl_icon = 'TIME'
     bl_description = (
-        "按系统时间推进帧计数器；帧变量按节点预分配（$swapvar{序号}），"
+        "按系统时间推进帧计数器；帧变量按节点预分配（$anim_frame{序号}），"
         "并由序号最小的节点维护 $swapvar / $fps 兼容别名"
     )
 
