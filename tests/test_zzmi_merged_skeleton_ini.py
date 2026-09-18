@@ -287,6 +287,35 @@ class _FakeGameType:
     }
 
 
+def _with_channel_plan(components):
+    """为手工构造的组件记录补上 t75 通道计划（**用真实实现**推导，不塞假记录）。
+
+    导出侧现在要求「通道计划缺失 = 该部件退出合并骨架」（绝不静默退回出现次
+    判据），所以夹具必须像生产链路一样带上它。
+    """
+    if not components:
+        return components
+    channel_module = sys.modules[f"{PKG}.common.zzmi_channel"]
+    records = channel_module.select_channel_plan(
+        [
+            {
+                "draw_ib": component["draw_ib"],
+                "vg_map": dict(component.get("vg_map") or {}),
+                "vg_count": int(component.get("vg_count") or 0),
+                "vg_offset": int(component.get("vg_offset") or 0),
+                "skeleton_group": int(component.get("skeleton_group") or 0),
+            }
+            for component in components
+        ]
+    )
+    for index, component in enumerate(components):
+        record = records.get(component["draw_ib"])
+        if record is not None and "channel" not in component:
+            component["channel"] = dict(record)
+            component["channel_digest"] = ""
+    return components
+
+
 class _FakeSubmesh:
     def __init__(self, unique_str, vg_offset=0, vg_count=0, skeleton_group=0, vg_map=None,
                  deform_draw=0, original_vertex_count=0, vertex_count=0,
@@ -300,6 +329,13 @@ class _FakeSubmesh:
         self.vg_map = vg_map if vg_map is not None else {
             local: vg_offset + local for local in range(vg_count)
         }
+        # t75：通道计划由导出侧 `_merged_resolve_channel_plans` 按整组补算
+        self.channel_plan_version = 0
+        self.channel_plan = {}
+        self.channel_plan_digest = ""
+        self.channel_plan_slot_weights = {}
+        # 生产侧 draw_ib 来自 `drawib_model.draw_ib`；夹具显式给出同口径的值。
+        self.draw_ib = unique_str.split(".", 1)[-1].split("-", 1)[0]
         # ZZMI 导出侧守卫元数据（反查写回）：deform draw 序号 / 原部件顶点数
         self.deform_draw_index = deform_draw
         self.original_vertex_count = original_vertex_count
@@ -412,6 +448,52 @@ class ZZSIMergedSkeletonCollectTests(unittest.TestCase):
         components, id_dict = exporter._collect_merged_skeleton_components()
         self.assertEqual(components, [])
         self.assertEqual(id_dict, {})
+
+    def test_collect_accepts_migratable_v4_cache_with_complete_vgmap(self):
+        """**阻断修复（t80 §2.4）**：v4 缓存内容完整时**不得**再被拒绝。
+
+        可证伪：修复前这里 `components == []`（逐件拒绝）→ 合并骨架契约把
+        「全部被拒」升级成整次导出中止，而"重新一键导入"依赖的 FrameAnalysis
+        帧可能已被用户删除 ⇒ 用户无路可走。修复后按当前算法就地补算通道计划。
+        """
+        submesh = _FakeSubmesh("LOD0.b20f90ea-19182-0", 0, 4)
+        submesh.vg_map_algorithm_version = 4  # 旧版但 VGMap 完整覆盖 0..3
+        exporter = _make_exporter(
+            [_FakeDrawIBModel("b20f90ea", [submesh])], merged_vgmap=True
+        )
+        components, id_dict = exporter._collect_merged_skeleton_components()
+        self.assertEqual(
+            [component["draw_ib"] for component in components],
+            ["b20f90ea"],
+            "v4 且内容完整的缓存必须放行，不得整次导出中止",
+        )
+        self.assertEqual(id_dict, {"b20f90ea": 0})
+        self.assertEqual(exporter._zzmi_merged_contract_stats["skip_reasons"], {})
+        self.assertEqual(
+            exporter._zzmi_merged_contract_stats["migrated_cache"], {"b20f90ea": 4}
+        )
+
+    def test_collect_rejects_v4_cache_with_incomplete_vgmap(self):
+        """反向可证伪：版本旧**且**内容不完整（缺键）时必须仍然拒绝。
+
+        缺键会让 attach CS 的 `vg_map.get(local, 0)` 静默塌缩到槽位 0（整块蒙皮
+        炸裂）⇒ 不能靠"版本号旧就放行"换成活下来。
+        """
+        submesh = _FakeSubmesh("LOD0.b20f90ea-19182-0", 0, 4)
+        submesh.vg_map_algorithm_version = 4
+        submesh.vg_map = {0: 0, 1: 1}  # 缺 2/3
+        exporter = _make_exporter(
+            [_FakeDrawIBModel("b20f90ea", [submesh])], merged_vgmap=True
+        )
+        components, id_dict = exporter._collect_merged_skeleton_components()
+        self.assertEqual(components, [])
+        self.assertEqual(id_dict, {})
+        reason = exporter._zzmi_merged_contract_stats["skip_reasons"]["b20f90ea"]
+        self.assertIn(
+            "内容不完整",
+            reason,
+            "版本旧**且**内容不完整必须按'内容不完整'拒绝（不是'过旧'就放行）",
+        )
 
 
 class ZZSIMergedSkeletonIniTests(unittest.TestCase):
@@ -859,6 +941,7 @@ class ZZMICrossGroupGuardTests(unittest.TestCase):
         dcm = sys.modules[f"{PKG}.common.draw_call_model"].DrawCallModel
         submesh.drawcall_model_list = [dcm(obj_name=submesh.unique_str)]
         exporter = _make_exporter([_FakeDrawIBModel(draw_ib, [submesh])], merged_vgmap=True)
+        components = _with_channel_plan(components)
         exporter.merged_skeleton_components = components
         exporter.merged_skeleton_component_id_dict = {
             c["draw_ib"]: i for i, c in enumerate(components)
@@ -1010,6 +1093,7 @@ class ZZSIMultiInstanceGuardTests(unittest.TestCase):
             _FakeDrawIBModel("b20f90ea", [sub_b]),
         ]
         exporter = _make_exporter(models, merged_vgmap=True)
+        components = _with_channel_plan(components)
         exporter.merged_skeleton_components = components
         exporter.merged_skeleton_component_id_dict = {
             c["draw_ib"]: i for i, c in enumerate(components)
@@ -1386,7 +1470,7 @@ class ZZSIMultiInstanceGuardTests(unittest.TestCase):
             merged_vgmap=True,
         )
         # 组件字典需带 vg_map（add_merged_skeleton_sections 要写 vg_map 二进制）
-        exporter.merged_skeleton_components = [
+        exporter.merged_skeleton_components = _with_channel_plan([
             {
                 "draw_ib": "5144c409", "unique_str": "LOD0.5144c409-17364-0",
                 "vg_offset": 41, "vg_count": 106, "skeleton_group": 2,
@@ -1399,7 +1483,7 @@ class ZZSIMultiInstanceGuardTests(unittest.TestCase):
                 "vg_map": {i: 147 + i for i in range(102)}, "deform_draw": 0,
                 "original_vertex_count": 0,
             },
-        ]
+        ])
         exporter.merged_skeleton_component_id_dict = {"5144c409": 0, "73757570": 1}
         builder = _FakeIniBuilder()
         exporter.add_unity_vs_texture_override_vb_sections(
@@ -1498,6 +1582,7 @@ class ZZSIDirectPathGuardTests(unittest.TestCase):
             _FakeDrawIBModel("b20f90ea", [sub_absorbed]),
         ]
         exporter = _make_exporter(models, merged_vgmap=True)
+        components = _with_channel_plan(components)
         exporter.merged_skeleton_components = components
         exporter.merged_skeleton_component_id_dict = {
             c["draw_ib"]: i for i, c in enumerate(components)
@@ -1605,7 +1690,7 @@ class ZZSIDirectPathGuardTests(unittest.TestCase):
             ],
             merged_vgmap=True,
         )
-        exporter.merged_skeleton_components = self._components()
+        exporter.merged_skeleton_components = _with_channel_plan(self._components())
         exporter.merged_skeleton_component_id_dict = {"a23aa8a3": 0, "b20f90ea": 1}
         # b20f90ea 的顶点权重挂在 a23aa8a3 的槽位 0 上 ⇒ 几何被吸收；再把重定向
         # 计划清空（模拟"本轮没有任何可行的重放宿主"）⇒ 只能在本挂点用组级门控重放。
@@ -1847,7 +1932,7 @@ class ZZSIMergedHostDirectPathTests(unittest.TestCase):
         for sibling in models[1:]:
             sibling.d3d11GameType.CategoryStrideDict["Blend"] = sibling_blend_stride
         exporter = _make_exporter(models, merged_vgmap=True)
-        exporter.merged_skeleton_components = self._components()
+        exporter.merged_skeleton_components = _with_channel_plan(self._components())
         exporter.merged_skeleton_component_id_dict = {
             "a23aa8a3": 0, "b20f90ea": 1, "b30db54e": 2
         }
@@ -1976,6 +2061,38 @@ class ZZMIStubObjectTests(unittest.TestCase):
         # 清 fake bpy 注册表
         _fake_bpy_data.objects._items.clear()
         _fake_bpy_data.meshes._items.clear()
+
+    def test_present_object_in_scene_does_not_suppress_missing_sibling_stub(self):
+        """**阻断修复（t80 §2.3）**：`present` 必须按**场景里真实存在的对象**判定。
+
+        形态：同一 DrawIB 的一个组件有真实对象、另一个组件只在蓝图/工作区里声明
+        （没有场景对象）。修复前 `present` 取自 DrawCall 的**声明名**集合 ⇒ 缺席的
+        兄弟组件被判成"存在" ⇒ 不插桩 ⇒ 紧随其后的 SubMeshModel 找不到 Blender
+        对象直接 Fatal（实测 19 件声明 / 4 个 mesh 的真实工程）。
+
+        本用例把两个组件都注册成真实对象，再删掉其中一个的对象（模拟"声明了、
+        但场景里没有"），断言另一个组件补了占位。
+        """
+        dcm = sys.modules[f"{PKG}.common.draw_call_model"].DrawCallModel
+        home = self._register_present_object_with_groups(
+            "LOD0.84618ee0-22296-0", [7], group_names=["7"]
+        )
+        sibling = self._register_present_object_with_groups(
+            "LOD0.84618ee0-1164-22296", [7], group_names=["7"]
+        )
+        _fake_bpy_data.objects.remove(sibling)
+
+        ordered = [dcm(obj_name="LOD0.84618ee0-22296-0")]
+        exporter = _make_exporter([], merged_vgmap=True, ordered_drawcalls=ordered)
+
+        stub = _fake_bpy_data.objects.get("LOD0.84618ee0-1164-22296")
+        self.assertIsNotNone(
+            stub, "场景里缺席的兄弟组件必须由生成器注入占位，否则 SubMeshModel Fatal"
+        )
+        self.assertEqual(stub.get("ZZMI_STUB"), 1)
+        exporter._cleanup_stub_objects()
+        # 真实存在的那个对象必须原样保留（不得被当成占位清理掉）
+        self.assertIsNotNone(_fake_bpy_data.objects.get(home.name))
 
     def test_stub_created_for_missing_component(self):
         dcm = sys.modules[f"{PKG}.common.draw_call_model"].DrawCallModel
@@ -2198,6 +2315,63 @@ class ZZMIStubObjectTests(unittest.TestCase):
         with open(os.path.join(lod0, "DrawIB-Component.json"), "w", encoding="utf-8") as f:
             json.dump(component_map, f)
 
+    def test_skipped_part_is_removed_from_ordered_draw_calls(self):
+        """**阻断修复（t81 阻断④）**：判「按用户意图不生成」的部件必须从模型列表摘除。
+
+        现象：`_ensure_stub_objects_for_missing_parts` 只 `continue`（不建占位），
+        DrawCall 仍留在 `ordered_draw_obj_data_model_list` 里 ⇒ 下游
+        `SubMeshModel` 去 `bpy.data.objects` 找那个**不存在**的对象并 `Fatal:
+        找不到 Blender 对象: 'LOD0.c28e6303-7308-0'`（实测真实工程里
+        `{611df76d, 93c3c2b7, c28e6303×3}` 五件如此）。手改参考版里这些部件
+        total=0 ⇒ 决策对，缺的只是「决策 → 模型列表」的传播。
+
+        可证伪：修复前 `names` 里仍会有 `LOD0.c28e6303-7308-0`（必红）。
+        """
+        # 缺席 + 专属槽位无人引用 ⇒ 判「不生成」
+        self._write_component_map({"c28e6303": {"0": "c28e6303-7308-0"}})
+        vg_map = {"0": 0}
+        for index, slot in enumerate(range(168, 177), start=1):
+            vg_map[str(index)] = slot
+        self._write_vgmap_json_full(
+            "c28e6303-7308-0", vg_map, vg_offset=167, vg_count=10, group=0
+        )
+        # 场景里有另一个真实对象（载体），但只引用借位槽位 0
+        self._register_present_object_with_groups("LOD0.8c8de427-798-0", [0])
+
+        dcm = sys.modules[f"{PKG}.common.draw_call_model"].DrawCallModel
+        skipped = dcm(obj_name="LOD0.c28e6303-7308-0")   # 声明了，场景里没有
+        carrier = dcm(obj_name="LOD0.8c8de427-798-0")    # 真实存在
+        ordered = [carrier, skipped]
+        exporter = _make_exporter([], merged_vgmap=True, ordered_drawcalls=ordered)
+
+        names = [str(dc.get_workspace_unique_str()) for dc in ordered]
+        self.assertNotIn(
+            "LOD0.c28e6303-7308-0",
+            names,
+            "判不生成的部件不得留在模型列表里（否则下游按不存在对象构造 ⇒ Fatal）",
+        )
+        self.assertIn("LOD0.8c8de427-798-0", names, "真实存在的部件不得被误摘")
+        self.assertEqual(exporter._zzmi_stub_object_names, [])
+
+    def test_empty_scene_fallback_never_removes_draw_calls(self):
+        """边界钉子：拿不到任何真实场景对象时（轻量宿主 / 空注册表）**不得**摘除。
+
+        `scene_present` 为空 ⇒ 兼容兜底退回按**声明名**判定（宁可不插桩，也不在
+        信息不足时把全部部件判成缺席并摘掉）⇒ `ordered` 原样保留。这条钉住
+        「摘除只在**正向判定为缺席**时发生」，防止把 UI/无头环境差异变成静默丢件。
+        """
+        self._write_component_map({"611df76d": {"0": "611df76d-132-0"}})
+        self._write_vgmap_json("611df76d-132-0", 7)
+        dcm = sys.modules[f"{PKG}.common.draw_call_model"].DrawCallModel
+        ordered = [dcm(obj_name="LOD0.611df76d-132-0")]
+        exporter = _make_exporter([], merged_vgmap=True, ordered_drawcalls=ordered)
+        self.assertEqual(
+            [str(dc.get_workspace_unique_str()) for dc in ordered],
+            ["LOD0.611df76d-132-0"],
+            "空注册表 ⇒ 无法证明缺席 ⇒ 必须原样保留（不静默丢件）",
+        )
+        self.assertEqual(exporter._zzmi_stub_object_names, [])
+
     def test_no_stub_when_only_dedup_borrowed_slots_are_referenced(self):
         """回归（2026-09-16 叶瞬光01 脸部被误插占位事故，同类样本 869976a3-5202-0）。
 
@@ -2411,6 +2585,7 @@ class _ZZMIGroup3RedirectFixture:
 
     def _make_exporter(self, models, components):
         exporter = _make_exporter(models, merged_vgmap=True)
+        components = _with_channel_plan(components)
         exporter.merged_skeleton_components = components
         exporter.merged_skeleton_component_id_dict = {
             c["draw_ib"]: i for i, c in enumerate(components)
@@ -3215,13 +3390,15 @@ class ZZMIMultiInstanceLatchRemovalTests(_ZZMIGroup3RedirectFixture, unittest.Te
         """
         exporter, models = self._group3_exporter()
         # 先按夹具（无共享骨骼）建计划：Texcoord/VLR 等产物与 vg_map 无关，
-        # 之后再改 vg_map（真实形态：槽位 0 根骨被去重合并 → 三个部件都引用它）
-        # 并补上计划里的 pose_anchor_slot，避免影响重定向计划本身的判定。
+        # 之后再改 vg_map（真实形态：槽位 0 根骨被去重合并 → 三个部件都引用它），
+        # 并按**整组**重算通道计划（t75：通道骨是共享骨连通分量的性质）。
         _carrier_map, target_map, _unredirected = self._build_and_apply_plan(exporter)
         for component in exporter.merged_skeleton_components:
             vg_map = dict(component["vg_map"])
             vg_map[min(vg_map)] = 0
             component["vg_map"] = vg_map
+            component.pop("channel", None)
+        _with_channel_plan(exporter.merged_skeleton_components)
         target_map["a23aa8a3"]["pose_anchor_slot"] = 0
 
         self.assertEqual(target_map["a23aa8a3"]["pose_anchor_slot"], 0)
@@ -3231,14 +3408,21 @@ class ZZMIMultiInstanceLatchRemovalTests(_ZZMIGroup3RedirectFixture, unittest.Te
         exporter.add_unity_vs_texture_override_vb_sections(builder, carrier)
         text = "\n".join(builder.sections[0].SectionLineList)
         self.assertIn("ResourceZZPoseKeySrc = ref vs-t0", text)
-        # 共享骨骼平移分量 = 48 字节/骨骼的第 3/7/11 个 float（r0.w/r1.w/r2.w）
-        self.assertIn("->SpatialHash(3, 7, 11, 0.01)", text)
-        self.assertIn("if $zz_ms_pose_key_3 != 0", text)
+        # t75：键 = 通道骨的 **48 字节矩阵**整块哈希（逐字节精确，无容差）。
+        # 本部件（b20f90ea）映射到共享槽 79 的本地骨是 0 ⇒ HashRegion(0, 48)。
+        self.assertIn("->HashRegion(0, 48)", text)
+        self.assertNotIn("SpatialHash", text)
+        # 守卫必须 > 0：HashRegion 失败返回 -1/-2/-3，`!= 0` 挡不住
+        self.assertIn("if $zz_ms_pose_key_3 > 0", text)
+        self.assertNotIn("if $zz_ms_pose_key_3 != 0", text)
         self.assertIn("$PoolZZMISlotOfKey_G3[$zz_ms_pose_key_3] = 1", text)
         self.assertIn("$PoolZZMIG_Taken_G3[1] = 1", text)
-        # 指纹与出现次不一致时，把刚捕获的 palette / SO 引用搬到正确槽
-        self.assertIn(
+        # t75：不再有"出现次 ↔ 键"互搬（emit_move）；捕获直接写在键算出的槽上
+        self.assertNotIn(
             "ResourceZZPalette_b20f90ea_s1 = copy ResourceZZPalette_b20f90ea_s2", text
+        )
+        self.assertIn(
+            "ResourceZZPalette_b20f90ea_s1 = copy vs-t0 unless_null", text
         )
         self.assertIn("ResourceZZRedirectSO_G3_s1 = ref so0", text)
 
@@ -3257,21 +3441,36 @@ class ZZMIMultiInstanceLatchRemovalTests(_ZZMIGroup3RedirectFixture, unittest.Te
         """
         exporter, models = self._group3_exporter()
         self._build_and_apply_plan(exporter)
+        # t75：手工把 b20f90ea 的通道记录清掉 = 模拟"无通道部件"（缓存缺失且
+        # 组级补算也没能给出通道骨）。
+        for component in exporter.merged_skeleton_components:
+            if component["draw_ib"] == "b20f90ea":
+                component["channel"] = {}
         carrier = next(m for m in models if m.draw_ib == "b20f90ea")
         builder = _FakeIniBuilder()
         captured = self._capture_stdout(
             lambda: exporter.add_unity_vs_texture_override_vb_sections(builder, carrier)
         )
         text = "\n".join(builder.sections[0].SectionLineList)
-        # 旧口径保持不变：无共享骨骼 ⇒ 不发姿态指纹块
+        # 无通道部件：不发键块（也不再有 SpatialHash 这种量化哈希）
         self.assertNotIn("SpatialHash", text)
         self.assertNotIn("$zz_ms_pose_key_", text)
-        # 新增（C-2）：静默 → 显式诊断
+        # 但必须落显式诊断（绝不静默）
         self.assertIn("; ZZMI-MERGE-DIAG POSE_ALIGNMENT_UNAVAILABLE", text)
-        self.assertIn("reason=no_shared_canonical_bone", text)
+        self.assertIn("reason=no_channel_plan", text)
         self.assertIn("POSE_ALIGNMENT_UNAVAILABLE", captured)
         codes = [record["code"] for record in exporter._merged_diag_sink()]
         self.assertIn("POSE_ALIGNMENT_UNAVAILABLE", codes)
+        # 供骨必须保留：palette 捕获与 attach run 都还在
+        self.assertIn("ResourceZZPalette_b20f90ea_s1 = copy vs-t0 unless_null", text)
+        self.assertIn(
+            "run = CustomShaderZZMIMergedSkeletonAttach_C1_s1", text
+        )
+        # 判定必须摘掉：本部件不得出现在任何门控表达式的 seen/prev 项里
+        for line in text.split("\n"):
+            if line.lstrip().startswith("if ") and "seen_" in line:
+                self.assertNotIn("$zz_ms_seen_11", line)
+                self.assertNotIn("$zz_ms_prev_11", line)
 
     def test_skin_publish_emitted_for_every_required_component(self):
         """每个必需部件（含不能重放 draw 的窄布局部件）都能发布合并几何。
@@ -3937,23 +4136,28 @@ class ZZMIMergedOrderingContractTests(_ZZMIGroup3RedirectFixture, unittest.TestC
             current_exporter.add_unity_vs_texture_override_vb_sections(builder, carrier)
             return "\n".join(builder.sections[0].SectionLineList)
 
-        # 分支①：夹具默认组内无共享骨骼 ⇒ 计划在但没有锚点
+        # 分支①：t75 起"组内无共享骨"不再让整组没有通道（按连通分量各自取通道），
+        # 所以这里显式清掉通道记录来代表「无通道部件」这条不可达路径。
+        for component in exporter.merged_skeleton_components:
+            component["channel"] = {}
         stdout = self._capture_stdout(lambda: _carrier_text(exporter))
         text = _carrier_text(exporter)
         self.assertIn("; ZZMI-MERGE-DIAG POSE_ALIGNMENT_UNAVAILABLE", text)
-        self.assertIn("reason=no_shared_canonical_bone", text)
+        self.assertIn("reason=no_channel_plan", text)
         self.assertIn("POSE_ALIGNMENT_UNAVAILABLE", stdout)
         self.assertNotIn("SpatialHash", text)
 
-        # 分支③：造出共享锚点（同现有 test_pose_key_alignment_* 的形态）⇒ 必须发射
+        # 分支③：造出整组共享的通道骨 ⇒ 必须发射（且没有任何 UNAVAILABLE 诊断）
         for component in exporter.merged_skeleton_components:
             vg_map = dict(component["vg_map"])
             vg_map[min(vg_map)] = 0
             component["vg_map"] = vg_map
+            component.pop("channel", None)
+        _with_channel_plan(exporter.merged_skeleton_components)
         exporter._redirect_target_map["a23aa8a3"]["pose_anchor_slot"] = 0
         reachable_text = _carrier_text(exporter)
         self.assertIn("ResourceZZPoseKeySrc = ref vs-t0", reachable_text)
-        self.assertIn("->SpatialHash(3, 7, 11, 0.01)", reachable_text)
+        self.assertIn("->HashRegion(0, 48)", reachable_text)
         self.assertNotIn("POSE_ALIGNMENT_UNAVAILABLE", reachable_text)
 
         # 分支②：有锚点但本轮没有重定向计划（G2 情形）
@@ -4198,8 +4402,23 @@ class ZZMIReuseDiagnosticsO3Tests(_ZZMIGroup3RedirectFixture, unittest.TestCase)
         self.assertEqual(len(ratio_lines), 2, "每 (组,槽) 一行")
 
     def test_o3_no_new_state_variables(self):
-        """③ 未新增任何 `$zz_ms_*` 状态变量（§61：禁止新状态变量/闩锁/if 体内 `$` 写）。"""
-        _exporter, vb_text, _ib, skeleton_text, _captured = self._render()
+        """③ 未新增任何 `$zz_ms_*` 状态变量（§61：禁止新状态变量/闩锁/if 体内 `$` 写）。
+
+        t75：唯一允许新增的是「每组一条」的通道骨键变量，而它只在**跨部件共享通道骨**
+        存在时才发（默认夹具三件互不共骨 ⇒ 都按"只供骨"处置，不发键块）。这里按
+        生产形态造出共享通道骨（与 `test_pose_key_alignment_uses_shared_canonical_bone`
+        同法：槽位 0 被三件同时引用），再核对变量全集。
+        """
+        exporter, models = self._group3_exporter()
+        self._build_and_apply_plan(exporter)
+        for component in exporter.merged_skeleton_components:
+            vg_map = dict(component["vg_map"])
+            vg_map[min(vg_map)] = 0
+            component["vg_map"] = vg_map
+            component.pop("channel", None)
+        _with_channel_plan(exporter.merged_skeleton_components)
+        self._capture_stdout(lambda: self._sections_text(exporter, models))
+        vb_text, skeleton_text = self._sections_text(exporter, models)
         # 排除诊断注释行（其字段里出现 `$zz_ms_seen_<i>1` 这种**文档占位**，不是变量实例）
         lines = [
             line
@@ -4212,6 +4431,9 @@ class ZZMIReuseDiagnosticsO3Tests(_ZZMIGroup3RedirectFixture, unittest.TestCase)
             {f"$zz_ms_occ_{c}" for c in component_ids}
             | {f"$zz_ms_seen_{c}{s}" for c in component_ids for s in (1, 2)}
             | {f"$zz_ms_prev_{c}{s}" for c in component_ids for s in (1, 2)}
+            # t75：唯一新增的是「每组一条」的通道骨键变量（读 HashRegion 的值）。
+            # 不新增任何闩锁/相位/消费标记变量。
+            | {"$zz_ms_pose_key_3"}
         )
         self.assertEqual(names, expected, "`$zz_ms_*` 变量集合必须与 t2 代次完全相同")
         for banned in ("consumed", "reuse", "gate", "ready", "phase", "drawn", "any_"):
@@ -4435,7 +4657,7 @@ class ZZMIMergedContractWiringTests(unittest.TestCase):
         self.assertEqual(decisions[0]["component_count"], 0)
         self.assertEqual(
             decisions[0]["skip_reasons"],
-            {"8c8de427": "VGMap 缓存版本 1 过旧（需重新一键导入）"},
+            {"8c8de427": "VGMap 缓存版本 1 过旧且内容不完整（需重新一键导入）"},
         )
         self.assertFalse(write_reached, "契约 error 时不得到达任何落盘点")
         self.assertEqual(os.listdir(self._tmp_dir), [], "不得写出任何输出文件")
@@ -4476,7 +4698,7 @@ class ZZMIMergedContractWiringTests(unittest.TestCase):
         self.assertEqual(len(decisions), 1)
         self.assertEqual(decisions[0]["parts_with_data"], 2)
         self.assertEqual(decisions[0]["component_count"], 1)
-        self.assertEqual(decisions[0]["skip_reasons"], {"8c8de427": "VGMap 缓存版本 1 过旧（需重新一键导入）"})
+        self.assertEqual(decisions[0]["skip_reasons"], {"8c8de427": "VGMap 缓存版本 1 过旧且内容不完整（需重新一键导入）"})
 
         # 继续导出：确实走到落盘点，且抛的是哨兵而不是 Fatal
         self.assertTrue(write_reached)

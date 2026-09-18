@@ -19,9 +19,67 @@ from .unity import ExportUnity
 # 导出模块在 Blender 启动时可以直接读取反查模块的版本；轻量 fake/旧插件环境
 # 可能未加载该模块，使用同一当前版本常量仍保持“陈旧缓存拒绝”这一安全默认。
 try:
-    from ...common.zzmi_skeleton import ZZMI_VG_MAP_ALGORITHM_VERSION
+    from ...common.zzmi_skeleton import (
+        ZZMI_VG_MAP_ALGORITHM_VERSION,
+        ZZMISkeletonMergeHelper as _ZZMISkeletonMergeHelper,
+    )
 except Exception:  # pragma: no cover - 仅兼容无完整 Blender 依赖的导入环境
-    ZZMI_VG_MAP_ALGORITHM_VERSION = 4
+    ZZMI_VG_MAP_ALGORITHM_VERSION = 5
+
+    class _ZZMISkeletonMergeHelper:  # type: ignore[no-redef]
+        """轻量 fake 宿主下的最小替身：与导入侧同一「可升级旧版本」口径。"""
+
+        MIGRATABLE_VG_MAP_ALGORITHM_VERSIONS = (4,)
+
+
+# 「场景里是否真实存在这个对象」的统一判据（阻断修复 t80 §2.3）。
+# 轻量 fake 宿主可能没加载 blueprint.export_helper：退化为只按 bpy 查名。
+try:
+    from ...blueprint.export_helper import BlueprintExportHelper as _BpHelper
+
+    def _scene_object_present(*names):
+        return _BpHelper.scene_object_present(*names)
+
+except Exception:  # pragma: no cover - 轻量 fake 宿主
+    def _scene_object_present(*names):
+        # 轻量 fake 宿主 / 无完整 bpy：**不做"缺席"判定**，一律返回"存在" ⇒
+        # `present` 的构建与旧行为逐字相同（宁可不插桩，也不要在拿不到真实场景
+        # 信息时凭空判定部件缺席）。
+        registry = getattr(bpy, "data", None)
+        registry = getattr(registry, "objects", None)
+        if registry is None or not hasattr(registry, "get"):
+            return True
+        try:
+            for name in names:
+                text = str(name or "").strip()
+                if text and registry.get(text) is not None:
+                    return True
+        except Exception:
+            return True
+        return False
+
+# t75：通道计划版本。导出侧与缓存门控共用同一常量（轻量 fake/旧插件环境
+# 未加载 common.zzmi_channel 时用同一当前版本，保持「陈旧缓存拒绝」的安全默认）。
+try:
+    from ...common.zzmi_channel import ZZMI_CHANNEL_PLAN_VERSION
+except Exception:  # pragma: no cover - 仅兼容无完整 Blender 依赖的导入环境
+    ZZMI_CHANNEL_PLAN_VERSION = 1
+# 共享骨图连通分量（池定容用）。轻量环境下退化为"每个部件自成一个分量"
+# （池只会偏大，不会偏小——偏小才会同帧 FIFO 淘汰同帧键）。
+try:
+    from ...common.zzmi_channel import shared_bone_components as _shared_bone_components
+except Exception:  # pragma: no cover
+    def _shared_bone_components(components):
+        return [[index] for index in range(len(components))]
+
+# t75：判定「跨部件共享通道骨」的唯一实现（与导入期同一份代码）。轻量环境没有
+# common.zzmi_channel 时保守判 False = 一律按「只供骨、不参与判定」处置——宁可
+# 少发键块（老口径的出现次捕获仍在），也绝不把身份未知的部件放进门控。
+try:
+    from ...common.zzmi_channel import is_cross_part_channel as _is_cross_part_channel
+except Exception:  # pragma: no cover
+    def _is_cross_part_channel(record, min_parts: int = 2) -> bool:
+        return False
 
 
 def _zzmi_prop_flag(name: str, default: bool) -> bool:
@@ -151,9 +209,14 @@ ZZMI_MERGE_DIAG_POSE_UNAVAILABLE = "POSE_ALIGNMENT_UNAVAILABLE"
 # **禁止**：为它新增任何 `$zz_ms_*` 变量、闩锁、if 体内 `$` 赋值（§61）。
 ZZMI_MERGE_DIAG_REUSE_SITE = "REUSE_SITE"
 ZZMI_MERGE_DIAG_REUSE_RATIO = "REUSE_RATIO"
-# 姿态指纹的空间哈希格边长（对象空间单位）：同一实例同帧骨骼矩阵逐位相同 ⇒ 同格；
-# 不同实例姿态不同 ⇒ 不同格。取 0.01：远小于姿势差异，又不会把同一姿势抖开。
-ZZMI_MERGED_POSE_KEY_CELL = 0.01
+# t75：通道骨哈希键 = 读**一根**骨的 48 字节矩阵（12 floats）。
+# **逐字节精确**（`HashRegion`）：t73 实测同一实例、同一根物理骨在不同部件的
+# palette 里逐位相同（Δ=0），而两个实例的差极小（G0 槽 0 = 1.4e-7…8.2e-6、
+# G2 槽 185 = 1.32e-3），远小于任何量化格 ⇒ 旧的
+# `SpatialHash(..., 0.01)` 会把两个实例并键（实测并键率最高 99/135）。
+ZZMI_CHANNEL_HASH_BYTES = 48
+# 键不可用（`HashRegion` 返回 -1/-2/-3）时写进产物的显式诊断码。
+ZZMI_MERGE_DIAG_POSE_KEY_UNAVAILABLE = "POSE_KEY_HASH_UNAVAILABLE"
 
 # ---------------------------------------------------------------------------
 # 蒙皮 CS 的**行布局单一事实源**（t40：动态逐元素识别，消除写死 magic number）
@@ -823,6 +886,7 @@ class ExportZZMI(ExportUnity):
         self._purge_stale_stub_state(ordered)
 
         present = set()
+        scene_present = set()
         for draw_call in ordered:
             try:
                 unique_str = str(draw_call.get_workspace_unique_str() or "")
@@ -830,6 +894,26 @@ class ExportZZMI(ExportUnity):
                 continue
             if unique_str:
                 present.add(self._zzmi_bare_workspace_unique(unique_str))
+            # 阻断修复（t80 §2.3 实测）：`ordered` 里的名字来自**蓝图声明**，
+            # 声明了但场景里没有对象的部件（实测 19 件声明 / 4 个 mesh）**不能**被
+            # 当成 present——否则占位注入整段被跳过，紧接着 SubMeshModel 会因为
+            # 找不到 Blender 对象直接 Fatal（"部件无对象 → 极限小三角占位"这条
+            # 受支持的路径变成不可达）。
+            #
+            # 判据用 **DrawCall 自己解析出的场景对象名**（`get_blender_obj_name()`：
+            # source_obj_name 优先，回退 obj_name——前处理把对象改名为副本后这里
+            # 拿到的就是副本名），而不是工作区身份字符串；两者在有合并/副本的工程里
+            # 本来就不相同。
+            if not self._zzmi_drawcall_object_present(draw_call):
+                continue
+            if unique_str:
+                scene_present.add(self._zzmi_bare_workspace_unique(unique_str))
+
+        # 兼容兜底：蓝图里**一个** DrawCall 都解析不到场景对象时（轻量测试宿主 /
+        # 拿不到真实 bpy 数据），退回按声明名判定 —— 宁可不插桩，也不要在信息不足
+        # 时凭空给全部部件插桩。只要能解析出至少一个真实对象，就按场景真相判定。
+        if not scene_present:
+            scene_present = set(present)
 
         # 只把活跃合并对象的**目标**身份加入 present。源身份必须继续被视为
         # 缺席：对应的 3 顶点占位会触发这些原始 deform pass 的 palette attach，
@@ -846,17 +930,29 @@ class ExportZZMI(ExportUnity):
 
         used_group_ids = None  # 惰性计算：首个全缺 DrawIB 需要判定时才算
 
+        # 阻断修复（t81 阻断④）：本次决策为「按用户意图不生成」的部件身份集合。
+        # 光 `continue` 只表示**不建占位**，DrawCall 仍留在
+        # `ordered_draw_obj_data_model_list` 里 ⇒ 下游 `SubMeshModel` 会去
+        # `bpy.data.objects` 找那个**不存在**的对象并 `Fatal`（实测
+        # `LOD0.611df76d-132-0`）。手改参考版里这些部件 total=0 ⇒ 决策本身是对的，
+        # 缺的只是「决策 → 模型列表」这一步传播。
+        skipped_identities: set[str] = set()
+
         created = []
         for draw_ib, comp_dict in component_map.items():
             members = sorted(str(v) for v in (comp_dict or {}).values())
             if not members:
                 continue
 
-            if any(member in present for member in members):
-                # 部分缺失：缺失组件补占位
-                stub_members = [member for member in members if member not in present]
+            if any(member in scene_present for member in members):
+                # 部分缺失：缺失组件补占位（判据只看**场景里真实存在的对象**）
+                stub_members = [
+                    member for member in members if member not in scene_present
+                ]
             else:
-                # 整个 DrawIB 缺席：判定几何是否被合并进其它对象
+                # 整个 DrawIB 在场景里缺席：判定几何是否被合并进其它对象
+                # （`any(member in present ...)` 这条"有声明身份"的旧分支已并入：
+                #  两种情况下都只能靠几何吸收证据决定补不补占位）。
                 if used_group_ids is None:
                     used_group_ids = self._collect_used_group_ids(ordered)
                 if self._is_drawib_absorbed(draw_ib, workspace_root, used_group_ids):
@@ -870,6 +966,7 @@ class ExportZZMI(ExportUnity):
                         f"[ZZMI骨骼合并] DrawIB {draw_ib} 无对象且本部件专属骨骼槽位未被引用，"
                         "按用户意图不生成"
                     )
+                    skipped_identities.update(members)
                     continue
 
             for member in stub_members:
@@ -878,6 +975,7 @@ class ExportZZMI(ExportUnity):
                         f"[ZZMI骨骼合并] 部件 {member} 已标记 VGMapDedupExcluded，"
                         "按用户意图不生成占位（游戏保留原版绘制）"
                     )
+                    skipped_identities.add(member)
                     continue
                 obj_name = self._create_stub_object(member)
                 if obj_name:
@@ -899,6 +997,33 @@ class ExportZZMI(ExportUnity):
                         f"[ZZMI骨骼合并] 部件 {member} 没有对应对象，"
                         f"已创建极限小三角面占位（游戏内不可见）"
                     )
+
+        # 阻断修复（t81 阻断④）：把「判定不生成」的部件从模型列表**原地摘除**。
+        # 范式与 `_purge_stale_stub_state`（`ordered[:] = [...]`）一致。
+        # 只用**正向判定为缺席**（`_zzmi_drawcall_object_present` 为假）的条目做删除
+        # ——拿不到真实场景时该谓词一律为真，因此这里不会误删真实对象。
+        if skipped_identities:
+            kept = []
+            removed = []
+            for draw_call in ordered:
+                identity = self._zzmi_bare_workspace_unique(
+                    self._draw_call_object_name(draw_call)
+                )
+                if identity in skipped_identities and not self._zzmi_drawcall_object_present(
+                    draw_call
+                ):
+                    removed.append(identity)
+                    continue
+                kept.append(draw_call)
+            if removed:
+                ordered[:] = kept
+                shown = "、".join(sorted(set(removed))[:5])
+                suffix = "…" if len(set(removed)) > 5 else ""
+                print(
+                    f"[ZZMI骨骼合并] 已从模型列表摘除 {len(removed)} 个"
+                    f"「按用户意图不生成」的部件（否则下游会按不存在的对象构造）："
+                    f"{shown}{suffix}"
+                )
         return created
 
     def _load_drawib_vg_slots(
@@ -1226,9 +1351,15 @@ class ExportZZMI(ExportUnity):
         # vg_count > 0（= 导入侧写回过 VGMap）；skip_reasons 面向用户、按 DrawIB 去重。
         parts_with_data: set[str] = set()
         skip_reasons: dict[str, str] = {}
+        # 阻断修复（t80 §2.4）：按「内容可用」而**不是**按版本号放行的旧缓存，
+        # 逐 DrawIB 记一条可读痕迹（绝不静默降级）。
+        migrated_cache: dict[str, int] = {}
 
         def _record_reject(component_draw_ib: str, reason: str) -> None:
             skip_reasons.setdefault(str(component_draw_ib), reason)
+
+        def _record_migration(component_draw_ib: str, version: int) -> None:
+            migrated_cache.setdefault(str(component_draw_ib), int(version))
 
         for drawib_model in self.drawib_model_list:
             draw_ib = str(drawib_model.draw_ib)
@@ -1258,17 +1389,66 @@ class ExportZZMI(ExportUnity):
                     cache_version is not None
                     and int(cache_version or 0) != ZZMI_VG_MAP_ALGORITHM_VERSION
                 ):
+                    # 阻断修复（t80 §2.4 实测）：旧版缓存**不得**再"逐件拒绝 +
+                    # 契约把整次导出中止"。v5 相对 v4 的新增字段全部可由既有 VGMap
+                    # 单独推导（见 `_merged_resolve_channel_plans` 与
+                    # common/zzmi_channel.select_channel_plan），palette 也在
+                    # ModImpRuntime 里 ⇒ 缓存可用性应看**内容**（VGMap 完整覆盖 +
+                    # 槽位合法），而不是看版本号这一个整数。
+                    #
+                    # 放行范围**显式限定**在已知可升级的旧版本（当前 = 4），
+                    # 与导入侧 `ZZMISkeletonMergeHelper.MIGRATABLE_VG_MAP_ALGORITHM_VERSIONS`
+                    # 同一口径；未知版本仍拒绝（宁缺毋滥）。
+                    if (
+                        int(cache_version or 0)
+                        in _ZZMISkeletonMergeHelper.MIGRATABLE_VG_MAP_ALGORITHM_VERSIONS
+                        and self._merged_cached_vg_map_usable(submesh_model, vg_count)
+                    ):
+                        print(
+                            f"[ZZMI骨骼合并] 提示 {draw_ib}: VGMap 缓存版本 "
+                            f"{cache_version} != 当前版本 "
+                            f"{ZZMI_VG_MAP_ALGORITHM_VERSION}，但 VGMap 内容完整"
+                            "（可脱离 dump 使用）⇒ 按当前算法就地补算通道计划，"
+                            "不拒绝该部件；请重新一键导入以把缓存固化到 v"
+                            f"{ZZMI_VG_MAP_ALGORITHM_VERSION}"
+                        )
+                        _record_migration(draw_ib, int(cache_version or 0))
+                    else:
+                        print(
+                            f"[ZZMI骨骼合并] 警告 {draw_ib}: "
+                            f"VGMap 缓存版本 {cache_version} != 当前版本 "
+                            f"{ZZMI_VG_MAP_ALGORITHM_VERSION}，且 VGMap 内容不完整"
+                            "（无法脱离 dump 复用），拒绝导出该部件；"
+                            "请先用当前 FrameAnalysis，或仅凭工作区缓存，重新一键导入"
+                        )
+                        _record_reject(
+                            draw_ib,
+                            f"VGMap 缓存版本 {cache_version} 过旧且内容不完整"
+                            "（需重新一键导入）",
+                        )
+                        continue
+                # t75：通道计划（唯一判定口径）随缓存一起就位。缓存缺失/版本不符时
+                # **不静默**：这里先记下缺口，装配完成后由
+                # `_merged_resolve_channel_plans` 在**整组**口径上补算一次（共享骨图
+                # 是组级性质，单看一个部件算不出通道骨），并落显式诊断；补算仍失败
+                # 的部件按"无通道部件"处置（撤销门控到达项、保留 palette 捕获与
+                # attach），绝不退回出现次判据。
+                channel_version = int(
+                    getattr(submesh_model, "channel_plan_version", 0) or 0
+                )
+                channel_plan = getattr(submesh_model, "channel_plan", None)
+                channel_cache_ok = bool(
+                    channel_version == ZZMI_CHANNEL_PLAN_VERSION
+                    and isinstance(channel_plan, dict)
+                    and channel_plan.get("channel_slot") is not None
+                    and channel_plan.get("channel_local") is not None
+                )
+                if not channel_cache_ok:
                     print(
-                        f"[ZZMI骨骼合并] 警告 {draw_ib}: "
-                        f"VGMap 缓存版本 {cache_version} != 当前版本 "
-                        f"{ZZMI_VG_MAP_ALGORITHM_VERSION}，拒绝导出该部件；"
-                        "请先用当前 FrameAnalysis，或仅凭工作区缓存，重新一键导入"
+                        f"[ZZMI骨骼合并] 提示 {draw_ib}: 通道计划缓存缺失或版本不符"
+                        f"（{channel_version} != {ZZMI_CHANNEL_PLAN_VERSION}），"
+                        "将按整组共享骨图重新推导通道骨；请重新一键导入以固化缓存"
                     )
-                    _record_reject(
-                        draw_ib,
-                        f"VGMap 缓存版本 {cache_version} 过旧（需重新一键导入）",
-                    )
-                    continue
                 # 导出侧防线：VGMap 必须完整覆盖 0..vg_count-1 且槽位非负。
                 # 缓存正常时由 ensure_skeleton_data 保证；此处兜底拦截陈旧/被
                 # 手工改坏的 json——缺键会让 attach CS 的 vg_map.get(local, 0)
@@ -1331,6 +1511,22 @@ class ExportZZMI(ExportUnity):
                     "original_vertex_count": int(
                         getattr(submesh_model, "original_vertex_count", 0) or 0
                     ),
+                    # t75 通道计划（唯一判定口径；导入期算好，导出期只读）
+                    "channel": dict(channel_plan),
+                    "channel_digest": str(
+                        getattr(submesh_model, "channel_plan_digest", "") or ""
+                    ),
+                    # F6（复核发现）：缓存里落盘的「跨部件顶点权重合计」必须带进
+                    # 导出侧——补算（缓存缺失）时它是候选排序的**第二键**，
+                    # `ChannelPlanSlotWeights` 也才有消费方。缺省空表 = 全部权重 0
+                    # （排序退化为按槽位号，仍确定性，但与导入期口径不一致）。
+                    "slot_weights": {
+                        int(key): int(value)
+                        for key, value in (
+                            getattr(submesh_model, "channel_plan_slot_weights", {}) or {}
+                        ).items()
+                        if str(key).lstrip("-").isdigit()
+                    },
                 })
                 break
         if components:
@@ -1356,6 +1552,10 @@ class ExportZZMI(ExportUnity):
                 valid_components.append(component)
             components = valid_components
         components.sort(key=lambda c: (c["skeleton_group"], c["vg_offset"], c["draw_ib"]))
+        # t75：缓存缺失通道计划的部件在这里按**整组共享骨图**补算（缓存优先，
+        # 只补缺的组），补算结果写回组件记录；仍未解析出通道的部件保持 None
+        # ⇒ 由 `_merged_component_channel_record` 判为"无通道部件"。
+        self._merged_resolve_channel_plans(components)
         component_id_dict = {c["draw_ib"]: i for i, c in enumerate(components)}
         # B1：把判定输入快照落盘在实例上（_enforce_merged_skeleton_contract 读取）。
         self._zzmi_merged_contract_stats = {
@@ -1363,8 +1563,69 @@ class ExportZZMI(ExportUnity):
             "parts_with_data": len(parts_with_data),
             "component_count": len(components),
             "skip_reasons": dict(skip_reasons),
+            # 阻断修复（t80 §2.4）：因「版本号旧但内容完整」而按当前算法就地补算
+            # 通道计划、未被拒绝的部件（{draw_ib: 旧版本号}）。为空 = 无降级。
+            "migrated_cache": dict(migrated_cache),
         }
         return components, component_id_dict
+
+    @staticmethod
+    def _zzmi_drawcall_object_present(draw_call) -> bool:
+        """该 DrawCall 解析到的 Blender 对象在场景里**真实存在**吗（阻断修复 t80 §2.3）。
+
+        `DrawCallModel.get_blender_obj_name()` = ``source_obj_name or obj_name``：
+        前处理把对象改成副本后，`to_draw_call_model()` 已把 source_obj_name 写成
+        副本名，因此这里读到的是**场景里真正要导出的那个对象**，而不是蓝图声明的
+        源名。拿不到对象名（或宿主拿不到真实场景）时返回 True —— 宁可不插桩，
+        也不要在信息不足时凭空判定部件缺席。
+        """
+        try:
+            resolved = str(draw_call.get_blender_obj_name() or "").strip()
+        except Exception:
+            return True
+        if not resolved:
+            return True
+        return _scene_object_present(resolved)
+
+    @staticmethod
+    def _merged_cached_vg_map_usable(submesh_model, vg_count: int) -> bool:
+        """旧版 VGMap 缓存是否**仅凭自身内容**可用（不依赖 FrameAnalysis/dump）。
+
+        阻断修复（t80 §2.4 实测）：版本号从 4 抬到 5 后，旧工作区被"逐件拒绝 +
+        契约把整次导出中止"，而"重新一键导入"依赖的 FrameAnalysis 帧可能已被
+        删除 ⇒ 用户无路可走。v5 相对 v4 的**全部**新增字段都是可由既有 VGMap
+        推导的派生量（``ChannelPlan*`` / ``BoneIdentity*`` /
+        ``ChannelPlanSlotWeights``，见 `_merged_resolve_channel_plans` 与
+        ``common/zzmi_channel.select_channel_plan``），palette 也在 ModImpRuntime
+        里，因此**判据应当是内容完整性，而不是版本号**：
+
+        - ``VGMap`` 是 dict、键**完整覆盖** ``0..vg_count-1``（缺键会让 attach CS
+          的 ``vg_map.get(local, 0)`` 静默塌缩到槽位 0，整块蒙皮炸裂）；
+        - 槽位是非负整数且在 32 位范围内。
+
+        返回 False 时调用方仍按"拒绝该部件"处置（内容不完整无法安全复用）。
+        """
+        try:
+            expected_count = int(vg_count)
+        except (TypeError, ValueError):
+            return False
+        if expected_count <= 0:
+            return False
+        raw_map = getattr(submesh_model, "vg_map", None)
+        if not isinstance(raw_map, dict) or not raw_map:
+            return False
+        try:
+            normalized: dict[int, int] = {}
+            for raw_key, raw_value in raw_map.items():
+                key = int(raw_key)
+                if key in normalized:
+                    return False
+                normalized[key] = int(raw_value)
+        except (TypeError, ValueError):
+            return False
+        if set(normalized.keys()) != set(range(expected_count)):
+            return False
+        return all(0 <= slot <= 0xFFFFFFFF for slot in normalized.values())
 
     def _enforce_merged_skeleton_contract(self) -> dict:
         """B1：按合并骨架契约判定「继续 / 中止」，**必须在任何写盘之前调用**。
@@ -2247,6 +2508,37 @@ class ExportZZMI(ExportUnity):
                 )
             section.append("endif")
 
+    def _merged_pose_key_pool_sizes(self, groups) -> dict[int, int]:
+        """每组「键 → 槽位」池的容量：``连通分量数 × 槽位数 × 实例上界（2）``。
+
+        键是**逐字节精确**的：同一连通分量的同实例必然算出同一个键（t73 实测
+        同实例跨部件逐位相同），不同连通分量各用**自己的**通道骨（分量之间本来
+        就不共骨）⇒ 一个组一帧最多 `分量数 × 2` 个不同键。池按此定容，既不会
+        同帧 FIFO 淘汰同帧键，也不再是无依据的写死 16。
+        """
+        sizes: dict[int, int] = {}
+        for skeleton_group in groups:
+            group_components = [
+                self.merged_skeleton_components[component_id]
+                for component_id in self._merged_group_component_ids(skeleton_group)
+            ]
+            if not self._merged_group_has_key_driven(skeleton_group):
+                continue
+            partitions = _shared_bone_components(group_components)
+            channel_partitions = [
+                members
+                for members in partitions
+                if any(
+                    self._merged_component_is_key_driven(group_components[index])
+                    for index in members
+                )
+            ]
+            sizes[int(skeleton_group)] = max(
+                len(self._merged_skeleton_slots()),
+                len(channel_partitions) * len(self._merged_skeleton_slots()) * 2,
+            )
+        return sizes
+
     def _merged_group_component_ids(self, skeleton_group: int) -> list[int]:
         """本骨架组包含的组件号列表（升序；与 merged_skeleton_components 同序）。
 
@@ -2259,6 +2551,84 @@ class ExportZZMI(ExportUnity):
             int(component_id)
             for component_id, component in enumerate(self.merged_skeleton_components)
             if int(component["skeleton_group"]) == int(skeleton_group)
+        ]
+
+    def _merged_determinable_component_ids(
+        self, component_ids, fallback_to_all: bool = True
+    ) -> list[int]:
+        """从守卫集合里剔除**不参与实例判定**的部件（t75，用户 2026-09-18 实机拍板）。
+
+        不参与判定的部件 = 导入期缓存里没有通道骨记录（导入未刷新 / json 被改坏）
+        **或**通道骨退化（所在共享骨连通分量内没有 ≥2 件引用的槽位，例如叶瞬光01
+        G0 的 ``8c8de427``，槽 50..55 与谁都不共骨）。这两类都**无法**参与跨部件
+        实例对齐：把它们留在守卫里只会让槽的闭合被一个"身份未知"的部件拖住，
+        **实测症状 = 骨骼动画直接卡住**（它的项既挡住、也半开其它部件的发布）。
+        处置：
+
+        - **撤销它在门控里的到达项**（不再阻塞本槽闭合）；
+        - **保留**它的 palette 捕获与 attach（它是自己那些槽位的唯一写入者，
+          撤销写入会让合并几何读不到那些骨）；
+        - 由 `_append_merged_skeleton_deform_block_body` 落一条显式诊断点名它
+          （``POSE_ALIGNMENT_UNAVAILABLE`` / ``POSE_KEY_HASH_UNAVAILABLE``）。
+
+        残余风险（已在报告具名）：该部件的骨可能在"本槽闭合"之后才写入 ⇒ 合并
+        几何最多读到**上一帧**的该部件骨（attach 每帧都跑，一帧内收敛）。
+
+        ``fallback_to_all``：过滤会把集合清空时怎么兜底（**三级**，逐级放宽）：
+
+        1. **参与判定**的部件（跨部件共享通道骨）——正常形态；
+        2. 退到**有通道记录**的部件（退化候选：它的到达仍是本槽闭合的必要条件，
+           只是不参与跨部件身份判定）；
+        3. 再退到**原集合**：一个**空**的到达条件会让 `if ` 变成语法垃圾，整段
+           重放/发布静默失效，宁可保守等待（`fallback_to_all=True` 时）。
+
+        ``fallback_to_all=False``（SO 别名就绪门）时不做兜底 —— 由
+        `_merged_so_ready_capturer_ids` 另行处理。
+        """
+        ordered = [int(component_id) for component_id in component_ids]
+        judgeable = [
+            component_id
+            for component_id in ordered
+            if self._merged_component_is_key_driven(
+                self.merged_skeleton_components[component_id]
+            )
+        ]
+        if judgeable:
+            return judgeable
+        if not fallback_to_all:
+            return []
+        # 二级：有通道记录（退化候选）的部件仍参与到达闭合——它们按出现次捕获，
+        # `seen` 就是「本槽当帧已到达」的正确标记。
+        recorded = [
+            component_id
+            for component_id in ordered
+            if self._merged_component_channel_record(
+                self.merged_skeleton_components[component_id]
+            )
+            is not None
+        ]
+        if recorded:
+            return recorded
+        return ordered
+
+    def _merged_so_ready_capturer_ids(self, component_ids) -> list[int]:
+        """SO 别名就绪门的**捕获者**集合（**不退回到全部**）。
+
+        判据是「有没有通道记录」（不是「参不参与判定」）：按出现次捕获的**只供骨**
+        部件同样会把当帧 SO 引用写进 `ResourceZZRedirectSO_s<k>`，它的
+        `$zz_ms_seen_<i><k>` 正是「别名本槽当帧已刷新」的标记 —— 摘掉它会让重放
+        绑到上一帧 / 未赋值的别名（2026-09-17 实测：当帧正确写入被丢掉）。所以
+        这里只摘**连通道记录都没有**的捕获者（它的捕获槽位根本无从判定），
+        判据与 §`_merged_component_channel_record` 一致、与实机确认要摘掉的那一项
+        一致。**不退回**到原集合：一个空集合会让 `if ` 变成语法垃圾。
+        """
+        return [
+            int(component_id)
+            for component_id in component_ids
+            if self._merged_component_channel_record(
+                self.merged_skeleton_components[int(component_id)]
+            )
+            is not None
         ]
 
     def _merged_slot_seen_condition(
@@ -2336,108 +2706,307 @@ class ExportZZMI(ExportUnity):
         """本 pass 姿态指纹变量名。"""
         return f"$zz_ms_pose_key_{skeleton_group}"
 
-    def _merged_group_pose_anchor_slot(self, skeleton_group: int) -> int | None:
-        """本组所有部件 vg_map 值集合的交集中最小的槽位（= 全组共享骨骼）。
+    def _merged_resolve_channel_plans(self, components) -> None:
+        """补算缺失的通道计划（**缓存优先**，只对缺的骨架组重跑判定）。
 
-        用途（2026-09-17「双实例动画混在一起」修复）：出现次是**位置标签**——引擎
-        的 deform 提交顺序是按 mesh+instance 排序的，两个实例的相对先后**可以逐部件
-        不同**（实测 033520 G2：实例 A 的顺序是 c209c22b→3b1b73fe→869976a3→4a178546，
-        实例 B 却是 3b1b73fe→c209c22b→…，即排序键本身随实例变化）。于是「第 1 次出现」
-        对某些部件是 A、对另一些是 B → 同一槽骨架里混进两个实例的 palette = 两个实例
-        的动画粘在一起。这里改用**姿态指纹**分组：取一个全组共享的 canonical 骨骼
-        （叶瞬光01 G0 = 槽位 0，六个部件都引用它），用它的本帧矩阵位置当键——
-        同一实例在同一帧内该骨骼矩阵**逐位相同** ⇒ 键相同；不同实例姿态不同 ⇒ 键不同。
+        生产链路里通道骨由导入期算好并写进工作区 json（``ChannelPlan``），导出侧
+        直接消费。只有在缓存缺失 / 版本不符时才在这里按**整组共享骨图**重算一次
+        ——通道骨是「共享骨图连通分量」的组级性质，单看一个部件算不出来（会退化成
+        "本部件最小槽位"）。补算结果写回组件记录，并在诊断表里留一条可检测痕迹。
 
-        无交集（组内没有共享骨骼）时返回 None：调用方跳过姿态对齐、保持出现次口径。
+        重算用**真实实现**（``common/zzmi_channel.select_channel_plan``），与导入期
+        同一份代码 ⇒ 两条链路口径一致，不存在"导出侧另有一套判据"。
         """
-        components = [
-            self.merged_skeleton_components[component_id]
-            for component_id in self._merged_group_component_ids(skeleton_group)
-        ]
-        if len(components) < 2:
-            return None
-        common: set[int] | None = None
-        for component in components:
-            values = {int(v) for v in (component.get("vg_map") or {}).values()}
-            common = values if common is None else (common & values)
-            if not common:
-                return None
-        return min(common) if common else None
+        missing_groups = {
+            int(component["skeleton_group"])
+            for component in components
+            if not isinstance(component.get("channel"), dict)
+            or component["channel"].get("channel_slot") is None
+        }
+        if not missing_groups:
+            return
+        try:
+            from ...common.zzmi_channel import select_channel_plan
+        except Exception:  # pragma: no cover - 轻量 fake 宿主
+            return
+        for skeleton_group in sorted(missing_groups):
+            group_components = [
+                component
+                for component in components
+                if int(component["skeleton_group"]) == int(skeleton_group)
+            ]
+            plan = select_channel_plan(
+                [
+                    {
+                        "draw_ib": str(component.get("draw_ib") or ""),
+                        "vg_map": dict(component.get("vg_map") or {}),
+                        "vg_count": int(component.get("vg_count") or 0),
+                        "vg_offset": int(component.get("vg_offset") or 0),
+                        "skeleton_group": int(skeleton_group),
+                        # F6（复核发现）：补算必须带上缓存里的跨部件权重，否则
+                        # 候选排序的第二键（权重合计）在补算路径上**失效**，
+                        # 补算结果可能与导入期选出的通道骨不同
+                        # （`ChannelPlanSlotWeights` 也就永远没有消费方）。
+                        "slot_weights": dict(component.get("slot_weights") or {}),
+                    }
+                    for component in group_components
+                ]
+            )
+            for component in group_components:
+                record = plan.get(str(component.get("draw_ib") or ""))
+                if record is not None and record.get("channel_slot") is not None:
+                    component["channel"] = dict(record)
+                    component["channel_digest"] = ""
+            print(
+                f"[ZZMI骨骼合并] 提示 G{int(skeleton_group)}: 通道计划缓存缺失，"
+                "已按整组共享骨图在导出期补算（请重新一键导入以固化缓存）"
+            )
 
-    @staticmethod
+    def _merged_component_channel_record(self, component: dict) -> dict | None:
+        """本部件在导入期算好的**通道骨**记录（唯一判定口径的输入）。
+
+        返回的 dict 至少含 ``channel_slot``（通道骨的全局槽位，跨部件一致）与
+        ``channel_local``（该骨在**本部件 palette** 里的本地骨下标，算键用）。
+        缓存缺失 / 字段非法 / 与 VGMap 自相矛盾一律返回 None——调用方必须把它
+        当**显式诊断**处理，绝不静默退回出现次判据（用户 2026-09-18 拍板）。
+        """
+        record = component.get("channel")
+        if not isinstance(record, dict):
+            return None
+        try:
+            slot = int(record.get("channel_slot"))
+            local = int(record.get("channel_local"))
+        except (TypeError, ValueError):
+            return None
+        if slot < 0 or local < 0:
+            return None
+        vg_map = component.get("vg_map") or {}
+        try:
+            mapped = int(vg_map.get(local, vg_map.get(str(local), -1)))
+        except (TypeError, ValueError):
+            return None
+        if mapped != slot:
+            return None
+        return record
+
+    def _merged_component_key_record(self, component: dict) -> dict | None:
+        """本部件**参与跨部件实例判定**的通道记录；不参与时 None。
+
+        判据只有一条（``common/zzmi_channel.is_cross_part_channel``）：通道骨被
+        **≥2 个部件**引用。分量内没有共享骨时导入期给的是**退化候选**（本部件最小
+        槽位，只区分它自己两个实例）——它不能当跨部件判定输入（不同物理骨 ⇒ 不同
+        哈希 ⇒ 同组两件各占一个池槽、槽位永远对不上），因此与「缓存缺失」同样处置：
+        **只供骨、不参与任何门控**（用户 2026-09-18 实机确认的硬事实：无判定的部件
+        留在门控里会把有键部件的发布一起拖死，症状 = 骨骼动画直接卡住）。
+        """
+        record = self._merged_component_channel_record(component)
+        if record is None:
+            return None
+        if not _is_cross_part_channel(record):
+            return None
+        return record
+
+    def _merged_group_has_key_driven(self, skeleton_group: int) -> bool:
+        """本组是否按**精确哈希键**选槽（= 该组至少一个部件参与跨部件判定）。
+
+        组级门控的单一事实源：全局键变量声明、键池段、SKIN 段的键诊断探针都用它，
+        确保「发键块」与「声明键变量 / 发键池」永远同进同退（F1）。
+        """
+        return any(
+            self._merged_component_is_key_driven(
+                self.merged_skeleton_components[component_id]
+            )
+            for component_id in self._merged_group_component_ids(skeleton_group)
+        )
+
+    def _merged_component_is_key_driven(self, component: dict) -> bool:
+        """本部件是否按**精确哈希键**选槽（= 参与跨部件实例判定的唯一模式）。
+
+        两个条件**同时**成立才算：
+
+        1. 有跨部件共享通道记录（``_merged_component_key_record``）；
+        2. 本组走**重定向路径**（``_merged_group_redirect_plan`` 非 None）。
+
+        条件 2 是 F1（复核发现）的修复：直连路径（本组没有重定向计划）的绘制决策
+        仍然是**按出现次**的（``_append_merged_direct_slot_guards`` 的自足挂点
+        `if $zz_ms_occ_<i> == <slot>` → 绑本槽骨架），而 palette 捕获若改由键块写进
+        `$PoolZZMISlotOfKey_G<g>[key]` 算出的槽，两者在 ``pool[key] != occ`` 时会
+        对不上——本 pass 把自己的 palette 写进键槽，却用出现次槽的合并骨架绘制
+        ⇒ 用**另一实例/上一帧**的骨架画本部件几何。HEAD 的直连路径**根本不发键块**
+        （`group_plan is not None` 把整个对齐块挡掉），因此这里回到 HEAD 行为：
+        直连路径一律按键出现次捕获（palette + SO 别名一起），不发键块、不声明键
+        变量、不发键池。重定向路径（用户实机验证过的 v9 形态）行为不变。
+        """
+        if self._merged_component_key_record(component) is None:
+            return False
+        try:
+            skeleton_group = int(component["skeleton_group"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        return self._merged_group_redirect_plan(skeleton_group) is not None
+
+    def _merged_group_pose_anchor_slot(self, skeleton_group: int) -> int | None:
+        """本组通道骨的**全局槽位**（t75：唯一判定口径，读导入期缓存）。
+
+        返回值只用于**复核/诊断**：真正的键输入是逐部件自己的 ``channel_local``
+        （同一连通分量内不同部件映射到同一通道槽位的本地下标可以不同，例如
+        叶瞬光01 G0 的槽 0：``01ef4403``#0 / ``999bff94``#7 / ``ae840e72``#2）。
+        同组内不同连通分量可以有不同通道槽位，此时返回升序第一个。
+
+        旧实现取全组 ``vg_map`` **值集合的交集最小值**，只要有一件与谁都不共骨
+        （G0 的 ``8c8de427``，槽 50..55）就整组返回 None ⇒ 六个部件各打一行
+        ``no_shared_canonical_bone`` 后整组静默退回出现次口径。t75 改为按
+        **共享骨图连通分量**选通道骨（``common/zzmi_channel.py``）。
+        """
+        slots = sorted(
+            {
+                int(record["channel_slot"])
+                for record in (
+                    self._merged_component_channel_record(
+                        self.merged_skeleton_components[component_id]
+                    )
+                    for component_id in self._merged_group_component_ids(skeleton_group)
+                )
+                if record is not None
+            }
+        )
+        return slots[0] if slots else None
+
     def _merged_component_pose_anchor_local(
-        component: dict, anchor_slot: int
+        self, component: dict, anchor_slot: int | None = None
     ) -> int | None:
-        """该部件里映射到 <anchor_slot> 的本地骨骼索引（取最小者）。"""
-        for local, slot in sorted((component.get("vg_map") or {}).items()):
-            if int(slot) == int(anchor_slot):
-                return int(local)
-        return None
+        """该部件里参与精确哈希的**本地骨下标**（t75：= 缓存里的 channel_local）。
+
+        ``anchor_slot`` 只用于复核（缓存里的通道槽位必须与它一致）；为 None 时
+        不做复核（旧调用点形态）。
+        """
+        record = self._merged_component_channel_record(component)
+        if record is None:
+            return None
+        local = int(record["channel_local"])
+        if anchor_slot is not None and int(record["channel_slot"]) != int(anchor_slot):
+            return None
+        return local
 
     def _merged_pose_alignment_unavailable_reason(
-        self, skeleton_group: int, group_plan: dict | None
+        self, component_id: int, group_plan: dict | None
     ) -> str | None:
-        """姿态指针对齐**结构性不可达**的原因码；可达（或单部件组无歧义）时 None。
+        """本部件**通道判定结构性不可达**的原因码；可达时 None。
 
-        只覆盖**组级**原因——部件级 `local is None`（某个部件自己不引用锚点骨骼）
-        是正常形态，不是缺口，不在此列。三处原因对应契约 §2.5 实测的两种现实：
-        「有锚点的组没有计划」（G2）、「有计划的组没有锚点」（G0）。
+        只有两种情况算缺口（都必须落机器可读诊断，绝不静默）：
+        - ``no_redirect_plan``：该组件所在组没有重定向计划（没有合并几何 / SO
+          语义，判定与发布都无从落地）；
+        - ``no_channel_plan_cache``：工作区缓存里没有该部件的通道记录
+          （导入期未刷新，或 json 被手工改坏）。
+        单部件组**不是**缺口：它自成一个连通分量，通道骨只用于区分**它自己**的
+        两个实例（跨部件混槽在该组内不可能发生），因此既不诊断也不发键块。
+        另外，即使有重定向计划，单部件组也没有"跨部件实例对齐"这回事 ⇒ 不报。
         """
-        component_ids = self._merged_group_component_ids(skeleton_group)
+        component_ids = self._merged_group_component_ids(
+            int(self.merged_skeleton_components[component_id]["skeleton_group"])
+        )
         if len(component_ids) < 2:
-            # 单部件组：同槽只可能被**同一部件**写（各实例分占不同槽），出现次口径
-            # 在该组内不会跨部件混用 ⇒ 不是缺口，不报。
             return None
         if group_plan is None:
             return "no_redirect_plan"
-        if group_plan.get("pose_anchor_slot") is None:
-            return "no_shared_canonical_bone"
+        component = self.merged_skeleton_components[component_id]
+        if self._merged_component_channel_record(component) is None:
+            return "no_channel_plan_cache"
         return None
 
     def _append_merged_pose_key_alignment(
-        self, section, draw_ib: str, component_id: int, skeleton_group: int, group_plan: dict
+        self,
+        section,
+        draw_ib: str,
+        component_id: int,
+        skeleton_group: int,
+        group_plan: dict | None,
+        capture_so: bool | None = None,
     ) -> None:
-        """按「共享骨骼姿态指纹」把本 pass 的 palette / SO 引用改投到正确的槽。
+        """把本 pass 的 palette / SO 引用按**通道骨精确哈希键**投到正确的槽。
 
-        实现为**修正块**：出现次口径的捕获保持原样（指纹不可用时它就是历史行为，
-        安全性基线不变），随后按指纹算出的槽位与出现次不一致时，把刚捕获的内容搬到
-        对应槽；SO 引用同理重新捕获（此刻 `so0` 仍是游戏的流输出目标）。
+        t75 唯一判定口径（用户 2026-09-18 拍板后只剩这一条）：
 
-        键取自本部件 palette 里共享骨骼的平移分量：48 字节/骨骼 = 12 floats，
-        `r0.w / r1.w / r2.w` = 平移 ⇒ float 下标 12*local + {3, 7, 11}；
-        `->SpatialHash(x, y, z, cell)` 的下标单位是 **float**（EFMI 的 CB 用法
-        `+12/+13/+14` = 4x4 矩阵平移，实证口径一致）。
+        - 键 = ``vs-t0->HashRegion(48 * channel_local, 48)``——只读**一根**骨的
+          48 字节矩阵，**逐字节精确**（源码 ``CommandList.cpp:4033/7961``；失败
+          返回 -1/-2/-3）。
+        - 通道骨 ``channel_local`` 来自导入期缓存（``common/zzmi_channel.py``）：
+          该骨是**共享骨连通分量**内被最多部件引用、且带顶点权重最多的槽位在本
+          部件 palette 里的本地下标。
+        - 池 ``PoolZZMISlotOfKey_G<g>`` 用 ``pool_index_type = fifo``：键是 32 位
+          整数，**全位精确匹配**，不能再用量化空间池（0.01 格会把两个实例并键，
+          实测并键率最高 99/135）。
+        - 守卫写 ``> 0``：``HashRegion`` 失败返回 -1/-2/-3，``!= 0`` 挡不住。
+
+        **为什么必须逐字节精确**：t73 实测同一实例、同一根物理骨在不同部件的
+        palette 里**逐位相同（Δ=0）**，而两个实例的差极小（G0 槽 0 只有
+        1.4e-7…8.2e-6、G2 槽 185 = 1.32e-3），远小于任何量化格。
+
+        **不再有出现次回退分支**：指纹块是**唯一**的捕获路径；``HashRegion`` 失败
+        （键 ≤ 0）时走**显式诊断路径**（``POSE_KEY_HASH_UNAVAILABLE``），由调用方
+        分级记录，绝不静默退回出现次。捕获不能写在该 ``if`` 体内（3DMigoto 的
+        加载期优化器会把只在 ``if`` 体内赋值的语句静态折叠掉），所以两条分支各发
+        一次捕获——它们是**同一判据**的两条结果路径，不是两套判据。
         """
-        anchor_slot = group_plan.get("pose_anchor_slot")
-        if anchor_slot is None:
-            return
         component = self.merged_skeleton_components[component_id]
-        local = self._merged_component_pose_anchor_local(component, int(anchor_slot))
-        if local is None:
+        record = self._merged_component_channel_record(component)
+        if record is None:
             return
+        local = int(record["channel_local"])
         slots = self._merged_skeleton_slots()
         slot_first, slot_second = slots[0], slots[-1]
-        occ_var = self._merged_occ_var(component_id)
         key_var = self._merged_pose_key_var(skeleton_group)
         # 池在表达式里带 `$` 前缀（EFMI 口径：$PoolInput_ObjectSpatialIdentity[...]）
         key_pool = "$" + self._merged_pose_key_pool_prefix(skeleton_group)
         taken_pool = "$" + self._merged_pose_slot_taken_pool(skeleton_group)
-        f0 = 12 * int(local) + 3
-        owner = self._merged_component_is_so_owner(draw_ib, group_plan)
+        offset = ZZMI_CHANNEL_HASH_BYTES * local
+        # SO 引用捕获条件由调用方给出（与旧出现次分支逐字同条件：重定向路径的
+        # SO owner / 直连路径的合并宿主）；未给出时退回「本组 SO owner」这一读法。
+        owner = (
+            bool(capture_so)
+            if capture_so is not None
+            else self._merged_component_is_so_owner(draw_ib, group_plan)
+        )
+        reason = str(record.get("channel_reason") or "")
+        shared = int(record.get("channel_shared_components") or 0)
+        weight = int(record.get("channel_shared_weight") or 0)
+
+        def emit_capture(target_slot: int) -> None:
+            """把当帧 palette 落到 <target_slot>，SO 别名只由 SO owner 重捕获。"""
+            section.append(
+                f"    {self._merged_palette_name(draw_ib, target_slot)} = "
+                "copy vs-t0 unless_null"
+            )
+            if owner:
+                section.append(
+                    f"    {self._merged_redirect_so_name(skeleton_group, target_slot)}"
+                    " = ref so0"
+                )
+                # O3：登记 referent 捕获点（只计数，不改产物文本）。键块里两个槽
+                # 各发一次（if/else 两条结果路径），与旧出现次分支的登记口径一致。
+                self._merged_reuse_capture_site(skeleton_group, target_slot)
 
         section.append("")
         section.append(
-            "; --- 实例对齐：共享骨骼姿态指纹 → 槽位（出现次只是位置标签，两个实例"
+            "; --- 实例对齐：通道骨精确哈希键（唯一判定口径）→ 槽位 ---"
         )
+        # F5（复核发现）：身份口径必须**在产物里可见**——只读 ini 的人必须能一眼看到
+        # 这条判定用的是骨名身份还是 `local_slot_map` 弱代理（槽位号 ≠ 骨头身份）。
         section.append(
-            "; 的提交先后可以逐部件不同，光看出现次会把两份姿态混进同一槽骨架）---"
+            f"; channel_slot={int(record['channel_slot'])} channel_local={local} "
+            f"hash_region={offset},{ZZMI_CHANNEL_HASH_BYTES} shared_components={shared} "
+            f"shared_weight={weight} reason={reason} "
+            f"identity_basis={record.get('channel_identity_basis') or 'unknown'} "
+            f"identity_token={record.get('channel_identity_token') or ''} "
+            "逐字节精确匹配（无容差）"
         )
         section.append("ResourceZZPoseKeySrc = ref vs-t0")
         section.append(
-            f"{key_var} = ResourceZZPoseKeySrc->SpatialHash("
-            f"{f0}, {f0 + 4}, {f0 + 8}, {ZZMI_MERGED_POSE_KEY_CELL})"
+            f"{key_var} = ResourceZZPoseKeySrc->HashRegion("
+            f"{offset}, {ZZMI_CHANNEL_HASH_BYTES})"
         )
-        section.append(f"if {key_var} != 0")
+        # 守卫 > 0：HashRegion 失败返回 -1/-2/-3，`!= 0` 挡不住。
+        section.append(f"if {key_var} > 0")
         section.append(f"    if {key_pool}[{key_var}] == 0")
         section.append(f"        if {taken_pool}[{slot_first}] == 0")
         section.append(f"            {taken_pool}[{slot_first}] = 1")
@@ -2447,24 +3016,17 @@ class ExportZZMI(ExportUnity):
         section.append(f"            {key_pool}[{key_var}] = {slot_second}")
         section.append("        endif")
         section.append("    endif")
-        def emit_move(target_slot: int, source_slot: int):
-            """本 pass 落进了 <source_slot>（按出现次），但指纹说该进 <target_slot>：
-            把刚捕获的 palette 搬过去，SO 引用同理重新捕获。"""
-            section.append(f"    if {key_pool}[{key_var}] == {target_slot}")
-            section.append(f"        if {occ_var} == {source_slot}")
-            section.append(
-                f"            {self._merged_palette_name(draw_ib, target_slot)} = "
-                f"copy {self._merged_palette_name(draw_ib, source_slot)}"
-            )
-            if owner:
-                section.append(
-                    f"            {self._merged_redirect_so_name(skeleton_group, target_slot)}"
-                    " = ref so0"
-                )
-            section.append("        endif")
-            section.append("    endif")
-        emit_move(slot_first, slot_second)
-        emit_move(slot_second, slot_first)
+        section.append(f"    if {key_pool}[{key_var}] == {slot_second}")
+        emit_capture(slot_second)
+        section.append("    else")
+        emit_capture(slot_first)
+        section.append("    endif")
+        section.append(f"else")
+        section.append(
+            f"    ; 键 <= 0：HashRegion 失败（-1/-2/-3）。显式诊断路径——"
+            "**不退回出现次**，本 pass 不捕获（保持上一帧内容），由下面"
+            "对应的诊断注释与契约判定承担。"
+        )
         section.append("endif")
 
     def _merged_group_so_capturer_component_ids(self, skeleton_group: int) -> list[int]:
@@ -2525,9 +3087,19 @@ class ExportZZMI(ExportUnity):
         闭合，与 `$zz_ms_prev_<i><k>` 的期望集合门控合起来得到：
         `max(捕获者本槽到达, 最后一个必需部件本槽到达)` —— 单实例帧里第 2 槽
         永远不闭合（不再往未赋值别名落笔），多实例帧里每槽在别名刷新后闭合一次。
+
+        t75：捕获者集合先剔除**连通道记录都没有**的部件（用户实机确认 2026-09-18：
+        把这种部件（G0 的 ``8c8de427`` 一类）留在门控里会把**有键部件的发布一起
+        拖死**，症状 = 骨骼动画直接卡住）。它只"供骨"（palette 捕获 + attach 照旧
+        保留），绝不参与任何门控。判据见 `_merged_so_ready_capturer_ids`：
+        「有没有通道记录」——按出现次捕获的只供骨部件仍靠 `seen` 标记本槽别名已刷新，
+        摘掉它会丢 F8 保护。
         """
         return self._merged_so_ready_condition(
-            self._merged_group_so_capturer_component_ids(skeleton_group), slot
+            self._merged_so_ready_capturer_ids(
+                self._merged_group_so_capturer_component_ids(skeleton_group),
+            ),
+            slot,
         )
 
     def _merged_slot_guard_condition(
@@ -2537,11 +3109,17 @@ class ExportZZMI(ExportUnity):
 
         前半段防「写进上一帧/未赋值的别名」，后半段防「提前用半帧骨架落笔」——
         两条各自对应 2026-09-17 的一次实机现象，说明见两个子条件的 docstring。
+
+        t75：期望到达集合先剔除**无通道判定**的部件（
+        `_merged_determinable_component_ids`）——它的实例身份未知，留在集合里
+        只会阻塞或污染本槽闭合；它的 attach / palette 捕获照旧保留（供骨）。
         """
         parts = [
             self._merged_slot_so_ready_condition(skeleton_group, slot),
             self._merged_slot_seen_condition(
-                component_ids, slot, cull_aware=cull_aware
+                self._merged_determinable_component_ids(component_ids),
+                slot,
+                cull_aware=cull_aware,
             ),
         ]
         return " && ".join(part for part in parts if part)
@@ -2643,57 +3221,107 @@ class ExportZZMI(ExportUnity):
             int(host["component_id"]) == int(component_id) for host in absorbed_hosts
         )
         so_owner_target_ibs = self._merged_so_owner_target_ibs(draw_ib)
-        for index, slot in enumerate(slots):
-            palette_line = (
-                f"{self._merged_palette_name(draw_ib, slot)} = copy vs-t0 unless_null"
-            )
-            condition = f"if {occ_var} == {slot}" if index == 0 else "else"
-            texture_override_vb_section.append(condition)
-            texture_override_vb_section.append(f"    {palette_line}")
-            for _so_owner_target_ib in so_owner_target_ibs:
-                texture_override_vb_section.append(
-                    f"    {self._merged_redirect_so_name(skeleton_group, slot)} = ref so0"
+        # t75：**唯一判定模式**。通道骨被 ≥2 件引用（真正跨部件共享）⇒ 由键块按
+        # 精确哈希算出的槽捕获 palette / SO 引用（`_append_merged_pose_key_alignment`）；
+        # 没有通道判定（缓存缺失，或通道骨退化为"只区分自己两个实例"的候选）⇒
+        # 保留历史上的出现次捕获：它是自己那些槽位的唯一写入者，必须供骨；同时它
+        # 从**所有**门控里摘掉（`_merged_determinable_component_ids`）。
+        # 两条路径互斥，不会重复捕获，也不存在"两套判据同时生效"。
+        channel_record = self._merged_component_channel_record(component)
+        key_driven_capture = self._merged_component_is_key_driven(component)
+        # SO 引用（`ResourceZZRedirectSO_s<k> = ref so0`）的捕获条件与旧出现次分支
+        # **逐字一致**：重定向路径里作为 SO owner 的挂点，或直连路径里被吸收的合并
+        # 宿主。判据换成键以后这个条件必须原样带过去——否则直连路径的宿主不再刷新
+        # 自己的 SO（它的每槽重放会写上一帧的缓冲）。
+        captures_redirect_so = bool(so_owner_target_ibs) or is_absorbed_host
+        if not key_driven_capture:
+            for index, slot in enumerate(slots):
+                palette_line = (
+                    f"{self._merged_palette_name(draw_ib, slot)} = copy vs-t0 unless_null"
                 )
-                # O3：登记 referent 捕获点（只计数，不改产物文本）
-                self._merged_reuse_capture_site(skeleton_group, slot)
-            if is_absorbed_host:
-                # 直连路径的合并宿主：把本轮自己的 SO 引用捕获下来（与重定向路径
-                # 同名资源、同语义），任何兼容挂点闭合守卫后都能把合并几何写进去。
-                texture_override_vb_section.append(
-                    f"    {self._merged_redirect_so_name(skeleton_group, slot)} = ref so0"
-                )
-                self._merged_reuse_capture_site(skeleton_group, slot)
-        if len(slots) > 1:
-            texture_override_vb_section.append("endif")
+                condition = f"if {occ_var} == {slot}" if index == 0 else "else"
+                texture_override_vb_section.append(condition)
+                texture_override_vb_section.append(f"    {palette_line}")
+                for _so_owner_target_ib in so_owner_target_ibs:
+                    texture_override_vb_section.append(
+                        f"    {self._merged_redirect_so_name(skeleton_group, slot)} = ref so0"
+                    )
+                    # O3：登记 referent 捕获点（只计数，不改产物文本）
+                    self._merged_reuse_capture_site(skeleton_group, slot)
+                if is_absorbed_host:
+                    # 直连路径的合并宿主：把本轮自己的 SO 引用捕获下来（与重定向路径
+                    # 同名资源、同语义），任何兼容挂点闭合守卫后都能把合并几何写进去。
+                    texture_override_vb_section.append(
+                        f"    {self._merged_redirect_so_name(skeleton_group, slot)} = ref so0"
+                    )
+                    self._merged_reuse_capture_site(skeleton_group, slot)
+            if len(slots) > 1:
+                texture_override_vb_section.append("endif")
 
-        # 3.5) 实例对齐修正：出现次只是**位置标签**，两个实例的提交先后可以逐部件
-        # 不同（排序键本身随实例变化）→ 只按出现次捕获会把两份姿态混进同一槽骨架，
-        # 表现就是用户实测的「双实例动画混在一起、没按实例分开」。这里用全组共享骨骼
-        # 的当帧矩阵位置做姿态指纹，把本 pass 的 palette / SO 引用改投到正确槽位。
-        if group_plan is not None:
+        # 3.5) 实例对齐：把本 pass 的 palette / SO 引用按**通道骨精确哈希键**
+        # 改投到正确槽位（唯一判定口径，见 `_append_merged_pose_key_alignment`）。
+        # 出现次只是**位置标签**：两个实例的提交先后可以逐部件不同（排序键本身
+        # 随实例变化），按出现次捕获会把两份姿态混进同一槽骨架。
+        if key_driven_capture:
             self._append_merged_pose_key_alignment(
                 texture_override_vb_section,
                 draw_ib,
                 component_id,
                 skeleton_group,
                 group_plan,
+                capture_so=captures_redirect_so,
             )
-        # 对齐块**不可达**时必须留下机器可读痕迹：此前这里是**静默**退化
-        # （有计划的组没有共享锚点 / 有锚点的组没有计划 → 出现次口径成为唯一手段，
+        # 判定块**不可达**时必须留下机器可读痕迹：此前这里是**静默**退化
+        # （有计划的组没有共享锚点 / 有锚点的组没有计划 ⇒ 出现次口径成为唯一手段，
         # 而出现次是位置标签、不是实例标签 ⇒ 主症②的槽位归属翻转无人可判）。
         unavailable_reason = self._merged_pose_alignment_unavailable_reason(
-            skeleton_group, group_plan
+            component_id, group_plan
         )
-        if unavailable_reason is not None:
+        if key_driven_capture:
+            # 键块已记录完整复核信息（通道槽位 / 本地下标 / 理由），无需重复诊断。
+            pass
+        elif unavailable_reason is not None:
+            # F1：直连路径（`no_redirect_plan`）或缓存缺失（`no_channel_plan_cache`）
+            # ⇒ 本部件按「只供骨、不参与判定」处置 —— 必须显式点名（绝不静默）。
+            # 直连路径上**不能**发键块：绘制决策仍是按出现次
+            # （`_append_merged_direct_slot_guards` 的自足挂点 `occ == slot`），
+            # 键驱动捕获会把 palette 写进 `pool[key]` 而绘制读 `occ` 槽 ⇒ 两套判据
+            # 混用（复核实测：直连路径 HEAD 0 个键块 ✓ / 工作区 6 次 ✗）。
+            # F9（**待用户裁定**）：退化/无通道部件是否允许把它的 `seen` 留在
+            # **SO 别名就绪项**里（`_merged_so_ready_capturer_ids` 判据是「有没有
+            # 通道记录」，不是「参不参与判定」）——现状 = 允许（理由见该函数
+            # docstring 与复核报告 F9/判定 2），本修复**不改语义**，仅标注待裁定。
             texture_override_vb_section.append(
                 self._merged_diag(
                     ZZMI_MERGE_DIAG_POSE_UNAVAILABLE,
-                    "实例对齐（姿态指纹）不可达，本组回退出现次口径"
-                    "（出现次是位置标签，不是实例标签）。",
+                    "通道骨判定不可达：本部件不参与跨部件实例判定（不做键驱动捕获），"
+                    "仅按出现次捕获当帧 palette + attach 供骨，并已从全部门控里摘掉"
+                    "（身份未知的门控项会拖死有键部件的发布）。"
+                    if unavailable_reason == "no_channel_plan_cache"
+                    else "实例对齐（通道骨）不可达：本组没有重定向计划（直连路径），"
+                    "绘制决策按出现次、捕获也必须按出现次 ⇒ 不发键块。"
+                    "判定与发布都无从落地。",
                     group=f"G{int(skeleton_group)}",
                     draw_ib=draw_ib,
                     reason=unavailable_reason,
                     slots=",".join(str(int(slot)) for slot in slots),
+                )
+            )
+        elif channel_record is not None:
+            # 通道骨**退化**（分量内没有全体成员可比的共享骨，例如叶瞬光01 G0 的
+            # `8c8de427`）：键只区分本部件自己的两个实例，不能当跨部件判定输入，
+            # 因此本部件按「只供骨、不参与判定」处置 —— 必须显式点名（绝不静默）。
+            channel_diag = str(channel_record.get("channel_diagnostic") or "")
+            texture_override_vb_section.append(
+                self._merged_diag(
+                    ZZMI_MERGE_DIAG_POSE_KEY_UNAVAILABLE,
+                    channel_diag
+                    or "通道骨退化为本部件候选：不参与跨部件实例判定。",
+                    group=f"G{int(skeleton_group)}",
+                    draw_ib=draw_ib,
+                    channel_slot=int(channel_record["channel_slot"]),
+                    channel_local=int(channel_record["channel_local"]),
+                    reason=str(channel_record.get("channel_reason") or ""),
                 )
             )
 
@@ -4363,10 +4991,9 @@ class ExportZZMI(ExportUnity):
                 "so_owner_ib": so_owner_ib,
                 "required_component_ids": sorted(required_component_ids),
                 "compatible_component_ids": compatible_component_ids,
-                # 实例对齐用的「姿态指纹」锚点：全组共享的 canonical 骨骼槽位
-                # （2026-09-17「双实例动画混在一起」修复，见
-                # `_merged_group_pose_anchor_slot`）。None = 组内无共享骨骼，
-                # 退回出现次口径。
+                # 实例对齐用的**通道骨**（t75 唯一判定口径）：导入期已按「共享骨图
+                # 连通分量 + 引用件数 + 顶点权重」算好并缓存，这里只做组级复核读数
+                # （逐部件的真实键输入见组件记录的 `channel.channel_local`）。
                 "pose_anchor_slot": self._merged_group_pose_anchor_slot(
                     skeleton_group
                 ),
@@ -4598,8 +5225,17 @@ class ExportZZMI(ExportUnity):
         # 保守等待 → 首帧也能在最后一个必需部件处闭合一次；第一帧末 [Present]
         # 就会把真实到达情况抄进来，之后照常预测。
         for skeleton_group in groups:
-            anchor_plan = self._merged_group_redirect_plan(skeleton_group)
-            if anchor_plan and anchor_plan.get("pose_anchor_slot") is not None:
+            # 只要该组有任一部件**参与跨部件实例判定**（跨部件共享通道骨）**且走
+            # 重定向路径**，就发出组级通道骨键变量：同一组共享同一条键变量与同一个池
+            # （键是逐字节精确的，同分量同实例必然算出同一个键 ⇒ 同槽）。
+            #
+            # F1（复核发现）：条件里**必须**含重定向路径（`_merged_group_has_key_driven`
+            # 已内含）。直连路径（无 target）现在**不发键块**（回 HEAD 行为：
+            # 绘制决策按出现次，捕获也必须按出现次，两者不可混用），因此也不能声明
+            # `$zz_ms_pose_key_*` —— 否则会留下一个**写不进也读不出**的悬挂全局变量。
+            # 旧注释「直连路径也发键块，漏声明会让变量退化成部件级局部变量」只适用于
+            # 直连路径真的发键块的假设，与 HEAD 代码不符（更正见 t75 修复报告）。
+            if self._merged_group_has_key_driven(skeleton_group):
                 constants_section.append(
                     f"global {self._merged_pose_key_var(skeleton_group)} = 0"
                 )
@@ -4781,9 +5417,7 @@ class ExportZZMI(ExportUnity):
                 )
                 section.append(f"Dispatch = {dispatch_count}, 1, 1")
                 section.append("cs-u0 = null")
-                group_plan_for_probe = self._merged_group_redirect_plan(
-                    int(component["skeleton_group"])
-                )
+                component_key_driven = self._merged_component_is_key_driven(component)
                 if slot == slots[0]:
                     # 诊断探针（主症①b / AC-A3 的**运行时**失败标记）：把本部件在
                     # 槽 <slots[0]> 的到达计数透到 IniParams。该值是帧内单调累加
@@ -4792,40 +5426,41 @@ class ExportZZMI(ExportUnity):
                     # `ini param override = 2` ⇒ 同帧同部件出现次数 > len(SLOTS)
                     # ⇒ 第 3 笔已被 occ 回绕复用槽位（槽内混了实例）。
                     section.append(f"x3 = {self._merged_seen_var(component_id, slot)}")
-                if (
-                    group_plan_for_probe
-                    and group_plan_for_probe.get("pose_anchor_slot") is not None
-                ):
-                    # 诊断探针：把本 pass 的「姿态指纹」透到 IniParams，帧分析日志里
-                    # 会以 `ini param override = <值>` 出现（每个部件每次 deform 一条），
-                    # 用来核对两个实例的指纹是否不同、以及出现次标签是否翻转。
+                if component_key_driven:
+                    # 诊断探针：把本 pass 的通道骨键（HashRegion，逐字节精确）透到
+                    # IniParams，帧分析日志里会以 `ini param override = <值>` 出现
+                    # （每个部件每次 deform 一条），用来核对两个实例是否算出不同的
+                    # 键、以及同分量跨部件是否算出同一个键。
                     pose_key_var = self._merged_pose_key_var(int(component["skeleton_group"]))
                     section.append(f"x2 = {pose_key_var}")
                 section.new_line()
 
         # ---------------------------------------------------------------
-        # 姿态指纹 → 槽位 的池（2026-09-17「双实例动画混在一起」修复）
+        # 通道骨键 → 槽位 的池（t75 唯一判定口径）
         #
         # 出现次是**位置标签**：引擎按 mesh+instance 排序提交 deform，两个实例的
-        # 相对先后可以逐部件不同（实测 033520 G2：A 的顺序 c209c22b→3b1b73fe→
-        # 869976a3→4a178546，B 却是 3b1b73fe→c209c22b→…）⇒「第 1 次出现」对某些
-        # 部件是 A、对另一些是 B，同一槽骨架混进两份姿态 = 用户看到的动画粘连。
-        # 改用全组共享骨骼的当帧矩阵位置当指纹（同实例同帧逐位相同、不同实例姿态
-        # 不同），用池把「指纹 → 槽位」记在本帧内。
+        # 相对先后可以逐部件不同（实测 033720：G2 四件的先后切分是 2-2） ⇒「第 1
+        # 次出现」对某些部件是 A、对另一些是 B，同一槽骨架混进两份姿态。
+        # 改用**共享骨连通分量**内被最多部件引用的通道骨、以 `HashRegion(48*local,
+        # 48)` 的**逐字节精确**哈希当键（同实例同帧同分量逐位相同；不同实例差
+        # 1e-7…1e-2，远在 0.01 格之下 ⇒ 必须精确匹配）。
         # 池按帧过期（pool_expiration_timeout_frames = 1）= 每帧重新分配；
-        # 主池 pool_index_type = spatial：索引就是 ->SpatialHash 的取值（EFMI 的
-        # ObjectSpatialIdentity 同口径）。
+        # `pool_index_type = fifo`：键是 32 位整数，全位精确匹配——**不能**再用
+        # `spatial` + `pool_spatial_radius`（会把两个实例并键，实测并键率最高
+        # 99/135）。池容量按「该组连通分量数 × 槽位数 × 实例上界」定，见下。
         # ---------------------------------------------------------------
+        pool_size_by_group = self._merged_pose_key_pool_sizes(groups)
         for skeleton_group in groups:
-            group_plan = self._merged_group_redirect_plan(skeleton_group)
-            if not group_plan or group_plan.get("pose_anchor_slot") is None:
+            # 池容量只由「该组是否有参与判定的部件（且走重定向路径）」决定
+            # （`_merged_pose_key_pool_sizes` 已按 `_merged_group_has_key_driven`
+            # 过滤）。F1：直连路径**不发键块**（绘制按出现次，捕获也必须按出现次），
+            # 因此这里也不发池——发了会留下没有任何消费者的空池段。
+            pool_size = pool_size_by_group.get(int(skeleton_group), 0)
+            if pool_size <= 0:
                 continue
             section.append(f"[{self._merged_pose_key_pool_prefix(skeleton_group)}]")
-            section.append("pool_size = 16")
-            section.append("pool_index_type = spatial")
-            section.append(
-                f"pool_spatial_radius = {ZZMI_MERGED_POSE_KEY_CELL}"
-            )
+            section.append(f"pool_size = {int(pool_size)}")
+            section.append("pool_index_type = fifo")
             section.append("pool_variable_default_value = 0")
             section.append("pool_expiration_timeout_frames = 1")
             section.append("pool_expiration_reset_elements = 1")
@@ -5368,6 +6003,14 @@ class ExportZZMI(ExportUnity):
             GlobalKeyCountHelper.generated_mod_number = GlobalKeyCountHelper.generated_mod_number + 1
 
         M_IniHelper.add_branch_key_sections(ini_builder=ini_builder, key_name_mkey_dict=self.blueprint_model.keyname_mkey_dict)
+        # legacy / never-fires-on-ZZMI：经典（非直出）形态键发射器。ZZMI 的两条实际路径上
+        # 它都不产出 —— ① 直出路线在 Meshes0000 基础轮次主动抑制形态键资源，② 标准路线的前
+        # 处理已把键块烘焙掉（blueprint/preprocess.py::_apply_shape_keys）。4 份产物实测
+        # `CustomShaderComputeShapes` 恒为 0，见 review-reports/t82-shapekey-drag-retest.md §2.6/§3.3 R-B。
+        # 保留此调用而非删除：该发射器全仓共 9 处调用点，其中 8 处在 ZZMI 之外
+        # （unity×2 / srmi / gimi / identityv / yysls / snowbreak / zzmidx12），
+        # 且它现在是本轮 R-A「非直出不得静默丢弃」诊断的唯一落点。
+        # 形态键导出请走直出：SSMTNode_PostProcess_ShapeKey.direct_export_mode（新节点默认勾选）。
         M_IniHelper.add_shapekey_ini_sections(ini_builder=ini_builder, drawib_drawibmodel_dict=drawib_drawibmodel_dict)
         M_IniHelperGUI.add_branch_mod_gui_section(ini_builder=ini_builder, key_name_mkey_dict=self.blueprint_model.keyname_mkey_dict)
 

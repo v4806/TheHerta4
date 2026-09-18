@@ -166,6 +166,7 @@ _load_real_module(
     f"{PKG}.common.object_prefix_helper", "common/object_prefix_helper.py"
 )
 _load_real_module(f"{PKG}.common.draw_call_model", "common/draw_call_model.py")
+_load_real_module(f"{PKG}.common.zzmi_channel", "common/zzmi_channel.py")
 
 _FAKE_MOD_FOLDER = tempfile.mkdtemp(prefix="zzmi_pose_anchor_chain_")
 _FAKE_GLOBAL_CONFIG = types.SimpleNamespace(
@@ -366,7 +367,7 @@ class _PoseAnchorFixture(unittest.TestCase):
             }
         deform = {self.TARGET_IB: 20, self.CARRIER_IB: 2, self.SIBLING_IB: 8}
         order = [self.TARGET_IB, self.CARRIER_IB, self.SIBLING_IB]
-        return [
+        components = [
             {
                 "draw_ib": draw_ib,
                 "unique_str": f"LOD0.{draw_ib}-19182-0",
@@ -378,6 +379,13 @@ class _PoseAnchorFixture(unittest.TestCase):
             }
             for draw_ib in order
         ]
+        # t75：通道计划（导入期由 common/zzmi_channel.select_channel_plan 算出）。
+        # 夹具用**真实实现**按整组推导，与生产口径同源。
+        channel_module = sys.modules[f"{PKG}.common.zzmi_channel"]
+        plan = channel_module.select_channel_plan(components)
+        for component in components:
+            component["channel"] = dict(plan[component["draw_ib"]])
+        return components
 
     def _build(self, shared_anchor=True, single_component=False):
         self._register_obj(
@@ -464,10 +472,10 @@ class ZZMIPoseAnchorDerivationTests(_PoseAnchorFixture):
 
     def test_anchor_slot_is_intersection_of_group_vgmap_values(self):
         exporter, _models = self._build(shared_anchor=True)
-        # L1930-1956：交集 = {79} ⇒ 锚点 79（真实推导，无任何手工注入）
+        # t75：三个部件共骨 {79}（同一个连通分量）⇒ 通道槽位 = 79；
+        # 三件里槽位 79 都对应本地索引 0 ⇒ HashRegion(0, 48)。
         self.assertEqual(exporter._merged_group_pose_anchor_slot(self.GROUP), 79)
         for component in exporter.merged_skeleton_components:
-            # L1958-1966：三个部件里槽位 79 都对应本地索引 0
             self.assertEqual(
                 exporter._merged_component_pose_anchor_local(component, 79), 0
             )
@@ -479,46 +487,63 @@ class ZZMIPoseAnchorDerivationTests(_PoseAnchorFixture):
         self.assertIsNotNone(plan)
         # 计划里的锚点来自真实推导（对照：既有测试在此处手工注入）
         self.assertEqual(plan["pose_anchor_slot"], 79)
-        # L1968-1986：可达时无原因码
+        # t75：可达时无原因码
         self.assertIsNone(
-            exporter._merged_pose_alignment_unavailable_reason(self.GROUP, plan)
+            exporter._merged_pose_alignment_unavailable_reason(0, plan)
         )
 
-    def test_no_shared_bone_yields_none_and_reason_code(self):
+    def test_no_shared_bone_falls_back_per_connected_component(self):
+        """t75：组内不共骨不再让整组放弃——每个连通分量各取自己的通道骨。
+
+        三个部件互不相交 ⇒ 三个分量，各自退化到「本部件最小槽位」；
+        因此 `_merged_group_pose_anchor_slot` 返回升序第一个（79），
+        每件仍然拿到自己的通道记录（判定可达，不报原因码）。
+        """
         exporter, _models = self._build(shared_anchor=False)
-        self.assertIsNone(exporter._merged_group_pose_anchor_slot(self.GROUP))
+        self.assertEqual(exporter._merged_group_pose_anchor_slot(self.GROUP), 79)
         self._apply_plan(exporter)
         plan = exporter._merged_group_redirect_plan(self.GROUP)
         self.assertIsNotNone(plan)
-        self.assertIsNone(plan["pose_anchor_slot"])
-        self.assertEqual(
-            exporter._merged_pose_alignment_unavailable_reason(self.GROUP, plan),
-            "no_shared_canonical_bone",
+        self.assertEqual(plan["pose_anchor_slot"], 79)
+        for component in exporter.merged_skeleton_components:
+            record = exporter._merged_component_channel_record(component)
+            self.assertIsNotNone(record)
+            self.assertEqual(record["channel_reason"], "no_shared_bone_in_component")
+            # 退化的通道骨只对本部件两实例可区分 ⇒ 必须有点名诊断
+            self.assertTrue(record["channel_diagnostic"])
+        self.assertIsNone(
+            exporter._merged_pose_alignment_unavailable_reason(0, plan)
         )
 
-    def test_single_component_group_has_no_anchor(self):
+    def test_single_component_group_still_gets_its_own_channel(self):
+        """t75：单部件组自成一个连通分量，通道骨只用于区分它自己的两实例。"""
         exporter, _models = self._build(shared_anchor=True, single_component=True)
-        # L1948-1949：单部件组返回 None（出现次口径在该组内不会跨部件混用）
-        self.assertIsNone(exporter._merged_group_pose_anchor_slot(self.GROUP))
+        self.assertEqual(exporter._merged_group_pose_anchor_slot(self.GROUP), 79)
+        component = exporter.merged_skeleton_components[0]
+        record = exporter._merged_component_channel_record(component)
+        self.assertIsNotNone(record)
+        self.assertEqual(record["channel_slot"], 79)
+        self.assertEqual(record["channel_local"], 0)
 
 
 class ZZMIPoseAlignmentBlockTests(_PoseAnchorFixture):
     """对齐修正块 + 池段的真实产出。"""
 
-    def test_alignment_block_emitted_with_spatial_hash_and_pools(self):
+    def test_alignment_block_emitted_with_exact_hash_and_pools(self):
         exporter, models = self._build(shared_anchor=True)
         self._apply_plan(exporter)
         text = self._vb_text(exporter, models)
 
-        # L2026-2030：指纹 = 共享骨骼平移（本地索引 0 ⇒ float 下标 3/7/11）
+        # t75：键 = 通道骨的 48 字节矩阵整块哈希（逐字节精确，无容差）。
+        # 三件里通道槽位 79 都对应本地索引 0 ⇒ HashRegion(0, 48)。
         self.assertIn("ResourceZZPoseKeySrc = ref vs-t0", text)
         self.assertIn(
-            f"$zz_ms_pose_key_{self.GROUP} = ResourceZZPoseKeySrc->SpatialHash("
-            "3, 7, 11, 0.01)",
+            f"$zz_ms_pose_key_{self.GROUP} = ResourceZZPoseKeySrc->HashRegion(0, 48)",
             text,
         )
-        # L2031-2040：指纹 → 槽位池（先占 1，占用则占 2）
-        self.assertIn(f"if $zz_ms_pose_key_{self.GROUP} != 0", text)
+        self.assertNotIn("SpatialHash", text)
+        # 守卫必须 > 0（HashRegion 失败返回 -1/-2/-3，`!= 0` 挡不住）
+        self.assertIn(f"if $zz_ms_pose_key_{self.GROUP} > 0", text)
         self.assertIn(
             f"if $PoolZZMISlotOfKey_G{self.GROUP}[$zz_ms_pose_key_{self.GROUP}] == 0",
             text,
@@ -534,46 +559,60 @@ class ZZMIPoseAlignmentBlockTests(_PoseAnchorFixture):
             f"$PoolZZMISlotOfKey_G{self.GROUP}[$zz_ms_pose_key_{self.GROUP}] = 2",
             text,
         )
-        # L2041-2058：指纹说该进另一槽时搬运 palette（本文件唯一运行的 emit_move 路径）
+        # t75：不再有"出现次 ↔ 键"互搬（emit_move）；捕获直接写在键算出的槽上。
         self.assertIn(
             f"if $PoolZZMISlotOfKey_G{self.GROUP}[$zz_ms_pose_key_{self.GROUP}] == 2",
             text,
         )
-        self.assertIn(
+        self.assertNotIn(
             f"ResourceZZPalette_{self.CARRIER_IB}_s2 = "
             f"copy ResourceZZPalette_{self.CARRIER_IB}_s1",
             text,
         )
+        self.assertIn(
+            f"ResourceZZPalette_{self.CARRIER_IB}_s2 = copy vs-t0 unless_null",
+            text,
+        )
 
-    def test_pool_sections_are_emitted_for_a_derived_anchor(self):
+    def test_pool_sections_are_emitted_for_a_derived_channel(self):
         exporter, models = self._build(shared_anchor=True)
         self._apply_plan(exporter)
         text = self._skeleton_text(exporter, models)
 
-        # L4396-4415：锚点存在才发池段
+        # t75：通道存在才发池段；池必须是 fifo（键是 32 位整数，全位精确匹配）
         self.assertIn(f"[PoolZZMISlotOfKey_G{self.GROUP}]", text)
-        self.assertIn("pool_size = 16", text)
-        self.assertIn("pool_index_type = spatial", text)
-        self.assertIn("pool_spatial_radius = 0.01", text)
+        # 一个连通分量 × 2 槽 × 2 实例上界 = 4
+        self.assertIn("pool_size = 4", text)
+        self.assertIn("pool_index_type = fifo", text)
+        self.assertNotIn("pool_spatial_radius", text)
+        self.assertNotIn("pool_index_type = spatial", text)
         self.assertIn("pool_expiration_timeout_frames = 1", text)
         self.assertIn("pool_expiration_reset_elements = 1", text)
         self.assertIn(f"[PoolZZMIG_Taken_G{self.GROUP}]", text)
-        self.assertIn("pool_size = 4", text)
 
-    def test_no_anchor_skips_block_diagnoses_and_emits_no_pool(self):
+    def test_no_channel_skips_block_diagnoses_and_emits_no_pool(self):
         exporter, models = self._build(shared_anchor=False)
         self._apply_plan(exporter)
         vb_text = self._vb_text(exporter, models)
         skeleton_text = self._skeleton_text(exporter, models)
 
-        # 负向：无共享骨骼 ⇒ 不发指纹块、不发池段
+        # 负向：清掉通道记录 = 无通道部件 ⇒ 不发键块、不发池段
+        for component in exporter.merged_skeleton_components:
+            component["channel"] = {}
+        vb_text = self._vb_text(exporter, models)
+        skeleton_text = self._skeleton_text(exporter, models)
         self.assertNotIn("ResourceZZPoseKeySrc", vb_text)
         self.assertNotIn("SpatialHash(", vb_text)
         self.assertNotIn(f"[PoolZZMISlotOfKey_G{self.GROUP}]", skeleton_text)
         self.assertNotIn(f"[PoolZZMIG_Taken_G{self.GROUP}]", skeleton_text)
-        # 但必须留下机器可读原因码（L2122-2133 的诊断落点）
+        # 但必须留下机器可读原因码（绝不静默）
         self.assertIn("; ZZMI-MERGE-DIAG POSE_ALIGNMENT_UNAVAILABLE", vb_text)
-        self.assertIn("reason=no_shared_canonical_bone", vb_text)
+        self.assertIn("reason=no_channel_plan", vb_text)
+        # 供骨必须保留：palette 捕获与 attach run 都还在
+        self.assertIn(
+            f"ResourceZZPalette_{self.CARRIER_IB}_s1 = copy vs-t0 unless_null", vb_text
+        )
+        self.assertIn("run = CustomShaderZZMIMergedSkeletonAttach_", vb_text)
 
 
 if __name__ == "__main__":
