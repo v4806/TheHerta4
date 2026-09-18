@@ -243,6 +243,37 @@ def _base_sections(hash_value="abc123", base_name="abc123-43191", vertex_count=1
     ])
 
 
+def _two_component_sections():
+    """双组件产物形态（叶瞬光01 实测布局的合成版）。
+
+    组件 1 ``abc123``：单 IB、单 part（base 0）。
+    组件 2 ``def456``：同一 DrawIB 两个 part——P0 承载真实几何（47448 索引，base 3，
+    Position.buf 的 13671 行落在运行时 VB0 的 3 行 stub 前缀之后）与 P1 头部的
+    3 行 stub 前缀（base 0）。VLR = 13674 = 3 + 13671。
+    """
+    sections = _base_sections()
+    extra = _base_sections(hash_value="def456", base_name="def456-43191", vertex_count=13674)
+    extra["[TextureOverride_def456_def456-43191A]"] = [
+        "hash = def456",
+        "match_first_index = 17946",
+        "ib = Resourcedef456-43191AIB",
+        "; [mesh:LOD0.def456-6462-17946_copy] [vertex_count:24180]",
+        "drawindexed = 47448, 0, 3",
+    ]
+    extra["[TextureOverride_def456_def456-43191B]"] = [
+        "hash = def456",
+        "match_first_index = 0",
+        "ib = Resourcedef456-43191BIB",
+        "; [mesh:LOD0.def456-17946-0] [vertex_count:3]",
+        "drawindexed = 3, 0, 0",
+    ]
+    for section, lines in extra.items():
+        if section in ("[Constants]", "[Present]"):
+            continue
+        sections[section] = lines
+    return sections
+
+
 def _cross_ib_sections():
     return OrderedDict([
         ("[Constants]", []),
@@ -4977,9 +5008,12 @@ class DragMergedSkeletonDiagnosticLevelTests(unittest.TestCase):
     @staticmethod
     def _sections_with_split_base_vertices():
         sections = _base_sections()
-        # part A base=3 / part B base=0 ⇒ 触发「多个 base vertex」分支（t82 实测 {0,3}）
+        # part A base=3（承载真实几何）/ part B base=0（ZZMI 头部 3 行 stub 前缀，
+        # 只画那 3 个顶点）⇒ 触发「多个 base vertex」分支（t82/叶瞬光01 实测 {0,3}）。
+        # B 必须保持 stub 形态：真实几何 part 的 base 一旦不同于掩码基准就会被
+        # _assert_component_base_alignment 判为掩码错位并 fail loudly。
         sections["[TextureOverride_abc123_abc123-43191A]"][-1] = "drawindexed = 52688, 0, 3"
-        sections["[TextureOverride_abc123_abc123-43191B]"][-1] = "drawindexed = 12000, 0, 0"
+        sections["[TextureOverride_abc123_abc123-43191B]"][-1] = "drawindexed = 3, 0, 0"
         return sections
 
     def _locate_stdout(self, sections):
@@ -5067,6 +5101,244 @@ class DragMergedSkeletonDiagnosticLevelTests(unittest.TestCase):
         self.assertNotIn("[DragInteraction][WARNING] Position.buf 顶点数", out)
         self.assertIn("[DragInteraction][INFO] Position.buf 顶点数 20 与 VLR 14078", out)
         self.assertIn("合并骨架场景下必然出现且良性", out)
+
+
+class DragTwoComponentIndependenceTests(unittest.TestCase):
+    """多 IB / 多组件必须各自成链（叶瞬光01 实测：body 3b1b73fe 可用、hair 999bff94 无命中）。
+
+    两条根因（review-reports/t106-merge-vs-drag-causal-audit.md §C4b）：
+    1. 组件本该独立的屏幕状态/路径进度缓冲与 UpdateScreenJiggle pass 被共享 ⇒ 两组件读
+       同一个命中赢家，要么同时移动要么后者饿死；
+    2. ``vertex_base`` 取各 part 的最小值 ⇒ {0,3} 时逐顶点掩码整体前移 3 行，真实几何读到
+       错位权重，且基座 Detect 段的 z26 与 P0 变体自相矛盾（0 vs 3）。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_drag_module()
+
+    def _emit_two(self, **props):
+        node = _make_node(self.mod, **props)
+        sections = _two_component_sections()
+        comps = node._locate_components(sections, ["abc123", "def456"])
+        node._emit_sections(sections, comps, "testns")
+        return node, sections, comps
+
+    @staticmethod
+    def _zone_item(zone_id, weight=1.0):
+        settings = types.SimpleNamespace(
+            enabled=True,
+            brush_strength=weight,
+            brush_falloff_k=4.6,
+            radius=0.0,
+            strength=0.0,
+            max_offset=0.0,
+            falloff=0.0,
+            damping=0.0,
+            grabbable=True,
+        )
+        empty = types.SimpleNamespace(
+            name=f"zone_{zone_id}",
+            ssmt_drag_zone=settings,
+            matrix_world=np.eye(4),
+        )
+        return types.SimpleNamespace(zone_id=zone_id, zone_object=empty)
+
+    # ---- (a) 逐组件屏幕状态/进度资源 + 逐组件 UpdateScreenJiggle ----
+
+    def test_two_component_fixture_yields_two_components(self):
+        _, _, comps = self._emit_two()
+        self.assertEqual([c["comp_name"] for c in comps], ["abc123_43191", "def456_43191"])
+        # 真实几何 part（base 3）与头部 stub 前缀 part（base 0）并存
+        self.assertEqual([p["vertex_base"] for p in comps[1]["parts"]], [3, 0])
+
+    def test_per_component_screen_state_resources_emitted(self):
+        _, sections, _ = self._emit_two()
+        for cn in ("abc123_43191", "def456_43191"):
+            self.assertEqual(
+                sections[f"[ResourceDragJiggleScreenState_{cn}_testns]"],
+                ["type = RWBuffer", "format = R32G32B32A32_FLOAT", "array = 15"],
+            )
+            self.assertEqual(
+                sections[f"[ResourceDragPathProgressState_{cn}_testns]"][:2],
+                ["type = RWBuffer", "format = R32_FLOAT"],
+            )
+        # 手部/光标/预览按设计消费的共享副本必须保留
+        self.assertIn("[ResourceDragJiggleScreenState_testns]", sections)
+        self.assertIn("[ResourceDragPathProgressState_testns]", sections)
+
+    def test_each_jiggle_binds_its_own_screen_state(self):
+        _, sections, _ = self._emit_two()
+        for cn, other in (("abc123_43191", "def456_43191"), ("def456_43191", "abc123_43191")):
+            jig = "\n".join(sections[f"[CustomShaderDragJiggle{cn}_testns]"])
+            self.assertIn(f"cs-t71 = ResourceDragJiggleScreenState_{cn}_testns", jig)
+            self.assertIn(f"cs-t74 = ResourceDragPathProgressState_{cn}_testns", jig)
+            # 不得再读共享副本，也不得读另一个组件的那一份
+            self.assertNotIn("cs-t71 = ResourceDragJiggleScreenState_testns", jig)
+            self.assertNotIn("cs-t74 = ResourceDragPathProgressState_testns", jig)
+            self.assertNotIn(f"ResourceDragJiggleScreenState_{other}_testns", jig)
+            self.assertNotIn(f"ResourceDragPathProgressState_{other}_testns", jig)
+
+    def test_per_component_update_screen_jiggle_sections(self):
+        _, sections, _ = self._emit_two()
+        for cn in ("abc123_43191", "def456_43191"):
+            usj = "\n".join(sections[f"[CustomShaderDragUpdateScreenJiggle_{cn}_testns]"])
+            # 喂入本组件自己的命中赢家，写出本组件自己的状态缓冲
+            self.assertIn(f"cs-t67 = ResourceDragPinnedComponentInfo_{cn}_testns", usj)
+            self.assertIn(f"cs-u0 = ResourceDragJiggleScreenState_{cn}_testns", usj)
+            self.assertIn(f"cs-u1 = ResourceDragPathProgressState_{cn}_testns", usj)
+            self.assertIn(f"cs-t75 = ResourceDragZoneParams_testns", usj)
+            self.assertIn("post cs-u0 = null", usj)
+            # 本组件段不得引用共享赢家/共享状态
+            self.assertNotIn("ResourceDragPinnedDetectInfo_testns", usj)
+        shared = "\n".join(sections["[CustomShaderDragUpdateScreenJiggle_testns]"])
+        self.assertIn("cs-t67 = ResourceDragPinnedDetectInfo_testns", shared)
+        self.assertIn("cs-u0 = ResourceDragJiggleScreenState_testns", shared)
+        self.assertIn("cs-u1 = ResourceDragPathProgressState_testns", shared)
+
+    def test_command_list_runs_shared_then_each_component_pass(self):
+        _, sections, _ = self._emit_two()
+        cmd = sections["[CommandListDragPinDetected_testns]"]
+        order = [
+            "\trun = CustomShaderDragUpdateScreenJiggle_testns",
+            "\trun = CustomShaderDragUpdateScreenJiggle_abc123_43191_testns",
+            "\trun = CustomShaderDragUpdateScreenJiggle_def456_43191_testns",
+        ]
+        for line in order:
+            self.assertIn(line, cmd)
+        self.assertEqual([cmd.index(line) for line in order], sorted(cmd.index(line) for line in order))
+        # 共享 pass 仍跟随 PinComponent 之后、逐组件 pass 之前
+        self.assertLess(
+            cmd.index("\trun = CustomShaderDragPinComponentdef456_43191_testns"),
+            cmd.index(order[0]),
+        )
+        # boot-clear 必须覆盖逐组件副本（不清则首帧残留垃圾会假命中）
+        for cn in ("abc123_43191", "def456_43191"):
+            self.assertIn(f"\tclear = ResourceDragJiggleScreenState_{cn}_testns 0.0", cmd)
+            self.assertIn(f"\tclear = ResourceDragPathProgressState_{cn}_testns 0.0", cmd)
+
+    def test_present_gate_clears_per_component_state(self):
+        node, sections, comps = self._emit_two()
+        node._emit_present_and_constants(sections, comps, "testns")
+        present = "\n".join(sections["[Present]"])
+        for cn in ("abc123_43191", "def456_43191"):
+            self.assertIn(f"clear = ResourceDragJiggleScreenState_{cn}_testns 0.0", present)
+            self.assertIn(f"clear = ResourceDragPathProgressState_{cn}_testns 0.0", present)
+
+    # ---- (b) 逐组件 vertex_base 正确性 ----
+
+    def test_split_base_vertices_use_geometry_part_base(self):
+        node, sections, comps = self._emit_two()
+        comp = comps[1]
+        self.assertEqual(comp["vertex_base"], 3)
+        self.assertEqual(int(comp["parts"][0]["vertex_base"]), 3)
+        self.assertEqual(int(comp["parts"][1]["vertex_base"]), 0)
+
+        base = "\n".join(sections["[CustomShaderDragDetectdef456_43191_testns]"])
+        p0 = "\n".join(sections["[CustomShaderDragDetectdef456_43191P0_testns]"])
+        p1 = "\n".join(sections["[CustomShaderDragDetectdef456_43191P1_testns]"])
+        # 基座段曾取 min()=0，与 P0 变体的 3 自相矛盾；两者必须都等于掩码基准
+        self.assertIn("z26 = 3", base)
+        self.assertIn("z26 = 3", p0)
+        # stub 前缀 part 保留自身 base，继续读掩码的无效前缀区
+        self.assertIn("z26 = 0", p1)
+
+    def test_mask_buffer_places_geometry_rows_after_prefix(self):
+        """端到端：真实几何 base=3 ⇒ Position.buf 第 0 行必须落在掩码第 3 行。
+
+        取 min()=0 会把权重写在 0..13670，而真实几何按 index+3 读到 3..13673 ⇒ 整体
+        错位 3 行（叶瞬光01 hair 999bff94 完全无命中的直接原因）。
+        """
+        import tempfile
+
+        node = _make_node(self.mod, zone_objects=[self._zone_item(0)])
+        sections = _two_component_sections()
+        comp = node._locate_components(sections, ["abc123", "def456"])[1]
+        node._check_zone_radius_scale = lambda zones: False
+        node._read_position_buf = lambda *args: np.zeros((13671, 3), dtype=np.float32)
+        node._get_reference_matrix_inv = lambda comp: None
+        node._get_export_space_matrix = lambda: np.eye(4)
+        node._get_non_mirror_mirror = lambda: None
+        node._buffer_dir = lambda sections, comp: "Meshes"
+        node._evaluate_zone_field = lambda positions, *args, **kwargs: np.ones(
+            len(positions), dtype=np.float32
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            self.assertTrue(node._write_jiggle_masks(td, sections, comp, "testns"))
+            weights = np.fromfile(
+                Path(td) / "Meshes" / "def456-43191JiggleZoneWeights.buf", dtype=np.float32
+            ).reshape(-1, 4)
+            ids = np.fromfile(
+                Path(td) / "Meshes" / "def456-43191JiggleZoneIDs.buf", dtype=np.uint32
+            ).reshape(-1, 4)
+
+        self.assertEqual(weights.shape, (13674, 4))
+        self.assertTrue(bool(np.all(weights[:3] == 0.0)))
+        self.assertTrue(bool(np.all(ids[:3] == self.mod.INVALID_ZONE_ID)))
+        self.assertTrue(bool(np.all(weights[3:, 0] == 1.0)))
+
+    def test_real_geometry_part_with_foreign_base_fails_loudly(self):
+        node = _make_node(self.mod)
+        sections = _two_component_sections()
+        # part B 不再是 3 行 stub 而是真实几何（12000 索引）却仍声明 base 0：
+        # 同一条 Position.buf 无法同时对齐 0 与 3 ⇒ 必须 fail loudly 而不是静默错位
+        sections["[TextureOverride_def456_def456-43191B]"][-1] = "drawindexed = 12000, 0, 0"
+        with self.assertRaises(ValueError) as ctx:
+            node._locate_components(sections, ["abc123", "def456"])
+        self.assertIn("掩码基准", str(ctx.exception))
+
+    def test_prefix_only_part_boundary(self):
+        detector = self.mod.SSMTNode_PostProcess_DragInteraction._part_is_prefix_only
+        self.assertTrue(detector({"vertex_base": 0, "index_count": 9}, 3))
+        self.assertTrue(detector({"vertex_base": 0, "index_count": 3}, 3))
+        self.assertFalse(detector({"vertex_base": 0, "index_count": 12}, 3))
+        self.assertFalse(detector({"vertex_base": 3, "index_count": 47448}, 3))
+        self.assertFalse(detector({"vertex_base": 5, "index_count": 12}, 3))
+
+    # ---- (c) objvis array == Σ 每组件物体数 ----
+
+    def test_object_vis_array_equals_sum_of_component_counts(self):
+        _, sections, comps = self._emit_two()
+        counts = [len(c["object_id_map"]) for c in comps]
+        total = sum(counts)
+        self.assertEqual(
+            sections["[ResourceDragObjectVis_testns]"],
+            ["type = RWBuffer", "format = R32_FLOAT", f"array = {total}"],
+        )
+        self.assertEqual([c["object_count"] for c in comps], counts)
+        pub = "\n".join(sections["[CommandListDragVisPublish_testns]"])
+        for oid in range(total):
+            self.assertIn(f"$ssmtdrag_objvis_testns_{oid}", pub)
+
+    def test_stale_object_vis_array_is_rewritten_to_current_counts(self):
+        node = _make_node(self.mod)
+        sections = _two_component_sections()
+        # 旧导出残留（物体增删后）：array 与新 oid 空间错位会让发布 CS 漏写后段 flag
+        sections["[ResourceDragObjectVis_testns]"] = [
+            "type = RWBuffer", "format = R32_FLOAT", "array = 99",
+        ]
+        comps = node._locate_components(sections, ["abc123", "def456"])
+        node._emit_sections(sections, comps, "testns")
+        total = sum(len(c["object_id_map"]) for c in comps)
+        self.assertEqual(sections["[ResourceDragObjectVis_testns]"][-1], f"array = {total}")
+
+    def test_duplicate_object_ids_fail_loudly(self):
+        node = _make_node(self.mod)
+        comps = [
+            {"comp_name": "a", "object_count": 2, "object_id_map": {"A": 0, "B": 1}},
+            {"comp_name": "b", "object_count": 2, "object_id_map": {"C": 1, "D": 2}},
+        ]
+        with self.assertRaises(ValueError) as ctx:
+            node._emit_vis_publish_sections(OrderedDict(), comps, "testns")
+        self.assertIn("ResourceDragObjectVis", str(ctx.exception))
+
+    def test_object_count_must_be_derived_from_id_map(self):
+        node = _make_node(self.mod)
+        comps = [{"comp_name": "a", "object_count": 5, "object_id_map": {"A": 0}}]
+        with self.assertRaises(ValueError) as ctx:
+            node._emit_vis_publish_sections(OrderedDict(), comps, "testns")
+        self.assertIn("object_id_map", str(ctx.exception))
 
 
 if __name__ == "__main__":
