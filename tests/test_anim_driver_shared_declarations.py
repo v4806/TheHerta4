@@ -70,31 +70,20 @@ sys.modules[_spec.name] = collector_module
 _spec.loader.exec_module(collector_module)
 
 
-def _runtime_segment(fps, frame_var="anim_frame1", alias_owner=False):
+def _runtime_segment(fps, frame_var="anim_frame1"):
     """与生产实现（anim_driver_runtime.generate_ini_segment）同形。
 
-    每个运行时间节点只声明**自己的**预分配帧变量；``auto_index`` 最小的那个
-    额外维护 ``$swapvar`` / ``$fps`` 兼容别名（只一份，不再重复声明）。
+    每个运行时间节点只声明**自己的**预分配帧变量；不再有共享的 ``$swapvar`` /
+    ``$fps`` 兼容别名。
     """
-    lines = [
+    return "\n".join([
         "[Constants]",
         f"global persist ${frame_var} = 0",
         "; 当前帧索引（整数）",
-    ]
-    if alias_owner:
-        lines.extend([
-            "global persist $swapvar = 0",
-            f"global persist $fps = {fps}",
-            "; 兼容别名（手写 $swapvar / $fps 仍可用）",
-        ])
-    lines.extend([
         "[Present]",
         "; 基于系统时间的自动计算（每帧执行）",
         f"${frame_var} = (time * {fps}) // 1",
     ])
-    if alias_owner:
-        lines.append(f"$swapvar = ${frame_var}")
-    return "\n".join(lines)
 
 
 class _FakeRuntimeNode:
@@ -119,22 +108,8 @@ class _FakeRuntimeNode:
             or f"anim_frame{self.auto_index}"
         )
 
-    def is_compat_alias_owner(self):
-        tree = self.id_data
-        runtime_nodes = [
-            node for node in (getattr(tree, "nodes", None) or [])
-            if getattr(node, "bl_idname", "") == "SSMTNode_AnimDriver_Runtime"
-        ] if tree else []
-        if not runtime_nodes:
-            return True
-        owner = min(
-            runtime_nodes,
-            key=lambda node: (int(getattr(node, "auto_index", 0) or 0), str(getattr(node, "name", ""))),
-        )
-        return owner is self
-
     def generate_ini_segment(self, connected_nodes=None):
-        return _runtime_segment(self.fps, self.frame_variable_name(), self.is_compat_alias_owner())
+        return _runtime_segment(self.fps, self.frame_variable_name())
 
 
 class _FakeToggleNode:
@@ -346,9 +321,9 @@ class RuntimeDriverDedupIntegrationTests(unittest.TestCase):
         for index in range(1, 5):
             self.assertEqual(joined.count(f"global persist $anim_frame{index} = 0"), 1)
             self.assertEqual(joined.count(f"$anim_frame{index} = (time * 60) // 1"), 1)
-        # 兼容别名只有一份（auto_index 最小的那个节点发），手写 $swapvar/$fps 仍可用
-        self.assertEqual(joined.count("global persist $swapvar = 0"), 1)
-        self.assertEqual(joined.count("global persist $fps = 60"), 1)
+        # 不再有共享的 $swapvar / $fps 兼容别名
+        self.assertNotIn("$swapvar", joined)
+        self.assertNotIn("$fps", joined)
         self.assertEqual(collector.last_normalization["renames"], [])
 
     def test_different_fps_runtime_nodes_do_not_conflict(self):

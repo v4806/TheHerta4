@@ -10,9 +10,8 @@ SHAPEKEY_PREFIX = "Freq_"
 CONTINUOUS_SHAPEKEY_INDEX_PREFIX = "continuous_shapekey_frame"
 UV_OFFSET_PREFIX = "uv_offset"
 #: 「运行时间」动画驱动节点的帧计数器变量前缀（按节点 auto_index 命名）。
-#: 刻意不用历史共享名 ``swapvar`` —— 那个名字要留给兼容别名（手写文本/外部 mod
-#: 仍按 ``$swapvar`` 读），每节点帧变量用独立前缀才不会与旧名/Velo 桥接的
-#: ``$swapvar_*`` 交叉冲突。
+#: 全部运行时间节点都用这一族名字（不再有共享的 ``swapvar`` 兼容别名），
+#: 因此不会与历史产物里的 ``$swapvar`` / Velo 桥接的 ``$swapvar_*`` 交叉冲突。
 ANIM_DRIVER_FRAME_PREFIX = "anim_frame"
 
 _SAFE_NAME_RE = re.compile(r"[^a-zA-Z0-9_]")

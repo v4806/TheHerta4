@@ -368,7 +368,7 @@ class AnimDriverBaseTests(unittest.TestCase):
         ini = node.generate_ini_segment()
 
         self.assertIn("global persist $speed_auto1 = 2", ini)
-        self.assertIn("if $swapvar % $speed_auto1 == 0", ini)
+        self.assertIn("if $anim_frame % $speed_auto1 == 0", ini)
         self.assertIn("if $a == 1\n            $progress = $progress + 0.1", ini)
         self.assertIn("if $b == 1\n            $progress = $progress + 0.1", ini)
         self.assertEqual(ini.count("$progress = $progress + 0.1"), 2)
@@ -1539,8 +1539,11 @@ class AnimDriverBaseTests(unittest.TestCase):
         merged = collector_module.AnimationDriverCollector(node_group).collect()[0]["ini_content"]
 
         _assert_balanced_conditionals(self, merged)
-        self.assertIn("global persist $fps = 30", merged)
-        self.assertIn("global persist $swapvar = 0", merged)
+        # 运行时间节点只发自己的预分配帧变量（不再有共享的 $fps / $swapvar）
+        self.assertIn("global persist $anim_frame1 = 0", merged)
+        self.assertIn("$anim_frame1 = (time * 30) // 1", merged)
+        self.assertNotIn("$swapvar", merged)
+        self.assertNotIn("$fps", merged)
 
     def test_toggle_comment_is_emitted_into_ini(self):
         node = toggle_module.SSMTNode_AnimDriver_Toggle()
@@ -1725,38 +1728,34 @@ class RuntimeFrameVariablePreallocationTests(unittest.TestCase):
 
         self.assertEqual(node.frame_variable_name(), "my_frame")
 
-    def test_only_smallest_index_runtime_emits_compat_alias(self):
+    def test_each_runtime_node_only_emits_its_own_frame_variable(self):
+        """不再有共享的 $swapvar / $fps 兼容别名：全部走 $anim_frame{序号}。"""
         tree = types.SimpleNamespace(name="动画驱动蓝图", bl_idname='SSMTBlueprintTreeType', nodes=[], links=[])
         owner = self._make_runtime("运行时间", 1, tree)
         other = self._make_runtime("运行时间.001", 2, tree)
 
         owner_segment = owner.generate_ini_segment()
         other_segment = other.generate_ini_segment()
+        joined = owner_segment + other_segment
 
-        self.assertTrue(owner.is_compat_alias_owner())
-        self.assertFalse(other.is_compat_alias_owner())
         # 各自声明自己的帧变量，互不重名
         self.assertIn("global persist $anim_frame1 = 0", owner_segment)
         self.assertIn("$anim_frame1 = (time * 30) // 1", owner_segment)
         self.assertIn("global persist $anim_frame2 = 0", other_segment)
         self.assertIn("$anim_frame2 = (time * 30) // 1", other_segment)
-        # 兼容别名只出现一次（$swapvar / $fps 不再被 N 个节点重复声明）
-        self.assertIn("global persist $swapvar = 0", owner_segment)
-        self.assertIn("$swapvar = $anim_frame1", owner_segment)
-        self.assertNotIn("global persist $swapvar = 0", other_segment)
-        self.assertNotIn("global persist $fps", other_segment)
-        self.assertEqual(
-            (owner_segment + other_segment).count("global persist $swapvar = 0"), 1
-        )
-        self.assertEqual((owner_segment + other_segment).count("global persist $fps"), 1)
+        # 旧的共享名彻底消失（既不是别名，也没有 $fps 字面量变量）
+        self.assertNotIn("$swapvar", joined)
+        self.assertNotIn("$fps", joined)
 
-    def test_frame_variable_of_falls_back_to_shared_swapvar(self):
-        self.assertEqual(anim_driver_base.SSMTNode_AnimDriver_Base._frame_variable_of(None), "$swapvar")
+    def test_frame_variable_of_falls_back_to_unindexed_anim_frame(self):
+        self.assertEqual(
+            anim_driver_base.SSMTNode_AnimDriver_Base._frame_variable_of(None), "$anim_frame"
+        )
         self.assertEqual(
             anim_driver_base.SSMTNode_AnimDriver_Base._frame_variable_of(
                 types.SimpleNamespace(custom_frame_variable_name="", assigned_frame_variable_name="")
             ),
-            "$swapvar",
+            "$anim_frame",
         )
         self.assertEqual(
             anim_driver_base.SSMTNode_AnimDriver_Base._frame_variable_of(
