@@ -3952,6 +3952,9 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 f"ps = {RES_SHADER_DIR}/rzm_gs_probe.hlsl",
                 "topology = point_list",
                 f"o0 = set_viewport no_view_cache ResourceDragBakeRT_{ns}",
+                # [t148] 探针精确写入：透明 pass 的 alpha 混合会污染校准 RT
+                "blend = ADD ONE ZERO",
+                "alpha = ADD ONE ZERO",
                 f"local {off_var}",
                 f"{off_var} = {base_var} + {i_var} * {step_var}",
                 f"x26 = {i_var}",

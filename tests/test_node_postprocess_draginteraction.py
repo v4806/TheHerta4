@@ -1807,6 +1807,9 @@ class DragNodeEmitTests(unittest.TestCase):
         # part A: index_count=52688 → step = 52688//8 = 6586；R5 段合并后单 sample 段
         #（8P → P），偏移经 [Constants] global 迭代变量推导
         s1 = sections["[CustomShaderDragBakeSample_abc123_43191P0_testns]"]
+        # [t148] 探针必须强制精确写入（透明 pass 的混合会污染校准）
+        assert "blend = ADD ONE ZERO" in s1
+        assert "alpha = ADD ONE ZERO" in s1
         self.assertIn("local $ssmtdrag_bake_off_abc123_43191P0_testns", s1)
         self.assertIn(
             "$ssmtdrag_bake_off_abc123_43191P0_testns = "
