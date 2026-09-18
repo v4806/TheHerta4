@@ -224,6 +224,7 @@ class ExportRoundExecutor:
         reverse_rename = {v: k for k, v in BluePrintModel._object_name_mapping.items()}
 
         invalid_objects = []
+        absent_objects = []
         for chain in blueprint_model.processing_chains:
             if chain.is_valid:
                 obj_name = chain.object_name
@@ -236,7 +237,22 @@ class ExportRoundExecutor:
                     continue
                 if chain.original_object_name and chain.original_object_name in copy_names:
                     continue
+                # 阻断修复（t80 §2.3）：**源对象根本不存在**的链路不是"副本引用没更新"
+                # 的错误——生成器会给它注入极限小三角占位（部件缺席是受支持形态：
+                # 蓝图声明 19 件 / 场景只有 4 个 mesh）。只有源对象真实存在的链路
+                # 拿不到副本才算前处理失败。
+                if not BlueprintExportHelper.scene_object_present(
+                    obj_name, getattr(chain, "original_object_name", "")
+                ):
+                    absent_objects.append(obj_name)
+                    continue
                 invalid_objects.append(obj_name)
+
+        if absent_objects:
+            LOG.info(
+                f"   豁免 {len(absent_objects)} 条「源对象不存在」链路"
+                "（交由生成器的极限小三角占位处理）"
+            )
 
         if invalid_objects:
             raise ParallelExportError("前处理错误：物体引用未正确更新为副本")

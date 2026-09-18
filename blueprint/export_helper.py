@@ -480,6 +480,72 @@ class BlueprintExportHelper:
         return bool(BlueprintExportHelper.suppress_shapekey_resource_export)
 
     @staticmethod
+    def count_exportable_shapekey_blocks(obj) -> int:
+        """物体的可导出形态键数量（不含第 0 个 Basis 键块）。"""
+        if obj is None:
+            return 0
+        data = getattr(obj, "data", None)
+        shape_keys = getattr(data, "shape_keys", None)
+        key_blocks = getattr(shape_keys, "key_blocks", None)
+        if not key_blocks:
+            return 0
+        return max(len(key_blocks) - 1, 0)
+
+    @staticmethod
+    def detect_standard_route_baked_shapekey_objects(
+        original_to_copy_map=None,
+        object_getter=None,
+    ) -> list:
+        """找出「标准前处理把形态键烘焙掉」的源物体（非直出路线静默丢产物的根因证据）。
+
+        标准（非直出）前处理 `blueprint/preprocess.py::_apply_shape_keys` 会把副本上的
+        非 Basis 键块烘焙进网格并移除（`bake_current_shape_key_mix_to_mesh` +
+        `remove_non_basis_shape_keys`）。于是「源物体有形态键、副本一个都不剩」是本轮
+        不可能产出形态键载荷的确证 —— 经典发射器 `M_IniHelper.add_shapekey_ini_sections`
+        据此报警，而不是静默 `return`。
+
+        直出路线同样烘焙副本，但键位置在烘焙**之前**已被采样记录
+        （`_capture_direct_shape_key_positions`），所以调用方必须结合
+        `should_suppress_shapekey_resource_export()` 判断是否真的丢产物。
+
+        Args:
+            original_to_copy_map: 源物体名 → 副本物体名。缺省懒读
+                `PreProcessHelper.original_to_copy_map`（懒导入，避免与 preprocess 循环依赖）。
+            object_getter: 名字 → 物体。缺省 `bpy.data.objects.get`，测试可注入。
+
+        Returns:
+            排序后的源物体名列表（源物体有可导出形态键，而副本已无）。
+        """
+        if object_getter is None:
+            object_getter = bpy.data.objects.get
+
+        if original_to_copy_map is None:
+            original_to_copy_map = {}
+            try:
+                from .preprocess import PreProcessHelper
+
+                original_to_copy_map = dict(
+                    getattr(PreProcessHelper, "original_to_copy_map", {}) or {}
+                )
+            except Exception:
+                original_to_copy_map = {}
+
+        baked_object_names = []
+        for original_name, copy_name in (original_to_copy_map or {}).items():
+            if not original_name or not copy_name:
+                continue
+            original_obj = object_getter(original_name)
+            copy_obj = object_getter(copy_name)
+            if original_obj is None or copy_obj is None:
+                continue
+            if BlueprintExportHelper.count_exportable_shapekey_blocks(original_obj) <= 0:
+                continue
+            if BlueprintExportHelper.count_exportable_shapekey_blocks(copy_obj) <= 0:
+                baked_object_names.append(original_name)
+
+        return sorted(baked_object_names)
+
+    @staticmethod
     def set_capture_direct_shapekey_positions(enabled: bool):
         BlueprintExportHelper.capture_direct_shapekey_positions = bool(enabled)
 
@@ -743,6 +809,34 @@ class BlueprintExportHelper:
             visited_trees=set(),
         )
         return ordered_nodes
+
+    @staticmethod
+    def scene_object_present(*names: str) -> bool:
+        """任一给定名字（或其 ``.ZZMI_SOURCE`` / ``_copy`` 变体）在场景里有对象。
+
+        阻断修复（t80 §2.2/§2.3）：蓝图声明的部件**未必**在场景里有对象
+        （实测 19 件声明 / 4 个 mesh）——这些部件由生成器的「极限小三角占位」
+        机制在导出期实体化。两个地方必须能区分「源对象不存在（受支持形态）」与
+        「源对象在、但副本引用没更新（真错误）」：
+
+        - `blueprint/export_parallel.py` 的副本引用守卫；
+        - `ui/universal/zzmi.py` 的占位注入（`present` 必须按**场景真实存在**判定）。
+        """
+        candidates: set[str] = set()
+        for name in names:
+            text = str(name or "").strip()
+            if not text:
+                continue
+            candidates.add(text)
+            for suffix in (".ZZMI_SOURCE", "_copy", "_copy_temp", "_temp"):
+                if text.endswith(suffix):
+                    candidates.add(text[: -len(suffix)])
+                else:
+                    candidates.add(text + suffix)
+        for candidate in candidates:
+            if candidate and bpy.data.objects.get(candidate) is not None:
+                return True
+        return False
 
     @staticmethod
     def collect_connected_object_names(tree) -> list[str]:
