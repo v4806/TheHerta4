@@ -26,6 +26,8 @@ from .variable_registry import (
     cjk_to_ascii,
     is_pinyin_available,
     reset_pinyin_cache,
+    shape_key_base_variable_name,
+    get_referenced_variable_names,
 )
 from ..common.mod_path_compat import collect_base_position_resource_map
 from ..common.mod_path_compat import derive_shapekey_base_resource_name
@@ -363,33 +365,54 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                     if shape_key_name not in newly_created_names:
                         backfilled_count += 1
                 else:
-                    # 已存在预分配：用当前规则重算“理想名”，判断是否需要刷新。
-                    # 会触发刷新的场景：
+                    # 已存在预分配：**已分配就不再重新分配**。
+                    # 只有命名函数本身对该形态键的输出变了才允许刷新：
                     #   * 之前生成时 pypinyin 未安装，中文形态键名被 _sanitize_name 剥离，
                     #     只剩后缀（如 "摇摆_001" -> "Freq__001"）；装上 pypinyin 后
                     #     能正确转换（"Freq_yaobai_001"）。
                     #   * 反过来 pypinyin 被卸载，需要回落到 uXXXX 编码。
                     #   * cjk_to_ascii 实现升级导致转换结果变化。
-                    # 重算时把本项自身已占用的名字作为 owned 排除，避免自我冲突。
-                    ideal_assigned = allocate_shape_key_variable_name(
-                        shape_key_name,
-                        owned_names=owned_names,
+                    # 旧名已经是当前基名（或它的 _N 变体）时，说明差异只可能来自
+                    # 「基名被别的 owner 占了」的冲突去重 —— 那不是命名变化，改写它
+                    # 会让变量名随别的蓝图树一增一减而变，驱动/导出引用全部错位。
+                    base_assigned = shape_key_base_variable_name(shape_key_name)
+                    naming_output_unchanged = (
+                        old_assigned == base_assigned
+                        or old_assigned.startswith(f"{base_assigned}_")
                     )
-                    if ideal_assigned != old_assigned:
-                        existing.assigned_variable_name = ideal_assigned
-                        # 仅当 custom 仍等于旧 assigned（即未被用户手动修改）时才同步更新，
-                        # 否则保留用户自定义输入。
-                        if old_custom == old_assigned:
-                            existing.custom_variable_name = ideal_assigned
-                        print(
-                            f"[ShapeKey] 已刷新变量名: '{shape_key_name}' "
-                            f"'{old_assigned}' -> '{ideal_assigned}'"
+                    if naming_output_unchanged:
+                        if old_assigned != base_assigned:
+                            print(
+                                f"[ShapeKey] 保留已分配变量名 '{old_assigned}'"
+                                f"（'{shape_key_name}' 当前基名 '{base_assigned}'；"
+                                f"已分配的变量不再重新分配，如需改名请手动修改「导出变量」）"
+                            )
+                        if not old_custom:
+                            # 名字没变但 custom 是空的：按老逻辑回填
+                            existing.custom_variable_name = old_assigned
+                            backfilled_count += 1
+                    else:
+                        # 命名规则变了：用当前规则重算“理想名”。
+                        # 重算时把本项自身已占用的名字作为 owned 排除，避免自我冲突。
+                        ideal_assigned = allocate_shape_key_variable_name(
+                            shape_key_name,
+                            owned_names=owned_names,
                         )
-                        refreshed_count += 1
-                    elif not old_custom:
-                        # 名字没变但 custom 是空的：按老逻辑回填
-                        existing.custom_variable_name = old_assigned
-                        backfilled_count += 1
+                        if ideal_assigned != old_assigned:
+                            existing.assigned_variable_name = ideal_assigned
+                            # 仅当 custom 仍等于旧 assigned（即未被用户手动修改）时才同步更新，
+                            # 否则保留用户自定义输入。
+                            if old_custom == old_assigned:
+                                existing.custom_variable_name = ideal_assigned
+                            print(
+                                f"[ShapeKey] 已刷新变量名: '{shape_key_name}' "
+                                f"'{old_assigned}' -> '{ideal_assigned}'"
+                            )
+                            refreshed_count += 1
+                        elif not old_custom:
+                            # 名字没变但 custom 是空的：按老逻辑回填
+                            existing.custom_variable_name = old_assigned
+                            backfilled_count += 1
 
                 rebuilt_items.append(existing)
 
@@ -432,6 +455,57 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
         if refreshed_count:
             print(f"[ShapeKey] 已自动刷新 {refreshed_count} 个形态键变量名")
         return created_count, backfilled_count
+
+    def heal_forked_shape_key_variable_names(self):
+        """把被「驱动引用名」挤到 _N 的预分配名拉回基名。
+
+        历史 bug：variable_registry 把动画驱动/点击导出的「目标变量」也算作已占用，
+        形态键预分配只能退到 ``Freq_xxx_1``；驱动侧保存的仍是 ``Freq_xxx`` →
+        两边永久错开（自锁：重算理想名恒返回 _N，用户再点预分配也回不去）。
+        分配口径已修正为「只跟 owner 比」；这里在导出前做一次**非破坏性**归一：
+        只改「旧名 == 理想名 + _N」的条目，不增删条目、不动用户手改过的名字
+        （custom != assigned 时只改 assigned）。返回 [(形态键名, 旧名, 新名)]。
+
+        额外门槛：只有基名**确实还被某处引用**（驱动/点击目标等，且限于本节点
+        所在的这棵树）时才归一。没有引用时那个 ``_N`` 只是历史冲突残留，拉回
+        基名等于改写一个已分配的变量名 —— 违反「已分配就不再重新分配」，也会让
+        变量名随别的蓝图树一增一减而变。
+        """
+        changed = []
+        try:
+            referenced_names = get_referenced_variable_names(tree=getattr(self, "id_data", None))
+        except Exception:
+            referenced_names = set()
+        for item in getattr(self, "shapekey_variable_items", None) or []:
+            shape_key_name = str(getattr(item, "shape_key_name", "") or "").strip()
+            if not shape_key_name:
+                continue
+            old_assigned = normalize_variable_name(getattr(item, "assigned_variable_name", "") or "")
+            if not old_assigned:
+                continue
+            old_custom = normalize_variable_name(getattr(item, "custom_variable_name", "") or "")
+            owned_names = (
+                getattr(item, "assigned_variable_name", ""),
+                getattr(item, "custom_variable_name", ""),
+            )
+            ideal = allocate_shape_key_variable_name(shape_key_name, owned_names=owned_names)
+            if ideal == old_assigned:
+                continue
+            # 只处理「带 _N 后缀 → 去后缀基名」这一种分叉；其它差异交给导出校验告警
+            if not old_assigned.startswith(f"{ideal}_"):
+                continue
+            # 基名没人引用 ⇒ 旧后缀不是「引用名挤占」留下的分叉，保留已分配名
+            if ideal not in referenced_names:
+                continue
+            item.assigned_variable_name = ideal
+            if old_custom == old_assigned:
+                item.custom_variable_name = ideal
+            changed.append((shape_key_name, old_assigned, ideal))
+        if changed:
+            print(f"[ShapeKey] 变量名分叉自愈 {len(changed)} 项（驱动引用不再挤占预分配基名）:")
+            for shape_key_name, old_name, new_name in changed:
+                print(f"    '{shape_key_name}': {old_name} -> {new_name}")
+        return changed
 
     def _is_shape_key_export_enabled(self, shape_key_name) -> bool:
         """形态键未在映射列表中时默认视为勾选；仅显式取消勾选的条目才不导出。"""
@@ -2050,34 +2124,43 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
             if drag_drive_enabled:
                 define_lines.append(f"Buffer<float> ShapeKeyDrive : register(t{self.DRAG_DRIVE_REGISTER});")
                 define_lines.append(f"Buffer<uint> ShapeKeyClickCount : register(t{self.DRAG_CLICK_COUNT_REGISTER});")
-                if any(zone >= 0 for zone in zone_ids):
-                    ids_text = ", ".join(str(zone) if zone >= 0 else "0xFFFFFFFFu" for zone in zone_ids)
-                    define_lines.append(f"static const uint SHAPEKEY_ZONE_IDS[{len(zone_ids)}] = {{ {ids_text} }};")
-                    stage_list = list(click_stages) if len(click_stages) == len(zone_ids) else [1] * len(zone_ids)
-                    dir_list = list(drag_dirs) if len(drag_dirs) == len(zone_ids) else [4] * len(zone_ids)
-                    nd_stage_ids = []
-                    slot_ids = []
-                    for idx, zone in enumerate(zone_ids):
-                        if zone < 0 or zone >= len(zone_bases):
-                            nd_stage_ids.append(0xFFFFFFFF)
-                            slot_ids.append(0xFFFFFFFF)
-                            continue
-                        d = dir_list[idx] if idx < len(dir_list) else 4
-                        if d >= 0 and d < 4:
-                            nd_stage_ids.append(0xFFFFFFFF)
-                            slot_ids.append(zone_bases[zone] + d)
-                        else:
-                            stage = max(1, stage_list[idx] if idx < len(stage_list) else 1)
-                            nd_stage_ids.append(stage)
-                            slot_ids.append(zone_bases[zone] + 4 + (stage - 1))
-                    nd_text = ", ".join(str(v) if v >= 0 else "0xFFFFFFFFu" for v in nd_stage_ids)
-                    define_lines.append(f"static const uint SHAPEKEY_ND_STAGE_IDS[{len(zone_ids)}] = {{ {nd_text} }};")
-                    slot_text = ", ".join(str(v) if v >= 0 else "0xFFFFFFFFu" for v in slot_ids)
-                    define_lines.append(f"static const uint SHAPEKEY_SLOT_IDS[{len(zone_ids)}] = {{ {slot_text} }};")
-                else:
-                    define_lines.append("static const uint SHAPEKEY_ZONE_IDS[1] = { 0xFFFFFFFFu };")
-                    define_lines.append("static const uint SHAPEKEY_ND_STAGE_IDS[1] = { 0xFFFFFFFFu };")
-                    define_lines.append("static const uint SHAPEKEY_SLOT_IDS[1] = { 0xFFFFFFFFu };")
+                # 数组长度必须覆盖全部 FREQ 索引：freq_idx 取自 vertex_freq_indices，
+                # 取值范围 0..len(unique_names)-1，而下方取值逻辑无条件按 freq_idx 索引
+                # 三张表。历史实现只在「至少一个区域被绑定」时才发满长度数组，否则发
+                # [1] 占位 —— 于是「开了拖拽驱动但一个区域都没绑」的工程会越界读常量
+                # 缓冲（HLSL 不做边界检查），读到垃圾 zone/slot → 面板变量被
+                # ShapeKeyDrive[垃圾] 顶掉，表现为形态键不受滑块控制/跳变。
+                # 这里恒发满长度数组，未绑定项填 0xFFFFFFFF（走变量回退分支）。
+                array_len = max(len(zone_ids), len(unique_names), 1)
+                zone_text = ", ".join(
+                    str(zone_ids[i])
+                    if i < len(zone_ids) and 0 <= int(zone_ids[i]) < len(zone_bases)
+                    else "0xFFFFFFFFu"
+                    for i in range(array_len)
+                )
+                define_lines.append(f"static const uint SHAPEKEY_ZONE_IDS[{array_len}] = {{ {zone_text} }};")
+                stage_list = list(click_stages) if len(click_stages) == array_len else [1] * array_len
+                dir_list = list(drag_dirs) if len(drag_dirs) == array_len else [4] * array_len
+                nd_stage_ids = []
+                slot_ids = []
+                for idx in range(array_len):
+                    zone = int(zone_ids[idx]) if idx < len(zone_ids) else -1
+                    if zone < 0 or zone >= len(zone_bases):
+                        nd_stage_ids.append(0xFFFFFFFF)
+                        slot_ids.append(0xFFFFFFFF)
+                        continue
+                    d = dir_list[idx] if idx < len(dir_list) else 4
+                    if d >= 0 and d < 4:
+                        nd_stage_ids.append(0xFFFFFFFF)
+                        slot_ids.append(zone_bases[zone] + d)
+                    else:
+                        stage = max(1, stage_list[idx] if idx < len(stage_list) else 1)
+                        nd_stage_ids.append(stage)
+                        slot_ids.append(zone_bases[zone] + 4 + (stage - 1))
+                nd_text = ", ".join(str(v) if v >= 0 else "0xFFFFFFFFu" for v in nd_stage_ids)
+                define_lines.append(f"static const uint SHAPEKEY_ND_STAGE_IDS[{array_len}] = {{ {nd_text} }};")
+                slot_text = ", ".join(str(v) if v >= 0 else "0xFFFFFFFFu" for v in slot_ids)
+                define_lines.append(f"static const uint SHAPEKEY_SLOT_IDS[{array_len}] = {{ {slot_text} }};")
             for i, name in enumerate(unique_names):
                 zone = zone_ids[i] if i < len(zone_ids) else -1
                 if drag_drive_enabled and zone >= 0:
@@ -2402,6 +2485,15 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
 
             all_unique_names = list(OrderedDict.fromkeys(name for slot_data in slot_to_name_to_objects.values() for name in slot_data.keys()))
             all_unique_objects = list(OrderedDict.fromkeys(obj for slot_data in slot_to_name_to_objects.values() for name_data in slot_data.values() for obj in name_data))
+
+            # 变量名自愈（非破坏性）：动画驱动/点击导出的「目标变量」只是引用，
+            # 历史版本误当作占用，把形态键预分配挤成了 Freq_xxx_1，与驱动保存的
+            # 基名永久错开。分配口径已修正；这里在导出前把已分叉的名字拉回基名，
+            # 让「再导出一次」就自动修好，不要求用户先点预分配。
+            try:
+                self.heal_forked_shape_key_variable_names()
+            except Exception as exc:
+                print(f"[ShapeKey][警告] 变量名分叉自愈失败（不影响导出；驱动侧引用会在发射前对齐）: {exc}")
 
             hash_to_base_resources = {}
             resource_pattern = re.compile(r'\[(Resource_?([a-f0-9]{8}(?:[_-][a-f0-9]+)*)_?Position(\d*))\]')

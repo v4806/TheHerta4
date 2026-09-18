@@ -78,6 +78,8 @@ _install_module(
     cjk_to_ascii=lambda value: str(value or ""),
     is_pinyin_available=lambda **_kwargs: False,
     reset_pinyin_cache=lambda *_args, **_kwargs: None,
+    shape_key_base_variable_name=lambda shape_key_name: f"Freq_{shape_key_name}",
+    get_referenced_variable_names=lambda *_args, **_kwargs: set(),
 )
 _install_module(
     f"{PKG}.common.mod_path_compat",
