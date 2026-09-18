@@ -2942,11 +2942,16 @@ class ExportZZMI(ExportUnity):
         palette 里**逐位相同（Δ=0）**，而两个实例的差极小（G0 槽 0 只有
         1.4e-7…8.2e-6、G2 槽 185 = 1.32e-3），远小于任何量化格。
 
-        **不再有出现次回退分支**：指纹块是**唯一**的捕获路径；``HashRegion`` 失败
-        （键 ≤ 0）时走**显式诊断路径**（``POSE_KEY_HASH_UNAVAILABLE``），由调用方
-        分级记录，绝不静默退回出现次。捕获不能写在该 ``if`` 体内（3DMigoto 的
-        加载期优化器会把只在 ``if`` 体内赋值的语句静态折叠掉），所以两条分支各发
-        一次捕获——它们是**同一判据**的两条结果路径，不是两套判据。
+        **判据不退回出现次，但捕获必须在两条结果路径上都发**：指纹是**唯一**的
+        *判定*口径，``HashRegion`` 失败（键 ≤ 0）时走**显式诊断**（由调用方分级
+        记录），绝不静默改用出现次*判定*。但**写不能只存在于 ``> 0`` 体内**：键
+        失败（实测返回 -1/-2/-3）时该分支整块不执行，若无条件读取 palette 的
+        attach（顶层无条件 ``run``）/ 重放守卫照常读取，则它们读到**从未写入**的
+        缓冲 ⇒ 合并骨架为空（可全零）→ 模型消失 / 形态键静默失效（用户实测症状
+        「门控的问题，就是形态键失效」，叶瞬光01：键恒 0/-1，失败分支曾是**空壳**）。
+        因此两条结果路径各发一次捕获（``> 0`` 用键算出的槽；``≤ 0`` 用出现次这个
+        **位置标签**定落点，与绘制侧在键不可用时同样按出现次选槽的口径一致）；
+        它们是**同一判据**的两条结果路径，不是两套判据。
         """
         component = self.merged_skeleton_components[component_id]
         record = self._merged_component_channel_record(component)
@@ -2956,6 +2961,8 @@ class ExportZZMI(ExportUnity):
         slots = self._merged_skeleton_slots()
         slot_first, slot_second = slots[0], slots[-1]
         key_var = self._merged_pose_key_var(skeleton_group)
+        # 键不可用时的**落点**依据：本 pass 的出现次（位置标签，不是判据）。
+        occ_var = self._merged_occ_var(component_id)
         # 池在表达式里带 `$` 前缀（EFMI 口径：$PoolInput_ObjectSpatialIdentity[...]）
         key_pool = "$" + self._merged_pose_key_pool_prefix(skeleton_group)
         taken_pool = "$" + self._merged_pose_slot_taken_pool(skeleton_group)
@@ -2971,15 +2978,15 @@ class ExportZZMI(ExportUnity):
         shared = int(record.get("channel_shared_components") or 0)
         weight = int(record.get("channel_shared_weight") or 0)
 
-        def emit_capture(target_slot: int) -> None:
+        def emit_capture(target_slot: int, indent: str = "    ") -> None:
             """把当帧 palette 落到 <target_slot>，SO 别名只由 SO owner 重捕获。"""
             section.append(
-                f"    {self._merged_palette_name(draw_ib, target_slot)} = "
+                f"{indent}{self._merged_palette_name(draw_ib, target_slot)} = "
                 "copy vs-t0 unless_null"
             )
             if owner:
                 section.append(
-                    f"    {self._merged_redirect_so_name(skeleton_group, target_slot)}"
+                    f"{indent}{self._merged_redirect_so_name(skeleton_group, target_slot)}"
                     " = ref so0"
                 )
                 # O3：登记 referent 捕获点（只计数，不改产物文本）。键块里两个槽
@@ -3021,12 +3028,21 @@ class ExportZZMI(ExportUnity):
         section.append("    else")
         emit_capture(slot_first)
         section.append("    endif")
-        section.append(f"else")
+        section.append("else")
         section.append(
-            f"    ; 键 <= 0：HashRegion 失败（-1/-2/-3）。显式诊断路径——"
-            "**不退回出现次**，本 pass 不捕获（保持上一帧内容），由下面"
-            "对应的诊断注释与契约判定承担。"
+            "    ; 键 <= 0：HashRegion 失败（-1/-2/-3）。判定**不退回出现次判定**"
+            "（唯一判据仍是键），但本 pass 的"
         )
+        section.append(
+            "    ; palette / SO 引用**必须照发**：写不能只存在于上面的 if 体内"
+            "（无条件读取它的 attach / 重放守卫会读走空骨架）"
+        )
+        section.append("    ; → 落点改用出现次位置标签（只定落点，不参与判定）。")
+        for index, slot in enumerate(slots):
+            section.append(f"    if {occ_var} == {slot}" if index == 0 else "    else")
+            emit_capture(slot, indent="        ")
+        if len(slots) > 1:
+            section.append("    endif")
         section.append("endif")
 
     def _merged_group_so_capturer_component_ids(self, skeleton_group: int) -> list[int]:

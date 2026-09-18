@@ -467,6 +467,37 @@ class _Fixture(unittest.TestCase):
         return "\n".join(_all_builder_lines(builder))
 
 
+def _key_guard_blocks(text, group):
+    """把 VB 段里每个 ``if $zz_ms_pose_key_<g> > 0`` 守卫切成 ``(if_body, else_body)``。
+
+    守卫级 ``else`` / ``endif`` 都写在第 0 列（池/槽内的 else/endif 有缩进），因此按
+    **整行精确匹配**取出的就是键守卫自己的两条边界行。
+    """
+    lines = text.splitlines()
+    guard = f"if $zz_ms_pose_key_{group} > 0"
+    blocks = []
+    for index, line in enumerate(lines):
+        if line != guard:
+            continue
+        else_index = lines.index("else", index)
+        endif_index = lines.index("endif", else_index)
+        blocks.append(
+            (
+                "\n".join(lines[index + 1 : else_index]),
+                "\n".join(lines[else_index + 1 : endif_index]),
+            )
+        )
+    return blocks
+
+
+def _block_palette_draw_ib(if_body):
+    """从键命中路径的捕获行反推该键块所属部件（夹具里每块恰一个部件）。"""
+    draw_ibs = sorted(set(re.findall(r"ResourceZZPalette_(\w+)_s\d", if_body)))
+    if len(draw_ibs) != 1:
+        raise ValueError(f"键块应恰属一个部件，实得 {draw_ibs}: {if_body!r}")
+    return draw_ibs[0]
+
+
 # ===========================================================================
 # 1~4：判定口径只剩指纹（产物级可证伪）
 # ===========================================================================
@@ -504,7 +535,12 @@ class ZZMIExactHashOnlyTests(_Fixture):
         self.assertNotIn("pool_size = 16", text)
 
     def test_no_occurrence_dual_path_anywhere(self):
-        """出现次双路径必须彻底移除（用户明确：多判据共存只增加开销）。"""
+        """出现次**判定**双路径必须彻底移除（用户明确：多判据共存只增加开销）。
+
+        t-fix（「门控吞掉写入」回归）：出现次仍以**位置标签**身份出现在键 ≤ 0 的
+        失败路径上——那里只定落点、不改判槽位归属（判定唯一口径仍是键）。它不得
+        以 `key <= 0` 以外的形态出现（尤其不得成为 pre-key 的第二套捕获）。
+        """
         exporter, models = self._build()
         self._apply_plan(exporter)
         vb_text = self._vb_text(exporter, models)
@@ -513,8 +549,14 @@ class ZZMIExactHashOnlyTests(_Fixture):
 
         # ① 不得有 `key == 0` 的出现次回退分支
         self.assertNotIn(f"if $zz_ms_pose_key_{self.GROUP} == 0", combined)
-        # ② 不得有 `key <= 0` 以外的出现次捕获分支（键块内只有 >0 / else 诊断）
+        # ② 不得有键块**之外**的出现次捕获分支（键块内 = 键 ≤ 0 的落点标签）
         self.assertNotIn("$zz_ms_occ_0 == 1\n    ResourceZZPalette", combined)
+        # ②b 出现次捕获必须落在键守卫的 else 里（= 键 ≤ 0 的**落点标签**）
+        blocks = _key_guard_blocks(vb_text, self.GROUP)
+        self.assertTrue(blocks)
+        for _if_body, else_body in blocks:
+            self.assertIn("$zz_ms_occ_", else_body)
+            self.assertIn("= copy vs-t0 unless_null", else_body)
         # ③ 不得有 emit_move 单向互搬
         self.assertNotRegex(
             combined,
@@ -525,24 +567,64 @@ class ZZMIExactHashOnlyTests(_Fixture):
         self.assertIn("$zz_ms_seen_01 = $zz_ms_seen_01 + ($zz_ms_occ_0 == 1)", combined)
 
     def test_null_hash_failure_is_an_explicit_diagnosed_path(self):
-        """HashRegion 失败（键 ≤ 0）必须是显式诊断路径，**不得**静默退回出现次。"""
+        """HashRegion 失败（键 ≤ 0）仍是显式诊断路径，**但捕获必须照发**。
+
+        回归（用户实测「门控的问题，就是形态键失效」）：失败分支曾只剩诊断注释
+        （空壳）⇒ 该 pass 的 palette 一条都不发，而读它的 attach / 重放守卫在
+        顶层**无条件**执行 ⇒ 骨架为空、模型消失 / 形态键静默失效。
+        契约：判定不退回出现次（唯一判据仍是键），但**写不能只存在于 `if key > 0`
+        体内**；失败路径用出现次这个**位置标签**定落点（只定落点，不参与判定）。
+        """
         exporter, models = self._build()
         self._apply_plan(exporter)
         text = self._vb_text(exporter, models)
-        # else 分支必须只剩下诊断注释（不写 palette、不查出现次）
+        # else 分支的显式诊断与「不退回出现次**判定**」声明都必须在
         self.assertIn("HashRegion 失败", text)
-        self.assertIn("**不退回出现次**", text)
-        lines = text.splitlines()
-        start = lines.index(f"if $zz_ms_pose_key_{self.GROUP} > 0")
-        # 守卫级 `else` / `endif` 都写在第 0 列（池内的 else/endif 缩进 4 格），
-        # 因此按**整行精确匹配**取出的就是键守卫自己的两条边界行。
-        else_index = lines.index("else", start)
-        endif_index = lines.index("endif", else_index)
-        else_body = lines[else_index + 1 : endif_index]
-        self.assertTrue(else_body, "键 ≤ 0 的 else 分支必须有显式诊断语句")
-        for line in else_body:
-            self.assertNotIn("$zz_ms_occ_", line)
-            self.assertNotIn("ResourceZZPalette_", line)
+        self.assertIn("不退回出现次判定", text)
+        self.assertNotIn(f"if $zz_ms_pose_key_{self.GROUP} == 0", text)
+        blocks = _key_guard_blocks(text, self.GROUP)
+        self.assertEqual(len(blocks), 3, "三件各一段键块")
+        for if_body, else_body in blocks:
+            draw_ib = _block_palette_draw_ib(if_body)
+            self.assertTrue(else_body, "键 ≤ 0 的 else 分支必须有显式诊断语句")
+            # 失败分支不得引入**键**判据（键 ≤ 0 时键不可用）
+            self.assertNotIn(f"$zz_ms_pose_key_{self.GROUP}", else_body)
+            # 也不得变成"出现次**判定**"：只有位置标签 `if $zz_ms_occ_<i> == <slot>`，
+            # 没有 pool 查表、没有改判槽位归属的语句
+            self.assertNotIn("PoolZZMISlotOfKey", else_body)
+            self.assertIn("$zz_ms_occ_", else_body)
+            for slot in (1, 2):
+                self.assertIn(
+                    f"ResourceZZPalette_{draw_ib}_s{slot} = copy vs-t0 unless_null",
+                    else_body,
+                )
+
+    def test_palette_write_is_never_only_inside_the_key_gate(self):
+        """写绝不允许只存在于 `if $zz_ms_pose_key_* > 0` 体内（无条件读者 ⇒ 门假时数据永不产生）。
+
+        这是「门控吞掉写入」类回归的可证伪断言：对每个 key 驱动部件，`> 0` 守卫的
+        `else`（键 ≤ 0）路径上必须同样有 palette 捕获（运行时两条路径互斥，同一次
+        pass 只写一个槽，不会把一个实例的 palette 同时灌进两个槽）。
+        """
+        exporter, models = self._build()
+        self._apply_plan(exporter)
+        vb_text = self._vb_text(exporter, models)
+        blocks = _key_guard_blocks(vb_text, self.GROUP)
+        self.assertEqual(len(blocks), 3)
+        for if_body, else_body in blocks:
+            draw_ib = _block_palette_draw_ib(if_body)
+            for slot in (1, 2):
+                capture = f"ResourceZZPalette_{draw_ib}_s{slot} = copy vs-t0 unless_null"
+                self.assertIn(capture, if_body)
+                self.assertIn(
+                    capture,
+                    else_body,
+                    f"键 ≤ 0 路径未捕获 {capture}（写被门控吞掉）",
+                )
+            # 两条路径互斥：命中路径用池/键，失败路径用出现次位置标签
+            self.assertIn("PoolZZMISlotOfKey", if_body)
+            self.assertIn("$zz_ms_occ_", else_body)
+            self.assertNotIn("$zz_ms_occ_", if_body)
 
 
 # ===========================================================================
@@ -917,9 +999,21 @@ class ZZMISingleComponentEquivalenceTests(_Fixture):
     新版按精确键选槽（`if pool[key] == 2 → s2 else → s1`）。两者对"同部件两实例
     分占两槽"给出**同一结果**（一个键落 s1、另一个键落 s2），而新版不再依赖
     出图先后 —— 这正是本次变更的目的。
+
+    键不可用时（`HashRegion` 失败返回 -1/-2/-3）落点退回出现次位置标签：**写**不
+    允许只存在于 `> 0` 体内，否则该 pass 的 palette 一条都不发，而无条件读取它的
+    attach / 重放守卫会读走空骨架（用户实测「门控的问题，就是形态键失效」）。
     """
 
-    def test_two_slots_are_each_captured_once_per_part(self):
+    def test_two_slots_are_captured_on_every_result_path(self):
+        """每个 (部件, 槽) 在判定的**两条结果路径**上各有一条捕获（运行时只执行一条）。
+
+        回归（用户实测「门控的问题，就是形态键失效」）：键 ≤ 0 的失败路径曾是空壳
+        ⇒ 该 pass 的 palette 一条都不发，而顶层无条件 `run` 的 attach / 重放守卫
+        照常读取 ⇒ 骨架为空（模型消失 / 形态键失效）。因此文本上每槽 2 条
+        （键可用路径 + 键不可用路径），运行时命中其中 1 条 ⇒ 仍是每 pass 每槽
+        恰好捕获一次。
+        """
         exporter, models = self._build()
         self._apply_plan(exporter)
         text = self._vb_text(exporter, models)
@@ -929,8 +1023,8 @@ class ZZMISingleComponentEquivalenceTests(_Fixture):
                     text.count(
                         f"ResourceZZPalette_{draw_ib}_s{slot} = copy vs-t0 unless_null"
                     ),
-                    1,
-                    f"{draw_ib} s{slot} 必须恰好捕获一次",
+                    2,
+                    f"{draw_ib} s{slot} 必须在键可用 / 键不可用两条路径上各捕获一次",
                 )
 
     def test_attach_runs_are_unconditional_and_cover_every_component_slot(self):
