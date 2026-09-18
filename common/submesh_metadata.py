@@ -94,6 +94,12 @@ class SubmeshMetadata:
     vg_map: dict = field(init=False, default_factory=dict)
     # ZZMI VGMap 缓存算法版本；导出侧拒绝陈旧缓存，避免旧分组/门控结果继续生效。
     vg_map_algorithm_version: int = field(init=False, default=0)
+    # t75 通道计划（导入期算好的**唯一**实例判定口径）：通道骨全局槽位/本地下标、
+    # 共享件数、跨部件顶点权重合计、理由与诊断。缺失 = 缓存未刷新（导出侧显式诊断）。
+    channel_plan_version: int = field(init=False, default=0)
+    channel_plan: dict = field(init=False, default_factory=dict)
+    channel_plan_digest: str = field(init=False, default="")
+    channel_plan_slot_weights: dict = field(init=False, default_factory=dict)
     merged_skeleton_metadata_valid: bool = field(init=False, default=True)
     # EFMI 跨 LOD 对应账本：不直接参与槽位编号；投影开启时用于 LOD1 分区
     # 约束、未匹配过滤及自动匹配节点的物体配对，关闭时保留为诊断元数据。
@@ -137,6 +143,19 @@ class SubmeshMetadata:
         self.vg_map = dict(self.submesh_json_dict.get("VGMap", {}) or {})
         self.vg_map_algorithm_version = int(
             self.submesh_json_dict.get("VGMapAlgorithmVersion", 0) or 0
+        )
+        # t75 通道计划（唯一判定口径）；缺失/版本不符由缓存门控拒绝复用。
+        self.channel_plan_version = int(
+            self.submesh_json_dict.get("ChannelPlanVersion", 0) or 0
+        )
+        channel_plan = self.submesh_json_dict.get("ChannelPlan")
+        self.channel_plan = dict(channel_plan) if isinstance(channel_plan, dict) else {}
+        self.channel_plan_digest = str(
+            self.submesh_json_dict.get("ChannelPlanDigest", "") or ""
+        )
+        slot_weights = self.submesh_json_dict.get("ChannelPlanSlotWeights")
+        self.channel_plan_slot_weights = (
+            dict(slot_weights) if isinstance(slot_weights, dict) else {}
         )
         # EFMI 跨 LOD 对应账本（v9 投影写回；行 = target_local -> {local_vg_id: ref_local, ...}）
         corr = self.submesh_json_dict.get("EFMILODCorrespondence", {}) or {}
