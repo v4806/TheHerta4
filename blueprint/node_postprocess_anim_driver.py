@@ -213,8 +213,16 @@ class SSMTNode_PostProcess_AnimDriver(SSMTNode_PostProcess_Base):
                     pass
 
         collector = AnimationDriverCollector(blueprint)
-        return collector.collect()
-
+        paragraphs = collector.collect()
+        summary = getattr(collector, "last_normalization", None) or {}
+        merges = summary.get("merges") or []
+        renames = summary.get("renames") or []
+        if merges or renames:
+            print(
+                f"[AnimDriver] 驱动块重复变量归一：合并同值声明 {len(merges)} 条，"
+                f"异值分叉 {len(renames)} 个"
+            )
+        return paragraphs
     def _compose_updated_ini_content(self, original_content: str, ini_content: str):
         content_without_section, _removed = self._strip_existing_anim_driver_section(original_content)
         base_content, tail_content = SSMTNode_PostProcess_Base.split_auto_appended_tail_content(content_without_section)
