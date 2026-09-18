@@ -1,5 +1,5 @@
 import bpy
-from bpy.props import IntProperty, StringProperty
+from bpy.props import BoolProperty, IntProperty, StringProperty
 
 from .anim_driver_base import (
     ANIM_DRIVER_INPUT_SOCKET_NAME,
@@ -8,6 +8,7 @@ from .anim_driver_base import (
 )
 from .variable_registry import (
     ensure_anim_driver_frame_variable_name,
+    mark_variable_name_used,
     normalize_variable_name,
 )
 
@@ -41,10 +42,49 @@ class SSMTNode_AnimDriver_Runtime(SSMTNode_AnimDriver_Base):
         max=9999,
     )
 
+    frame_var_initialized: BoolProperty(
+        name="Frame Variable Initialized",
+        default=False,
+        options={'HIDDEN'},
+    )
+
+    def _ensure_initial_visible_frame_variable_name(self, context=None) -> bool:
+        """首次把预分配名**填进输入框**（用户清空后不再回填，与连续索引变量同规则）。"""
+        if getattr(self, "frame_var_initialized", False):
+            return False
+
+        assigned_name = self.ensure_frame_variable_name(context=context)
+        if not assigned_name:
+            return False
+
+        if str(getattr(self, "custom_frame_variable_name", "") or "").strip():
+            self.frame_var_initialized = True
+            return False
+
+        self.frame_var_initialized = True
+        self.custom_frame_variable_name = assigned_name
+        return True
+
+    def update_frame_variable_name(self, context):
+        if self._ensure_initial_visible_frame_variable_name(context=context):
+            return
+        normalized = normalize_variable_name(self.custom_frame_variable_name)
+        if normalized != str(self.custom_frame_variable_name or "").strip().lstrip("$"):
+            self.custom_frame_variable_name = normalized
+            return
+        if normalized:
+            mark_variable_name_used(normalized, context=context)
+        self.ensure_frame_variable_name(context=context)
+        self.update_node_width([
+            getattr(self, "custom_frame_variable_name", ""),
+            getattr(self, "assigned_frame_variable_name", ""),
+        ])
+
     custom_frame_variable_name: StringProperty(
         name="帧变量",
-        description="当前帧索引变量名；创建时自动填入预分配名，可直接复制或手动修改",
+        description="当前帧索引变量名；创建时会自动填入预分配变量名，可直接复制或手动修改。",
         default="",
+        update=update_frame_variable_name,
     )
 
     assigned_frame_variable_name: StringProperty(
@@ -60,19 +100,28 @@ class SSMTNode_AnimDriver_Runtime(SSMTNode_AnimDriver_Base):
         self.width = 300
         self._assign_next_available_index()
         # 预分配帧变量名（依赖 auto_index，必须在 _assign_next_available_index 之后）
-        self.ensure_frame_variable_name()
+        self._ensure_initial_visible_frame_variable_name(context=context)
+
+    def copy(self, node):
+        # 复制节点必须重新取序号与预分配名，否则两个节点会声明同一个帧变量
+        self._assign_next_available_index()
+        self.custom_frame_variable_name = ""
+        self.assigned_frame_variable_name = ""
+        self.frame_var_initialized = False
+        self._ensure_initial_visible_frame_variable_name()
 
     def update(self):
         super().update()
         # 旧蓝图（保存时还没有预分配字段）与复制节点在这里补上名字；已分配的不动
-        self.ensure_frame_variable_name()
+        self._ensure_initial_visible_frame_variable_name()
 
     # ------------------------------------------------------------------
     # 帧变量（预分配 + 可手改）
     # ------------------------------------------------------------------
 
-    def ensure_frame_variable_name(self) -> str:
-        return ensure_anim_driver_frame_variable_name(self)
+    def ensure_frame_variable_name(self, context=None) -> str:
+        """确保预分配名存在（写回 ``assigned_frame_variable_name``）并返回它。"""
+        return ensure_anim_driver_frame_variable_name(self, context=context)
 
     def frame_variable_name(self) -> str:
         """最终生效的帧变量名（不含 ``$``）：手改优先，其次预分配名。"""
@@ -109,9 +158,16 @@ class SSMTNode_AnimDriver_Runtime(SSMTNode_AnimDriver_Base):
     def draw_buttons(self, context, layout):
         layout.prop(self, "fps")
         layout.prop(self, "playback_rate")
+
         box = layout.box()
-        box.label(text=f"预分配帧变量: ${self.frame_variable_name()}", icon='INFO')
-        box.prop(self, "custom_frame_variable_name", text="帧变量")
+        box.label(text=f"索引: {self._read_safe_index()}", icon='LINENUMBERS_ON')
+        row = box.row(align=True)
+        row.prop(self, "custom_frame_variable_name", text="帧变量")
+        assigned_name = normalize_variable_name(
+            getattr(self, "assigned_frame_variable_name", "") or ""
+        )
+        if not str(getattr(self, "custom_frame_variable_name", "") or "").strip() and assigned_name:
+            row.label(text=f"预分配变量: ${assigned_name}", icon='INFO')
         if self.is_compat_alias_owner():
             box.label(text="本节点同时维护兼容别名 $swapvar / $fps", icon='CHECKBOX_HLT')
 
@@ -154,6 +210,9 @@ def _runtime_load_handler(dummy):
             if node.bl_idname == 'SSMTNode_AnimDriver_Runtime':
                 try:
                     SSMTNode_AnimDriver_Base._migrate_dynamic_sockets(node)
+                    # 旧蓝图：补上帧变量（含填入输入框），让面板上直接看得到
+                    if not str(getattr(node, "custom_frame_variable_name", "") or "").strip():
+                        node._ensure_initial_visible_frame_variable_name()
                 except Exception:
                     pass
 

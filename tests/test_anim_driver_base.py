@@ -1788,5 +1788,99 @@ class RuntimeFrameVariablePreallocationTests(unittest.TestCase):
         self.assertNotIn("if $swapvar % $speed_auto1 == 0", ini)
 
 
+    def test_init_fills_preallocated_frame_variable_into_input_box(self):
+        tree = types.SimpleNamespace(
+            name="动画驱动蓝图", bl_idname='SSMTBlueprintTreeType', nodes=[], links=[]
+        )
+        node = runtime_module.SSMTNode_AnimDriver_Runtime()
+        node.name = "运行时间"
+        node.auto_index = 1
+        node.id_data = tree
+        node.fps = 30
+        node.playback_rate = 1
+        node.custom_frame_variable_name = ""
+        node.assigned_frame_variable_name = ""
+        node.frame_var_initialized = False
+        node.inputs = types.SimpleNamespace(new=lambda *_args, **_kwargs: None)
+        node.outputs = types.SimpleNamespace(new=lambda *_args, **_kwargs: None)
+        tree.nodes.append(node)
+
+        node.init(None)
+
+        self.assertEqual(node.assigned_frame_variable_name, "swapvar1")
+        self.assertEqual(
+            node.custom_frame_variable_name, "swapvar1",
+            "预分配帧变量名必须填入输入框（与暂停变量/连续索引变量同规则）",
+        )
+        self.assertEqual(node.frame_variable_name(), "swapvar1")
+
+    def test_copy_reallocates_frame_variable(self):
+        tree = types.SimpleNamespace(
+            name="动画驱动蓝图", bl_idname='SSMTBlueprintTreeType', nodes=[], links=[]
+        )
+        original = self._make_runtime("运行时间", 1, tree)
+        duplicate = runtime_module.SSMTNode_AnimDriver_Runtime()
+        duplicate.name = "运行时间.001"
+        duplicate.id_data = tree
+        duplicate.fps = 30
+        duplicate.playback_rate = 1
+        duplicate.custom_frame_variable_name = original.custom_frame_variable_name
+        duplicate.assigned_frame_variable_name = original.assigned_frame_variable_name
+        duplicate.frame_var_initialized = True
+        tree.nodes.append(duplicate)
+
+        duplicate.copy(original)
+
+        self.assertNotEqual(
+            duplicate.assigned_frame_variable_name, original.assigned_frame_variable_name,
+            "复制节点必须重新预分配，否则两个节点声明同一个帧变量",
+        )
+        self.assertEqual(duplicate.custom_frame_variable_name, duplicate.assigned_frame_variable_name)
+
+    def test_accumulative_trigger_init_fills_accumulator_variable(self):
+        node = accumulative_trigger_module.SSMTNode_AnimDriver_AccumulativeTrigger()
+        node.name = "AccumulativeTrigger"
+        node.auto_index = 1
+        tree = types.SimpleNamespace(
+            name="动画驱动蓝图", bl_idname='SSMTBlueprintTreeType', nodes=[node], links=[]
+        )
+        node.id_data = tree
+        node.custom_paused_var = ""
+        node.accumulator_variable = ""
+        node.inputs = types.SimpleNamespace(new=lambda *_args, **_kwargs: None)
+        node.outputs = types.SimpleNamespace(new=lambda *_args, **_kwargs: None)
+
+        node.init(None)
+
+        self.assertEqual(
+            node.accumulator_variable, "$accumulator1",
+            "累计变量名必须填入输入框（此前只有回退 label，输入框始终为空）",
+        )
+
+    def test_accumulative_trigger_copy_reallocates_accumulator_variable(self):
+        tree = types.SimpleNamespace(
+            name="动画驱动蓝图", bl_idname='SSMTBlueprintTreeType', nodes=[], links=[]
+        )
+        original = accumulative_trigger_module.SSMTNode_AnimDriver_AccumulativeTrigger()
+        original.name = "AccumulativeTrigger"
+        original.auto_index = 1
+        original.id_data = tree
+        original.accumulator_variable = "$accumulator1"
+        original.custom_paused_var = "$accumulative_trigger_paused1"
+        tree.nodes.append(original)
+
+        duplicate = accumulative_trigger_module.SSMTNode_AnimDriver_AccumulativeTrigger()
+        duplicate.name = "AccumulativeTrigger.001"
+        duplicate.id_data = tree
+        duplicate.accumulator_variable = "$accumulator1"
+        duplicate.custom_paused_var = "$accumulative_trigger_paused1"
+        tree.nodes.append(duplicate)
+
+        duplicate.copy(original)
+
+        self.assertEqual(duplicate.accumulator_variable, "$accumulator2")
+        self.assertEqual(duplicate.custom_paused_var, "$accumulative_trigger_paused2")
+
+
 if __name__ == "__main__":
     unittest.main()

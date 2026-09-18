@@ -221,12 +221,35 @@ class SSMTNode_AnimDriver_AccumulativeTrigger(SSMTNode_AnimDriver_Base):
         except (AttributeError, TypeError):
             setattr(self, migration_key, True)
 
+    def _ensure_accumulator_variable_name(self):
+        """确保累计变量名存在并**填入输入框**（与暂停变量同规则）。
+
+        此前只有 ``draw_buttons`` 里的回退 label 显示 ``$accumulator{idx}``，输入框
+        始终是空的 —— 与其它动画驱动节点（暂停变量/连续索引变量/形态键序列驱动
+        变量都会在 init 时回填预分配名）不一致。
+        """
+        current_value = str(getattr(self, "accumulator_variable", "") or "").strip()
+        if current_value:
+            self.accumulator_variable = self._normalize_variable_name(current_value, "")
+            return self.accumulator_variable
+
+        preferred = f"accumulator{self._read_safe_index()}"
+        used_names = self._collect_anim_driver_variable_names()
+        if preferred not in used_names:
+            self.accumulator_variable = f"${preferred}"
+            return self.accumulator_variable
+
+        allocated = self._allocate_unique_anim_driver_variable_name("accumulator")
+        self.accumulator_variable = f"${allocated}"
+        return self.accumulator_variable
+
     def init(self, context):
         self.inputs.new('SSMTSocketAnimDriver', ANIM_DRIVER_INPUT_SOCKET_NAME)
         self.outputs.new('SSMTSocketAnimDriver', ANIM_DRIVER_OUTPUT_SOCKET_NAME)
         self.width = 420
         self._assign_next_available_index()
         self._ensure_paused_variable_name("accumulative_trigger_paused")
+        self._ensure_accumulator_variable_name()
         self._mark_play_state_migrated()
 
     def copy(self, node):
@@ -234,7 +257,13 @@ class SSMTNode_AnimDriver_AccumulativeTrigger(SSMTNode_AnimDriver_Base):
         self.custom_paused_var = ""
         self.accumulator_variable = ""
         self._ensure_paused_variable_name("accumulative_trigger_paused")
+        self._ensure_accumulator_variable_name()
         self._mark_play_state_migrated()
+
+    def update(self):
+        super().update()
+        # 旧蓝图（保存时输入框还是空的）在这里补上累计变量名
+        self._ensure_accumulator_variable_name()
 
     def draw_buttons(self, context, layout):
         safe_idx = self._read_safe_index()
@@ -450,6 +479,8 @@ def _accumulative_trigger_load_handler(dummy):
                 SSMTNode_AnimDriver_Base._migrate_dynamic_sockets(node)
                 if not node.custom_paused_var:
                     node._ensure_indexed_paused_variable_name("accumulative_trigger_paused")
+                if not str(getattr(node, "accumulator_variable", "") or "").strip():
+                    node._ensure_accumulator_variable_name()
             except Exception:
                 pass
 
