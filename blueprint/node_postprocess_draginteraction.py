@@ -5284,7 +5284,8 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 "endif",
                 f"if {drag_mode_var} >= 1 && $ssmtdrag_viewport_probe_enabled_{ns} == 1 && time >= $ssmtdrag_viewport_probe_next_time_{ns}",
                 f"\tResourceDragViewportSource_{ns} = null",
-                f"\tclear = ResourceDragViewportFrameAPI_{ns} 0.0",
+                # [t138] 不再 clear：重新布防失败时保留上一份好布局（解码器失败是提前 return，不会写坏）
+                # f"\tclear = ResourceDragViewportFrameAPI_{ns} 0.0",
                 f"\t$ssmtdrag_viewport_probe_armed_{ns} = 1",
                 f"\t$ssmtdrag_viewport_probe_generation_{ns} = $ssmtdrag_viewport_probe_generation_{ns} + 1",
                 f"\t$ssmtdrag_viewport_probe_next_time_{ns} = time + $ssmtdrag_viewport_probe_interval_{ns}",
