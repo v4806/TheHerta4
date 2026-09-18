@@ -215,6 +215,16 @@ class ShaderReplaceExportPathTests(unittest.TestCase):
         )
         # zzmi.py / efmi.py 新增依赖：utils.json_utils（真实模块，仅 JSON 读写）
         _load_module(f"{self.pkg}.utils.json_utils", "utils/json_utils.py")
+        # m_ini_helper.py 依赖 utils.log_utils（形态键丢弃诊断落 stdout/sink）
+        _install_module(
+            f"{self.pkg}.utils.log_utils",
+            LOG=types.SimpleNamespace(
+                info=lambda *_args, **_kwargs: None,
+                warning=lambda *_args, **_kwargs: None,
+                debug=lambda *_args, **_kwargs: None,
+                error=lambda *_args, **_kwargs: None,
+            ),
+        )
 
         self.shader_replace_section_calls = []
 

@@ -184,10 +184,13 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
         default=False
     )
     # 直出开关和同蓝图中的其他 ShapeKey 后处理节点同步，避免槽位资源生成策略不一致。
+    # 默认勾选（True）：形态键导出只走直出路线；经典（非直出）路线会把键块在标准前处理里
+    # 烘焙掉（blueprint/preprocess.py `_apply_shape_keys`），产物无形态键且原先静默无告警。
+    # 本默认值只决定**新建**节点的初始勾选；已保存的 .blend 里各节点保存的取值不变。
     direct_export_mode: bpy.props.BoolProperty(
         name="直出模式",
-        description="启用后该节点参与直出导出，并与同类节点同步",
-        default=False,
+        description="启用后该节点参与直出导出，并与同类节点同步（形态键导出仅支持直出模式）",
+        default=True,
         update=sync_shapekey_direct_mode,
     )
     drag_drive_enabled: bpy.props.BoolProperty(
