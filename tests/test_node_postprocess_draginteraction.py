@@ -5228,6 +5228,37 @@ class DragTwoComponentIndependenceTests(unittest.TestCase):
             self.assertIn(f"clear = ResourceDragJiggleScreenState_{cn}_testns 0.0", present)
             self.assertIn(f"clear = ResourceDragPathProgressState_{cn}_testns 0.0", present)
 
+    def test_dead_detect_timer_vars_not_emitted(self):
+        """t149 变量追溯审计：两个**只写不读**的计时变量已从产物移除。
+
+        静态使用表（对产物 ini 逐 `$var` 统计写/读）显示
+        `$ssmtdrag_detect_next_time` / `$ssmtdrag_detect_interval` 只被声明与赋值，
+        **从不被任何条件、表达式或 IniParams 槽消费**，也未被任何 hlsl 读取；
+        且 `0.25` / `time` 均无副作用 ⇒ 删除行为等价。
+        同块的 dt 钳制用的是 `$ssmtdrag_delta_time_*`，必须原样保留。
+        """
+        from pathlib import Path
+
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "blueprint"
+            / "node_postprocess_draginteraction.py"
+        ).read_text(encoding="utf-8")
+        # 发射点已删除（连注释里的原样记录都带上 `local ` 前缀，故只匹配发射形态）
+        self.assertNotIn('"local $ssmtdrag_detect_next_time"', source)
+        self.assertNotIn('"local $ssmtdrag_detect_interval = 0.25"', source)
+        self.assertNotIn('"\\t$ssmtdrag_detect_next_time = time"', source)
+        # 只删死变量：同块的 dt 钳制仍在源码里发射
+        self.assertIn('"\\t$ssmtdrag_delta_time_{ns} = 0.0166667"', source)
+        self.assertIn('f"$ssmtdrag_prev_time_{ns} = time"', source)
+
+        # 兜底：任何已发射的段里都不得再出现这两个名字
+        node, sections, comps = self._emit_two()
+        node._emit_present_and_constants(sections, comps, "testns")
+        blob = "\n".join("\n".join(v) for v in sections.values())
+        self.assertNotIn("ssmtdrag_detect_next_time", blob)
+        self.assertNotIn("ssmtdrag_detect_interval", blob)
+
     # ---- (b) 逐组件 vertex_base 正确性 ----
 
     def test_split_base_vertices_use_geometry_part_base(self):

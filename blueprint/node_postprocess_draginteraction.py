@@ -4415,8 +4415,17 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                     "",
                 ])
             lines.extend([
-                "local $ssmtdrag_detect_next_time",
-                "local $ssmtdrag_detect_interval = 0.25",
+                # t149 变量追溯审计：此处原发
+                #     local $ssmtdrag_detect_next_time
+                #     local $ssmtdrag_detect_interval = 0.25
+                # 以及
+                #     if $isMouseButtonDown == 1
+                #         $ssmtdrag_detect_next_time = time
+                #     endif
+                # 两者在产物 ini 里**只写不读**（无任何条件/表达式/IniParams 消费；
+                # 也未被任何 hlsl 读），且表达式 `0.25` / `time` 无副作用 ⇒ 删除是
+                # 行为等价的（不改变任何其它命令的求值）。dt 钳制用的是
+                # `$ssmtdrag_delta_time_{ns}`，与它们无关。
                 # dt 钳制 [0.001, 0.100]（time 单位分钟 → 秒）
                 f"if $ssmtdrag_prev_time_{ns} == 0",
                 f"\t$ssmtdrag_delta_time_{ns} = 0.0166667",
@@ -4429,10 +4438,6 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 "\tendif",
                 "endif",
                 f"$ssmtdrag_prev_time_{ns} = time",
-                "",
-                "if $isMouseButtonDown == 1",
-                "\t$ssmtdrag_detect_next_time = time",
-                "endif",
                 "",
                 f"if {drag_mode_var} >= 1 && $inputMode == 0 && $ssmtdrag_mode_{ns} == 1 && $ssmtdrag_drawn_{ns} == 1",
                 f"\t$ObjectDetectAllowed_{ns} = 1",
