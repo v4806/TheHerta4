@@ -10,6 +10,8 @@
   检测 CS 的 cs-t3 绑定不断链；
 - 全开 → 与现状（legacy enable_shapekey_drive=True）基线等价（除 R5 合并段）。
 """
+import contextlib
+import io
 import re
 import shutil
 import tempfile
@@ -189,6 +191,74 @@ class DragFeatureSwitchTests(unittest.TestCase):
         self.assertTrue(node._feature_skd())
 
     # ------------------------------------------------------------------
+    # F4 开但无区域绑定：不发段族、不留死变量、显式告警
+    # ------------------------------------------------------------------
+
+    def test_variable_link_without_zone_binding_leaves_no_dead_seed_variable(self):
+        """F4 开但一个形态键都没绑区域：F4 段族整体不发，且不留"只读不写"的死变量。
+
+        回归：``$ssmtdrag_seed_pending_*`` 曾被无条件声明并被驱动 CS 读，但没有
+        任何地方置 1（播种条目为空），同时驱动 CS 的 ``y80``/``x81`` 未绑定 →
+        CS 可能读到槽位残留值（槽位 80/81 与变量同步取值区 81..89 重叠）而误播种。
+        """
+        sk = _sk_node()
+        sk.shapekey_variable_items[0].drag_zone_id = -1  # 取消区域绑定
+        node = _make_node(self.mod)
+        node.id_data = types.SimpleNamespace(nodes=[sk])
+
+        sections = _base_sections()
+        comps = node._locate_components(sections, ["abc123"])
+        node._emit_sections(sections, comps, "testns")
+        node._emit_present_and_constants(sections, comps, "testns")
+
+        text = self._all_text(sections)
+        const = "\n".join(sections["[Constants]"])
+        drive = "\n".join(sections["[CustomShaderDragShapeKeyDrive_testns]"])
+
+        self.assertTrue(node._feature_var(), "F4 总开关仍开（F1 消费方存在）")
+        self.assertEqual(node._drag_drive_var_sync_bindings(), [], "无绑定 → 同步绑定为空")
+        for token in (
+            "CustomShaderDragShapeKeyVarSync_testns",
+            "CommandListDragShapeKeyVarReadback_testns",
+            "ResourceDragShapeKeyVarPrev_testns",
+            "ResourceDragShapeKeyVarSyncMap_testns",
+            "ResourceDragShapeKeyZoneActive_testns",
+        ):
+            self.assertNotIn(token, text)
+        # 死变量不再声明，也不再被任何段引用
+        self.assertNotIn("$ssmtdrag_seed_pending_testns", const)
+        self.assertNotIn("$ssmtdrag_seed_pending_testns", text)
+        # 驱动 CS 的播种槽位显式写 0，不依赖残留值
+        self.assertIn("y80 = 0", drive)
+        self.assertIn("x81 = 0", drive)
+        # 显式告警：用户能查到"为什么没联动"
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            node.validate_export_configuration()
+        self.assertIn("没有任何形态键绑定拖拽区域", buffer.getvalue())
+
+    def test_zone_binding_keeps_seed_variable_and_sync_family(self):
+        """对照组：绑定区域后 F4 段族回来，seed_pending 仍按播种条目存在与否声明。"""
+        sk = _sk_node()  # drag_zone_id=0 → 有绑定
+        node = _make_node(self.mod)
+        node.id_data = types.SimpleNamespace(nodes=[sk])
+
+        sections = _base_sections()
+        comps = node._locate_components(sections, ["abc123"])
+        node._emit_sections(sections, comps, "testns")
+        node._emit_present_and_constants(sections, comps, "testns")
+
+        text = self._all_text(sections)
+        self.assertTrue(node._drag_drive_var_sync_bindings())
+        self.assertIn("[CustomShaderDragShapeKeyVarSync_testns]", sections)
+        self.assertIn("[CommandListDragShapeKeyVarReadback_testns]", sections)
+        # 无 ClickExport 播种条目 → 仍不声明 seed_pending，驱动 CS 写 0
+        const = "\n".join(sections["[Constants]"])
+        drive = "\n".join(sections["[CustomShaderDragShapeKeyDrive_testns]"])
+        self.assertNotIn("$ssmtdrag_seed_pending_testns", const)
+        self.assertIn("y80 = 0", drive)
+
+    # ------------------------------------------------------------------
     # S6：F3 关闭 → UI 桥消失
     # ------------------------------------------------------------------
 
@@ -243,6 +313,16 @@ class DragFeatureSwitchTests(unittest.TestCase):
             on = _make_node(self.mod)
             on.id_data = types.SimpleNamespace(nodes=[sk])
             self.assertEqual(_run(on), base | drive | var_sync)
+
+            # F1/F4 全开但一个区域都没绑 → 不拷贝 var_sync（否则 res/ 留下
+            # 没有 ini 引用、也没有编译产物的孤儿 hlsl）
+            unbound_sk = _sk_node()
+            unbound_sk.shapekey_variable_items[0].drag_zone_id = -1
+            unbound = _make_node(self.mod)
+            unbound.id_data = types.SimpleNamespace(nodes=[unbound_sk])
+            self.assertTrue(unbound._feature_var())
+            self.assertEqual(unbound._drag_drive_var_sync_bindings(), [])
+            self.assertEqual(_run(unbound), base | drive)
         finally:
             shutil.rmtree(toolset, ignore_errors=True)
 

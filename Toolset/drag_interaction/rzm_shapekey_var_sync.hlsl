@@ -45,7 +45,10 @@
 //   u3   = ResourceDragShapeKeyClickCountF (R32_FLOAT, array = zone capacity;
 //          float mirror kept coherent with ClickCount for CPU store export)
 //   u4   = ResourceDragShapeKeyZoneActive (R32_FLOAT, array = zone capacity;
-//          per-zone drag-active flags, mirrored from the latch every frame)
+//          per-zone drag-active flags, mirrored from the latch on each dispatch.
+//          Retained for binding compatibility: the CPU readback no longer polls
+//          these (it reads the single-slot DragLatch once on press/release edges
+//          and derives per-zone activity itself — one store instead of N).
 //   u5   = ResourceDragShapeKeyDragLatch (shared latch resource maintained by
 //          rzm_shapekey_drive; single slot: 0 = unbound, otherwise bound
 //          zone id + 1 — boot/disarm clears (0.0) read as unbound)
@@ -95,9 +98,9 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     // 拖拽激活标志（每区域）：直接镜像驱动 CS 的绑定锁存（单一事实源）。
     // 驱动 CS 维护锁存：按住 LMB/X 命中即绑定、绑定期间移出区域不丢、
     // 松开当帧写 0（=未绑定编码）解除；失臂（松 Alt/undraw/模式 0）由生成器
-    // else 分支整清锁存资源兜底。本 CS 每帧照抄为 ZoneActive，门控 CPU 回读
-    // 拉取方向；帧序上驱动 CS 先于本 CS 运行（[Present] 段内 PinDetected →
-    // VarSync），因此绑定/释放沿当帧生效。
+    // else 分支整清锁存资源兜底。本 CS 照抄为 ZoneActive（保留给绑定兼容）；
+    // CPU 侧回读改为在按住/松开沿直接读单槽 DragLatch 自行推导区域激活
+    //（一次 store 代替 N 次），因此不再依赖这里的镜像值。
     uint latchSlots;
     DragLatch.GetDimensions(latchSlots);
     float latchValue = latchSlots >= 1u ? DragLatch[0] : 0.0;

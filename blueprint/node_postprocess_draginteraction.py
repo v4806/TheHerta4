@@ -2160,7 +2160,10 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         files = list(SHADER_FILES)
         if self._feature_skd():
             files += list(SHADER_DRIVE_FILES)
-        if self._feature_var():
+        if self._feature_var() and self._drag_drive_var_sync_bindings():
+            # 只有真会发射同步段时才拷贝：否则 res/ 里留下一个没有 ini 引用、
+            # 也没有编译产物的孤儿 hlsl（旧版曾在「F4 开但一个形态键都没绑区域」
+            # 的工程里留下 rzm_shapekey_var_sync.hlsl 孤儿）。
             files += list(SHADER_VARSYNC_FILES)
         vertex_struct = self._get_vertex_struct_definition()
         rewritten = 0
@@ -3352,6 +3355,50 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 "[DragInteraction][WARNING] 已启用变量联动但形态键联动关闭，"
                 "变量联动随之后台降级（其缓冲族依赖形态键联动）"
             )
+        # F4 开、但没有任何形态键绑定区域：整族同步段/回读命令表/同步映射表都不会
+        # 发射（设计上按绑定项非空门控）。这不是崩溃，但用户会看到「拖拽与形态键
+        # 变量毫无联动」却查不出原因，必须显式告警。
+        if self._feature_var() and not self._drag_drive_var_sync_bindings():
+            print(
+                "[DragInteraction][WARNING] 变量联动已开启，但没有任何形态键绑定拖拽区域 → "
+                "不会生成「变量↔驱动缓冲同步」段与回读命令表（拖拽/动画驱动与形态键变量之间"
+                "不会有联动，形态键只会跟随面板/驱动变量）。"
+                "如需联动，请在形态键配置节点的「区域」列填写拖拽节点区域编号后重新导出。"
+            )
+
+    def _click_export_seed_variable_declared(self):
+        """``$ssmtdrag_seed_pending_{ns}`` 是否会被声明（= 是否存在冷启动播种条目）。
+
+        与 ``_emit_present_and_constants`` 的声明谓词必须保持一致：不声明却被
+        点击计数导出段引用，会让该变量退化成 3DMigoto 的局部变量（跨段失效）。
+        「开关值」模式的点击导出节点不提供播种变量（列表值 → 计数不可逆），
+        此时导出段必须去掉门控里的 seed_pending 项。
+        """
+        try:
+            if not self._feature_var():
+                return False
+            if self._is_efmi_mode():
+                # EFMI 分支在 F1 下恒声明 $ssmtdrag_efmi_seed_pending_{ns}
+                #（驱动段无条件绑 x157），门控里的 seed_pending 项必须保留。
+                return True
+            return bool(self._click_export_seed_entries())
+        except Exception:
+            return False
+
+    def _click_export_trigger_vars(self, ns):
+        """点击计数导出的"按住"变量（LMB / X）。
+
+        点击计数只可能在按住期间推进（驱动 CS 只在按住时写 ClickCount），
+        所以回读只需在按住（含松开沿与首帧建基线）时进行——空闲帧零 store。
+        EFMI 分支的驱动门控语义不同（Candidate 跨实例赢家仲裁 + shader 内部
+        mode 门），未做等价论证前不做门控 → 返回空表示"保持每帧回读"。
+        """
+        if self._is_efmi_mode():
+            return []
+        return [
+            f"$ssmtdrag_lmb_down_{ns}",
+            f"$ssmtdrag_x_down_{ns}",
+        ]
 
     def _is_efmi_mode(self):
         """当前游戏类型是否为 EFMI（路由与消费方契约共用判定）。"""
@@ -4207,17 +4254,20 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             "y79 = $ssmtdrag_shapekey_dx_" + ns,
             "x80 = " + self._fmt(self.shapekey_drive_move_sensitivity),
         ]
-        if self._feature_var():
+        seed_entries = self._click_export_seed_entries() if self._feature_var() else []
+        if seed_entries:
             # 冷启动播种（F4/ClickExport 链）：x81=条目数，从 82 起每条
-            # (x=区域, y=导出变量当前值)；变量联动关闭时不发，避免残留 F4 引用
+            # (x=区域, y=导出变量当前值)。
             lines.append(f"y80 = $ssmtdrag_seed_pending_{ns}")
-            seed_entries = self._click_export_seed_entries()
-            if seed_entries:
-                # 冷启动播种参数：x81=条目数，从 82 起每条 (x=区域, y=导出变量当前值)
-                lines.append(f"x81 = {len(seed_entries)}")
-                for seed_idx, (seed_zone, seed_var) in enumerate(seed_entries):
-                    lines.append(f"x{82 + seed_idx} = {seed_zone}")
-                    lines.append(f"y{82 + seed_idx} = {seed_var}")
+            lines.append(f"x81 = {len(seed_entries)}")
+            for seed_idx, (seed_zone, seed_var) in enumerate(seed_entries):
+                lines.append(f"x{82 + seed_idx} = {seed_zone}")
+                lines.append(f"y{82 + seed_idx} = {seed_var}")
+        else:
+            # 不发射播种链时必须显式写 0：槽位 80/81 与变量同步段的取值区
+            # （81..89）重叠，残留值可能让驱动 CS 走进播种分支（读到脏条目）。
+            lines.append("y80 = 0")
+            lines.append("x81 = 0")
         lines.extend([
             f"cs-t67 = ResourceDragPinnedDetectInfo_{ns}",
             f"cs-t68 = ResourceDragShapeKeyZoneStageCounts_{ns}",
@@ -4308,7 +4358,28 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         # 变量优先 + 确认握手：变量变化后 pending=1/mode=2，GPU 每帧强制推送，
         # 直到 store 回读追平 prev 才结束；仅区域实际激活且无 pending 时允许缓冲
         # 回拉变量。这样 store 的延迟旧值不会覆盖刚写入的新变量。
-        lines = []
+        #
+        # ---- 回读最小化（只在"值可能变了"时回读）----
+        # store 是 GPU→CPU 同步，属整条链里最贵的操作。旧实现每帧对每个绑定
+        # 固定做 2 次 store（ZoneActive + Drive），即 2N 次/帧，绝大多数帧什么都没
+        # 变。现在：
+        #   * 区域激活不再逐绑定回读 ZoneActive（N 次），改为在"按住 / 松开沿"上
+        #     回读一次**绑定锁存**（单槽，驱动 CS 当帧写、本 CL 之前刚跑过，最新），
+        #     再由 CPU 推导每个绑定是否激活 → 0~1 次 store/帧；
+        #   * 驱动槽只在该绑定"拖拽激活"或"等待 store 确认"时回读 → 空闲帧 0 次；
+        #   * 变量只在**真的变了**时才回写（拖拽拉动缓冲 → 值变了才写变量）；
+        #   * 同步 CS 的 dispatch 由 skany 门控（只有绑定处于 mode!=0 才需要跑）。
+        lines = [
+            # 本帧是否需要 dispatch 变量→缓冲同步 CS（有绑定 mode!=0 时置 1）
+            f"$ssmtdrag_skany_{ns} = 0",
+            # 锁存只在按住/松开沿回读；跳过时必须显式清 0，否则陈旧绑定会让
+            # CPU 一直以为拖拽还在进行（每帧回拉一个已经不动的缓冲值）
+            f"$ssmtdrag_sklatch_{ns} = 0",
+            f"if $ssmtdrag_skheld_{ns} == 1 || $ssmtdrag_skheldprev_{ns} == 1",
+            f"\tstore = $ssmtdrag_sklatch_{ns}, ResourceDragShapeKeyDragLatch_{ns}, 0",
+            "endif",
+            f"$ssmtdrag_skheldprev_{ns} = $ssmtdrag_skheld_{ns}",
+        ]
         for i, (var_name, slot, zone, _nd_stage) in enumerate(bindings):
             active = f"$ssmtdrag_skact_{ns}_{i}"
             rb = f"$ssmtdrag_skrb_{ns}_{i}"
@@ -4316,8 +4387,16 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             pending = f"$ssmtdrag_skpending_{ns}_{i}"
             mode = f"$ssmtdrag_skmode_{ns}_{i}"
             lines.extend([
-                f"store = {active}, ResourceDragShapeKeyZoneActive_{ns}, {zone}",
-                f"store = {rb}, ResourceDragShapeKeyDrive_{ns}, {slot}",
+                # 由锁存推导本绑定的区域激活（纯 CPU，零回读）。锁存编码 = 区域id+1，
+                # 与 ZoneActive 同源，整数取值比较精确。
+                f"{active} = 0",
+                f"if $ssmtdrag_sklatch_{ns} == {zone + 1}",
+                f"\t{active} = 1",
+                "endif",
+                # 只有"拖拽激活"或"等 store 确认"时才回读驱动槽
+                f"if {active} >= 1 || {pending} == 1",
+                f"\tstore = {rb}, ResourceDragShapeKeyDrive_{ns}, {slot}",
+                "endif",
                 f"if {var_name} != {prev}",
                 f"\t{prev} = {var_name}",
                 f"\t{pending} = 1",
@@ -4330,11 +4409,19 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 f"\t\t{mode} = 2",
                 "\tendif",
                 f"elif {active} >= 1",
-                f"\t{var_name} = {rb}",
-                f"\t{prev} = {rb}",
+                # 拖拽激活：缓冲值**变了才**回写变量（不再每帧无脑覆盖）
                 f"\t{mode} = 1",
+                f"\tif {rb} != {prev}",
+                f"\t\t{var_name} = {rb}",
+                f"\t\t{prev} = {rb}",
+                "\tendif",
                 "else",
                 f"\t{mode} = 0",
+                "endif",
+                # mode=1 也需要 CS 跑一趟：让它把 VarSyncPrev 追平到已拉取值，
+                # 否则之后 CS 再次运行时会把这个值当"变量变化"回声写回缓冲
+                f"if {mode} != 0",
+                f"\t$ssmtdrag_skany_{ns} = 1",
                 "endif",
             ])
         sections[sec] = lines
@@ -5066,8 +5153,16 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             _sync_n = len(self._drag_drive_var_sync_bindings())
             if _sync_n:
                 globals_to_add.append(f"global $ssmtdrag_skheld_{ns} = 0")
-            # 冷启动播种标志：开启驱动即声明，保证引用处变量恒存在（默认 0）
-            globals_to_add.append(f"global $ssmtdrag_seed_pending_{ns} = 0")
+                # 回读最小化用：按住沿（决定何时回读绑定锁存）、锁存值（区域激活的
+                # CPU 侧推导源）、是否需要 dispatch 同步 CS
+                globals_to_add.append(f"global $ssmtdrag_skheldprev_{ns} = 0")
+                globals_to_add.append(f"global $ssmtdrag_sklatch_{ns} = 0")
+                globals_to_add.append(f"global $ssmtdrag_skany_{ns} = 0")
+            # 冷启动播种标志：只有真的会置 1（存在 ClickExport 播种条目）时才声明，
+            # 否则它是个「声明 + 被 CS 读 + 从不赋值」的死变量。未发射时驱动 CS 段
+            # 显式绑 y80 = 0 / x81 = 0，不依赖本变量存在。
+            if self._click_export_seed_entries():
+                globals_to_add.append(f"global $ssmtdrag_seed_pending_{ns} = 0")
             for i in range(_sync_n):
                 globals_to_add.extend([
                     f"global $ssmtdrag_skact_{ns}_{i} = 0",
@@ -5332,9 +5427,10 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             if self._feature_var() else []
         )
         if sync_bindings:
-            # 分时互斥：ZoneActive 标志由同步 CS 每帧镜像驱动 CS 的绑定锁存
+            # 分时互斥：区域激活由回读命令列表从驱动 CS 的绑定锁存（单槽）推导
             #（按住命中即绑定、移出区域不丢、松开解除）；
-            # 回读只在「对应区域拖拽激活」时进行，其余时间变量完全归驱动器/用户所有
+            # 回读只在「拖拽激活」或「等 store 确认」时进行，其余时间变量完全归
+            # 驱动器/用户所有——空闲帧零回读。
             block.extend([
                 f"$ssmtdrag_skheld_{ns} = 0",
                 f"if $ssmtdrag_mode_{ns} == 1 && ($ssmtdrag_lmb_down_{ns} == 1 || $ssmtdrag_x_down_{ns} == 1)",
@@ -5343,9 +5439,9 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 f"if $ssmtdrag_booted_{ns} == 1 && $ssmtdrag_drawn_{ns} == 1",
                 f"\tpre run = CommandListDragShapeKeyVarReadback_{ns}",
                 "endif",
-                # 变量→驱动缓冲同步：只在角色在屏（drawn，由网格覆写置位）时运行；
-                # 排在回读之后让采用结果当帧生效
-                f"if $ssmtdrag_drawn_{ns} == 1",
+                # 变量→驱动缓冲同步：只在「有绑定需要推送 / 刚从缓冲拉取」时 dispatch
+                #（skany 由回读命令列表当帧算出），空闲帧不再空跑一次 CS
+                f"if $ssmtdrag_drawn_{ns} == 1 && $ssmtdrag_skany_{ns} == 1",
                 f"\trun = CustomShaderDragShapeKeyVarSync_{ns}",
                 "endif",
             ])

@@ -62,6 +62,43 @@ def _drag_drive_feature_linked(candidate):
     return bool(getattr(candidate, "enable_shapekey_drive", False))
 
 
+def _seed_pending_var_declared(drag_node) -> bool:
+    """拖拽节点是否真的会声明 ``$ssmtdrag_seed_pending_*``。
+
+    只有存在冷启动播种条目时才声明（「开关值」模式的点击导出节点不提供播种）。
+    不声明却在门控条件里引用它，会让它变成 3DMigoto 的局部变量——本段与拖拽
+    节点不在同一段，读到的恒为 0（行为上"恰好"还能跑，但属于悬空引用，导出
+    校验会报未声明变量）。谓词不同步（旧节点/测试桩）时保守返回 True，保持
+    旧行为不变。
+    """
+    checker = getattr(drag_node, "_click_export_seed_variable_declared", None)
+    if not callable(checker):
+        return True
+    try:
+        return bool(checker())
+    except Exception:
+        return True
+
+
+def _booted_gate(booted_var: str, seed_pending_var: str, drag_node) -> str:
+    """构造导出段的门控条件：boot 完成 && 无待播种。"""
+    parts = [f"{booted_var} == 1"]
+    if _seed_pending_var_declared(drag_node):
+        parts.append(f"{seed_pending_var} == 0")
+    return " && ".join(parts)
+
+
+def _trigger_gate_vars(drag_node, ns) -> list:
+    """取拖拽节点的"按住"变量（LMB/X）。取不到时返回空 = 不做回读门控。"""
+    getter = getattr(drag_node, "_click_export_trigger_vars", None)
+    if not callable(getter):
+        return []
+    try:
+        return [str(v) for v in (getter(ns) or []) if v]
+    except Exception:
+        return []
+
+
 class ClickExportTargetItem(bpy.types.PropertyGroup):
     variable_name: StringProperty(
         name="受控变量",
@@ -385,6 +422,7 @@ class SSMTNode_AnimDriver_ClickExport(SSMTNode_AnimDriver_Base):
         if sequence:
             return self._generate_click_value_segment(
                 sequence, target_vars, click_f_resource, booted_var, seed_pending_var, zone, ns,
+                drag_node,
             )
         # 值仲裁、变量为主（修复「快捷键切换被每帧点击计数回读顶掉」）：
         #   变量变化（热键/驱动器）→ 不回读，置 seed_pending 触发播种把变量值
@@ -395,10 +433,23 @@ class SSMTNode_AnimDriver_ClickExport(SSMTNode_AnimDriver_Base):
         block_lines = [
             "[Present]",
             "; 点击计数导出（值仲裁、变量为主）：变量变化时经 seed_pending 触发播种",
-            "; 把变量值推回点击计数缓冲（下一帧点击从新值继续推进）；变量未变时",
-            "; 每帧拉取缓冲值（点击推进）；热键改动绝不被回读顶掉。",
-            f"if {booted_var} == 1 && {seed_pending_var} == 0",
+            "; 把变量值推回点击计数缓冲（下一帧点击从新值继续推进）；变量未变且",
+            "; 处于按住期间才拉取缓冲值（点击推进）；热键改动绝不被回读顶掉。",
+            f"if {_booted_gate(booted_var, seed_pending_var, drag_node)}",
         ]
+        # 回读最小化：store 只在「按住 / 上一帧还按着（松开沿，防丢最后一次点击）」
+        # 时执行——点击计数只在按住期间推进，空闲帧零回读。
+        trigger_vars = _trigger_gate_vars(drag_node, ns)
+        held_var = f"$ssmtdrag_ckheld_{ns}_{zone}"
+        held_prev_var = f"$ssmtdrag_ckheldprev_{ns}_{zone}"
+        if trigger_vars:
+            held_expr = " || ".join(f"{var} == 1" for var in trigger_vars)
+            block_lines.extend([
+                f"\t{held_var} = 0",
+                f"\tif {held_expr}",
+                f"\t\t{held_var} = 1",
+                "\tendif",
+            ])
         prev_names = []
         for var in target_vars:
             stem = re.sub(r"[^0-9A-Za-z_]", "_", str(var).lstrip("$"))
@@ -409,19 +460,33 @@ class SSMTNode_AnimDriver_ClickExport(SSMTNode_AnimDriver_Base):
                 f"\t\t{prev} = {var}",
                 f"\t\t{seed_pending_var} = 1",
                 "\telse",
-                f"\t\tstore = {var}, {click_f_resource}, {zone}",
+            ])
+            if trigger_vars:
+                block_lines.extend([
+                    f"\t\tif {held_var} == 1 || {held_prev_var} == 1",
+                    f"\t\t\tstore = {var}, {click_f_resource}, {zone}",
+                    "\t\tendif",
+                ])
+            else:
+                block_lines.append(f"\t\tstore = {var}, {click_f_resource}, {zone}")
+            block_lines.extend([
                 f"\t\t{prev} = {var}",
                 "\tendif",
             ])
+        if trigger_vars:
+            block_lines.append(f"\t{held_prev_var} = {held_var}")
         block_lines.append("endif")
         # 每绑定声明一个 prev 辅助变量（全局、跨节可见）
         globals_lines = ["[Constants]"]
+        if trigger_vars:
+            globals_lines.append(f"global {held_var} = 0")
+            globals_lines.append(f"global {held_prev_var} = 0")
         for prev in prev_names:
             globals_lines.append(f"global {prev} = 0")
         return "\n".join(globals_lines) + "\n" + "\n".join(block_lines)
 
     def _generate_click_value_segment(self, sequence, target_vars, click_f_resource,
-                                      booted_var, seed_pending_var, zone, ns):
+                                      booted_var, seed_pending_var, zone, ns, drag_node=None):
         """「开关值」模式段：点击 = 开关值列表的步进（对齐动画驱动开关的 cycle 语义）。
 
         语义（用户口径）：点第一下写列表第 1 项、第二下第 2 项……点完一轮回到第 1 项；
@@ -447,6 +512,8 @@ class SSMTNode_AnimDriver_ClickExport(SSMTNode_AnimDriver_Base):
         init_var = f"$ssmtdrag_ckinit_{ns}_{tag}"
         index_var = f"$ssmtdrag_ckidx_{ns}_{tag}"
         value_var = f"$ssmtdrag_ckval_{ns}_{tag}"
+        held_var = f"$ssmtdrag_ckheld_{ns}_{tag}"
+        held_prev_var = f"$ssmtdrag_ckheldprev_{ns}_{tag}"
 
         globals_lines = [
             "[Constants]",
@@ -460,36 +527,65 @@ class SSMTNode_AnimDriver_ClickExport(SSMTNode_AnimDriver_Base):
             # 当前开关值：未点击时即列表第 1 项
             f"global {value_var} = {values[0]}",
         ]
+        # ---- 回读最小化：点击计数只在按住 LMB/X 期间会变 ----
+        # store 是 GPU→CPU 同步，旧实现每帧无条件回读一次。现在只在
+        # 「按住 / 上一帧还按着（松开沿，防丢最后一次点击）/ 首帧建基线」时回读。
+        trigger_vars = _trigger_gate_vars(drag_node, ns)
+        if trigger_vars:
+            globals_lines.extend([
+                f"global {held_var} = 0",
+                f"global {held_prev_var} = 0",
+            ])
         block_lines = [
             "[Present]",
             "; 点击计数导出（开关值循环）：每次点击依次写入列表下一项，点完一轮回第一项；",
             "; 未点击时写列表首项；受控变量被外部改动（热键/驱动器）时以变量为准。",
-            f"if {booted_var} == 1 && {seed_pending_var} == 0",
-            f"\tstore = {read_var}, {click_f_resource}, {zone}",
-            f"\tif {init_var} == 0",
-            f"\t\t{init_var} = 1",
-            f"\t\t{last_var} = {read_var}",
-            f"\telif {read_var} != {last_var}",
-            f"\t\t{last_var} = {read_var}",
-            f"\t\t{index_var} = {index_var} + 1",
-            f"\t\tif {index_var} >= {count}",
-            f"\t\t\t{index_var} = 0",
-            "\t\tendif",
+            f"if {_booted_gate(booted_var, seed_pending_var, drag_node)}",
         ]
-        for idx, value in enumerate(values):
-            block_lines.append(f"\t\t{'if' if idx == 0 else 'elif'} {index_var} == {idx}")
-            block_lines.append(f"\t\t\t{value_var} = {value}")
+        if trigger_vars:
+            held_expr = " || ".join(f"{var} == 1" for var in trigger_vars)
+            block_lines.extend([
+                f"\t{held_var} = 0",
+                f"\tif {held_expr}",
+                f"\t\t{held_var} = 1",
+                "\tendif",
+                # 读 prev 要在更新 prev 之前（松开沿判定靠它）
+                f"\tif {held_var} == 1 || {held_prev_var} == 1 || {init_var} == 0",
+            ])
+            indent = "\t\t"
+        else:
+            indent = "\t"
         block_lines.extend([
-            "\t\telse",
-            f"\t\t\t{value_var} = {values[0]}",
-            "\t\tendif",
-            "\tendif",
+            f"{indent}store = {read_var}, {click_f_resource}, {zone}",
+            f"{indent}if {init_var} == 0",
+            f"{indent}\t{init_var} = 1",
+            f"{indent}\t{last_var} = {read_var}",
+            f"{indent}elif {read_var} != {last_var}",
+            f"{indent}\t{last_var} = {read_var}",
+            f"{indent}\t{index_var} = {index_var} + 1",
+            f"{indent}\tif {index_var} >= {count}",
+            f"{indent}\t\t{index_var} = 0",
+            f"{indent}\tendif",
         ])
+        for idx, value in enumerate(values):
+            block_lines.append(f"{indent}\t{'if' if idx == 0 else 'elif'} {index_var} == {idx}")
+            block_lines.append(f"{indent}\t\t{value_var} = {value}")
+        block_lines.extend([
+            f"{indent}\telse",
+            f"{indent}\t\t{value_var} = {values[0]}",
+            f"{indent}\tendif",
+            f"{indent}endif",
+        ])
+        if trigger_vars:
+            block_lines.append("\tendif")
+            block_lines.append(f"\t{held_prev_var} = {held_var}")
         for var in target_vars:
             # prev 按受控变量名派生：同一变量天然共享、不同变量天然隔离
             stem = re.sub(r"[^0-9A-Za-z_]", "_", str(var).lstrip("$"))
             prev = f"$ssmtdrag_ckprev_{ns}_{stem}"
             globals_lines.append(f"global {prev} = 0")
+            # 受控变量仲裁是纯 CPU 赋值（无 store），保持每帧执行：
+            # 变量被外部改动时以变量为准，否则写入当前开关值
             block_lines.extend([
                 f"\tif {var} != {prev}",
                 f"\t\t{prev} = {var}",

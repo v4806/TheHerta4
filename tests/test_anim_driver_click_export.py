@@ -67,6 +67,8 @@ _install_module(
 _install_module(
     f"{PKG}.blueprint.variable_registry",
     normalize_variable_name=lambda value: str(value or "").strip().lstrip("$"),
+    build_shape_key_reference_alias_map=lambda context=None: {},
+    rewrite_reference_variables_in_text=lambda text, alias_map=None: text,
 )
 
 
@@ -341,6 +343,107 @@ class ClickValueSequenceTests(unittest.TestCase):
         self.assertNotIn("$ssmtdrag_seed_pending_A = 1", content)
         self.assertIn("if $Swap != $ssmtdrag_ckprev_A_Swap", content)
         self.assertIn("\t\t$ssmtdrag_ckprev_A_Swap = $Swap", content)
+
+    def test_booted_gate_drops_seed_pending_when_drag_node_will_not_declare_it(self):
+        """拖拽节点不会声明 seed_pending 时（「开关值」模式无播种条目），门控必须
+        去掉该项——不声明却引用会退化成 3DMigoto 段内局部变量（跨段失效）。"""
+        node = _click_node(targets=("$Swap",), values="0 0 1")
+        drag = node._find_drag_drive_node()
+        drag._click_export_seed_variable_declared = lambda: False
+
+        content = node.generate_ini_segment()
+
+        self.assertIn("if $ssmtdrag_booted_A == 1", content)
+        self.assertNotIn("$ssmtdrag_seed_pending_A", content)
+
+    def test_booted_gate_keeps_seed_pending_when_declared(self):
+        """对照组：拖拽节点会声明（存在播种条目）时门控保留 seed_pending 项。"""
+        node = _click_node(targets=("$Swap",), values="0 0 1")
+        drag = node._find_drag_drive_node()
+        drag._click_export_seed_variable_declared = lambda: True
+
+        content = node.generate_ini_segment()
+
+        self.assertIn(
+            "if $ssmtdrag_booted_A == 1 && $ssmtdrag_seed_pending_A == 0", content)
+
+    def test_booted_gate_defaults_to_legacy_when_predicate_missing(self):
+        """旧节点/测试桩没有该谓词时保守保留（行为与旧版一致）。"""
+        node = _click_node(targets=("$Swap",), values="0 0 1")
+
+        content = node.generate_ini_segment()
+
+        self.assertIn(
+            "if $ssmtdrag_booted_A == 1 && $ssmtdrag_seed_pending_A == 0", content)
+
+    # ------------------------------------------------------------------
+    # 回读最小化：点击计数只在按住期间会变 → 只在按住/松开沿/首帧建基线时 store
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _enable_trigger_gate(node):
+        drag = node._find_drag_drive_node()
+        drag._click_export_trigger_vars = lambda ns: [
+            f"$ssmtdrag_lmb_down_{ns}", f"$ssmtdrag_x_down_{ns}",
+        ]
+        return drag
+
+    def test_switch_value_store_is_gated_on_trigger_hold(self):
+        node = _click_node(targets=("$Swap",), zone=5, values="001")
+        self._enable_trigger_gate(node)
+
+        content = node.generate_ini_segment()
+        lines = content.splitlines()
+
+        # 按住标志 + 回读门控（按住 / 上一帧按着 / 首帧建基线）
+        self.assertIn("global $ssmtdrag_ckheld_A_Click_Export_5 = 0", content)
+        self.assertIn("global $ssmtdrag_ckheldprev_A_Click_Export_5 = 0", content)
+        self.assertIn("if $ssmtdrag_lmb_down_A == 1 || $ssmtdrag_x_down_A == 1", content)
+        gate = ("if $ssmtdrag_ckheld_A_Click_Export_5 == 1 || "
+                "$ssmtdrag_ckheldprev_A_Click_Export_5 == 1 || "
+                "$ssmtdrag_ckinit_A_Click_Export_5 == 0")
+        self.assertIn(gate, content)
+        # store 落在门控内（缩进两层）
+        self.assertIn("\t\tstore = $ssmtdrag_ckread_A_Click_Export_5, "
+                      "ResourceDragShapeKeyClickCountF_A, 5", content)
+        # prev 必须在"读取门控之后"才更新，否则松开沿判定恒假
+        gate_idx = next(i for i, l in enumerate(lines) if gate in l)
+        store_idx = next(
+            i for i, l in enumerate(lines)
+            if "store = $ssmtdrag_ckread_A_Click_Export_5" in l)
+        prev_idx = next(
+            i for i, l in enumerate(lines)
+            if l.strip() == ("$ssmtdrag_ckheldprev_A_Click_Export_5 = "
+                             "$ssmtdrag_ckheld_A_Click_Export_5"))
+        self.assertLess(gate_idx, store_idx)
+        self.assertLess(store_idx, prev_idx)
+        # 受控变量仲裁是纯 CPU 赋值 → 仍每帧执行（门控外，单层缩进）
+        self.assertIn("\t\t$Swap = $ssmtdrag_ckval_A_Click_Export_5", content)
+
+    def test_switch_value_store_ungated_without_trigger_vars(self):
+        """取不到按住变量（旧节点/EFMI）时不做门控，保持旧行为。"""
+        node = _click_node(targets=("$Swap",), zone=5, values="001")
+
+        content = node.generate_ini_segment()
+
+        self.assertIn("\tstore = $ssmtdrag_ckread_A_Click_Export_5, "
+                      "ResourceDragShapeKeyClickCountF_A, 5", content)
+        self.assertNotIn("$ssmtdrag_ckheld_A", content)
+
+    def test_legacy_count_store_is_gated_on_trigger_hold(self):
+        node = _click_node(targets=("$Swap",), values="")
+        self._enable_trigger_gate(node)
+
+        content = node.generate_ini_segment()
+
+        self.assertIn("global $ssmtdrag_ckheld_A_2 = 0", content)
+        self.assertIn("global $ssmtdrag_ckheldprev_A_2 = 0", content)
+        self.assertIn(
+            "if $ssmtdrag_ckheld_A_2 == 1 || $ssmtdrag_ckheldprev_A_2 == 1", content)
+        # store 被包进按住门控（三层缩进）
+        self.assertIn("\t\t\tstore = $Swap, ResourceDragShapeKeyClickCountF_A, 2", content)
+        # 变量→缓冲的播种分支不受影响
+        self.assertIn("$ssmtdrag_seed_pending_A = 1", content)
 
     def test_generate_ini_segment_without_values_keeps_legacy_count_readback(self):
         node = _click_node(targets=("$Swap",), values="")

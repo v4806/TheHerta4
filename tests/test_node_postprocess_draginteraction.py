@@ -1434,10 +1434,22 @@ class DragNodeEmitTests(unittest.TestCase):
         rb = "\n".join(sections["[CommandListDragShapeKeyVarReadback_testns]"])
         # store 直接读源缓冲（无镜像/克隆）
         self.assertNotIn(" = copy ", rb)
+        # ---- 回读最小化：只在"值可能变了"时 store ----
+        # 区域激活不再逐绑定回读 ZoneActive（N 次 store），改为按住/松开沿回读
+        # 一次绑定锁存（单槽，驱动 CS 当帧写）再由 CPU 推导
+        self.assertNotIn("ResourceDragShapeKeyZoneActive_testns", rb)
+        self.assertIn(
+            "store = $ssmtdrag_sklatch_testns, ResourceDragShapeKeyDragLatch_testns, 0", rb)
+        self.assertIn("if $ssmtdrag_skheld_testns == 1 || $ssmtdrag_skheldprev_testns == 1", rb)
+        self.assertIn("$ssmtdrag_sklatch_testns = 0", rb)
+        self.assertIn("if $ssmtdrag_sklatch_testns == 1", rb)
+        self.assertIn("$ssmtdrag_skact_testns_0 = 1", rb)
+        # 驱动槽只在该绑定激活或等确认时回读
+        self.assertIn(
+            "if $ssmtdrag_skact_testns_0 >= 1 || $ssmtdrag_skpending_testns_0 == 1", rb)
+        self.assertIn("store = $ssmtdrag_skrb_testns_0, ResourceDragShapeKeyDrive_testns, 5", rb)
         # 变量优先握手：变化后 pending=1/mode=2，持续回推直到回读追平；
         # 只有追平后才允许拖拽/缓冲变化以 mode=1 拉回变量。
-        self.assertIn("store = $ssmtdrag_skact_testns_0, ResourceDragShapeKeyZoneActive_testns, 0", rb)
-        self.assertIn("store = $ssmtdrag_skrb_testns_0, ResourceDragShapeKeyDrive_testns, 5", rb)
         self.assertIn("if $Freq_A != $ssmtdrag_skprev_testns_0", rb)
         self.assertIn("$ssmtdrag_skprev_testns_0 = $Freq_A", rb)
         self.assertIn("$ssmtdrag_skpending_testns_0 = 1", rb)
@@ -1445,13 +1457,24 @@ class DragNodeEmitTests(unittest.TestCase):
         self.assertIn("elif $ssmtdrag_skpending_testns_0 == 1", rb)
         self.assertIn("if $ssmtdrag_skrb_testns_0 == $ssmtdrag_skprev_testns_0", rb)
         self.assertIn("elif $ssmtdrag_skact_testns_0 >= 1", rb)
+        # 拖拽拉动缓冲：值**变了才**回写变量（不再每帧无脑覆盖）
+        self.assertIn("if $ssmtdrag_skrb_testns_0 != $ssmtdrag_skprev_testns_0", rb)
         self.assertIn("$Freq_A = $ssmtdrag_skrb_testns_0", rb)
         self.assertIn("$ssmtdrag_skmode_testns_0 = 1", rb)
         self.assertIn("store = $ssmtdrag_skrb_testns_1, ResourceDragShapeKeyDrive_testns, 0", rb)
         self.assertIn("$Freq_B = $ssmtdrag_skrb_testns_1", rb)
+        # 只有绑定处于 mode!=0 才置 skany（Present 用它门控同步 CS 的 dispatch）
+        self.assertIn("if $ssmtdrag_skmode_testns_0 != 0", rb)
+        self.assertIn("$ssmtdrag_skany_testns = 1", rb)
+        self.assertIn("$ssmtdrag_skany_testns = 0", rb)
+        # 空闲帧不再空跑同步 CS
+        self.assertIn("if $ssmtdrag_drawn_testns == 1 && $ssmtdrag_skany_testns == 1", present)
 
         constants = "\n".join(sections["[Constants]"])
         self.assertIn("global $ssmtdrag_skheld_testns = 0", constants)
+        self.assertIn("global $ssmtdrag_skheldprev_testns = 0", constants)
+        self.assertIn("global $ssmtdrag_sklatch_testns = 0", constants)
+        self.assertIn("global $ssmtdrag_skany_testns = 0", constants)
         self.assertIn("global $ssmtdrag_skact_testns_0 = 0", constants)
         self.assertIn("global $ssmtdrag_skrb_testns_0 = 0", constants)
         self.assertIn("global $ssmtdrag_skprev_testns_0 = 0", constants)
@@ -1463,6 +1486,45 @@ class DragNodeEmitTests(unittest.TestCase):
         cs = "\n".join(sections["[CustomShaderDragShapeKeyVarSync_testns]"])
         self.assertIn("x90 = $ssmtdrag_skmode_testns_0", cs)
         self.assertIn("y90 = $ssmtdrag_skmode_testns_1", cs)
+
+    def test_readback_stores_do_not_scale_with_binding_count(self):
+        """回读最小化：store 次数必须与绑定数解耦（旧实现固定 2N 次/帧）。
+
+        新实现：锁存回读 1 次（且只在按住/松开沿）+ 每个绑定仅在该绑定
+        「拖拽激活」或「等 store 确认」时回读驱动槽 → 空闲帧 0 次 store。
+        """
+        zone = self._zone_item(0)
+        node = _make_node(
+            self.mod,
+            enable_shapekey_drive=True,
+            zone_objects=[zone],
+        )
+        node.id_data = types.SimpleNamespace(nodes=[
+            self._fake_sk_node([(f"SK{i}", 0, "0", 1) for i in range(6)]),
+        ])
+        sections = {}
+        node._emit_shapekey_var_readback_command_list(sections, "testns")
+        rb = sections["[CommandListDragShapeKeyVarReadback_testns]"]
+
+        stores = [line.strip() for line in rb if line.strip().startswith("store =")]
+        # 锁存 1 + 6 个绑定各 1（都在门控内）；旧实现是 6×2 = 12 次且无门控
+        self.assertEqual(len(stores), 7, stores)
+        self.assertEqual(
+            sum(1 for s in stores if "DragLatch" in s), 1,
+            "锁存只回读一次（区域激活由 CPU 推导）",
+        )
+        self.assertFalse(
+            any("ZoneActive" in line for line in rb),
+            "不再逐绑定回读 ZoneActive",
+        )
+        # 每个 store 都必须在条件里（不存在无条件回读）
+        for idx, line in enumerate(rb):
+            if not line.strip().startswith("store ="):
+                continue
+            self.assertTrue(
+                any(prev.strip().startswith("if ") for prev in rb[max(0, idx - 3):idx]),
+                f"store 未被门控: {line}",
+            )
 
     def test_shapekey_var_sync_nine_bindings_do_not_overlap_iniparams(self):
         zone = self._zone_item(0)
