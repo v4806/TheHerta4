@@ -87,6 +87,7 @@ def _stub_ensure_anim_driver_frame_variable_name(node, context=None):
 
 _install_module(
     f"{PKG}.blueprint.variable_registry",
+    ANIM_DRIVER_FRAME_PREFIX="anim_frame",
     allocate_continuous_shapekey_index_variable_name=lambda **_kwargs: "continuous_shapekey_frame1",
     mark_variable_name_used=lambda *_args, **_kwargs: None,
     normalize_variable_name=lambda value: str(value or "").strip().lstrip("$"),
@@ -1879,6 +1880,94 @@ class RuntimeFrameVariablePreallocationTests(unittest.TestCase):
 
         self.assertEqual(duplicate.accumulator_variable, "$accumulator2")
         self.assertEqual(duplicate.custom_paused_var, "$accumulative_trigger_paused2")
+
+
+    def test_migrate_legacy_frame_variable_renames_old_prefix(self):
+        node = runtime_module.SSMTNode_AnimDriver_Runtime()
+        node.name = "运行时间"
+        node.custom_frame_variable_name = "$swapvar3"
+        node.assigned_frame_variable_name = "swapvar3"
+
+        changed = runtime_module.migrate_legacy_frame_variable_name(node)
+
+        self.assertTrue(changed)
+        self.assertEqual(node.custom_frame_variable_name, "$anim_frame3")
+        self.assertEqual(node.assigned_frame_variable_name, "anim_frame3")
+
+    def test_migrate_legacy_frame_variable_keeps_user_names(self):
+        node = runtime_module.SSMTNode_AnimDriver_Runtime()
+        node.name = "运行时间"
+        node.custom_frame_variable_name = "$swapvar_myframe"
+        node.assigned_frame_variable_name = "my_frame"
+
+        changed = runtime_module.migrate_legacy_frame_variable_name(node)
+
+        self.assertFalse(changed, "手改过的名字（含 swapvar_xxx 这种自定名）不能动")
+        self.assertEqual(node.custom_frame_variable_name, "$swapvar_myframe")
+        self.assertEqual(node.assigned_frame_variable_name, "my_frame")
+
+    def _with_runtime_tree(self, module, node):
+        """把节点挂进假蓝图树并装到假 bpy 上，供迁移 sweep 测试使用。
+
+        用被测模块**自己的** ``bpy`` 引用：其它测试模块会各自替换
+        ``sys.modules["bpy"]``，读全局那个会与生产代码看到的不是同一个对象。
+        """
+        tree = types.SimpleNamespace(
+            name="动画驱动蓝图", bl_idname='SSMTBlueprintTreeType', nodes=[node], links=[]
+        )
+        node.id_data = tree
+        bpy_module = module.bpy
+        previous = list(getattr(bpy_module.data, "node_groups", []) or [])
+        bpy_module.data.node_groups = [tree]
+        self.addCleanup(lambda: setattr(bpy_module.data, "node_groups", previous))
+
+    def test_register_sweep_renames_legacy_name_and_fills_box(self):
+        """回归：重载（load_post / 插件重载）必须把旧节点刷新到当前命名。"""
+        node = runtime_module.SSMTNode_AnimDriver_Runtime()
+        node.name = "运行时间"
+        node.auto_index = 3
+        node.fps = 30
+        node.playback_rate = 1
+        node.custom_frame_variable_name = ""          # 旧版本只写 assigned，没填输入框
+        node.assigned_frame_variable_name = "swapvar3"  # 旧前缀
+        node.frame_var_initialized = False
+        self._with_runtime_tree(runtime_module, node)
+
+        migrated = runtime_module.migrate_existing_runtime_nodes()
+
+        self.assertEqual(migrated, 1)
+        self.assertEqual(node.assigned_frame_variable_name, "anim_frame3")
+        # 输入框里存的是归一化名（无 $，与连续索引变量同规则；消费侧自己补 $）
+        self.assertEqual(node.custom_frame_variable_name, "anim_frame3")
+
+    def test_register_sweep_respects_user_cleared_box(self):
+        node = runtime_module.SSMTNode_AnimDriver_Runtime()
+        node.name = "运行时间"
+        node.auto_index = 3
+        node.fps = 30
+        node.playback_rate = 1
+        node.custom_frame_variable_name = ""            # 用户手动清空过
+        node.assigned_frame_variable_name = "anim_frame3"
+        node.frame_var_initialized = True               # 守卫已置位 → 不再回填
+        self._with_runtime_tree(runtime_module, node)
+
+        migrated = runtime_module.migrate_existing_runtime_nodes()
+
+        self.assertEqual(migrated, 0)
+        self.assertEqual(node.custom_frame_variable_name, "")
+
+    def test_register_sweep_fills_accumulator_variable(self):
+        node = accumulative_trigger_module.SSMTNode_AnimDriver_AccumulativeTrigger()
+        node.name = "AccumulativeTrigger"
+        node.auto_index = 1
+        node.custom_paused_var = "$accumulative_trigger_paused1"
+        node.accumulator_variable = ""                  # 旧节点：输入框空
+        self._with_runtime_tree(accumulative_trigger_module, node)
+
+        migrated = accumulative_trigger_module.migrate_existing_accumulative_nodes()
+
+        self.assertEqual(migrated, 1)
+        self.assertEqual(node.accumulator_variable, "$accumulator1")
 
 
 if __name__ == "__main__":

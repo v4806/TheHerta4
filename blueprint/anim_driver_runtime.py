@@ -1,3 +1,5 @@
+import re
+
 import bpy
 from bpy.props import BoolProperty, IntProperty, StringProperty
 
@@ -7,10 +9,16 @@ from .anim_driver_base import (
     SSMTNode_AnimDriver_Base,
 )
 from .variable_registry import (
+    ANIM_DRIVER_FRAME_PREFIX,
     ensure_anim_driver_frame_variable_name,
     mark_variable_name_used,
     normalize_variable_name,
 )
+
+#: 历史自动生成的帧变量名（``swapvar{序号}``），只用于迁移到当前前缀。
+#: 注意：**不匹配** ``swapvar_xxx`` 这类用户自定义名（下划线 + 字母），
+#: 那属于用户手改，按「已分配不重分配」口径一律不动。
+_LEGACY_FRAME_VARIABLE_RE = re.compile(r"^swapvar(\d+(?:_\d+)?)$")
 
 
 class SSMTNode_AnimDriver_Runtime(SSMTNode_AnimDriver_Base):
@@ -158,20 +166,67 @@ class SSMTNode_AnimDriver_Runtime(SSMTNode_AnimDriver_Base):
 _load_handler_registered = False
 
 
+def migrate_legacy_frame_variable_name(node) -> bool:
+    """把历史自动生成的 ``swapvar{序号}`` / ``swapvar{序号}_n`` 迁到当前前缀。
+
+    只改「形状就是旧前缀自动生成」的名字：用户手改成别的名字（含 ``swapvar_xxx``
+    这类自定义名）一律不动 —— 与形态键预分配「已分配不重分配、只做可证明的迁移」
+    同一口径。
+    """
+    changed = False
+    for field in ("custom_frame_variable_name", "assigned_frame_variable_name"):
+        raw = str(getattr(node, field, "") or "").strip()
+        if not raw:
+            continue
+        has_dollar = raw.startswith("$")
+        match = _LEGACY_FRAME_VARIABLE_RE.match(raw.lstrip("$"))
+        if not match:
+            continue
+        new_name = f"{ANIM_DRIVER_FRAME_PREFIX}{match.group(1)}"
+        setattr(node, field, f"${new_name}" if has_dollar else new_name)
+        changed = True
+    return changed
+
+
+def migrate_existing_runtime_nodes() -> int:
+    """补齐/迁移已有运行时间节点；返回被动过的节点数。
+
+    两件事：
+      1. 历史预分配名 ``swapvar{序号}`` → ``anim_frame{序号}``（旧前缀已弃用）；
+      2. 输入框为空时把预分配名填进去（与暂停变量/连续索引变量同规则）。
+
+    ``load_post``（打开工程）与 ``register``（插件重载/重新启用）都会调用 —— 后者
+    是必需的：Reload Scripts / 重新启用插件**不会**触发 ``load_post``，只挂 load_post
+    的话「重载后旧节点没被刷新」。
+    """
+    migrated = 0
+    for tree in getattr(bpy.data, "node_groups", []) or []:
+        if getattr(tree, "bl_idname", "") != 'SSMTBlueprintTreeType':
+            continue
+        for node in getattr(tree, "nodes", []) or []:
+            if getattr(node, "bl_idname", "") != 'SSMTNode_AnimDriver_Runtime':
+                continue
+            try:
+                SSMTNode_AnimDriver_Base._migrate_dynamic_sockets(node)
+                renamed = migrate_legacy_frame_variable_name(node)
+                filled = False
+                if not str(getattr(node, "custom_frame_variable_name", "") or "").strip():
+                    filled = bool(node._ensure_initial_visible_frame_variable_name())
+                if renamed or filled:
+                    migrated += 1
+                    print(
+                        f"[AnimDriver] 运行时间节点 '{node.name}' 帧变量 → "
+                        f"${node.frame_variable_name()}"
+                        f"{'（旧前缀已迁移）' if renamed else '（补填入输入框）'}"
+                    )
+            except Exception as exc:
+                print(f"[AnimDriver][警告] 运行时间节点 '{getattr(node, 'name', '?')}' 迁移失败: {exc}")
+    return migrated
+
+
 @bpy.app.handlers.persistent
 def _runtime_load_handler(dummy):
-    for tree in bpy.data.node_groups:
-        if tree.bl_idname != 'SSMTBlueprintTreeType':
-            continue
-        for node in tree.nodes:
-            if node.bl_idname == 'SSMTNode_AnimDriver_Runtime':
-                try:
-                    SSMTNode_AnimDriver_Base._migrate_dynamic_sockets(node)
-                    # 旧蓝图：补上帧变量（含填入输入框），让面板上直接看得到
-                    if not str(getattr(node, "custom_frame_variable_name", "") or "").strip():
-                        node._ensure_initial_visible_frame_variable_name()
-                except Exception:
-                    pass
+    migrate_existing_runtime_nodes()
 
 
 classes = (
@@ -186,6 +241,8 @@ def register():
     if not _load_handler_registered:
         bpy.app.handlers.load_post.append(_runtime_load_handler)
         _load_handler_registered = True
+    # 插件（重新）加载时也要迁移：Reload Scripts / 重新启用不会触发 load_post
+    migrate_existing_runtime_nodes()
 
 
 def unregister():

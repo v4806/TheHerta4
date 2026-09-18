@@ -466,23 +466,47 @@ class SSMTNode_AnimDriver_AccumulativeTrigger(SSMTNode_AnimDriver_Base):
 _load_handler_registered = False
 
 
-@bpy.app.handlers.persistent
-def _accumulative_trigger_load_handler(dummy):
-    for tree in bpy.data.node_groups:
-        if tree.bl_idname != 'SSMTBlueprintTreeType':
+def migrate_existing_accumulative_nodes() -> int:
+    """补齐已有累计触发节点（暂停变量 + 累计变量）；返回被动过的节点数。
+
+    ``load_post``（打开工程）与 ``register``（插件重载/重新启用）都会调用 —— 后者
+    是必需的：Reload Scripts / 重新启用插件不会触发 ``load_post``，只挂 load_post
+    的话「重载后旧节点没被刷新」。
+    """
+    migrated = 0
+    for tree in getattr(bpy.data, "node_groups", []) or []:
+        if getattr(tree, "bl_idname", "") != 'SSMTBlueprintTreeType':
             continue
-        for node in tree.nodes:
-            if node.bl_idname != 'SSMTNode_AnimDriver_AccumulativeTrigger':
+        for node in getattr(tree, "nodes", []) or []:
+            if getattr(node, "bl_idname", "") != 'SSMTNode_AnimDriver_AccumulativeTrigger':
                 continue
             try:
                 SSMTNode_AnimDriver_Base.migrate_default_play_state_flag(node)
                 SSMTNode_AnimDriver_Base._migrate_dynamic_sockets(node)
+                touched = False
                 if not node.custom_paused_var:
                     node._ensure_indexed_paused_variable_name("accumulative_trigger_paused")
+                    touched = True
                 if not str(getattr(node, "accumulator_variable", "") or "").strip():
                     node._ensure_accumulator_variable_name()
-            except Exception:
-                pass
+                    touched = True
+                if touched:
+                    migrated += 1
+                    print(
+                        f"[AnimDriver] 累计触发节点 '{node.name}' 变量补填: "
+                        f"{node.custom_paused_var} / {node.accumulator_variable}"
+                    )
+            except Exception as exc:
+                print(
+                    f"[AnimDriver][警告] 累计触发节点 "
+                    f"'{getattr(node, 'name', '?')}' 迁移失败: {exc}"
+                )
+    return migrated
+
+
+@bpy.app.handlers.persistent
+def _accumulative_trigger_load_handler(dummy):
+    migrate_existing_accumulative_nodes()
 
 
 classes = (
@@ -506,6 +530,8 @@ def register():
     if not _load_handler_registered:
         bpy.app.handlers.load_post.append(_accumulative_trigger_load_handler)
         _load_handler_registered = True
+    # 插件（重新）加载时也要迁移：Reload Scripts / 重新启用不会触发 load_post
+    migrate_existing_accumulative_nodes()
 
 
 def unregister():

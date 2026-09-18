@@ -83,6 +83,7 @@ def _stub_ensure_anim_driver_frame_variable_name(node, context=None):
 
 _install_module(
     f"{PKG}.blueprint.variable_registry",
+    ANIM_DRIVER_FRAME_PREFIX="anim_frame",
     allocate_continuous_shapekey_index_variable_name=lambda **_kwargs: "continuous_shapekey_frame1",
     mark_variable_name_used=lambda *_args, **_kwargs: None,
     normalize_variable_name=lambda value: str(value or "").strip().lstrip("$"),
