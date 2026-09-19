@@ -57,9 +57,15 @@ sys.modules[spec.name] = module
 spec.loader.exec_module(module)
 
 
+class _NodeStub:
+    def _extract_hash_prefix(self, logical_hash):
+        return str(logical_hash).split("-")[0]
+
+
 class _Harness(module.DirectShapeKeyOutputMixin):
     def __init__(self, key_map):
         self.blueprint_model = types.SimpleNamespace(keyname_mkey_dict=key_map)
+        self.node = _NodeStub()
 
 
 class DirectShapeKeyActivationGuardTests(unittest.TestCase):
@@ -75,6 +81,99 @@ class DirectShapeKeyActivationGuardTests(unittest.TestCase):
         self.assertIn("if $active0 == 1", lines)
         self.assertIn("    run = CustomShader_abc_Anim", lines)
         self.assertIn("endif", lines)
+
+
+class ShapeKeySignatureGateTests(unittest.TestCase):
+    """形态键 dispatch 的脏签名门控：静止帧不重算（省 ~69MB/帧 的缓冲流量）。"""
+
+    def _build(self, **kwargs):
+        return _Harness({"$swap": object()})._build_present_run_block(
+            ["d942b3a7-39828-0"], **kwargs
+        )
+
+    def test_signature_gate_wraps_run_inside_active_guard(self):
+        lines = self._build(signature_vars=["$Freq_a", "$Freq_b"])
+
+        self.assertIn("if $active0 == 1", lines)
+        self.assertIn(
+            "    $ssmt_sk_sig_d942b3a7 = $Freq_a * 1 + $Freq_b * 3",
+            lines,
+        )
+        self.assertIn(
+            "    if $ssmt_sk_sig_d942b3a7 != $ssmt_sk_sig_prev_d942b3a7",
+            lines,
+        )
+        self.assertIn("        run = CustomShader_d942b3a7-39828-0_Anim", lines)
+        self.assertIn(
+            "        $ssmt_sk_sig_prev_d942b3a7 = $ssmt_sk_sig_d942b3a7",
+            lines,
+        )
+        self.assertEqual(
+            sum(1 for line in lines if line.strip() == "endif"),
+            2,
+            "内外两层 if 都要闭合",
+        )
+        self.assertEqual(lines[0], module.DirectShapeKeyOutputMixin._PRESENT_RUN_BEGIN)
+        self.assertEqual(lines[-1], module.DirectShapeKeyOutputMixin._PRESENT_RUN_END)
+
+    def test_drag_mode_forces_dispatch(self):
+        lines = self._build(
+            signature_vars=["$Freq_a"],
+            drag_active_var="$ssmtdrag_mode_A",
+        )
+
+        self.assertIn(
+            "    if $ssmt_sk_sig_d942b3a7 != $ssmt_sk_sig_prev_d942b3a7"
+            " || $ssmtdrag_mode_A == 1",
+            lines,
+        )
+
+    def test_without_signature_vars_keeps_legacy_form(self):
+        lines = self._build()
+
+        self.assertIn("    run = CustomShader_d942b3a7-39828-0_Anim", lines)
+        self.assertNotIn("$ssmt_sk_sig", "\n".join(lines))
+        self.assertEqual(sum(1 for line in lines if line.strip() == "endif"), 1)
+
+    def test_signature_gate_without_active_guard_still_applies(self):
+        lines = _Harness({})._build_present_run_block(
+            ["abc"], signature_vars=["$Freq_a"]
+        )
+
+        self.assertNotIn("if $active0 == 1", lines)
+        self.assertIn("$ssmt_sk_sig_abc = $Freq_a * 1", lines)
+        self.assertIn("if $ssmt_sk_sig_abc != $ssmt_sk_sig_prev_abc", lines)
+        self.assertIn("    run = CustomShader_abc_Anim", lines)
+        self.assertEqual(sum(1 for line in lines if line.strip() == "endif"), 1)
+
+    def test_long_signature_is_split_into_bounded_lines(self):
+        params = [f"$Freq_{index}" for index in range(40)]
+        lines = self._build(signature_vars=params)
+        signature_lines = [line for line in lines if "$ssmt_sk_sig_d942b3a7 = " in line]
+
+        self.assertGreater(len(signature_lines), 1, "超长签名必须拆成多条赋值")
+        for line in signature_lines:
+            self.assertLess(len(line), 600)
+
+    def test_signature_weights_are_distinct(self):
+        weights = module.DirectShapeKeyOutputMixin._SK_SIGNATURE_WEIGHTS
+        self.assertEqual(len(weights), len(set(weights)), "权重必须互不相同")
+        self.assertTrue(all(weight > 0 for weight in weights))
+
+    def test_drag_mode_variable_derivation(self):
+        derive = module.DirectShapeKeyOutputMixin._drag_mode_variable_for
+
+        self.assertEqual(derive("ResourceDragShapeKeyDrive_A"), "$ssmtdrag_mode_A")
+        self.assertEqual(derive("ResourceDragShapeKeyDrive_testns"), "$ssmtdrag_mode_testns")
+        self.assertEqual(derive(""), "")
+        self.assertEqual(derive("ResourceDragShapeKeyClickCount_A"), "")
+
+    def test_signature_var_names_are_per_hash(self):
+        harness = _Harness({"$swap": object()})
+        first = harness._sk_signature_var_names(["d942b3a7-39828-0"])
+        second = harness._sk_signature_var_names(["480eeade-6552-0"])
+
+        self.assertNotEqual(first, second, "多个形态键节点不能共用签名变量")
 
 
 if __name__ == "__main__":

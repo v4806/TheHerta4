@@ -23,23 +23,113 @@ class DirectShapeKeyOutputMixin:
     _PRESENT_RUN_BEGIN = "; --- SSMT DIRECT SHAPEKEY PRESENT BEGIN ---"
     _PRESENT_RUN_END = "; --- SSMT DIRECT SHAPEKEY PRESENT END ---"
 
+    #: 形态键强度签名：每帧把本帧所有强度/开关变量按固定权重求和，与上一帧比较，
+    #: 没变化就整段跳过 dispatch。一次 dispatch 要读 ~36MB、写 ~9MB 顶点缓冲
+    #: （14033 组 × 16 线程），静止（没有动画、没按 Alt 拖拽）时输入完全没变，
+    #: 重算一遍是纯显存带宽浪费 —— 装大量同类模组时这是最大的 GPU 开销。
+    #: 权重取互不相同的质数：任意单个强度变化都会改变加权和（避免两项抵消）。
+    _SK_SIGNATURE_WEIGHTS = (
+        1, 3, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53,
+        59, 61, 67, 71, 73, 79, 83, 89, 97, 101, 103, 107, 109,
+        113, 127, 131, 137, 139, 149, 151, 157, 163, 167, 173,
+        179, 181, 191, 193, 197, 199, 211, 223, 227, 229, 233,
+    )
+    #: 单条 INI 表达式里最多塞多少个强度项（3DMigoto 行缓冲有限，超长行会被截断）
+    _SK_SIGNATURE_TERMS_PER_LINE = 16
+
     def _uses_active_guard(self):
         key_map = getattr(getattr(self, "blueprint_model", None), "keyname_mkey_dict", None)
         return bool(key_map)
 
-    def _build_present_run_block(self, unique_hashes):
+    @staticmethod
+    def _drag_mode_variable_for(drag_drive_resource):
+        """从拖拽驱动资源名推出「拖拽系统本帧在臂动」的门控变量。
+
+        资源名形如 ``ResourceDragShapeKeyDrive_{ns}``（拖拽节点命名），对应变量
+        ``$ssmtdrag_mode_{ns}``（Alt 按住时为 1）。拖拽驱动缓冲每帧都在变，
+        签名看不出来，必须用它强制 dispatch。拿不到就返回空串（不加这一项）。
+        """
+        text = str(drag_drive_resource or "").strip()
+        prefix = "ResourceDragShapeKeyDrive_"
+        if not text.startswith(prefix):
+            return ""
+        namespace = text[len(prefix):].strip()
+        return f"$ssmtdrag_mode_{namespace}" if namespace else ""
+
+    def _sk_signature_var_names(self, unique_hashes):
+        """签名变量的名字（按 hash 前缀区分，多个形态键节点互不干扰）。"""
+        suffix = ""
+        for logical_hash in unique_hashes:
+            suffix = str(self.node._extract_hash_prefix(logical_hash) or "")
+            if suffix:
+                break
+        safe_suffix = re.sub(r"[^0-9A-Za-z_]", "_", suffix) or "0"
+        return f"$ssmt_sk_sig_{safe_suffix}", f"$ssmt_sk_sig_prev_{safe_suffix}"
+
+    def _build_signature_lines(self, signature_var, signature_vars):
+        """把签名拆成若干条有界长度的赋值（超长表达式行可能被 3DMigoto 截断）。"""
+        params = []
+        for name in signature_vars or ():
+            text = str(name or "").strip()
+            if text and text not in params:
+                params.append(text)
+        if not params:
+            return []
+
+        step = max(1, int(self._SK_SIGNATURE_TERMS_PER_LINE))
+        weights = self._SK_SIGNATURE_WEIGHTS
+        lines = []
+        for chunk_index in range(0, len(params), step):
+            chunk = params[chunk_index:chunk_index + step]
+            terms = " + ".join(
+                f"{param} * {weights[(chunk_index + offset) % len(weights)]}"
+                for offset, param in enumerate(chunk)
+            )
+            if chunk_index == 0:
+                lines.append(f"{signature_var} = {terms}")
+            else:
+                lines.append(f"{signature_var} = {signature_var} + {terms}")
+        return lines
+
+    def _build_present_run_block(self, unique_hashes, signature_vars=None, drag_active_var=""):
+        """[Present] 里的形态键 dispatch 块。
+
+        带 ``signature_vars`` 时先算签名，只有签名变化（或有拖拽在驱动形态键）才
+        真的 dispatch；没有签名变量（旧调用点）时保持原样无条件 dispatch。
+        """
+        signature_lines = []
+        if signature_vars:
+            signature_var, _prev_var = self._sk_signature_var_names(unique_hashes)
+            signature_lines = self._build_signature_lines(signature_var, signature_vars)
+
         lines = [self._PRESENT_RUN_BEGIN]
-        if self._uses_active_guard():
-            lines.extend([
-                'if $active0 == 1',
-                *[f"    run = CustomShader_{logical_hash}_Anim" for logical_hash in unique_hashes],
-                'endif',
-            ])
-        else:
+        guard_open = ['if $active0 == 1'] if self._uses_active_guard() else []
+        indent = "    " * len(guard_open)
+
+        if signature_lines:
+            signature_var, prev_var = self._sk_signature_var_names(unique_hashes)
+            condition = f"{signature_var} != {prev_var}"
+            if drag_active_var:
+                condition = f"{condition} || {drag_active_var} == 1"
+            lines.extend(guard_open)
+            lines.extend(f"{indent}{line}" for line in signature_lines)
+            lines.append(f"{indent}if {condition}")
             lines.extend(
-                f"run = CustomShader_{logical_hash}_Anim"
+                f"{indent}    run = CustomShader_{logical_hash}_Anim"
                 for logical_hash in unique_hashes
             )
+            lines.append(f"{indent}    {prev_var} = {signature_var}")
+            lines.append(f"{indent}endif")
+            if guard_open:
+                lines.append("endif")
+        else:
+            lines.extend(guard_open)
+            lines.extend(
+                f"{indent}run = CustomShader_{logical_hash}_Anim"
+                for logical_hash in unique_hashes
+            )
+            if guard_open:
+                lines.append("endif")
         lines.append(self._PRESENT_RUN_END)
         return lines
 
@@ -533,8 +623,29 @@ class DirectShapeKeyOutputMixin:
             rebuilt_present_lines.append(present_lines[line_index])
             line_index += 1
 
-        rebuilt_present_lines.extend(self._build_present_run_block(unique_hashes))
+        # 签名变量：本帧所有形态键强度（+ 基础网格切换开关）。没变化就不 dispatch，
+        # 拖拽臂动（Alt）期间强制 dispatch —— 拖拽驱动缓冲每帧都在变，签名看不出来。
+        signature_vars = sorted({
+            str(param).strip() for param in shapekey_freq_params.values() if str(param).strip()
+        })
+        if "$ssmt_sk_base_mesh" in vars_to_define:
+            signature_vars.append("$ssmt_sk_base_mesh")
+        rebuilt_present_lines.extend(self._build_present_run_block(
+            unique_hashes,
+            signature_vars=signature_vars,
+            drag_active_var=self._drag_mode_variable_for(drag_drive_resource),
+        ))
         sections['[Present]'] = rebuilt_present_lines
+
+        if signature_vars:
+            signature_var, prev_var = self._sk_signature_var_names(unique_hashes)
+            for declaration in (
+                f"global {signature_var} = 0",
+                # 初值 -1：第一帧必然与签名不同 → 至少 dispatch 一次
+                f"global {prev_var} = -1",
+            ):
+                if declaration not in constants_lines:
+                    constants_lines.append(declaration)
 
         compute_blocks_to_add = OrderedDict()
         for logical_hash in unique_hashes:
