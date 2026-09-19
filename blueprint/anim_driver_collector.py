@@ -52,13 +52,39 @@ def _decl_values_equal(left: str, right: str) -> bool:
         return False
 
 
-def normalize_driver_shared_declarations(paragraphs: List[Dict]) -> Dict:
+def _is_gate_variable(name: str, gate_variables) -> bool:
+    """是不是门控（暂停）变量。
+
+    门控变量**本来就是多写**的：累计/条件触发器把它置 1 开、驱动器播完置 0 关、
+    开关节点按热键在值列表里循环。同一个门控被多个段落写不同值是这套系统的设计
+    （谁最后写谁生效），不是"一个变量被赋予多个数值"的事故，因此不参与
+    ``shared_writes`` 提示——否则每次导出都会刷一堆吓人的 INFO。
+    """
+    text = str(name or "").strip()
+    if not text:
+        return False
+    if text in gate_variables:
+        return True
+    return "paused" in text.lower()
+
+
+def normalize_driver_shared_declarations(paragraphs: List[Dict], gate_variables=None) -> Dict:
     """就地归一驱动块内重复的 ``global`` 声明；返回归一摘要。
 
     只看 ``[Constants]`` 段内的 ``global`` / ``global persist`` 声明——``[Present]``
     里的 ``global $x = 0`` 是"每帧重置"惯用法，不能当重复声明删掉。
-    返回 ``{"merges": [...], "renames": [...]}``（供日志与测试断言）。
+
+    ``gate_variables`` 是蓝图里各驱动节点的门控（暂停）变量名集合：这些变量被多个
+    段落写不同值属于设计，不计入 ``shared_writes``。
+
+    返回 ``{"merges": [...], "renames": [...], "shared_writes": [...]}``
+    （供日志与测试断言）。
     """
+    gate_names = {
+        str(name or "").strip()
+        for name in (gate_variables or ())
+        if str(name or "").strip()
+    }
     declarations = []  # (paragraph_index, line_index, name, value)
     for paragraph_index, paragraph in enumerate(paragraphs or []):
         in_constants = False
@@ -157,6 +183,9 @@ def normalize_driver_shared_declarations(paragraphs: List[Dict]) -> Dict:
     # 最终生效的是最后执行的那段。这是"一个变量被赋予多个数值"的写入形态，
     # 不能自动分叉（读它的其它段并不知道该读哪一个），只能显式提示。
     # 各段写的是**同一个右侧表达式**时不提示——那只是幂等重复，无歧义。
+    # 例外：门控（暂停）变量（$animation_paused* / $random_paused* / …）的多写是
+    # 这套系统的设计——触发器置 1 开、驱动器播完置 0 关、开关节点按热键循环；
+    # 对它们刷 INFO 只会淹没真正的数值冲突，因此按名字/节点属性识别后跳过。
     # 注意：比较必须在改名**之后**做——分叉会改变写入的右侧（$fps → $fps_1），
     # 那正是"同一个变量被算出不同值"的典型形态。
     surviving_counts = {}
@@ -193,6 +222,9 @@ def normalize_driver_shared_declarations(paragraphs: List[Dict]) -> Dict:
     shared_writes = []
     for name, surviving in sorted(surviving_counts.items()):
         if surviving != 1:
+            continue
+        if _is_gate_variable(name, gate_names):
+            # 门控变量：触发器开 / 驱动器关 / 开关手动切，多写是设计。
             continue
         writers = final_assignments.get(name) or {}
         if len(writers) < 2:
@@ -286,7 +318,9 @@ class AnimationDriverCollector:
                 })
 
         # 跨段归一：同名 global 声明同值合并、异值分叉（见模块上方注释）
-        self.last_normalization = normalize_driver_shared_declarations(result)
+        self.last_normalization = normalize_driver_shared_declarations(
+            result, gate_variables=self._collect_gate_variables()
+        )
         for rename in self.last_normalization["renames"]:
             print(
                 f"[AnimDriver][WARNING] 变量 {rename['name']} 在段落 "
@@ -299,9 +333,24 @@ class AnimationDriverCollector:
                 f"[AnimDriver][INFO] 变量 {shared['name']} 被 "
                 f"{len(shared['paragraphs'])} 个段落写入不同值（段落 "
                 f"{shared['paragraphs']}）——同一帧内会互相覆盖，实际生效的是最后"
-                "执行的那段；若本意是各自独立的计数，请只保留一个「运行时间」节点"
+                "执行的那段；若本意是各自独立的数值，请检查这些节点是否撞了同一个"
+                "变量名"
             )
         return result
+
+    def _collect_gate_variables(self) -> set:
+        """蓝图里各驱动节点的门控（暂停）变量名（含 ``$``）。
+
+        门控变量的多写是设计（触发器开 / 驱动器关 / 开关手动切），不参与
+        ``shared_writes`` 提示；自定义门控名也在这里被收集到。
+        """
+        names = set()
+        for node in getattr(self.node_group, "nodes", []) or []:
+            raw = str(getattr(node, "custom_paused_var", "") or "").strip()
+            if not raw:
+                continue
+            names.add(raw if raw.startswith('$') else f"${raw}")
+        return names
 
     @staticmethod
     def _build_runtime_segment_key(node, segment: str) -> tuple:

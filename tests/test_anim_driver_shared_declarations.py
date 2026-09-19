@@ -140,6 +140,32 @@ def _runtime_node(name, fps, playback_rate=1):
     return _FakeRuntimeNode(name, fps, playback_rate)
 
 
+class _FakeWriterNode:
+    """声明并写某个全局变量的驱动节点（用于 shared_writes 分类测试）。
+
+    ``written_var`` 是它每帧写的变量，``pause_var`` 是它自己的门控变量——真实
+    节点里这两者通常是不同的变量（门控由触发器/开关写，数值由自己写）。
+    """
+
+    bl_idname = "SSMTNode_AnimDriver_ForwardPlay"
+
+    def __init__(self, name, written_var, value, pause_var=""):
+        self.name = name
+        self.mute = False
+        self.written_var = written_var
+        self.value = value
+        self.custom_paused_var = pause_var
+        self.id_data = None
+
+    def generate_ini_segment(self, connected_nodes=None):
+        return (
+            "[Constants]\n"
+            f"global persist {self.written_var} = 0\n"
+            "[Present]\n"
+            f"{self.written_var} = {self.value}\n"
+        )
+
+
 def _toggle_node(name, shared_value, speed):
     return _FakeToggleNode(name, shared_value, speed)
 
@@ -300,6 +326,37 @@ class NormalizeSharedDeclarationsUnitTests(unittest.TestCase):
         self.assertEqual(out[0].count("global persist $swapvar"), 1)
         self.assertEqual(len(summary["merges"]), 2)
 
+    def test_gate_variable_shared_writes_are_not_reported(self):
+        """门控变量（*paused*）被多段写不同值 = 设计：触发器开 / 驱动器关 / 开关切。"""
+        _out, summary = self._normalize(
+            "[Constants]\nglobal persist $animation_paused3 = 0\n"
+            "[Present]\n$animation_paused3 = 1\n",
+            "[Constants]\nglobal persist $animation_paused3 = 0\n"
+            "[Present]\n$animation_paused3 = 0,1\n$animation_paused3 = 0\n",
+        )
+
+        self.assertEqual(summary["shared_writes"], [])
+
+    def test_custom_gate_variable_name_is_excluded_when_passed_in(self):
+        paragraphs = [
+            {
+                "paragraph_index": 0,
+                "node_names": ["n0"],
+                "ini_content": "[Constants]\nglobal persist $my_gate = 0\n[Present]\n$my_gate = 1\n",
+            },
+            {
+                "paragraph_index": 1,
+                "node_names": ["n1"],
+                "ini_content": "[Constants]\nglobal persist $my_gate = 0\n[Present]\n$my_gate = 0\n",
+            },
+        ]
+
+        summary = collector_module.normalize_driver_shared_declarations(
+            paragraphs, gate_variables={"$my_gate"}
+        )
+
+        self.assertEqual(summary["shared_writes"], [])
+
 
 class RuntimeDriverDedupIntegrationTests(unittest.TestCase):
     """运行时间节点：段级去重 + 声明级归一 双保险。"""
@@ -367,6 +424,32 @@ class RuntimeDriverDedupIntegrationTests(unittest.TestCase):
         self.assertIn("global persist $shared_1 = 0", second)
         self.assertIn("if $shared_1 == 0", second)
         self.assertEqual(len(collector.last_normalization["renames"]), 1)
+
+
+class GateVariableSharedWriteTests(unittest.TestCase):
+    """门控变量的多写不报警；数值变量的多写仍然报警。"""
+
+    def test_gate_variable_written_by_two_paragraphs_is_not_reported(self):
+        collector, _paragraphs = _collect(
+            _FakeWriterNode("驱动器A", "$animation_paused3", 1, pause_var="$animation_paused3"),
+            _FakeWriterNode("驱动器B", "$animation_paused3", 0, pause_var="$animation_paused3"),
+        )
+
+        self.assertEqual(collector.last_normalization["shared_writes"], [])
+
+    def test_value_variable_written_by_two_paragraphs_is_still_reported(self):
+        collector, _paragraphs = _collect(
+            _FakeWriterNode("计数A", "$speed_auto20", 1, pause_var="$animation_paused1"),
+            _FakeWriterNode("计数B", "$speed_auto20", 0, pause_var="$animation_paused2"),
+        )
+
+        self.assertEqual(
+            [
+                {"name": w["name"], "paragraphs": w["paragraphs"]}
+                for w in collector.last_normalization["shared_writes"]
+            ],
+            [{"name": "$speed_auto20", "paragraphs": [0, 1]}],
+        )
 
 
 if __name__ == "__main__":

@@ -160,6 +160,25 @@ class _FakeCollection(list):
         del self[index]
 
 
+class _NodeProxy:
+    """模拟 bpy：同一个节点每次访问都可能返回**新的包装对象**。
+
+    ``tree.nodes`` 里的元素与节点自身不是同一个 Python 对象，所以判"是不是自己"
+    不能用 ``is``（真实导出里曾因此把本节点的门控塞进自己的守卫条件）。
+    """
+
+    def __init__(self, target):
+        self._target = target
+
+    def __getattr__(self, item):
+        return getattr(self._target, item)
+
+    def __eq__(self, other):
+        if isinstance(other, _NodeProxy):
+            return other._target is self._target
+        return other is self._target
+
+
 class _FakeSocketList:
     def __init__(self):
         self.created = []
@@ -233,6 +252,7 @@ class RandomDriverNodeTests(unittest.TestCase):
         self.assertIn("global persist $random_seed1 = 13579", ini)
         self.assertIn("global $random_high1 = 0", ini)
         self.assertIn("global $random_low1 = 0", ini)
+        self.assertIn("global persist $random_prev1 = 0", ini)
         self.assertIn("global persist $random_paused1 = 1", ini)
         self.assertIn("if $random_paused1 == 1", ini)
         self.assertTrue(ini.endswith("endif"))
@@ -243,17 +263,85 @@ class RandomDriverNodeTests(unittest.TestCase):
         self.assertIn("        $random_seed1 = $random_seed1 - 16764871", ini)
         _assert_balanced_conditionals(self, ini)
 
-        # 暂停时目标变量复位为 0
+        # 暂停时目标变量复位为 0（只在暂停边沿那一帧）
         ini_lines = ini.splitlines()
         self.assertIn("else", ini_lines)
+        self.assertIn("    if $random_prev1 == 1", ini_lines)
         for target in ("$shape_up", "$shape_down", "$shape_left", "$shape_right"):
-            self.assertIn(f"    {target} = 0", ini_lines)
+            self.assertIn(f"        {target} = 0", ini_lines)
 
         # 每个目标变量获得独立的 LCG 推进块（4 个目标 → 4 块）
         self.assertEqual(ini.count(f"$random_seed1 = (4001 * $random_low1)"), 4)
         self.assertEqual(ini.count("% 4193"), 4)
         self.assertNotIn("// 4193", ini)
         self.assertNotIn("$active0", ini)
+
+    def test_pause_does_not_zero_targets_every_frame(self):
+        """暂停中的节点必须"完全不动"：不能每帧继续写 0，否则会抹掉别人。"""
+        node = _make_node()
+        ini_lines = node.generate_ini_segment().splitlines()
+
+        # 播放分支里记录"上一帧在播放"，暂停分支只在 prev==1 时复位一次
+        self.assertIn("    $random_prev1 = 1", ini_lines)
+        self.assertIn("    if $random_prev1 == 1", ini_lines)
+        self.assertIn("    $random_prev1 = 0", ini_lines)
+        self.assertEqual(ini_lines[-1], "endif")
+        self.assertLess(
+            ini_lines.index("    if $random_prev1 == 1"),
+            ini_lines.index("    $random_prev1 = 0"),
+            "prev 必须在清零之前读取",
+        )
+        # 没有任何"裸"的目标清零行（没有守卫的每帧清零）
+        for target in ("$shape_up", "$shape_down", "$shape_left", "$shape_right"):
+            self.assertNotIn(f"    {target} = 0", ini_lines)
+
+    def test_shared_target_reset_waits_for_other_random_gate(self):
+        """同一变量被两个随机节点写时，暂停边沿的复位要等对方门控也关掉。"""
+        node = _make_node(targets=["$shape_up", "$shared"], custom_paused_var="$random_paused1")
+        other = _make_node(targets=["$shared", "$other"], custom_paused_var="$random_paused2")
+        other.name = "Random2"
+        other.auto_index = 2
+        tree = types.SimpleNamespace(nodes=[node, other], links=[])
+        node.id_data = tree
+        other.id_data = tree
+
+        ini_lines = node.generate_ini_segment().splitlines()
+
+        # 共享变量加守卫，独占变量保持无条件
+        self.assertIn("    if $random_prev1 == 1", ini_lines)
+        self.assertIn("    if $random_prev1 == 1 && $random_paused2 == 0", ini_lines)
+        self.assertIn("        $shape_up = 0", ini_lines)
+        self.assertIn("        $shared = 0", ini_lines)
+
+    def test_own_gate_is_not_treated_as_a_sharer(self):
+        """回归：bpy 的 RNA 包装对象不是同一个 Python 对象，判自己不能用 ``is``。"""
+        node = _make_node(targets=["$shared"], custom_paused_var="$random_paused1")
+        tree = types.SimpleNamespace(nodes=[_NodeProxy(node)], links=[])
+        node.id_data = tree
+
+        ini = node.generate_ini_segment()
+
+        self.assertIn("    if $random_prev1 == 1\n        $shared = 0", ini)
+        self.assertNotIn("$random_paused1 == 0", ini)
+
+    def test_shared_target_guard_ignores_muted_and_unrelated_nodes(self):
+        node = _make_node(targets=["$shared"], custom_paused_var="$random_paused1")
+        muted = _make_node(targets=["$shared"], custom_paused_var="$random_paused2")
+        muted.name = "Muted"
+        muted.mute = True
+        muted.auto_index = 2
+        unrelated = _make_node(targets=["$elsewhere"], custom_paused_var="$random_paused3")
+        unrelated.name = "Unrelated"
+        unrelated.auto_index = 3
+        tree = types.SimpleNamespace(nodes=[node, muted, unrelated], links=[])
+        for item in (node, muted, unrelated):
+            item.id_data = tree
+
+        ini = node.generate_ini_segment()
+
+        self.assertIn("    if $random_prev1 == 1\n        $shared = 0", ini)
+        self.assertNotIn("$random_paused2", ini)
+        self.assertNotIn("$random_paused3", ini)
 
     def test_generate_maps_custom_range(self):
         node = _make_node(min_value=0.25, max_value=1.0)
@@ -276,8 +364,8 @@ class RandomDriverNodeTests(unittest.TestCase):
         self.assertEqual(ini.count("$shape_up = 0 + ($random_seed1 / 16777216.0) * 1"), 1)
         self.assertEqual(ini.count("$shape_down = 0 + ($random_seed1 / 16777216.0) * 1"), 1)
         ini_lines = ini.splitlines()
-        self.assertEqual(ini_lines.count("    $shape_up = 0"), 1)
-        self.assertEqual(ini_lines.count("    $shape_down = 0"), 1)
+        self.assertEqual(ini_lines.count("        $shape_up = 0"), 1)
+        self.assertEqual(ini_lines.count("        $shape_down = 0"), 1)
         self.assertIsNone(re.search(r"(?m)^\s+shape_up = ", ini))
         self.assertIsNone(re.search(r"(?m)^\s+shape_down = ", ini))
 

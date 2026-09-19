@@ -184,7 +184,102 @@ class SSMTNode_AnimDriver_Random(SSMTNode_AnimDriver_Base):
         else:
             box.label(text="至少添加一个目标变量", icon='INFO')
 
+    def _collect_shared_target_pause_vars(self, targets):
+        """目标变量 -> 同样在写它的其它驱动节点的暂停变量。
+
+        随机驱动的暂停复位只在「刚进入暂停」那一帧写一次；如果这个变量同时被
+        别的驱动节点（门控开着的那个）驱动，那一次复位还必须等对方也暂停，
+        否则会在暂停边沿把对方正在播放的值抹掉一帧。
+        """
+        shared = {target: [] for target in targets}
+        tree = getattr(self, "id_data", None)
+        if not tree:
+            return shared
+
+        for node in getattr(tree, "nodes", []) or []:
+            if self._is_same_node(node, self) or getattr(node, "mute", False):
+                continue
+            bl_idname = str(getattr(node, "bl_idname", "") or "")
+            if bl_idname == "SSMTNode_AnimDriver_Base":
+                continue
+            if not bl_idname.startswith("SSMTNode_AnimDriver_"):
+                continue
+
+            pause_var = self._resolve_other_pause_var(node)
+            if not pause_var:
+                continue
+
+            written = self._collect_written_variable_names(node)
+            for target in targets:
+                if target in written and pause_var not in shared[target]:
+                    shared[target].append(pause_var)
+        return shared
+
+    @staticmethod
+    def _is_same_node(left, right) -> bool:
+        """判断是不是同一个节点。
+
+        bpy 的 RNA 包装对象**每次访问都可能是新的 Python 对象**，所以
+        ``node is self`` 在 Blender 里判不出自己（会把本节点当成"另一个共享者"，
+        给自己的守卫里塞进自己的门控）。按指针/相等性判断，名字兜底。
+        """
+        if left is right:
+            return True
+        try:
+            if bool(left == right):
+                return True
+        except Exception:
+            pass
+        return str(getattr(left, "name", "")) == str(getattr(right, "name", ""))
+
+    @staticmethod
+    def _collect_written_variable_names(node):
+        """驱动节点会写入的目标变量名（统一带 ``$`` 前缀）。"""
+        names = set()
+        single = str(getattr(node, "driven_variable", "") or "").strip()
+        if single:
+            names.add(single if single.startswith('$') else f"${single}")
+        for item in getattr(node, "driven_variable_list", []) or []:
+            raw = str(getattr(item, "variable_name", "") or "").strip()
+            if raw:
+                names.add(raw if raw.startswith('$') else f"${raw}")
+        return names
+
+    @staticmethod
+    def _resolve_other_pause_var(node):
+        """取另一个驱动节点的暂停变量；拿不到时返回空串（不参与共享判定）。"""
+        raw = str(getattr(node, "custom_paused_var", "") or "").strip()
+        if not raw:
+            return ""
+        return raw if raw.startswith('$') else f"${raw}"
+
+    @staticmethod
+    def _group_targets_by_guard(targets, shared_pause_vars, prev_var):
+        """按守卫条件分组，避免同一个条件重复展开。"""
+        groups = []
+        for target in targets:
+            condition = " && ".join(
+                [f"{prev_var} == 1"]
+                + [f"{pause_var} == 0" for pause_var in (shared_pause_vars.get(target) or [])]
+            )
+            for existing_condition, group_targets in groups:
+                if existing_condition == condition:
+                    group_targets.append(target)
+                    break
+            else:
+                groups.append((condition, [target]))
+        return groups
+
     def generate_ini_segment(self, connected_nodes=None) -> str:
+        """生成随机驱动段落。
+
+        暂停语义（重要）：门控关闭时**不再每帧写 0**。暂停中的节点每帧清零会
+        把同一个变量上正在播放的另一个驱动节点整个抹掉（靠后的段落总是后写、
+        先于形态键派发，所以"谁后写谁赢"），表现为"开了门控的那个随机驱动也
+        没效果"。现在只在「刚进入暂停」的那一帧复位一次（``$random_prev{idx}``
+        记录上一帧是否在播放），之后完全不碰目标变量：既不抢别人的变量，也不
+        会把模型停在随机的偏移姿态上。
+        """
         idx = self._read_safe_index()
         targets = []
         for item in self.driven_variable_list:
@@ -213,6 +308,8 @@ class SSMTNode_AnimDriver_Random(SSMTNode_AnimDriver_Base):
         seed_var = f"$random_seed{idx}"
         high_var = f"$random_high{idx}"
         low_var = f"$random_low{idx}"
+        prev_var = f"$random_prev{idx}"
+        shared_pause_vars = self._collect_shared_target_pause_vars(targets)
 
         paused_state = self._resolve_default_play_state(self.default_paused)
         paused_var = str(getattr(self, "custom_paused_var", "") or "").strip()
@@ -227,10 +324,13 @@ class SSMTNode_AnimDriver_Random(SSMTNode_AnimDriver_Base):
             "; LCG 随机序列状态（每帧推进，保证每帧取值不同）",
             self._format_global_assignment(high_var, 0),
             self._format_global_assignment(low_var, 0),
+            self._format_global_assignment(prev_var, 0, persist=True),
+            "; 上一帧的播放状态（只在暂停边沿复位一次目标变量）",
             self._format_global_assignment(paused_var, paused_state, persist=True),
             "; 播放状态（1=播放，0=暂停，由动画驱动开关节点切换）",
             "[Present]",
             f"if {paused_var} == 1",
+            f"    {prev_var} = 1",
         ]
 
         # Schrage 分解把取模拆成基础算术；low 用 %（fmod 对整数操作数精确），
@@ -253,10 +353,17 @@ class SSMTNode_AnimDriver_Random(SSMTNode_AnimDriver_Base):
                 f"    {target} = {min_str} + ({seed_var} / {_LCG_MODULUS}.0) * {span_str}",
             ])
 
-        # 暂停时把目标变量复位为 0，避免模型停在随机的偏移姿态上。
+        # 暂停：只在「刚进入暂停」那一帧复位一次，之后完全不再写目标变量 ——
+        # 暂停中的节点每帧写 0 会抹掉同一变量上正在播放的另一个驱动节点。
         lines.append("else")
-        for target in targets:
-            lines.append(f"    {target} = 0")
+        for condition, group_targets in self._group_targets_by_guard(
+            targets, shared_pause_vars, prev_var
+        ):
+            lines.append(f"    if {condition}")
+            for target in group_targets:
+                lines.append(f"        {target} = 0")
+            lines.append("    endif")
+        lines.append(f"    {prev_var} = 0")
         lines.append("endif")
         return "\n".join(lines)
 
