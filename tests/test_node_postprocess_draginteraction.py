@@ -1073,7 +1073,7 @@ class DragNodeEmitTests(unittest.TestCase):
         present = sections["[Present]"]
         boot_run = "if $ssmtdrag_booted_testns == 0"
         seed_run = "elif $ssmtdrag_seed_pending_testns == 1"
-        interaction_run = "elif $ssmtdrag_drag_enabled_testns >= 1"
+        interaction_run = "elif $ssmtdrag_drag_enabled_testns >= 1 && $ssmtdrag_drawn_testns == 1"
         self.assertIn(boot_run, present)
         self.assertIn(seed_run, present)
         self.assertLess(present.index(boot_run), present.index(seed_run))
@@ -1188,11 +1188,14 @@ class DragNodeEmitTests(unittest.TestCase):
         # 防陈旧绑定跨 mode-0 滞留、回模式 1 后无命中复活
         elif_idx = next(
             i for i, line in enumerate(present)
-            if line == "elif $ssmtdrag_drag_enabled_testns >= 1")
+            if line == "elif $ssmtdrag_drag_enabled_testns >= 1 && $ssmtdrag_drawn_testns == 1")
         tail = present[elif_idx:]
         else_idx = next(i for i, line in enumerate(tail) if line == "else")
-        self.assertEqual(tail[else_idx + 1], "\tclear = ResourceDragShapeKeyDragLatch_testns 0.0")
-        self.assertEqual(tail[else_idx + 2], "endif")
+        # 未绘制帧不再跑 PinDetected，其内部 else 够不到：终态 else 负责把检测
+        # 允许位与形态键绑定锁存一起清掉
+        self.assertEqual(tail[else_idx + 1], "\t$ObjectDetectAllowed_testns = 0")
+        self.assertEqual(tail[else_idx + 2], "\tclear = ResourceDragShapeKeyDragLatch_testns 0.0")
+        self.assertEqual(tail[else_idx + 3], "endif")
 
     def test_shapekey_drive_mouse_displacement_present_lines(self):
         zone = self._zone_item(0)
@@ -2068,7 +2071,36 @@ class DragNodeEmitTests(unittest.TestCase):
         present = "\n".join(sections["[Present]"])
         self.assertIn("global $ssmtdrag_objvis_testns_0 = 0", const)
         self.assertIn("pre run = CommandListDragVisPublish_testns", present)
-        self.assertIn("post $ssmtdrag_objvis_testns_0 = 0", present)
+        # 发布只在臂动模式（消费者置位的同一条条件）下执行
+        self.assertIn(
+            "if $ssmtdrag_drag_enabled_testns >= 1 && $inputMode == 0"
+            " && $ssmtdrag_mode_testns == 1 && $ssmtdrag_drawn_testns == 1\n"
+            "\tpre run = CommandListDragVisPublish_testns\n"
+            "endif",
+            present,
+        )
+        # 清零仍必须每绘制帧执行（objvis 是逐绘制置位的，与 mode 无关）
+        self.assertIn(
+            "if $ssmtdrag_drawn_testns == 1\n"
+            "\tpost $ssmtdrag_objvis_testns_0 = 0\n",
+            present,
+        )
+        self.assertIn(
+            "\tpost $ssmtdrag_objvis_testns_1 = 0\n"
+            "endif\n"
+            "if $ssmtdrag_drawn_testns == 1\n"
+            "\tpost run = CommandListDragUIReadback_testns\n",
+            present,
+        )
+        # 光标/视口更新只在臂动时执行（消费者全是 mode==1 链路，检测读的还是上一帧光标）
+        self.assertIn(
+            "elif $ssmtdrag_drag_enabled_testns >= 1 && $ssmtdrag_drawn_testns == 1\n"
+            "\tpre run = CommandListDragPinDetected_testns\n"
+            "\tif $ssmtdrag_mode_testns == 1\n"
+            "\t\trun = CommandListDragCursorUpdate_testns\n"
+            "\tendif\n",
+            present,
+        )
 
     def test_global_object_oids_union(self):
         node = _make_node(self.mod)
@@ -2885,10 +2917,13 @@ class DragNodeReexportLatchMigrationTests(unittest.TestCase):
                 pin[disarm_idx + 1],
                 "\tclear = ResourceDragShapeKeyDragLatch_testns 0.0",
             )
-            # Present 终态 else（G1：模式 1→0 直跳清锁存）
+            # Present 终态 else（G1：模式 1→0 直跳清锁存；未绘制帧也走这里）
             present = "\n".join(sections["[Present]"])
             self.assertIn(
-                "else\n\tclear = ResourceDragShapeKeyDragLatch_testns 0.0\nendif",
+                "else\n"
+                "\t$ObjectDetectAllowed_testns = 0\n"
+                "\tclear = ResourceDragShapeKeyDragLatch_testns 0.0\n"
+                "endif",
                 present,
             )
 

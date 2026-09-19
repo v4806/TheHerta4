@@ -5408,19 +5408,28 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 f"\tpre run = CommandListDragPinDetected_{ns}",
             ])
         block.extend([
-            # 与实机可用配置一致：Pin 检测/光标更新只由模式开关门控，不要求 Alt。
-            f"elif {drag_mode_var} >= 1",
+            # 与实机可用配置一致：Pin 检测/光标更新只由模式开关门控，不要求 Alt；
+            # 但必须要求本帧人物真的被绘制过（drawn==1）——否则角色不在场时每帧
+            # 仍在空跑整条检测/光标链路（装几十上百个模组时纯属浪费）。
+            f"elif {drag_mode_var} >= 1 && $ssmtdrag_drawn_{ns} == 1",
             f"\tpre run = CommandListDragPinDetected_{ns}",
-            f"\trun = CommandListDragCursorUpdate_{ns}",
+            # 光标/视口更新只被**臂动链路**消费：检测 CS 与手型光标都在 mode==1 下才跑
+            # （检测 CS 的 dispatch 条件里就有 mode==1），而检测读的本来就是上一帧的光标
+            # （`pre run` 在帧首执行，晚于它的光标更新要下一帧才可见）。所以不臂动时
+            # 更新光标/视口是纯空跑（本模组 ~32 条语句/帧，且"在场未臂动"是最常见状态）。
+            f"\tif $ssmtdrag_mode_{ns} == 1",
+            f"\t\trun = CommandListDragCursorUpdate_{ns}",
+            "\tendif",
         ])
+        # 未绘制（或模式 0）时 PinDetected 不执行，其内部 else 够不到：这里补上
+        # 终态清理，保证「不在场」帧的检测允许位归零。
+        block.append("else")
+        block.append(f"\t$ObjectDetectAllowed_{ns} = 0")
         if self._feature_skd():
             # 模式 0（含 1→0 直跳，不经过模式 2 dispatch 帧）：PinDetected 整体不
             # dispatch，臂动门控内的失臂 else 够不到；在此终态 else 清锁存，
             # 防陈旧绑定跨 mode-0 滞留、回模式 1 后无命中复活（评审 G1）。
-            block.extend([
-                "else",
-                f"\tclear = ResourceDragShapeKeyDragLatch_{ns} 0.0",
-            ])
+            block.append(f"\tclear = ResourceDragShapeKeyDragLatch_{ns} 0.0")
         block.append("endif")
         sync_bindings = (
             self._drag_drive_var_sync_bindings()
@@ -5503,13 +5512,26 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         # GPU 缓冲（下一帧检测消费）；随后 post 清零供下一帧分支重算。
         total_objs = sum(int(comp.get("object_count") or 0) for comp in components)
         if total_objs:
-            block.append(f"if $ssmtdrag_drawn_{ns} == 1")
+            # 发布只在「臂动模式」下被消费：绑定该缓冲的检测 CS（cs-t8）只在
+            # $ObjectDetectAllowed 为 1 时 dispatch，而它由下面这条**完全相同**的条件
+            # 置位（见 CommandListDragPinDetected 的发射点）。条件不成立时整条发布
+            # 命令列表（本模组 216 条语句 + 1 次 dispatch）纯属空跑。
+            block.append(
+                f"if {drag_mode_var} >= 1 && $inputMode == 0 && $ssmtdrag_mode_{ns} == 1"
+                f" && $ssmtdrag_drawn_{ns} == 1"
+            )
             block.append(f"\tpre run = CommandListDragVisPublish_{ns}")
             block.append("endif")
+            # 清零必须**每绘制帧**执行：objvis 标志是逐绘制置位的（与 mode 无关，
+            # 301 处都在材质分支里），攒着不清会让下次 mode==1 的发布读到陈旧可见性。
+            block.append(f"if $ssmtdrag_drawn_{ns} == 1")
             # 同上：post 清零按全局 oid 并集发射，按组件 range 会产生重复且漏掉
             # 第二组件起的 oid（曾出现 0-14 重复、37-51 缺失）。
+            # 清零只在「本帧真的发布过」时才有意义：角色不在场时没有任何分支把
+            # objvis 置 1，逐个 post 纯属每帧开销（本模组 215 条 × 每个模组）。
             for oid in self._global_object_oids(components):
-                block.append(f"post $ssmtdrag_objvis_{ns}_{oid} = 0")
+                block.append(f"\tpost $ssmtdrag_objvis_{ns}_{oid} = 0")
+            block.append("endif")
         if self._feature_panel():
             block.append(f"if $ssmtdrag_drawn_{ns} == 1")
             block.append(f"\tpost run = CommandListDragUIReadback_{ns}")
