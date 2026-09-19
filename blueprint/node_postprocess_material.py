@@ -1504,6 +1504,20 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
 
         return line.strip().startswith(f"if {base_var} ")
 
+    @staticmethod
+    def _should_emit_fx_reset(fx_kinds, next_mesh_fx_kinds) -> bool:
+        """当前 mesh 是否需要发射 FX 复位行。
+
+        **恒为 True（2026-09 用户口径）**：每一次绘制都必须自带 FX 复位，因为作者会
+        自行调整绘制顺序；"下一个绘制必然重设同名 FX"这个前提在重排后不再成立，
+        一旦依赖它就会让上一个 mesh 的 FX 绑定泄漏到不该有的部件上。
+
+        历史上这里做过"下一个 mesh 会重设同名 FX 就跳过复位"的优化（省下每模组
+        ~1380 条/帧的 `CommandList\\…\\Run`），已按上述理由撤销；`next_mesh_fx_kinds`
+        参数保留以兼容调用点与既有测试。
+        """
+        return True
+
     def _find_mesh_block_reset_insert_index(self, lines, mesh_start_index: int) -> int:
         search_end_idx = len(lines)
         for i in range(mesh_start_index + 1, len(lines)):
@@ -2105,7 +2119,7 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
         object_to_diffuse_swapkey = {}
 
         mesh_lines_info_phase1 = [(i, self.extract_mesh_name(line)) for i, line in enumerate(lines) if self.extract_mesh_name(line)]
-        
+
         for insert_index, mesh_name in reversed(mesh_lines_info_phase1):
             obj = self.find_object_by_mesh_name(mesh_name, object_filter=material_candidate_filter)
             if not obj:

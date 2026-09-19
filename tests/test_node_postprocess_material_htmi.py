@@ -280,6 +280,108 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             self.assertIn("Resource\\NTEMIFX\\FXMap = ref Resource_FXMap_Generic", sections["[TextureOverride_Generic]"])
             self.assertIn("run = CommandList\\NTEMIFX\\Run", sections["[TextureOverride_Generic]"])
 
+    def test_should_emit_fx_reset_rule(self):
+        """规则（2026-09 用户口径）：**每一次绘制都必须自带 FX 复位**。
+
+        作者会自行调整绘制顺序，因此"下一个绘制必然重设同名 FX"这个前提不成立；
+        依赖它跳过复位会让上一个 mesh 的 FX 绑定泄漏到不该有的部件上。
+        故规则恒为 True（历史上曾做过跳过优化，已按上述理由撤销）。
+        """
+        rule = node_postprocess_material.SSMTNode_PostProcess_Material._should_emit_fx_reset
+
+        self.assertTrue(rule(set(), set()), "即使本 mesh 没设 FX，也保持恒真（调用点已按 fx_kinds 决定是否复位）")
+        self.assertTrue(rule({"FXMap"}, {"FXMap"}), "不得因下一个 mesh 重设同名 FX 而跳过")
+        self.assertTrue(rule({"FXMap"}, {"FXMap", "Glowmap"}))
+        self.assertTrue(rule({"Glowmap", "FXMap"}, {"FXMap", "Glowmap"}))
+        self.assertTrue(rule({"FXMap"}, set()))
+        self.assertTrue(rule({"Glowmap"}, {"FXMap"}))
+        self.assertTrue(rule({"FXMap", "Glowmap"}, {"FXMap"}))
+
+    def _emit_fx_chain(self, temp_dir, first_materials, second_materials, section_name="[TextureOverride_Chain]"):
+        fx_path = os.path.join(temp_dir, "fx.dds")
+        with open(fx_path, "wb") as file_obj:
+            file_obj.write(b"fx")
+        diffuse_path = os.path.join(temp_dir, "diffuse.png")
+        with open(diffuse_path, "wb") as file_obj:
+            file_obj.write(b"diffuse")
+
+        def _material(entry):
+            name, kind = entry
+            return (name, fx_path if kind == "fx" else diffuse_path)
+
+        first = _FakeObject("MeshA", {}, [_material(m) for m in first_materials])
+        second = _FakeObject("MeshB", {}, [_material(m) for m in second_materials])
+        _fake_bpy.data.objects[first.name] = first
+        _fake_bpy.data.objects[second.name] = second
+        sections = OrderedDict([(section_name, [
+            f"[mesh:{first.name}]", "hash = 11111111",
+            "ps-t0 = Resource-old-DiffuseMap", "drawindexed = 3, 0, 0",
+            f"[mesh:{second.name}]", "hash = 22222222",
+            "ps-t0 = Resource-old-DiffuseMap", "drawindexed = 3, 0, 0",
+        ]), ("_config_path", temp_dir)])
+        node = node_postprocess_material.SSMTNode_PostProcess_Material()
+        node.name = "MaterialNode"
+        node.material_to_resource_override = False
+        node.material_switch_var = "$swapkey150"
+        node.process_texture_override_section(
+            section_name, sections, material_group_to_swapkey={},
+            swap_key_prefix="$swapkey", next_swap_key_num=150,
+            used_swap_keys=set(), transparency_sections_to_add=OrderedDict())
+        return sections[section_name]
+
+    def test_every_mesh_keeps_its_own_fx_reset(self):
+        """回退后的口径：**每个绘制都保留自己的 FX 复位**，不因下一个 mesh 重设同名 FX 而跳过。
+
+        作者会重排绘制顺序，跳过复位会让 FX 绑定泄漏。
+        """
+        sys.modules[f"{PKG}.common.global_config"].GlobalConfig.logic_name = "ZZMI"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            lines = self._emit_fx_chain(
+                temp_dir,
+                [("FXMap_A", "fx")],
+                [("FXMap_B", "fx")],
+            )
+
+            resets = [i for i, line in enumerate(lines) if line.strip() == "Resource\\RabbitFX\\FXMap = ref null"]
+            self.assertEqual(len(resets), 2, f"两个 mesh 各保留一次复位: {lines}")
+            draws = [i for i, line in enumerate(lines) if line.strip().startswith("drawindexed")]
+            # 每个复位都紧跟在自己的绘制之后（在其下一个 mesh 之前）
+            self.assertGreater(resets[0], draws[0], "第一个复位在第一次绘制之后")
+            self.assertLess(resets[0], draws[1], "第一个复位在第二次绘制之前")
+            self.assertGreater(resets[1], draws[1], "第二个复位在第二次绘制之后")
+
+    def test_fx_reset_is_kept_when_next_mesh_has_no_fx(self):
+        """下一个 mesh 没有 FX → 必须复位，否则它会继承上一个 mesh 的 FX 绑定。"""
+        sys.modules[f"{PKG}.common.global_config"].GlobalConfig.logic_name = "ZZMI"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            lines = self._emit_fx_chain(
+                temp_dir,
+                [("FXMap_A", "fx")],
+                [("DiffuseMap_B", "diffuse")],
+            )
+
+            resets = [i for i, line in enumerate(lines) if line.strip() == "Resource\\RabbitFX\\FXMap = ref null"]
+            self.assertEqual(len(resets), 1, f"应当保留复位: {lines}")
+            first_draw = min(i for i, line in enumerate(lines) if line.strip().startswith("drawindexed"))
+            last_draw = max(i for i, line in enumerate(lines) if line.strip().startswith("drawindexed"))
+            self.assertGreater(resets[0], first_draw)
+            self.assertLess(resets[0], last_draw, "复位必须在两个 mesh 之间，才能保护后一个绘制")
+
+    def test_fx_reset_is_kept_when_next_mesh_rebinds_only_another_fx_kind(self):
+        """下一个 mesh 只重设 Glowmap 时，FXMap 会泄漏 → 必须复位。"""
+        sys.modules[f"{PKG}.common.global_config"].GlobalConfig.logic_name = "ZZMI"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            lines = self._emit_fx_chain(
+                temp_dir,
+                [("FXMap_A", "fx")],
+                [("Glowmap_5_B", "fx")],
+            )
+
+            resets = [i for i, line in enumerate(lines) if line.strip() == "Resource\\RabbitFX\\FXMap = ref null"]
+            self.assertEqual(len(resets), 1, f"应当保留复位: {lines}")
+            last_draw = max(i for i, line in enumerate(lines) if line.strip().startswith("drawindexed"))
+            self.assertLess(resets[0], last_draw, "复位要在 Glowmap mesh 的绘制之前")
+
     def test_ntemi_fxmap_reset_is_emitted_after_conditional_block(self):
         """测试 NTEMI FXMap 在条件块后发出重置指令"""
         sys.modules[f"{PKG}.common.global_config"].GlobalConfig.logic_name = "NTEMI"
