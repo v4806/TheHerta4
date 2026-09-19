@@ -8,6 +8,7 @@ from bpy.types import Node
 from bpy.props import StringProperty
 
 from .node_postprocess_base import SSMTNode_PostProcess_Base
+from .anim_driver_base import SSMTNode_AnimDriver_Base
 from .anim_driver_collector import AnimationDriverCollector
 from ..common.global_config import GlobalConfig
 
@@ -327,6 +328,60 @@ class SSMTNode_PostProcess_AnimDriver(SSMTNode_PostProcess_Base):
         else:
             raise RuntimeError(message)
 
+    @staticmethod
+    def _anim_driver_active_flag() -> str:
+        """角色激活标志（`$active0`，NTEMI 为 `$ntmi_active0`）。
+
+        与动画驱动开关节点 KeyToggle 的 `condition` 同源：它在角色被绘制的那一帧
+        由 VB/IB override 置 1，帧尾由主 [Present] 的 `post $active0 = 0` 清零。
+        动画驱动段整体插在配置表最上方，所以这里读到的就是**本帧**的在场状态。
+        """
+        return SSMTNode_AnimDriver_Base._get_activation_flag()
+
+    def _gate_present_content(self, para_content: str) -> str:
+        """把单个段落的 ``[Present]`` 主体包进角色门控。
+
+        动画驱动段的每帧算术（帧计数、索引/往返/随机/触发器）只有在角色**在场**时
+        才有意义：不在场时它算出来的东西没人消费，却要在每个模组的每帧都跑一遍
+        （本模组实测 466 条语句/帧）。装几十上百个同类模组时这是纯 CPU 空转，
+        所以整段 `[Present]` 由 `if $active0 == 1` 门控。
+
+        只包 `[Present]` **段本身**：段落里 `[Present]` 之后还可能跟着别的段
+        （开关节点发的是 `[KeyToggle_*]`，其段位置取决于节点的拓扑/名称排序），
+        段头一旦被裹进 `if` 里就是非法结构，整段热键会失效。`[Constants]` /
+        `[KeySwap_*]` 同样不受影响 —— 热键输入照常，角色回到场上时驱动继续推进。
+        """
+        content = str(para_content or "")
+        lines = content.split("\n")
+        present_index = None
+        for index, line in enumerate(lines):
+            if line.strip() == "[Present]":
+                present_index = index
+                break
+        if present_index is None:
+            return content
+
+        # [Present] 段的结束 = 下一个段头（没有则到内容末尾）
+        body_end = len(lines)
+        for index in range(present_index + 1, len(lines)):
+            stripped = lines[index].strip()
+            if stripped.startswith("[") and stripped.endswith("]"):
+                body_end = index
+                break
+
+        body = lines[present_index + 1:body_end]
+        if not any(line.strip() for line in body):
+            return content
+
+        guard = self._anim_driver_active_flag()
+        return "\n".join(
+            lines[:present_index + 1]
+            + [f"if {guard} == 1"]
+            + body
+            + ["endif"]
+            + lines[body_end:]
+        )
+
     def _build_ini_content(self, paragraphs) -> str:
         lines = [
             _ANIM_DRIVER_SECTION_MARKER_START,
@@ -339,7 +394,7 @@ class SSMTNode_PostProcess_AnimDriver(SSMTNode_PostProcess_Base):
         for paragraph in paragraphs:
             para_content = paragraph["ini_content"]
             if para_content:
-                lines.append(para_content)
+                lines.append(self._gate_present_content(para_content))
                 lines.append("")
                 lines.append("; ------------------------------------------------------------------------------")
                 lines.append("")

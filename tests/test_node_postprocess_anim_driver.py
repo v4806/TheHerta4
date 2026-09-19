@@ -83,6 +83,22 @@ _install_module(
 )
 
 
+def _fake_activation_flag():
+    """与生产实现同源：角色激活标志（NTEMI 用 $ntmi_active0）。"""
+    config = sys.modules[f"{PKG}.common.global_config"].GlobalConfig
+    return "$ntmi_active0" if getattr(config, "logic_name", "") == "NTEMI" else "$active0"
+
+
+_install_module(
+    f"{PKG}.blueprint.anim_driver_base",
+    SSMTNode_AnimDriver_Base=type(
+        "SSMTNode_AnimDriver_Base",
+        (),
+        {"_get_activation_flag": staticmethod(_fake_activation_flag)},
+    ),
+)
+
+
 def _load_module(module_name, relative_path):
     module_path = Path(__file__).resolve().parents[1] / relative_path
     spec = importlib.util.spec_from_file_location(f"{PKG}.{module_name}", module_path)
@@ -213,6 +229,91 @@ class NodePostprocessAnimDriverTests(unittest.TestCase):
             self.assertTrue(success)
             self.assertIn("已是最新状态", message)
             self.assertEqual(backup_calls, [])
+
+    def test_present_body_is_gated_on_character_presence(self):
+        """角色不在场时动画驱动段整段不跑（每帧 466 条语句的常开开销）。"""
+        node = SSMTNode_PostProcess_AnimDriver()
+        paragraph = {
+            "ini_content": (
+                "[KeyToggle_Anim1]\ncondition = $active0 == 1\nkey = No_Ctrl Alt Numpad7\n"
+                "[Constants]\nglobal persist $animation_paused1 = 0\n"
+                "[Present]\nif $animation_paused1 == 1\n    $swapkey1 = $swapkey1 + 1\nendif"
+            )
+        }
+
+        gated = node._gate_present_content(paragraph["ini_content"])
+        lines = gated.split("\n")
+        present_index = lines.index("[Present]")
+
+        self.assertEqual(lines[present_index + 1], "if $active0 == 1")
+        self.assertEqual(lines[-1], "endif")
+        # [Present] 之前的段落（KeyToggle / Constants）不受影响：热键输入照常
+        self.assertEqual(lines[:present_index + 1], paragraph["ini_content"].split("\n")[:present_index + 1])
+        self.assertIn("    $swapkey1 = $swapkey1 + 1", lines)
+
+    def test_gate_stops_at_next_section_header(self):
+        """回归：段落里 [Present] 之后可能还有别的段（开关节点发的 [KeyToggle_*]，
+        其段位置取决于节点排序）—— 段头绝不能被裹进 if 里。"""
+        node = SSMTNode_PostProcess_AnimDriver()
+        content = (
+            "[Constants]\nglobal $a = 1\n"
+            "[Present]\n$a = $a + 1\n"
+            "[KeyToggle_Anim9]\ncondition = $active0 == 1\nkey = No_Modifiers K\n"
+            "type = cycle\n$animation_paused9 = 0,1"
+        )
+
+        gated = node._gate_present_content(content)
+        lines = gated.split("\n")
+        present_index = lines.index("[Present]")
+
+        self.assertEqual(lines[present_index + 1], "if $active0 == 1")
+        self.assertEqual(lines[present_index + 3], "endif")
+        # KeyToggle 段完整落在门控之外
+        toggle_index = lines.index("[KeyToggle_Anim9]")
+        self.assertGreater(toggle_index, present_index + 3)
+        self.assertEqual(
+            lines[toggle_index:],
+            content.split("\n")[content.split("\n").index("[KeyToggle_Anim9]"):],
+        )
+        self.assertEqual(sum(1 for line in lines if line.strip() == "endif"), 1)
+
+    def test_gate_uses_ntemi_activation_flag(self):
+        node = SSMTNode_PostProcess_AnimDriver()
+        config = sys.modules[f"{PKG}.common.global_config"].GlobalConfig
+        config.logic_name = "NTEMI"
+        try:
+            gated = node._gate_present_content("[Present]\n$foo = 1")
+        finally:
+            config.logic_name = ""
+
+        self.assertIn("if $ntmi_active0 == 1", gated)
+
+    def test_gate_skips_content_without_present_section(self):
+        node = SSMTNode_PostProcess_AnimDriver()
+        constants_only = "[Constants]\nglobal $foo = 1"
+        self.assertEqual(node._gate_present_content(constants_only), constants_only)
+
+    def test_gate_skips_empty_present_body(self):
+        node = SSMTNode_PostProcess_AnimDriver()
+        self.assertEqual(node._gate_present_content("[Present]\n"), "[Present]\n")
+
+    def test_build_ini_content_gates_every_paragraph(self):
+        node = SSMTNode_PostProcess_AnimDriver()
+        paragraphs = [
+            {"ini_content": "[Constants]\nglobal $a = 1\n[Present]\n$a = 1"},
+            {"ini_content": "[Constants]\nglobal $b = 1\n[Present]\n$b = 1"},
+        ]
+
+        content = node._build_ini_content(paragraphs)
+        lines = content.split("\n")
+
+        self.assertEqual(lines.count("[Present]"), 2)
+        self.assertEqual(lines.count("if $active0 == 1"), 2)
+        # 每个 [Present] 之后紧跟门控，且 endif 数量配平
+        for index, line in enumerate(lines):
+            if line == "[Present]":
+                self.assertEqual(lines[index + 1], "if $active0 == 1")
+        self.assertEqual(lines.count("endif"), 2)
 
     def test_find_target_ini_file_rejects_ambiguous_workspace_matches(self):
         with tempfile.TemporaryDirectory() as temp_dir:
