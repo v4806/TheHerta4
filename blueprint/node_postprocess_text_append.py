@@ -22,6 +22,9 @@
    高度），实时显示将要追加的内容；超过显示上限时截断并提示。
 5. **可重复执行**：追加内容带块标记，重复导出/重复执行会先移除上一次追加的
    同一块再重新追加，不会堆叠出多份。
+6. **「刷新已导出文本」**：不重新导出整个 Mod，只按当前节点文本重写已导出
+   配置表里的追加块；内容为空时清除该块（与「刷新已导出驱动 / 刷新已导出
+   面板」语义一致：让已导出的文件追上节点当前状态）。
 """
 
 import hashlib
@@ -297,8 +300,32 @@ def build_appended_content(original, content, block_id):
     return f"{base}{newline}{newline}{block}"
 
 
+def strip_appended_block(original, block_id):
+    """移除本节点追加的块，并收拢块前多出来的空行（幂等）。
+
+    返回清理后的内容；原内容里没有本节点的块时**原样返回**（不改变换行风格）。
+    换行风格跟随原内容：CRLF 文件清理后仍然是纯 CRLF，不会混入裸 LF。
+    """
+    original_text = str(original or "")
+    removed = remove_appended_block(original_text, block_id)
+    if removed == original_text:
+        return original_text
+
+    newline = "\r\n" if "\r\n" in original_text else "\n"
+    body = removed.rstrip("\r\n")
+    return f"{body}{newline}" if body else ""
+
+
+def _describe_files(paths) -> str:
+    """把文件路径列表写成简短提示（超过 3 个只报数量，避免撑爆状态栏）。"""
+    names = [os.path.basename(str(path)) for path in paths]
+    if len(names) > 3:
+        return f"{len(names)} 个配置表"
+    return ", ".join(names)
+
+
 # ---------------------------------------------------------------------------
-# 算子：编辑文本 / 清空 / 新建工程文本
+# 算子：编辑文本 / 清空 / 新建工程文本 / 刷新已导出文本
 # ---------------------------------------------------------------------------
 
 def _area_keys(screen):
@@ -633,6 +660,41 @@ class SSMT_OT_TextAppend_NewProjectText(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class SSMT_OT_TextAppend_RefreshExportedText(bpy.types.Operator):
+    """不重新导出整个 Mod，只按当前文本重写已导出配置表里的追加块。"""
+
+    bl_idname = "ssmt.text_append_refresh_exported_text"
+    bl_label = "刷新已导出文本"
+    bl_description = (
+        "不重新导出整个Mod，仅按当前节点文本重写已导出配置表中的文本追加块"
+        "（内容为空时清除该块）"
+    )
+    bl_options = {'REGISTER'}
+
+    node_name: StringProperty(
+        name="Node Name",
+        description="关联的文本追加后处理节点名称",
+        default="",
+    )
+
+    def execute(self, context):
+        node = _resolve_node(context, self.node_name)
+        if node is None or getattr(node, "bl_idname", "") != NODE_BL_IDNAME:
+            self.report({'ERROR'}, "未找到文本追加后处理节点")
+            return {'CANCELLED'}
+
+        from ..common.global_config import GlobalConfig
+        GlobalConfig.read_from_main_json_ssmt4()
+        mod_export_path = str(GlobalConfig.path_generate_mod_folder() or "").strip()
+        if not mod_export_path or not os.path.isdir(mod_export_path):
+            self.report({'ERROR'}, "当前导出目录不存在，请先确认Generate Mod输出路径")
+            return {'CANCELLED'}
+
+        success, message = node.refresh_exported_text_block(mod_export_path)
+        self.report({'INFO'} if success else {'ERROR'}, message)
+        return {'FINISHED'} if success else {'CANCELLED'}
+
+
 # ---------------------------------------------------------------------------
 # 节点
 # ---------------------------------------------------------------------------
@@ -782,33 +844,44 @@ class SSMTNode_PostProcess_TextAppend(SSMTNode_PostProcess_Base):
                 "ssmt.text_append_clear_text", text="清空", icon='TRASH'
             ).node_name = self.name
 
+        refresh_row = header.row(align=True)
+        refresh_op = refresh_row.operator(
+            "ssmt.text_append_refresh_exported_text",
+            text="刷新已导出文本",
+            icon='FILE_REFRESH',
+        )
+        refresh_op.node_name = self.name
+
         self._draw_text_box(layout)
 
     # ------------------------------------------------------------------
     # 导出
     # ------------------------------------------------------------------
 
-    def execute_postprocess(self, mod_export_path):
+    def _apply_appended_text(self, mod_export_path, remove_when_empty=False):
+        """把当前文本写入导出目录根目录的所有配置表。
+
+        返回 ``(written, unchanged, skipped, failed)`` 四个完整路径列表：
+        实际改写的 / 内容已是最新的 / 读取或编码失败跳过的 / 写入失败的。
+
+        ``remove_when_empty=True`` 时，空文本表示「该节点不该在配置表里留下
+        任何东西」—— 清掉上一次追加的块（「刷新已导出文本」的语义）；
+        默认 False 则空文本是安全 no-op（正式导出时配置表是重新生成的）。
+        """
         from ..utils.log_utils import LOG
 
         content = self.get_source_text()
-        if not str(content or "").strip():
-            LOG.warning("📄 文本追加节点：内容为空，未向配置表追加任何内容")
-            return False
-
-        config_tables = find_config_table_files(mod_export_path)
-        if not config_tables:
-            LOG.warning(f"📄 文本追加节点：导出目录未找到配置表（*.ini）: {mod_export_path}")
-            return False
-
+        has_content = bool(str(content or "").strip())
         block_id = self.get_block_id()
-        written_files = 0
-        for ini_path in config_tables:
+
+        written, unchanged, skipped, failed = [], [], [], []
+        for ini_path in find_config_table_files(mod_export_path):
             try:
                 with open(ini_path, "rb") as handle:
                     raw_bytes = handle.read()
             except OSError as exc:
                 LOG.warning(f"📄 文本追加节点：读取配置表失败 {ini_path}: {exc}")
+                skipped.append(ini_path)
                 continue
 
             # 二进制读取 + 显式解码：既保留原有换行风格，也能原样保留 BOM。
@@ -817,11 +890,20 @@ class SSMTNode_PostProcess_TextAppend(SSMTNode_PostProcess_Base):
                 original = raw_bytes.decode("utf-8-sig")
             except UnicodeDecodeError as exc:
                 LOG.warning(f"📄 文本追加节点：配置表不是 UTF-8，跳过 {ini_path}: {exc}")
+                skipped.append(ini_path)
                 continue
 
-            updated = build_appended_content(original, content, block_id)
+            if has_content:
+                updated = build_appended_content(original, content, block_id)
+            elif remove_when_empty:
+                updated = strip_appended_block(original, block_id)
+            else:
+                unchanged.append(ini_path)
+                continue
+
             if updated == original:
                 # 重复执行（同一份内容已经在最下方）时保持文件原样。
+                unchanged.append(ini_path)
                 continue
 
             self._create_cumulative_backup(ini_path, mod_export_path)
@@ -835,20 +917,71 @@ class SSMTNode_PostProcess_TextAppend(SSMTNode_PostProcess_Base):
                     handle.write(updated)
             except (OSError, UnicodeError) as exc:
                 LOG.warning(f"📄 文本追加节点：写入配置表失败 {ini_path}: {exc}")
+                failed.append(ini_path)
                 continue
 
-            written_files += 1
-            LOG.info(f"📄 文本追加节点：已追加到 {os.path.basename(ini_path)}")
+            written.append(ini_path)
+            if has_content:
+                LOG.info(f"📄 文本追加节点：已追加到 {os.path.basename(ini_path)}")
+            else:
+                LOG.info(f"📄 文本追加节点：已从 {os.path.basename(ini_path)} 清除追加块")
 
-        if written_files:
-            LOG.info(f"   ✅ 文本追加节点执行完成：{written_files} 个配置表")
-        return written_files > 0
+        return written, unchanged, skipped, failed
+
+    def execute_postprocess(self, mod_export_path):
+        from ..utils.log_utils import LOG
+
+        content = self.get_source_text()
+        if not str(content or "").strip():
+            LOG.warning("📄 文本追加节点：内容为空，未向配置表追加任何内容")
+            return False
+
+        if not find_config_table_files(mod_export_path):
+            LOG.warning(f"📄 文本追加节点：导出目录未找到配置表（*.ini）: {mod_export_path}")
+            return False
+
+        written, _unchanged, _skipped, _failed = self._apply_appended_text(mod_export_path)
+        if written:
+            LOG.info(f"   ✅ 文本追加节点执行完成：{len(written)} 个配置表")
+        return bool(written)
+
+    def refresh_exported_text_block(self, mod_export_path):
+        """不重新导出整个 Mod，仅按当前文本重写已导出配置表里的追加块。
+
+        返回 ``(success, message)``。内容为空时清除本节点上一次追加的块，
+        让已导出文件追上节点当前状态（与刷新已导出驱动/面板的语义一致）。
+        """
+        try:
+            self.validate_export_configuration()
+        except ValueError as exc:
+            return False, str(exc)
+
+        if not find_config_table_files(mod_export_path):
+            return False, f"导出目录中未找到配置表（*.ini）: {mod_export_path}"
+
+        has_content = bool(str(self.get_source_text() or "").strip())
+        written, unchanged, skipped, failed = self._apply_appended_text(
+            mod_export_path, remove_when_empty=True
+        )
+
+        if failed:
+            return False, f"写入配置表失败: {_describe_files(failed)}"
+        if written:
+            if has_content:
+                return True, f"已刷新配置表中的文本追加块: {_describe_files(written)}"
+            return True, f"文本为空，已清除配置表中的文本追加块: {_describe_files(written)}"
+        if skipped and not unchanged:
+            return False, f"配置表读取失败或不是 UTF-8，未能刷新: {_describe_files(skipped)}"
+        if has_content:
+            return True, f"文本追加块已是最新状态: {_describe_files(unchanged)}"
+        return True, f"配置表中没有本节点追加的文本块: {_describe_files(unchanged)}"
 
 
 classes = (
     SSMT_OT_TextAppend_ToggleEditor,
     SSMT_OT_TextAppend_ClearText,
     SSMT_OT_TextAppend_NewProjectText,
+    SSMT_OT_TextAppend_RefreshExportedText,
     SSMTNode_PostProcess_TextAppend,
 )
 

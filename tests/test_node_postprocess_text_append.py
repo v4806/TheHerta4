@@ -6,6 +6,7 @@
 - 追加内容构造：追加在配置表最下方、可重复执行不堆叠、CRLF 保持、半块清理；
 - 文本来源：节点自带文本块 / 引用工程文本块；
 - 导出执行：只动导出目录根目录的配置表，空内容/无配置表时是安全 no-op；
+- 刷新已导出文本：不重新导出，只重写已导出配置表里的追加块（内容为空时清除）；
 - 与 ``node_postprocess_base`` 的块标记集成：追加块被识别为自动追加尾部。
 """
 import importlib.util
@@ -184,6 +185,22 @@ class _FakeLog:
         return None
 
 
+#: 「刷新已导出文本」算子读取的导出目录，由各测试用例按需设置。
+_fake_global_config_state = {"mod_folder": ""}
+
+
+class _FakeGlobalConfig:
+    """GlobalConfig 替身：只提供刷新算子用到的两个入口。"""
+
+    @staticmethod
+    def read_from_main_json_ssmt4():
+        return None
+
+    @staticmethod
+    def path_generate_mod_folder():
+        return _fake_global_config_state["mod_folder"]
+
+
 # 假 bpy 只在「加载被测模块」期间生效：加载完立刻还原，避免污染同进程的其它测试。
 _SAVED_BPY_ENTRIES = {name: sys.modules.get(name) for name in _fake_bpy_submodules}
 _SAVED_BPY = sys.modules.get("bpy")
@@ -208,6 +225,7 @@ try:
         f"{PKG}.common.config_table_backup",
         Path("common") / "config_table_backup.py",
     )
+    _install_module(f"{PKG}.common.global_config", GlobalConfig=_FakeGlobalConfig)
     module = _load_real_module(
         f"{PKG}.blueprint.node_postprocess_text_append",
         Path("blueprint") / "node_postprocess_text_append.py",
@@ -331,6 +349,43 @@ class BuildAppendedContentTests(unittest.TestCase):
         result = module.remove_appended_block(dangling, self.BLOCK_ID)
 
         self.assertEqual(result, "[Constants]\n")
+
+
+class StripAppendedBlockTests(unittest.TestCase):
+    """清除追加块：刷新时内容为空要把上一次追加的块收干净。"""
+
+    BLOCK_ID = "abc123def456"
+
+    def test_removes_block_and_collapses_extra_blank_lines(self):
+        original = "[Constants]\n$x = 1\n"
+        appended = module.build_appended_content(original, "我的片段", self.BLOCK_ID)
+
+        self.assertEqual(module.strip_appended_block(appended, self.BLOCK_ID), original)
+
+    def test_keeps_crlf_style(self):
+        original = "[Constants]\r\n$x = 1\r\n"
+        appended = module.build_appended_content(original, "我的片段", self.BLOCK_ID)
+
+        result = module.strip_appended_block(appended, self.BLOCK_ID)
+
+        self.assertEqual(result, original)
+        self.assertNotIn("\n", result.replace("\r\n", ""), "CRLF 文件清理后不应混入裸 LF")
+
+    def test_content_without_own_block_is_unchanged(self):
+        original = "[Constants]\n"
+
+        self.assertEqual(module.strip_appended_block(original, self.BLOCK_ID), original)
+
+    def test_other_node_block_is_preserved(self):
+        original = "[Constants]\n"
+        other = module.build_appended_content(original, "别人的片段", "other000")
+        mine = module.build_appended_content(other, "我的片段", self.BLOCK_ID)
+
+        result = module.strip_appended_block(mine, self.BLOCK_ID)
+
+        self.assertEqual(result, other)
+        self.assertNotIn("我的片段", result)
+        self.assertIn("别人的片段", result)
 
 
 class DisplayWrapTests(unittest.TestCase):
@@ -512,6 +567,184 @@ class ExecutePostprocessTests(unittest.TestCase):
                 self.assertEqual(handle.read(), original_bytes, "非 UTF-8 配置表必须原样不动")
 
 
+class RefreshExportedTextTests(unittest.TestCase):
+    """「刷新已导出文本」：不重新导出整个 Mod，只重写已导出配置表里的追加块。"""
+
+    def setUp(self):
+        _fake_bpy.data.texts = _FakeTexts()
+        _fake_global_config_state["mod_folder"] = ""
+
+    def _write(self, path, content, newline=""):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline=newline) as handle:
+            handle.write(content)
+
+    def _read(self, path):
+        with open(path, "r", encoding="utf-8", newline="") as handle:
+            return handle.read()
+
+    def test_refresh_appends_and_creates_backup(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ini_path = os.path.join(temp_dir, "mod.ini")
+            self._write(ini_path, "[Constants]\n$x = 1\n")
+
+            node = _make_node(content="我的片段")
+            success, message = node.refresh_exported_text_block(temp_dir)
+
+            self.assertTrue(success)
+            self.assertIn("已刷新", message)
+            self.assertIn("我的片段", self._read(ini_path))
+            self.assertTrue(
+                os.path.isdir(os.path.join(temp_dir, "Backups")),
+                "改写配置表前必须留备份",
+            )
+
+    def test_refresh_replaces_previous_block_without_stacking(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ini_path = os.path.join(temp_dir, "mod.ini")
+            self._write(ini_path, "[Constants]\n")
+
+            node = _make_node(content="旧片段")
+            self.assertTrue(node.refresh_exported_text_block(temp_dir)[0])
+            module._write_text_block(module._node_text_block_name(node), "新片段")
+            success, _message = node.refresh_exported_text_block(temp_dir)
+
+            self.assertTrue(success)
+            content = self._read(ini_path)
+            self.assertNotIn("旧片段", content)
+            self.assertIn("新片段", content)
+            self.assertEqual(content.count(module.BLOCK_MARKER_PREFIX), 2, "只有 BEGIN/END 两行标记")
+
+    def test_refresh_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ini_path = os.path.join(temp_dir, "mod.ini")
+            self._write(ini_path, "[Constants]\n")
+
+            node = _make_node(content="我的片段")
+            node.refresh_exported_text_block(temp_dir)
+            first = self._read(ini_path)
+
+            success, message = node.refresh_exported_text_block(temp_dir)
+
+            self.assertTrue(success)
+            self.assertIn("已是最新", message)
+            self.assertEqual(self._read(ini_path), first)
+
+    def test_refresh_with_empty_content_clears_exported_block(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ini_path = os.path.join(temp_dir, "mod.ini")
+            self._write(ini_path, "[Constants]\n$x = 1\n")
+
+            node = _make_node(content="我的片段")
+            node.refresh_exported_text_block(temp_dir)
+            module._write_text_block(module._node_text_block_name(node), "")
+
+            success, message = node.refresh_exported_text_block(temp_dir)
+
+            self.assertTrue(success)
+            self.assertIn("已清除", message)
+            self.assertEqual(self._read(ini_path), "[Constants]\n$x = 1\n")
+
+    def test_refresh_without_config_tables_reports_failure(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            node = _make_node(content="我的片段")
+
+            success, message = node.refresh_exported_text_block(temp_dir)
+
+            self.assertFalse(success)
+            self.assertIn("未找到配置表", message)
+
+    def test_refresh_rejects_invalid_project_text_without_touching_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ini_path = os.path.join(temp_dir, "mod.ini")
+            self._write(ini_path, "[Constants]\n")
+
+            node = _make_node(text_source=module.TEXT_SOURCE_PROJECT, project_name="不存在")
+            success, message = node.refresh_exported_text_block(temp_dir)
+
+            self.assertFalse(success)
+            self.assertIn("不存在", message)
+            self.assertEqual(self._read(ini_path), "[Constants]\n")
+
+    def test_refresh_reports_failure_when_config_table_is_not_utf8(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ini_path = os.path.join(temp_dir, "mod.ini")
+            original_bytes = "[Constants]\n; 中文GBK\n".encode("gbk")
+            with open(ini_path, "wb") as handle:
+                handle.write(original_bytes)
+
+            node = _make_node(content="我的片段")
+            success, message = node.refresh_exported_text_block(temp_dir)
+
+            self.assertFalse(success)
+            self.assertIn("UTF-8", message)
+            with open(ini_path, "rb") as handle:
+                self.assertEqual(handle.read(), original_bytes)
+
+
+class RefreshExportedTextOperatorTests(unittest.TestCase):
+    """刷新按钮：从 GlobalConfig 取导出目录，只认文本追加节点。"""
+
+    def setUp(self):
+        _fake_bpy.data.texts = _FakeTexts()
+        _fake_global_config_state["mod_folder"] = ""
+
+    def _write(self, path, content):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8", newline="") as handle:
+            handle.write(content)
+
+    def _read(self, path):
+        with open(path, "r", encoding="utf-8", newline="") as handle:
+            return handle.read()
+
+    def _context(self, node):
+        return types.SimpleNamespace(
+            space_data=types.SimpleNamespace(
+                edit_tree=types.SimpleNamespace(nodes=_FakeNodes(node))
+            )
+        )
+
+    def _run(self, node, node_name=None):
+        operator = module.SSMT_OT_TextAppend_RefreshExportedText()
+        operator.node_name = node.name if node_name is None else node_name
+        return operator.execute(self._context(node))
+
+    def test_operator_refreshes_export_dir_from_global_config(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ini_path = os.path.join(temp_dir, "mod.ini")
+            self._write(ini_path, "[Constants]\n")
+            node = _make_node(content="我的片段")
+            _fake_global_config_state["mod_folder"] = temp_dir
+
+            self.assertEqual(self._run(node), {'FINISHED'})
+
+            self.assertIn("我的片段", self._read(ini_path))
+
+    def test_operator_cancels_when_export_dir_is_missing(self):
+        node = _make_node(content="我的片段")
+        _fake_global_config_state["mod_folder"] = os.path.join(
+            tempfile.gettempdir(), "definitely_missing_ta_refresh_dir"
+        )
+
+        self.assertEqual(self._run(node), {'CANCELLED'})
+
+    def test_operator_cancels_for_unknown_node(self):
+        node = _make_node(content="我的片段")
+        _fake_global_config_state["mod_folder"] = tempfile.gettempdir()
+
+        self.assertEqual(self._run(node, node_name="别的节点"), {'CANCELLED'})
+
+    def test_operator_succeeds_when_empty_content_has_nothing_to_clear(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            self._write(os.path.join(temp_dir, "mod.ini"), "[Constants]\n")
+            node = _make_node(content="")
+            _fake_global_config_state["mod_folder"] = temp_dir
+
+            # 空内容 + 配置表里没有本节点的块 = 无需改动，但不是错误
+            self.assertEqual(self._run(node), {'FINISHED'})
+
+
 class AutoAppendedMarkerIntegrationTests(unittest.TestCase):
     """追加块必须被其它后处理节点识别为「自动追加的尾部」并原样保留。"""
 
@@ -544,15 +777,16 @@ class _FakeOperatorProperties:
 class _FakeLayout:
     """极简 UILayout 替身：只记录画出来的文本/算子，用来验证 draw_buttons 不炸且内容对。"""
 
-    def __init__(self, labels=None, operators=None):
+    def __init__(self, labels=None, operators=None, operator_props=None):
         self.labels = labels if labels is not None else []
         self.operators = operators if operators is not None else []
+        self.operator_props = operator_props if operator_props is not None else []
 
     def box(self):
-        return _FakeLayout(self.labels, self.operators)
+        return _FakeLayout(self.labels, self.operators, self.operator_props)
 
     def row(self, align=False):
-        return _FakeLayout(self.labels, self.operators)
+        return _FakeLayout(self.labels, self.operators, self.operator_props)
 
     def label(self, text="", icon=""):
         self.labels.append(text)
@@ -565,9 +799,18 @@ class _FakeLayout:
 
     def operator(self, idname, **kwargs):
         self.operators.append((idname, kwargs))
-        return _FakeOperatorProperties()
+        properties = _FakeOperatorProperties()
+        self.operator_props.append((idname, properties))
+        return properties
 
     def separator(self):
+        return None
+
+    def operator_properties(self, idname):
+        """取最后一个同 idname 算子的属性对象（用来验证 node_name 传对了）。"""
+        for name, properties in reversed(self.operator_props):
+            if name == idname:
+                return properties
         return None
 
 
@@ -617,6 +860,34 @@ class DrawButtonsTests(unittest.TestCase):
 
         self.assertTrue(any("查看全部" in text for text in layout.labels))
         self.assertLessEqual(len(layout.labels), module.MAX_DISPLAY_LINES + 6)
+
+    def test_draws_refresh_exported_text_button(self):
+        node = _make_node(content="片段")
+        layout = _FakeLayout()
+
+        node.draw_buttons(None, layout)
+
+        self.assertIn(
+            (
+                "ssmt.text_append_refresh_exported_text",
+                {"text": "刷新已导出文本", "icon": 'FILE_REFRESH'},
+            ),
+            layout.operators,
+        )
+        properties = layout.operator_properties("ssmt.text_append_refresh_exported_text")
+        self.assertIsNotNone(properties)
+        self.assertEqual(properties.node_name, node.name)
+
+    def test_refresh_button_is_drawn_for_project_text_source_too(self):
+        _fake_bpy.data.texts.new("工程片段").write("来自工程文本")
+        node = _make_node(text_source=module.TEXT_SOURCE_PROJECT, project_name="工程片段")
+        layout = _FakeLayout()
+
+        node.draw_buttons(None, layout)
+
+        self.assertIsNotNone(
+            layout.operator_properties("ssmt.text_append_refresh_exported_text")
+        )
 
 
 class _FakeSpace:
@@ -854,6 +1125,7 @@ class RegistrationTests(unittest.TestCase):
         self.assertIn(module.SSMTNode_PostProcess_TextAppend, module.classes)
         self.assertIn(module.SSMT_OT_TextAppend_ToggleEditor, module.classes)
         self.assertIn(module.SSMT_OT_TextAppend_ClearText, module.classes)
+        self.assertIn(module.SSMT_OT_TextAppend_RefreshExportedText, module.classes)
 
     def test_node_bl_idname_matches_menu_entry(self):
         self.assertEqual(module.SSMTNode_PostProcess_TextAppend.bl_idname, module.NODE_BL_IDNAME)
