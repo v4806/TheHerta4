@@ -333,6 +333,49 @@ class ClickValueSequenceTests(unittest.TestCase):
         self.assertIn("store = $ssmtdrag_ckread_A_Click_Export_5, ResourceDragShapeKeyClickCountF_A, 5", content)
         self.assertNotIn("store = $Swap,", content)
 
+    def test_switch_value_target_is_written_on_click_edge_only(self):
+        """回归：受控变量只在**点击推进沿**写一次，不得每帧持续强写。
+
+        实机现象：`$animation_paused10` / `$animation_paused11` 这两个动画播放异常 ——
+        它们同时是「自动动画的播放状态」和本导出节点的受控变量。旧实现每帧走
+        `if var != prev … else: var = ckval` 的 else 分支，把播放状态按回列表首项
+        （每帧置 0），表现为该动画只播一帧就被按停。现在改为：
+        点击推进的那一帧写一次，其余帧完全不碰受控变量。
+        """
+        node = _click_node(targets=("$animation_paused10",), zone=3, values="0 1 0")
+
+        content = node.generate_ini_segment()
+
+        # 有独立的点击沿标志
+        self.assertIn("global $ssmtdrag_ckedge_A_Click_Export_3 = 0", content)
+        # 只有计数变化（点击推进）时置 1
+        self.assertIn("\t\t$ssmtdrag_ckedge_A_Click_Export_3 = 1", content)
+        self.assertIn("\t$ssmtdrag_ckedge_A_Click_Export_3 = 0", content)
+        # **位置**：沿标志必须在"计数回绕 if"的 endif **之后**、ckval 映射之前。
+        # 插进回绕 if 内部的话只在回绕那一帧置位（该帧 ckval 恒 0）→ 点击完全失效。
+        self.assertIn(
+            "\t\tif $ssmtdrag_ckidx_A_Click_Export_3 >= 3\n"
+            "\t\t\t$ssmtdrag_ckidx_A_Click_Export_3 = 0\n"
+            "\t\tendif\n"
+            "\t\t$ssmtdrag_ckedge_A_Click_Export_3 = 1\n"
+            "\t\tif $ssmtdrag_ckidx_A_Click_Export_3 == 0",
+            content,
+        )
+        # 受控变量：沿上写一次；否则仅在外部改动时重建基线（不写变量本身）
+        self.assertIn(
+            "\tif $ssmtdrag_ckedge_A_Click_Export_3 == 1\n"
+            "\t\t$animation_paused10 = $ssmtdrag_ckval_A_Click_Export_3\n"
+            "\t\t$ssmtdrag_ckprev_A_animation_paused10 = $animation_paused10\n"
+            "\telif $animation_paused10 != $ssmtdrag_ckprev_A_animation_paused10\n"
+            "\t\t$ssmtdrag_ckprev_A_animation_paused10 = $animation_paused10\n"
+            "\tendif",
+            content,
+        )
+        # 旧形态（每帧 else 强写）必须消失
+        self.assertNotIn(
+            "\telse\n\t\t$animation_paused10 = $ssmtdrag_ckval_A_Click_Export_3", content
+        )
+
     def test_generate_ini_segment_switch_values_do_not_seed_click_count(self):
         """列表值 → 点击计数不可逆（允许重复项），故不置 seed_pending、
         不做变量→缓冲播种；变量外部改动时只更新 prev 并让点击继续。"""

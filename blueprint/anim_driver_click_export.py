@@ -514,6 +514,11 @@ class SSMTNode_AnimDriver_ClickExport(SSMTNode_AnimDriver_Base):
         value_var = f"$ssmtdrag_ckval_{ns}_{tag}"
         held_var = f"$ssmtdrag_ckheld_{ns}_{tag}"
         held_prev_var = f"$ssmtdrag_ckheldprev_{ns}_{tag}"
+        # 点击边沿标志：只有本帧**真的推进了一档**才置 1。
+        # 受控变量只在边沿那一刻写一次 —— 不能每帧持续写：受控变量可能同时是
+        # 动画驱动的播放状态/自动动画目标（例如 `$animation_pausedN`），每帧强写会
+        # 把播放状态按回列表首项，表现为该动画只播一帧就被按停。
+        edge_var = f"$ssmtdrag_ckedge_{ns}_{tag}"
 
         globals_lines = [
             "[Constants]",
@@ -526,6 +531,8 @@ class SSMTNode_AnimDriver_ClickExport(SSMTNode_AnimDriver_Base):
             f"global {index_var} = {count - 1}",
             # 当前开关值：未点击时即列表第 1 项
             f"global {value_var} = {values[0]}",
+            # 本帧是否发生了点击推进（受控变量只在此时写一次）
+            f"global {edge_var} = 0",
         ]
         # ---- 回读最小化：点击计数只在按住 LMB/X 期间会变 ----
         # store 是 GPU→CPU 同步，旧实现每帧无条件回读一次。现在只在
@@ -557,6 +564,7 @@ class SSMTNode_AnimDriver_ClickExport(SSMTNode_AnimDriver_Base):
             indent = "\t"
         block_lines.extend([
             f"{indent}store = {read_var}, {click_f_resource}, {zone}",
+            f"{indent}{edge_var} = 0",
             f"{indent}if {init_var} == 0",
             f"{indent}\t{init_var} = 1",
             f"{indent}\t{last_var} = {read_var}",
@@ -566,6 +574,8 @@ class SSMTNode_AnimDriver_ClickExport(SSMTNode_AnimDriver_Base):
             f"{indent}\tif {index_var} >= {count}",
             f"{indent}\t\t{index_var} = 0",
             f"{indent}\tendif",
+            # 点击推进沿：本次点击确定了下标，值随之更新
+            f"{indent}\t{edge_var} = 1",
         ])
         for idx, value in enumerate(values):
             block_lines.append(f"{indent}\t{'if' if idx == 0 else 'elif'} {index_var} == {idx}")
@@ -584,13 +594,16 @@ class SSMTNode_AnimDriver_ClickExport(SSMTNode_AnimDriver_Base):
             stem = re.sub(r"[^0-9A-Za-z_]", "_", str(var).lstrip("$"))
             prev = f"$ssmtdrag_ckprev_{ns}_{stem}"
             globals_lines.append(f"global {prev} = 0")
-            # 受控变量仲裁是纯 CPU 赋值（无 store），保持每帧执行：
-            # 变量被外部改动时以变量为准，否则写入当前开关值
+            # 受控变量只在**两个时刻**写：
+            #   ① 点击推进沿（把新的开关值写下去一次）；
+            #   ② 变量被外部改动（热键/驱动器）时以变量为准、重建基线。
+            # 不再每帧持续强写 —— 受控变量可能同时是动画驱动的播放状态
+            # （`$animation_pausedN`）或自动动画目标，持续强写会把该动画按停。
             block_lines.extend([
-                f"\tif {var} != {prev}",
-                f"\t\t{prev} = {var}",
-                "\telse",
+                f"\tif {edge_var} == 1",
                 f"\t\t{var} = {value_var}",
+                f"\t\t{prev} = {var}",
+                f"\telif {var} != {prev}",
                 f"\t\t{prev} = {var}",
                 "\tendif",
             ])
