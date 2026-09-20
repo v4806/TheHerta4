@@ -258,6 +258,9 @@ class SSMTNode_AnimDriver_ForwardPlay(SSMTNode_AnimDriver_Base):
         if self._has_linked_output():
             box.label(text="  [链输出] 已连接（传递到下一节点）", icon='FORWARD')
 
+        box.separator()
+        self._draw_preview_controls(box)
+
     def generate_ini_segment(self, connected_nodes=None) -> str:
         idx = self._read_safe_index()
         driven_vars = self._get_driven_vars()

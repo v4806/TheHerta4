@@ -15,6 +15,10 @@ ANIM_DRIVER_SOCKET_TYPE = 'SSMTSocketAnimDriver'
 ANIM_DRIVER_INPUT_SOCKET_NAME = "链输入"
 ANIM_DRIVER_OUTPUT_SOCKET_NAME = "链输出"
 
+#: 关键帧预览的帧数上限。预览解释的是配置表里的每帧算术，帧数越多代价越大，
+#: 而动画驱动的一个周期通常远短于 300 帧；超出部分对预览没有信息量。
+ANIM_DRIVER_PREVIEW_MAX_FRAMES = 300
+
 
 class DrivenVariableItem(bpy.types.PropertyGroup):
     variable_name: StringProperty(
@@ -358,6 +362,14 @@ class SSMTNode_AnimDriver_Base(SSMTNodeBase):
         options={'HIDDEN'},
     )
 
+    preview_frame_count: bpy.props.IntProperty(
+        name="预览帧数",
+        description="关键帧预览解释多少帧（上限 300）；1 场景帧 = 1 驱动帧",
+        default=ANIM_DRIVER_PREVIEW_MAX_FRAMES,
+        min=1,
+        max=ANIM_DRIVER_PREVIEW_MAX_FRAMES,
+    )
+
     continuous_index_var_initialized: bpy.props.BoolProperty(
         name="Continuous Index Variable Initialized",
         default=False,
@@ -417,6 +429,15 @@ class SSMTNode_AnimDriver_Base(SSMTNodeBase):
 
     def generate_ini_segment(self, connected_nodes=None) -> str:
         raise NotImplementedError("子类必须实现 generate_ini_segment 方法")
+
+    def _draw_preview_controls(self, layout):
+        """关键帧预览控件（只由已支持预览的驱动节点调用）。
+
+        惰性 import：``anim_driver_preview`` 依赖采集器与变量注册表，
+        节点模块加载期不需要它（测试桩环境也拿不到完整依赖）。
+        """
+        from .anim_driver_preview import draw_anim_driver_preview_controls
+        draw_anim_driver_preview_controls(layout, self)
 
     @staticmethod
     def _resolve_default_play_state(default_play_enabled) -> int:

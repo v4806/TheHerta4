@@ -184,6 +184,9 @@ class SSMTNode_AnimDriver_Random(SSMTNode_AnimDriver_Base):
         else:
             box.label(text="至少添加一个目标变量", icon='INFO')
 
+        box.separator()
+        self._draw_preview_controls(box)
+
     def _collect_shared_target_pause_vars(self, targets):
         """目标变量 -> 同样在写它的其它驱动节点的暂停变量。
 
