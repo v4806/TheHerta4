@@ -195,6 +195,7 @@ def _make_node(**overrides):
         cs_v=0.0,
         enable_reset=True,
         buffer_tag='abcd1234',
+        active_target_index=0,
         show_targets=True,
         show_glow=True,
         show_breath=True,
@@ -295,6 +296,12 @@ class _FakeLayout:
         self.log.append(("op", idname, ""))
         return _FakeOperator(self.log, idname)
 
+    def template_list(self, list_type, _list_id, _data, propname, _active_data, active_propname, **kwargs):
+        self.log.append(
+            ("template_list", list_type, f"rows={kwargs.get('rows')} prop={propname} active={active_propname}")
+        )
+        return self
+
     def prop_search(self, *_args, **_kwargs):
         return self
 
@@ -363,8 +370,8 @@ class RabbitFXProTests(unittest.TestCase):
 
     # ──────────────── 目标物体列表（一个大列表） ────────────────
 
-    def test_target_list_is_one_flat_list(self):
-        """所有物体在同一个列表里一行一个，不再按物体分「目标 N」卡片。"""
+    def test_target_list_uses_scrollable_uilist(self):
+        """列表是 UIList（自带滚动条），可见行数有上限，不会把所有物体铺开。"""
         node = _make_node(
             target_items=[_item(_fake_object()), _item(_fake_object(SECOND_OBJECT))]
         )
@@ -373,18 +380,66 @@ class RabbitFXProTests(unittest.TestCase):
         node.draw_buttons(None, layout)
 
         log = layout.log
-        pickers = [e for e in log if e[0] == "prop" and e[1] == "target_object"]
-        self.assertEqual(len(pickers), 2, "每个物体一行 picker")
-        removes = [e for e in log if e[0] == "op" and e[1] == "ssmt.rabbitfx_pro_remove_at"]
-        self.assertEqual(len(removes), 2, "每行一个移除按钮")
-        remove_indices = [
-            e[2] for e in log
+        template_calls = [e for e in log if e[0] == "template_list"]
+        self.assertEqual(len(template_calls), 1)
+        self.assertEqual(template_calls[0][1], "SSMT_UL_RABBITFX_PRO_TARGETS")
+        self.assertIn("prop=target_items", template_calls[0][2])
+        self.assertIn("active=active_target_index", template_calls[0][2])
+        # 节点本身不再逐个画物体行
+        self.assertFalse([e for e in log if e[0] == "prop" and e[1] == "target_object"])
+
+    def test_hundreds_of_objects_keep_the_node_compact(self):
+        """两百个物体时仍然只占 6 行高度（其余靠滚动）。"""
+        node = _make_node(
+            target_items=[_item(_fake_object(f"Body_{i:03d}")) for i in range(200)]
+        )
+        layout = _FakeLayout()
+
+        node.draw_buttons(None, layout)
+
+        template_calls = [e for e in layout.log if e[0] == "template_list"]
+        self.assertEqual(len(template_calls), 1)
+        self.assertIn("rows=6", template_calls[0][2])
+        self.assertFalse([e for e in layout.log if e[0] == "prop" and e[1] == "target_object"])
+
+    def test_uilist_row_draws_picker_icons_and_remove(self):
+        """列表行：物体选择器 + 发光/FX 图标 + 移除按钮（带该行下标）。"""
+        node = _make_node()
+        item = _item(_fake_object())
+        item.has_glow = True
+        item.has_fx = True
+        uilist = pro.SSMT_UL_RabbitFXProTargets()
+        uilist.layout_type = 'DEFAULT'
+        layout = _FakeLayout()
+
+        uilist.draw_item(None, layout, node, item, None, None, None, 7)
+
+        props = [e for e in layout.log if e[0] == "prop"]
+        self.assertEqual([e[1] for e in props], ["target_object"])
+        icons = [e[2] for e in layout.log if e[0] == "label"]
+        self.assertIn("LIGHT", icons)
+        self.assertIn("TEXTURE", icons)
+        remove_props = [
+            e[2] for e in layout.log
             if e[0] == "op_prop" and e[1] == "ssmt.rabbitfx_pro_remove_at"
-            and e[2].startswith("index=")
         ]
-        self.assertEqual(remove_indices, ["index=0", "index=1"])
-        labels = [e[1] for e in log if e[0] == "label"]
-        self.assertFalse([text for text in labels if text.startswith("目标 ")])
+        self.assertIn("index=7", remove_props)
+        self.assertIn(f"node_name={node.name}", remove_props)
+
+    def test_side_remove_button_removes_active_row(self):
+        """右侧 − 不指定 index 时移除列表里高亮的那一行。"""
+        first, second = _fake_object(), _fake_object(SECOND_OBJECT)
+        node = _make_node(target_items=[_item(first), _item(second)], active_target_index=1)
+        context = types.SimpleNamespace(active_node=node)
+        operator = pro.SSMT_OT_RabbitFXProRemoveAt()
+        operator.index = -1  # 真实 Blender 里由 IntProperty(default=-1) 提供
+
+        operator.execute(context)
+
+        self.assertEqual(
+            [item.target_object.name for item in node.target_items], [OBJECT_NAME]
+        )
+        self.assertEqual(node.active_target_index, 0)
 
     def test_add_selected_operator_appends_into_one_list(self):
         """「添加选中物体」把选中的物体各加一行到同一个列表里，并去重。"""

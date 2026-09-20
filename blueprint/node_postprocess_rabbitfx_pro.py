@@ -373,6 +373,29 @@ class RabbitFXProTargetItem(bpy.types.PropertyGroup):
     )
 
 
+class SSMT_UL_RabbitFXProTargets(bpy.types.UIList):
+    """目标物体列表（UIList：固定可见行数 + 自带滚动条）。"""
+
+    bl_idname = "SSMT_UL_RABBITFX_PRO_TARGETS"
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        if self.layout_type in {'DEFAULT', 'COMPACT'}:
+            row = layout.row(align=True)
+            row.prop(item, "target_object", text="")
+            if item.target_object is None:
+                row.label(text="", icon='ERROR')
+            if item.has_glow:
+                row.label(text="", icon='LIGHT')
+            if item.has_fx:
+                row.label(text="", icon='TEXTURE')
+            op = row.operator("ssmt.rabbitfx_pro_remove_at", text="", icon='X')
+            op.node_name = getattr(data, "name", "")
+            op.index = index
+        elif self.layout_type in {'GRID'}:
+            layout.alignment = 'CENTER'
+            layout.label(text="", icon='OBJECT_DATA')
+
+
 class SSMTNode_PostProcess_RabbitFXPro(SSMTNode_PostProcess_Base):
     bl_idname = NODE_IDNAME
     bl_label = 'RabbitFX贴图后处理pro'
@@ -383,6 +406,10 @@ class SSMTNode_PostProcess_RabbitFXPro(SSMTNode_PostProcess_Base):
 
     # ── 目标物体 ──
     target_items: bpy.props.CollectionProperty(type=RabbitFXProTargetItem)
+    active_target_index: bpy.props.IntProperty(
+        name="当前物体", description="列表里高亮的行（右侧 − 与下方详情按它来）",
+        default=0, min=0,
+    )
 
     # ── 静态发光 ──
     enable_glow: bpy.props.BoolProperty(
@@ -504,6 +531,8 @@ class SSMTNode_PostProcess_RabbitFXPro(SSMTNode_PostProcess_Base):
         super().init(context)
         if not self.buffer_tag:
             self.buffer_tag = uuid.uuid4().hex[:8]
+        # 列表要放下「物体选择器 + 图标 + 移除」，默认 300 太窄。
+        self.width = 380
 
     # ──────────────────────────── UI ────────────────────────────
 
@@ -660,7 +689,6 @@ class SSMTNode_PostProcess_RabbitFXPro(SSMTNode_PostProcess_Base):
         )
         row.label(text=f"目标物体列表 ({len(self.target_items)})", icon='OUTLINER_OB_GROUP_INSTANCE')
         row.operator("ssmt.rabbitfx_pro_scan", text="", icon='VIEWZOOM').node_name = self.name
-        row.operator("ssmt.rabbitfx_pro_add", text="", icon='ADD').node_name = self.name
 
         if not self.show_targets:
             return
@@ -679,33 +707,41 @@ class SSMTNode_PostProcess_RabbitFXPro(SSMTNode_PostProcess_Base):
             layout.label(text="点扫描按钮从材质转资源收集 FX 物体", icon='INFO')
             return
 
-        # 一个大列表：一行一个物体，不再按物体分卡片。
-        rows = layout.box()
-        for index, item in enumerate(self.target_items):
-            row = rows.row(align=True)
-            row.prop(item, "target_object", text="")
-            if item.has_glow:
-                row.label(text="", icon='LIGHT')
-            if item.has_fx:
-                row.label(text="", icon='TEXTURE')
-            op = row.operator("ssmt.rabbitfx_pro_remove_at", text="", icon='X')
-            op.node_name = self.name
-            op.index = index
+        list_row = layout.row(align=True)
+        # 固定可见行数上限：一两百个物体时靠 UIList 自带的滚动条翻页，
+        # 而不是把所有物体一次性铺开把节点撑爆。
+        visible_rows = max(3, min(len(self.target_items), 6))
+        list_row.template_list(
+            "SSMT_UL_RABBITFX_PRO_TARGETS", "",
+            self, "target_items",
+            self, "active_target_index",
+            rows=visible_rows, type='DEFAULT',
+        )
+        op_col = list_row.column(align=True)
+        op_col.operator("ssmt.rabbitfx_pro_add", text="", icon='ADD').node_name = self.name
+        op_col.operator("ssmt.rabbitfx_pro_remove_at", text="", icon='REMOVE').node_name = self.name
 
-            obj = item.target_object
-            if obj is None:
-                rows.label(text="未选择物体", icon='ERROR')
-                continue
-            rows.label(
-                text=(
-                    f"哈希 {_extract_hash_from_object(obj.name) or '—'}"
-                    f"   标识 {_extract_resource_suffix(obj.name) or '—'}"
-                ),
-                icon='INFO',
-            )
-            duplicate = _objects_used_by_other_nodes(self, obj)
-            if duplicate:
-                rows.label(text=f"同一物体也被 {duplicate} 接管", icon='ERROR')
+        obj = self.active_target_object()
+        if obj is None:
+            return
+        layout.label(
+            text=(
+                f"哈希 {_extract_hash_from_object(obj.name) or '—'}"
+                f"   标识 {_extract_resource_suffix(obj.name) or '—'}"
+            ),
+            icon='INFO',
+        )
+        duplicate = _objects_used_by_other_nodes(self, obj)
+        if duplicate:
+            layout.label(text=f"同一物体也被 {duplicate} 接管", icon='ERROR')
+
+    def active_target_object(self):
+        """列表里当前高亮行的物体（越界时返回 None）。"""
+        items = self.target_items
+        index = int(getattr(self, "active_target_index", 0) or 0)
+        if 0 <= index < len(items):
+            return items[index].target_object
+        return None
 
     # ──────────────────────── 生成入口 ────────────────────────
 
@@ -1292,6 +1328,7 @@ class SSMT_OT_RabbitFXProScan(bpy.types.Operator):
             item.target_object = obj
             item.has_glow = has_glow
             item.has_fx = has_fx
+        node.active_target_index = 0
 
         glow_count = sum(1 for _o, has_glow, _f in found if has_glow)
         fx_count = sum(1 for _o, _g, has_fx in found if has_fx)
@@ -1356,23 +1393,27 @@ class SSMT_OT_RabbitFXProAdd(bpy.types.Operator):
         if node is None:
             return {"CANCELLED"}
         node.target_items.add()
+        node.active_target_index = len(node.target_items) - 1
         return {"FINISHED"}
 
 
 class SSMT_OT_RabbitFXProRemoveAt(bpy.types.Operator):
     bl_idname = "ssmt.rabbitfx_pro_remove_at"
     bl_label = "移除该物体"
+    bl_description = "移除这一行；不指定 index 时移除列表里高亮的那一行"
     bl_options = {"REGISTER", "UNDO", "INTERNAL"}
 
     node_name: bpy.props.StringProperty()
-    index: bpy.props.IntProperty(default=0)
+    index: bpy.props.IntProperty(default=-1, min=-1)
 
     def execute(self, context):
         node = _resolve_node(self, context)
         if node is None:
             return {"CANCELLED"}
-        if 0 <= self.index < len(node.target_items):
-            node.target_items.remove(self.index)
+        index = self.index if self.index >= 0 else int(getattr(node, "active_target_index", 0) or 0)
+        if 0 <= index < len(node.target_items):
+            node.target_items.remove(index)
+            node.active_target_index = max(0, min(index, len(node.target_items) - 1))
         return {"FINISHED"}
 
 
@@ -1406,6 +1447,7 @@ class SSMT_OT_RabbitFXProAddSelected(bpy.types.Operator):
             added += 1
 
         if added:
+            node.active_target_index = len(node.target_items) - 1
             self.report({"INFO"}, f"已加入 {added} 个物体")
         else:
             self.report({"INFO"}, "选中的物体都已在列表中")
@@ -1414,6 +1456,7 @@ class SSMT_OT_RabbitFXProAddSelected(bpy.types.Operator):
 
 _classes = (
     RabbitFXProTargetItem,
+    SSMT_UL_RabbitFXProTargets,
     SSMTNode_PostProcess_RabbitFXPro,
     SSMT_OT_RabbitFXProScan,
     SSMT_OT_RabbitFXProAdd,
