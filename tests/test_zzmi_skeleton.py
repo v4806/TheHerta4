@@ -1842,5 +1842,99 @@ class ZZMISiblingCacheTests(unittest.TestCase):
         self.assertEqual(cache_groups, dump_groups)
 
 
+class ZZMIMergedMetadataGateTests(unittest.TestCase):
+    """生成侧与开关无关（用户要求）+ 自愈的判据单测。
+
+    导入侧门控（ui/ui_func_import_ssmt.py）为
+    ``zzmi_merged_consumption or zzmi_merged_metadata_missing``——即复选框关闭
+    时，只要请求集内还有子网格缺合并元数据（或数据不完整），本次导入也必须
+    修复性反查/升级落盘。本类钉住这一半判据（`missing_merged_metadata_exist`）：
+    首次导入/清缓存后/旧版缓存必须为 True，数据完整后必须为 False（幂等，开关
+    关闭时不会重复解析提取文件）。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="zzmi_meta_gate_")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.dump, self.ws, self.unique_strs = _make_zzmi_dump_and_workspace(
+            Path(self.tmp)
+        )
+
+    def _missing(self) -> bool:
+        return ZZMISkeletonMergeHelper.missing_merged_metadata_exist(
+            str(self.ws), self.unique_strs
+        )
+
+    def test_missing_before_generation_and_present_after(self):
+        # 首次导入（新工作空间）：没有任何 VGMap ⇒ 必须触发预生成
+        self.assertTrue(self._missing())
+        ok, message = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs
+        )
+        self.assertTrue(ok, message)
+        # 数据完整后幂等：复选框关闭时不会因为本判据重复反查提取文件
+        self.assertFalse(self._missing())
+
+    def test_clear_cache_makes_metadata_missing_again(self):
+        ok, message = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs
+        )
+        self.assertTrue(ok, message)
+        self.assertFalse(self._missing())
+
+        # 用户执行「清除骨骼合并VGMap缓存」：即使复选框关闭，下次导入也必须
+        # 重新反查（有新提取文件用新的，没有则用工作空间缓存）。
+        _efmi.EFMISkeletonMergeHelper.clear_vgmap_cache(str(self.ws))
+        self.assertTrue(self._missing())
+
+        shutil.rmtree(self.dump)
+        ok2, message2 = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs
+        )
+        self.assertTrue(ok2, message2)
+        self.assertFalse(self._missing())
+        for bare in ("aaaa1111-100-0", "bbbb2222-200-0"):
+            runtime = self.ws / "LOD0" / bare / "ModImpRuntime"
+            self.assertTrue((runtime / f"{bare}-BoneMatrix.buf").is_file())
+            self.assertTrue((runtime / f"{bare}-ObjectCB1.buf").is_file())
+
+    def test_incomplete_cache_is_self_healed_without_dump(self):
+        """旧算法版本的「存在但不完整」数据也必须自愈，且不需要提取文件。"""
+        ok, message = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs
+        )
+        self.assertTrue(ok, message)
+        self.assertFalse(self._missing())
+
+        # 把缓存降级成 v4（缺 ChannelPlan 系列字段）：快路径完整性不再成立
+        for bare in ("aaaa1111-100-0", "bbbb2222-200-0"):
+            payload = _read_zzmi_json(self.ws, bare)
+            payload["VGMapAlgorithmVersion"] = 4
+            for key in ("ChannelPlan", "ChannelPlanVersion", "ChannelPlanSlotWeights"):
+                payload.pop(key, None)
+            _write_zzmi_json(self.ws, bare, payload)
+        self.assertTrue(
+            self._missing(),
+            "旧算法版本的缓存必须被判为需要处理（复选框关闭时也要自愈）",
+        )
+
+        # 提取文件已删除：v4→v5 只凭 VGMap 就地升级，不得要求重新提取
+        shutil.rmtree(self.dump)
+        ok2, message2 = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs
+        )
+        self.assertTrue(ok2, message2)
+        # 就地升级（v4→v5 只补 ChannelPlan，不需要提取文件）：两份 json 必须
+        # 已经带上当前算法版本与通道计划记录
+        for bare in ("aaaa1111-100-0", "bbbb2222-200-0"):
+            payload = _read_zzmi_json(self.ws, bare)
+            self.assertEqual(
+                payload["VGMapAlgorithmVersion"],
+                _zzmi.ZZMI_VG_MAP_ALGORITHM_VERSION,
+            )
+            self.assertIsInstance(payload.get("ChannelPlan"), dict)
+        self.assertFalse(self._missing())
+
+
 if __name__ == "__main__":
     unittest.main()

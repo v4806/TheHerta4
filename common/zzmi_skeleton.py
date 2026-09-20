@@ -1302,6 +1302,44 @@ class ZZMISkeletonMergeHelper:
         )
 
     @classmethod
+    def missing_merged_metadata_exist(
+        cls, workspace_root: str, unique_str_list: list[str]
+    ) -> bool:
+        """请求集内是否有子网格的骨骼合并数据**缺失或不完整**（自愈判据）。
+
+        供导入侧判断「复选框关闭时也必须预生成/修复」：与 EFMI 的同名方法
+        （t15 活性修复）语义一致但更严——EFMI 只判 ``VGMap``/``VGMapAlgorithmVersion``
+        是否缺失；ZZMI 还要判**快路径完整性**（``_zzmi_cache_intact``），因此旧算法
+        版本、缺 ``SkeletonGroup``/``DeformDrawIndex``/``OriginalVertexCount``、
+        palette 缓存缺失/截断、通道计划版本不符等一律算「需要处理」，复选框关闭时
+        的下一次导入也会自愈：能就地升级的就地升级（v4→v5 只需 VGMap，不需要提取
+        文件），其余按当前提取源重建，提取源不在则用工作空间缓存重建。
+
+        刻意**不做**提取源指纹（log.txt 全量哈希）比对：那会让每次导入都哈希整个
+        log；换用新提取文件请重新选择提取源并重新导入（或清缓存后重导入）。
+        只检查请求集内可解析的 json；``GPU-PreSkinning`` 为 False 的 json 不参与判定。
+        """
+        if not workspace_root or not unique_str_list:
+            return False
+        for unique_str in unique_str_list:
+            json_path = cls._resolve_submesh_json_path(workspace_root, unique_str)
+            if not json_path:
+                continue
+            try:
+                payload = JsonUtils.LoadFromFile(json_path)
+            except Exception:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("GPU-PreSkinning") is False:
+                continue
+            if not payload.get("VGMap") or not payload.get("VGMapAlgorithmVersion"):
+                return True
+            if not cls._zzmi_cache_intact(payload, json_path, unique_str):
+                return True
+        return False
+
+    @classmethod
     def ensure_skeleton_data(
         cls,
         workspace_root: str,
@@ -1339,10 +1377,14 @@ class ZZMISkeletonMergeHelper:
                     resolver = None
         else:
             # dump 目录已被删除：上次导入已把 palette / 对象变换 CB 复制进工作空间
-            # ModImpRuntime，缓存完整的子网格可以脱离 dump 重建。
+            # ModImpRuntime，缓存完整的子网格可以脱离 dump 重建。工作区已记录过提取源
+            # 时**不会**自动改用游戏目录里的其它帧（防跨帧/跨模型混用，见
+            # resolve_frame_analysis_dir）：要换用新的提取文件，请在面板重新选择
+            # 提取源后重新导入。
             print(
-                "[ZZMI骨骼合并] 提示: 未找到 FrameAnalysis 目录（可能已被删除），"
-                "将仅用工作空间缓存重建"
+                "[ZZMI骨骼合并] 提示: 未找到 FrameAnalysis 目录（记录过的提取源已被"
+                "删除/搬走），本次仅用工作空间缓存重建；如需改用新的提取文件，"
+                "请重新选择提取源后重新导入"
             )
 
         # 第一遍：收集每个子网格信息并按 DrawIB 分组（同 DrawIB 的拆分子网格共享

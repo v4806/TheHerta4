@@ -207,28 +207,62 @@ ZZMIv1 帧序下会让完整合并物体整块消失，故只作复核用途）�
 的合并需要一层**逐帧对象空间换算**，该功能**尚未实现**；因此本开关当前不参与任何导入/导出决策
 （属性描述里也如此声明）。开启它**不会**改变已验证的合并骨骼（`import_merged_vgmap`）行为。
 
-### 5.2 数据生成门控（唯一新增的主动作）
+两个实验开关都**不参与数据生成**：反查与落盘只发生在导入侧（见 §5.2 不变量），
+开关只决定导出侧怎么消费这份数据。
 
-`ImprotFromWorkSpaceFull`（`ui/ui_func_import_ssmt.py`）在 EFMI 门控段（`logic_name == EFMI and GlobalProterties.import_merged_vgmap()`）之后追加同构分支：
+### 5.2 数据生成门控（生成侧与消费侧分离）
+
+**不变量（用户要求）**：骨骼合并数据（`VGMap`/`VGOffset`/`VGCount` +
+`SkeletonGroup`/`DeformDrawIndex`/`OriginalVertexCount` + `ModImpRuntime` 的
+palette（`BoneMatrix`）/对象变换（`ObjectCB1`）副本）**在首次导入时一次性反查并落盘到工作空间**，
+与「使用融合统一顶点组」（§5.1）及两个实验开关（§5.1.1）是否开启**无关**；数据持久保存，
+除「清除骨骼合并VGMap缓存」外，数据**过期/残缺**（见下方自愈范围）也会在下次导入被修复——**有新的提取文件就用新的，没有则用工作空间
+缓存重建**（`ZZMISkeletonMergeHelper.ensure_skeleton_data`：palette 取 dump 的 deduped 路径、
+对象变换 CB 取当前渲染 draw 的 CB1 窗口，二者在 dump 不可用时都回退 `ModImpRuntime` 副本；
+dump 存在但该 IB 无可用 CB1 时**不回退**，显式跳过以免跨帧混用）。因此打开这些开关
+**永远不需要重新提取**。复选框只作为**消费侧**门控（§5.3 / §5.4）。
+
+`ImprotFromWorkSpaceFull`（`ui/ui_func_import_ssmt.py`）的 ZZMI 预生成门控：
 
 ```python
-if (
+zzmi_merged_consumption = (
     GlobalConfig.logic_name == LogicName.ZZMI
     and GlobalProterties.import_merged_vgmap()
-):
-    from ..common.zzmi_skeleton import ZZMISkeletonMergeHelper
-    ok, message = ZZMISkeletonMergeHelper.ensure_skeleton_data(
-        workspace_root=GlobalConfig.path_workspace_folder(),
-        target_list=<工作空间 drawib/component 列表>,
-    )
+)
+zzmi_merged_metadata_missing = ZZMISkeletonMergeHelper.missing_merged_metadata_exist(
+    GlobalConfig.path_workspace_folder(), import_keys
+)  # 缺 VGMap 家族，或快路径完整性（_zzmi_cache_intact）不通过
+if zzmi_merged_consumption or zzmi_merged_metadata_missing:
+    ok, message = ZZMISkeletonMergeHelper.ensure_skeleton_data(...)
     # 打印结果；失败不阻断导入（对齐 EFMI）
 ```
 
-复选框关闭 → 整段不执行，零文件读写，绝对现状。
+- 复选框**开** → 与旧实现一致：预生成 + 失败回退（自动关复选框并告警）。
+- 复选框**关**但元数据缺失或不完整（首次导入 / 清缓存后重导入 / 旧算法版本）→
+  仍然预生成或修复；只记 stdout，不弹告警、不自动关复选框、不归集 `SkeletonGroup_<N>` 合集。
+- 复选框**关**且数据完整 → 整段不执行（幂等快路径），零文件读写。
+
+**自愈范围（用户要求）**：ZZMI 的判据比 EFMI 同名方法更严——除 `VGMap` 家族缺失外，
+还包含快路径完整性 `_zzmi_cache_intact`（算法版本、`SkeletonGroup`/`DeformDrawIndex`/
+`OriginalVertexCount`、`VGMap` 覆盖度、palette 缓存存在且大小达标、通道计划版本与内容一致）。
+因此「数据存在但过期/残缺」也会在**下一次导入**（无论复选框状态）被处理：能就地升级的
+就地升级（`MIGRATABLE_VG_MAP_ALGORITHM_VERSIONS` 里的旧版本只凭 `VGMap` 补派生字段，
+**不需要提取文件**），其余按当前提取源重建、提取源不在则用工作空间缓存重建。
+刻意**不**在判据里做 log.txt 全量哈希比对（否则每次导入都要哈希整个 log）——因此
+**换用新的提取文件需要重新选择提取源并重新导入**；提取源记录失效时也**不会**自动改用
+游戏目录里其它帧（`resolve_frame_analysis_dir`，防跨帧/跨模型混用，`tests/test_zzmi_skeleton.py`
+的 `test_deleted_explicit_dump_does_not_fallback_to_latest_other_dump` 钉住）。
+
+契约测试：`tests/test_zzmi_merged_data_generation_gate.py`（门控形态）+
+`tests/test_zzmi_skeleton.py::ZZMIMergedMetadataGateTests`（判据行为）。
 
 ### 5.3 导入消费（走现有双条件路径，最小适配）
 
 现有顶点组导入已是双条件门控：`json 有 VGMap and import_merged_vgmap()` → 全局索引；否则局部索引（判定 = `common/ssmt_import_helper.py` 的 `merged_vgmap_enabled = GlobalProterties.import_merged_vgmap() if use_merged_vgmap is None else bool(use_merged_vgmap)` 与紧随其后的 `submesh_json.VGMap if (... and VGCount > 0)`；另见 `common/mesh_create_helper.py`）。ZZMI 侧只需让 mesh 创建在读子网格 json 时识别本方案写入的 VGMap 段——**有则用、无则现状**，不改动任何默认分支。实施时先核对 ZZMI 导入实际读子网格 json 的位置再定点接入（一个小适配点，不重写导入）。
+
+**预生成与消费解耦后的覆盖值（2026-09 用户要求）**：复选框关闭时，`create_mesh_from_json` 的
+`use_merged_vgmap` 传 `None`（= 沿用全局选项 ⇒ 局部索引），**即使 json 里已有 §5.2 预生成的
+VGMap 也不改变导入结果**；复选框开启时仍传预生成结果（失败即整批 `False`，真正回退普通导入）。
 
 **分组合集（2026-08-24 实施）**：分组版下，一键导入把每个子网格对象移入其骨架组合集 `SkeletonGroup_<N>`（挂在 LOD 合集下，颜色轮换区分；`ui/ui_func_import_ssmt.py:_zzmi_move_to_skeleton_group_collection`）。json 无 SkeletonGroup 字段（旧缓存/未生成）时保持原合集归属，零副作用。
 
