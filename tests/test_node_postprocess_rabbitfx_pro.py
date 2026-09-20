@@ -166,8 +166,6 @@ def _fake_object(name=OBJECT_NAME):
 
 def _make_node(**overrides):
     node = pro.SSMTNode_PostProcess_RabbitFXPro()
-    # 默认挂在一棵含「材质转资源」的假蓝图里（本节点的贴图绑定来源）。
-    node.id_data = _fake_tree([node])
     defaults = dict(
         name='RabbitFXPro',
         enable_glow=True,
@@ -209,6 +207,9 @@ def _make_node(**overrides):
     for key, value in defaults.items():
         setattr(node, key, value)
     node.target_items = _FakeCollection(node.target_items)
+    # 挂在一棵含「材质转资源」的假蓝图里（本节点的贴图绑定来源）；必须在
+    # name 等属性设置之后建树，节点集合是按名字索引的。
+    node.id_data = _fake_tree([node])
     return node
 
 
@@ -248,11 +249,20 @@ def _material_node():
     )
 
 
+class _FakeNodeCollection(dict):
+    """模拟 bpy 节点集合：`.get(name)` 按名取，迭代产出节点对象。"""
+
+    def __iter__(self):
+        return iter(self.values())
+
+
 def _fake_tree(nodes, with_material_node=True):
     members = list(nodes)
     if with_material_node:
         members.append(_material_node())
-    return types.SimpleNamespace(nodes=members)
+    return types.SimpleNamespace(
+        nodes=_FakeNodeCollection({getattr(node, "name", ""): node for node in members})
+    )
 
 
 class _FakeLayout:
@@ -368,7 +378,9 @@ class RabbitFXProTests(unittest.TestCase):
         removes = [e for e in log if e[0] == "op" and e[1] == "ssmt.rabbitfx_pro_remove_at"]
         self.assertEqual(len(removes), 2, "每行一个移除按钮")
         remove_indices = [
-            e[2] for e in log if e[0] == "op_prop" and e[1] == "ssmt.rabbitfx_pro_remove_at"
+            e[2] for e in log
+            if e[0] == "op_prop" and e[1] == "ssmt.rabbitfx_pro_remove_at"
+            and e[2].startswith("index=")
         ]
         self.assertEqual(remove_indices, ["index=0", "index=1"])
         labels = [e[1] for e in log if e[0] == "label"]
@@ -391,6 +403,62 @@ class RabbitFXProTests(unittest.TestCase):
             [item.target_object.name for item in node.target_items],
             [OBJECT_NAME, SECOND_OBJECT],
         )
+
+    def test_add_selected_resolves_node_by_name_without_active_node(self):
+        """点节点面板里的按钮时 active_node 可能不是本节点 —— 必须按名字取到。
+
+        这是实机反馈的 bug：按钮只认 context.active_node，活动节点是别的节点时
+        直接静默 CANCELLED，点了没反应。
+        """
+        node = _make_node()
+        first = _fake_object()
+        second = _fake_object(SECOND_OBJECT)
+        context = types.SimpleNamespace(
+            space_data=types.SimpleNamespace(edit_tree=node.id_data),
+            active_node=None,
+            selected_objects=[first, second],
+        )
+        operator = pro.SSMT_OT_RabbitFXProAddSelected()
+        operator.node_name = node.name
+        operator.report = lambda *_args, **_kwargs: None
+
+        operator.execute(context)
+
+        self.assertEqual(len(node.target_items), 2)
+
+    def test_add_selected_reports_when_nothing_selected(self):
+        node = _make_node()
+        context = types.SimpleNamespace(active_node=node, selected_objects=[])
+        reports = []
+        operator = pro.SSMT_OT_RabbitFXProAddSelected()
+        operator.report = lambda kind, message: reports.append((kind, message))
+
+        result = operator.execute(context)
+
+        self.assertEqual(result, {"CANCELLED"})
+        self.assertEqual(len(node.target_items), 0)
+        self.assertTrue(any("没有选中" in message for _kind, message in reports))
+
+    def test_node_buttons_carry_node_name(self):
+        """节点内部按钮都要带 node_name，否则点下去可能落到别的活动节点上。"""
+        node = _make_node(target_items=[_item(_fake_object())])
+        layout = _FakeLayout()
+
+        node.draw_buttons(None, layout)
+
+        buttons = {
+            entry[1] for entry in layout.log if entry[0] == "op"
+        }
+        self.assertIn("ssmt.rabbitfx_pro_scan", buttons)
+        self.assertIn("ssmt.rabbitfx_pro_add", buttons)
+        self.assertIn("ssmt.rabbitfx_pro_add_selected", buttons)
+        self.assertIn("ssmt.rabbitfx_pro_remove_at", buttons)
+        named = {
+            entry[1] for entry in layout.log
+            if entry[0] == "op_prop" and entry[2] == f"node_name={node.name}"
+        }
+        for idname in buttons:
+            self.assertIn(idname, named, f"{idname} 没有带 node_name")
 
     def test_remove_at_operator_removes_that_row(self):
         node = _make_node(

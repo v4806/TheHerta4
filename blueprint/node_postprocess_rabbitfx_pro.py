@@ -660,12 +660,14 @@ class SSMTNode_PostProcess_RabbitFXPro(SSMTNode_PostProcess_Base):
         )
         row.label(text=f"目标物体列表 ({len(self.target_items)})", icon='OUTLINER_OB_GROUP_INSTANCE')
         row.operator("ssmt.rabbitfx_pro_scan", text="", icon='VIEWZOOM').node_name = self.name
-        row.operator("ssmt.rabbitfx_pro_add", text="", icon='ADD')
+        row.operator("ssmt.rabbitfx_pro_add", text="", icon='ADD').node_name = self.name
 
         if not self.show_targets:
             return
 
-        layout.operator("ssmt.rabbitfx_pro_add_selected", icon='RESTRICT_SELECT_OFF')
+        layout.operator(
+            "ssmt.rabbitfx_pro_add_selected", icon='RESTRICT_SELECT_OFF'
+        ).node_name = self.name
 
         if _find_material_node_in_tree(self) is None:
             layout.label(
@@ -687,6 +689,7 @@ class SSMTNode_PostProcess_RabbitFXPro(SSMTNode_PostProcess_Base):
             if item.has_fx:
                 row.label(text="", icon='TEXTURE')
             op = row.operator("ssmt.rabbitfx_pro_remove_at", text="", icon='X')
+            op.node_name = self.name
             op.index = index
 
             obj = item.target_object
@@ -1195,15 +1198,65 @@ def _active_pro_node(context):
 
 
 def _node_by_name(context, node_name):
+    """按名字在节点树里取本节点。
+
+    节点内部的按钮点下去时，``context.active_node`` 未必是画这个按钮的节点
+    （按钮会吃掉鼠标事件，活动节点可能还是上一个点过的节点），所以按钮必须
+    带上 ``node_name``，这里优先按名字查树，再退回活动节点。
+    """
     space = getattr(context, "space_data", None)
     tree = None
     if space is not None:
         tree = getattr(space, "edit_tree", None) or getattr(space, "node_tree", None)
-    if tree is not None and node_name:
-        found = tree.nodes.get(node_name)
+    if tree is None:
+        tree = getattr(context, "edit_tree", None) or getattr(context, "node_tree", None)
+    nodes = getattr(tree, "nodes", None) if tree is not None else None
+    if nodes is not None and node_name:
+        found = nodes.get(node_name)
         if found is not None and getattr(found, "bl_idname", "") == NODE_IDNAME:
             return found
     return _active_pro_node(context)
+
+
+def _resolve_node(operator, context):
+    """取本节点；取不到时报出可读原因，避免按钮点了没反应。"""
+    node = _node_by_name(context, getattr(operator, "node_name", ""))
+    if node is None:
+        operator.report({"WARNING"}, "没找到 RabbitFX贴图后处理pro 节点（请直接点节点面板上的按钮）")
+    return node
+
+
+def _selected_mesh_objects(context):
+    """当前选中的网格物体；context 里取不到时退回视图层与全局选择。"""
+    selected = [
+        obj for obj in (getattr(context, "selected_objects", None) or [])
+        if getattr(obj, "type", "") == "MESH"
+    ]
+    if selected:
+        return selected
+
+    view_layer = getattr(context, "view_layer", None)
+    if view_layer is None:
+        view_layer = getattr(getattr(bpy, "context", None), "view_layer", None)
+    try:
+        layer_selected = list(getattr(getattr(view_layer, "objects", None), "selected", None) or [])
+    except Exception:
+        layer_selected = []
+    selected = [obj for obj in layer_selected if getattr(obj, "type", "") == "MESH"]
+    if selected:
+        return selected
+
+    try:
+        objects = list(getattr(bpy.data, "objects", None) or [])
+    except Exception:
+        objects = []
+    for obj in objects:
+        if getattr(obj, "type", "") != "MESH":
+            continue
+        select_get = getattr(obj, "select_get", None)
+        if callable(select_get) and select_get():
+            selected.append(obj)
+    return selected
 
 
 class SSMT_OT_RabbitFXProScan(bpy.types.Operator):
@@ -1218,9 +1271,8 @@ class SSMT_OT_RabbitFXProScan(bpy.types.Operator):
     node_name: bpy.props.StringProperty()
 
     def execute(self, context):
-        node = _node_by_name(context, self.node_name)
+        node = _resolve_node(self, context)
         if node is None:
-            self.report({"WARNING"}, "未找到 RabbitFX贴图后处理pro 节点")
             return {"CANCELLED"}
 
         candidates, source_label = _collect_scan_candidates(node)
@@ -1297,8 +1349,10 @@ class SSMT_OT_RabbitFXProAdd(bpy.types.Operator):
     bl_description = "在列表末尾加一个空行，再手动指定物体"
     bl_options = {"REGISTER", "UNDO", "INTERNAL"}
 
+    node_name: bpy.props.StringProperty()
+
     def execute(self, context):
-        node = _active_pro_node(context)
+        node = _resolve_node(self, context)
         if node is None:
             return {"CANCELLED"}
         node.target_items.add()
@@ -1310,10 +1364,11 @@ class SSMT_OT_RabbitFXProRemoveAt(bpy.types.Operator):
     bl_label = "移除该物体"
     bl_options = {"REGISTER", "UNDO", "INTERNAL"}
 
+    node_name: bpy.props.StringProperty()
     index: bpy.props.IntProperty(default=0)
 
     def execute(self, context):
-        node = _active_pro_node(context)
+        node = _resolve_node(self, context)
         if node is None:
             return {"CANCELLED"}
         if 0 <= self.index < len(node.target_items):
@@ -1324,24 +1379,36 @@ class SSMT_OT_RabbitFXProRemoveAt(bpy.types.Operator):
 class SSMT_OT_RabbitFXProAddSelected(bpy.types.Operator):
     bl_idname = "ssmt.rabbitfx_pro_add_selected"
     bl_label = "添加选中物体"
-    bl_description = "把当前选中的网格物体加入列表（已在列表中的跳过）"
+    bl_description = "把当前选中的所有网格物体一次性加入列表（已在列表中的跳过）"
     bl_options = {"REGISTER", "UNDO", "INTERNAL"}
 
+    node_name: bpy.props.StringProperty()
+
     def execute(self, context):
-        node = _active_pro_node(context)
+        node = _resolve_node(self, context)
         if node is None:
             return {"CANCELLED"}
+
+        selected = _selected_mesh_objects(context)
+        if not selected:
+            self.report({"WARNING"}, "没有选中任何网格物体：请先在 3D 视口或大纲里选中物体")
+            return {"CANCELLED"}
+
         existing = {item.target_object for item in node.target_items if item.target_object}
         added = 0
-        for obj in context.selected_objects:
-            if getattr(obj, "type", "") != "MESH" or obj in existing:
+        for obj in selected:
+            if obj in existing:
                 continue
             item = node.target_items.add()
             item.target_object = obj
             item.has_glow, item.has_fx = _probe_fx_textures(obj)
             existing.add(obj)
             added += 1
-        self.report({"INFO"}, f"已加入 {added} 个物体" if added else "选中物体已在列表中")
+
+        if added:
+            self.report({"INFO"}, f"已加入 {added} 个物体")
+        else:
+            self.report({"INFO"}, "选中的物体都已在列表中")
         return {"FINISHED"}
 
 
