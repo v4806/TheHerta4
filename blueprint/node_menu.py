@@ -1445,6 +1445,7 @@ class SSMT_MT_NodeMenu_PostProcess_Creative(bpy.types.Menu):
         _add_node_entry(layout, "贴图切换 V5.1", 'TEXTURE', "SSMTNode_PostProcess_DiffuseSwitch")
         _add_node_entry(layout, "物体贴图替换与清理", 'TEXTURE', "SSMTNode_PostProcess_ObjectTextureAssign")
         _add_node_entry(layout, "RabbitFX贴图后处理", 'LIGHT', "SSMTNode_PostProcess_Glow")
+        _add_node_entry(layout, "RabbitFX贴图后处理pro", 'LIGHT', "SSMTNode_PostProcess_RabbitFXPro")
         _add_node_entry(layout, "PS绑定+IB限定", 'SHADERFX', "SSMTNode_PostProcess_PSBinding")
 
 

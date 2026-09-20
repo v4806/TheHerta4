@@ -111,6 +111,7 @@ _MODULE_REGISTRY = [
     # 原 TheHerta4NodeExtras 扩展插件的节点，已集成进主插件
     {"name": "node_postprocess_shapekey_ext", "required": False},
     {"name": "node_postprocess_rabbitfx", "required": False},
+    {"name": "node_postprocess_rabbitfx_pro", "required": False},
     {"name": "node_postprocess_psbinding", "required": False},
     {"name": "node_postprocess_diffuse_switch", "required": False},
     {"name": "node_postprocess_object_texture", "required": False},
