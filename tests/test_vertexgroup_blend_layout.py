@@ -1,13 +1,19 @@
-"""顶点组 Blend 重排：**只允许等宽或升宽，任何形式的降宽一律报错**（用户裁定 2026-09）。
+"""顶点组 Blend 重排：等宽 / 升宽原样，**超槽位自动降宽（保留最强的 N 个 + 重新归一化）**。
+
+2026-09-21 用户裁定（修正旧口径）：不再因为「影响数 > 目标槽位数」中断导出——
+与其它所有游戏路径（v1 / v3 / v4_fast）同款，自动取权重最强的 N 个并重新归一化，
+损失量由主守卫汇总后大声报告。
 
 覆盖两层：
 - `utils/vertexgroup_utils.py` 的 `VertexGroupUtils.get_blendweights_blendindices_for_layout`
-  （纵深防御：任一顶点有效影响数 > 目标通道数 ⇒ 抛 `Fatal`，绝不再「按权重取前 N 归一化」）；
+  （纵深防御：超槽位取 top-N，并按**幸存权重之和**重新归一化）；
 - `common/obj_buffer_helper.py` 的 `ObjBufferHelper.parse_elementname_data_dict`
-  （ZZMI 合并分支主守卫：M > N ⇒ `SSMTErrorUtils.raise_fatal`，消息含对象名、
-  目标 `Format`/`ByteWidth`/槽位数 N、实际 M、首个违规顶点索引与处理建议）。
+  （ZZMI 合并分支：汇总超限顶点数 / 最大丢弃权重占比 / 样本顶点索引并打印；占比
+  ≥5% 时额外提示回 Blender 用 清理 Clean → 限制总影响数 Limit Total → 归一化 All）。
 """
+import contextlib
 import importlib.util
+import io
 import sys
 import types
 import unittest
@@ -153,11 +159,11 @@ class BlendLayoutExtractionTests(unittest.TestCase):
         np.testing.assert_array_equal(indices[0], [[12, 0, 0, 0], [2, 5, 0, 0]])
         np.testing.assert_allclose(weights[0], [[1.0, 0.0, 0.0, 0.0], [0.625, 0.375, 0.0, 0.0]])
 
-    def test_downcast_four_influences_to_two_channels_raises(self):
-        """改写自 `test_downcast_selects_highest_weights_and_renormalizes`：
+    def test_downcast_four_influences_to_two_channels_keeps_strongest(self):
+        """改写自旧 `..._raises` 用例（2026-09-21 用户裁定修正口径）。
 
-        旧口径期望「按权重取前 2 再归一化」正常返回；用户裁定**不允许任何形式的降宽**
-        ⇒ 现在必须抛错（该用例被改写、未删除）。
+        旧口径要求抛错；现在与其它游戏路径一致——保留最强的 2 个，并按**幸存
+        权重之和**重新归一化（被丢弃的 0.1 / 0.2 不再占权重和）。
         """
         mesh = _Mesh(
             [
@@ -166,23 +172,22 @@ class BlendLayoutExtractionTests(unittest.TestCase):
             ],
             [0, 1, 0],
         )
-        with self.assertRaises(Fatal) as ctx:
-            VertexGroupUtils.get_blendweights_blendindices_for_layout(mesh, 2)
-        message = str(ctx.exception)
-        self.assertIn("禁止降宽", message)
-        self.assertIn("channel_count=2", message)
-        self.assertIn("有效影响数=4", message)
-        self.assertIn("顶点索引 0", message)
+        weights, indices = VertexGroupUtils.get_blendweights_blendindices_for_layout(
+            mesh, 2
+        )
+        np.testing.assert_array_equal(indices[0], [[3, 7], [4, 0], [3, 7]])
+        np.testing.assert_allclose(
+            weights[0], [[0.6 / 0.9, 0.3 / 0.9], [1.0, 0.0], [0.6 / 0.9, 0.3 / 0.9]]
+        )
+        np.testing.assert_allclose(weights[0].sum(axis=1), [1.0, 1.0, 1.0])
 
-    def test_downcast_four_influences_to_one_channel_raises(self):
+    def test_downcast_four_influences_to_one_channel_keeps_strongest(self):
         mesh = _Mesh([[(9, 0.1), (3, 0.6), (7, 0.3), (11, 0.2)]], [0])
-        with self.assertRaises(Fatal) as ctx:
-            VertexGroupUtils.get_blendweights_blendindices_for_layout(mesh, 1)
-        message = str(ctx.exception)
-        self.assertIn("禁止降宽", message)
-        self.assertIn("channel_count=1", message)
-        self.assertIn("有效影响数=4", message)
-        self.assertIn("顶点索引 0", message)
+        weights, indices = VertexGroupUtils.get_blendweights_blendindices_for_layout(
+            mesh, 1
+        )
+        np.testing.assert_array_equal(indices[0], [[3]])
+        np.testing.assert_allclose(weights[0], [[1.0]])
 
     def test_widen_one_or_two_influences_to_four_channels_pads_and_normalizes(self):
         mesh = _Mesh([[(2, 0.5), (5, 0.3)], [(12, 1.0)]], [0, 1])
@@ -228,9 +233,15 @@ class BlendLayoutExtractionTests(unittest.TestCase):
 
 
 class ZZMIBlendDowncastGuardTests(unittest.TestCase):
-    """主守卫层：ZZMI 合并分支在调用提取函数**之前**就以 fatal 终止导出。"""
+    """主守卫层：超槽位不再中断导出，改为汇总报告（自动降宽在提取函数里完成）。"""
 
-    def test_guard_raises_fatal_when_influences_exceed_target_slots(self):
+    def _run(self, mesh, game_type):
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            result = ObjBufferHelper.parse_elementname_data_dict(mesh, game_type)
+        return result, buffer.getvalue()
+
+    def test_guard_auto_downsizes_and_reports(self):
         mesh = _Mesh(
             [
                 [(9, 0.1), (3, 0.6), (7, 0.3), (11, 0.2)],
@@ -240,29 +251,49 @@ class ZZMIBlendDowncastGuardTests(unittest.TestCase):
             name="MergedObject",
         )
         game_type = _FakeGameType(blend_format="R32G32_UINT", byte_width=8)  # N = 2
-        with self.assertRaises(Fatal) as ctx:
-            ObjBufferHelper.parse_elementname_data_dict(mesh, game_type)
-        message = str(ctx.exception)
-        self.assertIn("MergedObject", message)
-        self.assertIn("禁止任何形式的 Blend 降宽", message)
-        self.assertIn("R32G32_UINT", message)
-        self.assertIn("ByteWidth=8", message)
-        self.assertIn("N=2", message)
-        self.assertIn("M=4", message)
-        self.assertIn("首个违规顶点索引 0", message)
-        self.assertIn("或不要把该部件合并到更窄的槽位", message)
+        result, output = self._run(mesh, game_type)
+        self.assertEqual(result, {})
+        self.assertIn("MergedObject", output)
+        self.assertIn("已自动降宽", output)
+        self.assertIn("R32G32_UINT", output)
+        self.assertIn("ByteWidth=8", output)
+        self.assertIn("N=2", output)
+        self.assertIn("M=4", output)
+        self.assertIn("超限顶点 1/2", output)
+        self.assertIn("样本顶点索引 [0]", output)
 
     def test_guard_reports_single_channel_target(self):
         mesh = _Mesh([[(1, 0.6), (2, 0.4)]], [0], name="RigidMerged")
         game_type = _FakeGameType(blend_format="R32_UINT", byte_width=4)  # N = 1
-        with self.assertRaises(Fatal) as ctx:
-            ObjBufferHelper.parse_elementname_data_dict(mesh, game_type)
-        message = str(ctx.exception)
-        self.assertIn("N=1", message)
-        self.assertIn("M=2", message)
-        self.assertIn("R32_UINT", message)
-        self.assertIn("ByteWidth=4", message)
-        self.assertIn("首个违规顶点索引 0", message)
+        result, output = self._run(mesh, game_type)
+        self.assertEqual(result, {})
+        self.assertIn("RigidMerged", output)
+        self.assertIn("N=1", output)
+        self.assertIn("M=2", output)
+        self.assertIn("R32_UINT", output)
+        self.assertIn("ByteWidth=4", output)
+
+    def test_guard_warns_when_dropped_fraction_is_large(self):
+        """丢弃占比 ≥5% ⇒ 追加提示（重新归一化会让顶点位移，需回 Blender 修权重）。"""
+        mesh = _Mesh([[(1, 0.4), (2, 0.3), (3, 0.2), (4, 0.1)]], [0], name="HeavyDrop")
+        game_type = _FakeGameType(blend_format="R32G32_UINT", byte_width=8)  # N = 2
+        result, output = self._run(mesh, game_type)
+        self.assertEqual(result, {})
+        self.assertIn("最大丢弃权重占比 30.00%", output)
+        self.assertIn("丢弃占比偏大", output)
+        self.assertIn("Limit Total", output)
+
+    def test_guard_stays_quiet_when_influences_fit(self):
+        """等宽 / 升宽不得误报，也不打印降宽横幅。"""
+        for game_type in (
+            _FakeGameType(blend_format="R32G32_UINT", byte_width=8),
+            _FakeGameType(blend_format="R32G32B32A32_UINT", byte_width=16),
+        ):
+            with self.subTest(blend_format=game_type.D3D11ElementList[0].Format):
+                mesh = _Mesh([[(2, 0.5), (5, 0.5)]], [0], name="WithinSlots")
+                result, output = self._run(mesh, game_type)
+                self.assertEqual(result, {})
+                self.assertNotIn("已自动降宽", output)
 
     def test_guard_allows_equal_width_target(self):
         """等宽（M == N = 2）不得误报：守卫放行，函数继续走到元素循环（空表 ⇒ {}）。"""

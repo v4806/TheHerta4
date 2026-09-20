@@ -573,9 +573,14 @@ class ObjBufferHelper:
             and GlobalProterties.import_merged_vgmap()
         ):
             # ZZMI 合并对象可把 BI4/BI8/BI16 混在同一个 Blender Mesh 中。
-            # 目标 IB 的 BLENDINDICES 通道数就是最终 ABI。用户裁定（2026-09）：
-            # **不允许任何形式的 Blend 降宽** —— 顶点骨骼影响数超过目标槽位数时
-            # （包括「按权重取前 N 再归一化」）一律**直接报错终止导出**，绝不静默丢影响。
+            # 目标 IB 的 BLENDINDICES 通道数就是最终 ABI。
+            # 2026-09-21 用户裁定（修正旧口径）：与其它所有游戏路径（v1 / v3 /
+            # v4_fast）一致——顶点骨骼影响数超过目标槽位数时**自动降宽**（保留权重
+            # 最强的 N 个 + 重新归一化，见
+            # `VertexGroupUtils.get_blendweights_blendindices_for_layout`），不再
+            # Fatal 中断导出：权重平滑会制造大量极小尾巴，逐个顶点人工检查不现实。
+            # 影响损失改为**汇总后大声报告**（超限顶点数 / 最大丢弃权重占比 / 样本
+            # 顶点索引），占比过大时提示回 Blender 修权重。
             blend_index_element = next(
                 (
                     element
@@ -596,26 +601,40 @@ class ObjBufferHelper:
                     )
                 except (TypeError, ValueError, ZeroDivisionError):
                     blend_size = 4
-            # 降宽守卫（在调用提取函数**之前**）：统计每个顶点的**有效影响数**
-            # （weight > 0 且有限），取全网格最大值 M 与**首个违规顶点索引**。
+            # 统计（在调用提取函数**之前**，与提取函数同一口径：weight > 0 且有限）：
+            # 全网格最大有效影响数 M、超限顶点数、最大丢弃权重占比、样本顶点索引。
             max_effective_influences = 0
-            first_offender_index = -1
+            over_slot_vertices = 0
+            max_dropped_fraction = 0.0
+            sample_offenders: list[int] = []
             for vertex in mesh_vertices:
-                effective_influences = 0
+                weights: list[float] = []
                 for assignment in getattr(vertex, "groups", ()) or ():
                     try:
                         weight = float(getattr(assignment, "weight", 0.0) or 0.0)
                     except (TypeError, ValueError):
                         continue
                     if weight > 0.0 and numpy.isfinite(weight):
-                        effective_influences += 1
+                        weights.append(weight)
+                effective_influences = len(weights)
                 if effective_influences > max_effective_influences:
                     max_effective_influences = effective_influences
-                if effective_influences > blend_size and first_offender_index < 0:
-                    first_offender_index = int(
-                        getattr(vertex, "index", len(mesh_vertices))
+                if effective_influences <= blend_size:
+                    continue
+                over_slot_vertices += 1
+                if len(sample_offenders) < 3:
+                    sample_offenders.append(int(getattr(vertex, "index", 0)))
+                total_weight = float(sum(weights))
+                if total_weight > 0.0:
+                    kept_weight = float(
+                        sum(sorted(weights, reverse=True)[:blend_size])
                     )
-            if max_effective_influences > blend_size:
+                    dropped_fraction = max(
+                        0.0, (total_weight - kept_weight) / total_weight
+                    )
+                    if dropped_fraction > max_dropped_fraction:
+                        max_dropped_fraction = dropped_fraction
+            if over_slot_vertices:
                 target_format = (
                     str(getattr(blend_index_element, "Format", "") or "unknown")
                     if blend_index_element is not None
@@ -627,18 +646,24 @@ class ObjBufferHelper:
                     ) if blend_index_element is not None else 0
                 except (TypeError, ValueError):
                     target_byte_width = 0
-                SSMTErrorUtils.raise_fatal(
-                    f"对象 [{getattr(mesh, 'name', '') or '<unnamed mesh>'}] 的顶点骨骼"
-                    "影响数超过目标 BLENDINDICES 槽位 —— 禁止任何形式的 Blend 降宽"
-                    "（含按权重取前 N 再归一化）："
-                    f"目标 BLENDINDICES Format={target_format} / "
-                    f"ByteWidth={target_byte_width} ⇒ 槽位数 N={blend_size}，"
-                    f"本网格最大有效影响数 M={max_effective_influences}"
-                    f"（首个违规顶点索引 {first_offender_index}）。"
-                    "骨骼影响无法压缩：请改用能容纳 M 个槽位的目标布局"
-                    "（如 BLENDINDICES R32G32B32A32_UINT / 16B ⇒ N=4），"
-                    "或不要把该部件合并到更窄的槽位。"
+                print(
+                    "[ZZMI骨骼合并] !!! 顶点影响数超过目标 BLENDINDICES 槽位，"
+                    f"已自动降宽（保留最强 N={blend_size} 个 + 重新归一化）："
+                    f"对象 [{getattr(mesh, 'name', '') or '<unnamed mesh>'}]，"
+                    f"超限顶点 {over_slot_vertices}/{len(mesh_vertices)} 个，"
+                    f"最大丢弃权重占比 {max_dropped_fraction * 100:.2f}%，"
+                    f"样本顶点索引 {sample_offenders}（最大有效影响数 M="
+                    f"{max_effective_influences}；目标 Format={target_format} / "
+                    f"ByteWidth={target_byte_width}）"
                 )
+                if max_dropped_fraction >= 0.05:
+                    print(
+                        "[ZZMI骨骼合并] !!! 上述丢弃占比偏大（≥5%）：这些顶点重新"
+                        "归一化后蒙皮位置会偏移；请回 Blender 选中该物体执行 "
+                        "清理 Clean → 限制总影响数 Limit Total = "
+                        f"{blend_size} → 归一化 All 修好权重后再导出"
+                        "（合并骨骼下组名 = 全局骨骼 id，不要靠删组解决）。"
+                    )
             blendweights_dict, blendindices_dict = VertexGroupUtils.get_blendweights_blendindices_for_layout(
                 mesh=mesh,
                 channel_count=blend_size,

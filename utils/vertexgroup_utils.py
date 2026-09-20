@@ -753,13 +753,17 @@ class VertexGroupUtils:
     ):
         """按目标 GPU Blend 布局提取每个顶点的索引和权重。
 
-        ZZMI 的同组部件可能分别使用 BI4、BI8、BI16。合并到一个目标 IB 时
-        **只允许等宽或升宽**：目标通道多于源影响数时必须补零；目标通道
-        **少于**某顶点的有效影响数时**直接报错、绝不压缩** —— 旧行为「按权重取
-        前 N 再归一化」会静默丢掉影响，已按用户裁定（不允许任何形式的降宽）删除。
-        若不做这一步，`fit_component_width` 只会机械截断，留下权重和小于 1 的顶点
-        或把低权重骨骼排在高权重骨骼前面。返回值保持旧接口
-        （semantic index 0 的二维数组）。
+        ZZMI 的同组部件可能分别使用 BI4、BI8、BI16。合并到一个目标 IB 时按目标
+        通道数取**权重最强的 N 个**：等宽原样、升宽补零、**降宽自动丢弃最弱的**
+        并在下面重新归一化——2026-09-21 用户裁定：与其它所有游戏路径（v1 / v3 /
+        v4_fast）保持同一口径，绝不因为权重平滑产生的尾巴中断整个导出（平滑会
+        制造大量极小尾巴，逐个顶点人工检查不现实）。丢弃量由上层
+        （`common/obj_buffer_helper.py` 的 ZZMI 合并分支）汇总后大声报告：重新
+        归一化会把幸存权重放大、顶点位置随之偏移，若某顶点被丢掉的权重占比很大，
+        仍应回 Blender 用 清理 Clean → 限制总影响数 Limit Total → 归一化 All 修好。
+
+        排序用 `(-weight, group_id)` 稳定 tie-break，保证跨 Blender 版本与合并
+        顺序结果一致。返回值保持旧接口（semantic index 0 的二维数组）。
         """
         try:
             channel_count = int(channel_count)
@@ -788,23 +792,13 @@ class VertexGroupUtils:
                 if group_id < 0 or not numpy.isfinite(weight) or weight <= 0.0:
                     continue
                 influences.append((weight, group_id))
-            # 用户裁定（2026-09）：不允许任何形式的 Blend 降宽 —— 有效影响数超过
-            # 目标通道数时**直接报错终止**，绝不「按权重取前 N 再归一化」掩盖丢影响。
-            if len(influences) > channel_count:
-                raise Fatal(
-                    "Blend 影响数超过目标通道数，禁止降宽："
-                    f"顶点索引 {int(vertex.index)} 的有效影响数={len(influences)}"
-                    f" 超过 channel_count={channel_count}。"
-                    "骨骼影响无法压缩：请改用能容纳这些影响的布局"
-                    "（如 BLENDINDICES R32G32B32A32_UINT / 16B ⇒ 4 槽），"
-                    "或不要把该部件合并到更窄的槽位。"
-                )
             # Stable tie break by group id makes output deterministic across Blender
             # versions and independent of the order in which groups were joined.
             influences.sort(key=lambda item: (-item[0], item[1]))
-            # 等宽 / 升宽：上面的守卫已保证 len(influences) <= channel_count，
-            # 因此这里保留**全部**影响，不再做任何截断。
-            selected = influences
+            # 2026-09-21 用户裁定（修正旧口径）：有效影响数超过目标通道数时**自动保留
+            # 最强的 N 个**，并在下面按**幸存权重之和**重新归一化——与其它所有游戏
+            # 路径（v1 / v3 / v4_fast）同款，不再中断导出。丢失量由上层汇总后报告。
+            selected = influences[:channel_count]
             if not selected:
                 # A malformed/unweighted vertex must still be a valid rigid vertex;
                 # zero-weight all-zero rows are interpreted differently by some ZZZ
