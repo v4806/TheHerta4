@@ -194,6 +194,16 @@ class DirectShapeKeyGenerator(
 
         try:
             use_preprocess_records = bool(BlueprintExportHelper.get_direct_shapekey_position_records())
+            if use_preprocess_records and bool(getattr(self.node, "store_all_vertex_channels", False)):
+                # 前处理记录只存顶点坐标（preprocess.py 只 foreach_get("co")），
+                # 合成槽位时也只覆写 POSITION 元素字节 —— 法线/切线会保持基础网格值，
+                # 于是全通道增量的法线/切线部分是 0。这里必须显式说出来，
+                # 否则用户在游戏里只会看到"开关没反应"。
+                LOG.warning(
+                    "直出形态键: 已开启「存储全部顶点属性增量」，但本次走的是前处理记录路径——"
+                    "该路径只记录顶点坐标，法线/切线增量将为 0（描边/光照不会跟随形变）。"
+                    "需要法线/切线增量时请改用 exporter 缓冲路径（关闭前处理记录采集）。"
+                )
             if use_preprocess_records:
                 runtime_infos = self._build_runtime_infos(unique_hashes)
             else:

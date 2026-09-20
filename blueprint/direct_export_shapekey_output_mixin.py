@@ -133,6 +133,33 @@ class DirectShapeKeyOutputMixin:
         lines.append(self._PRESENT_RUN_END)
         return lines
 
+    def _delta_stride_for(self, logical_hash, vertex_stride, struct_definition=None):
+        """增量资源在 INI 里声明的 stride。
+
+        关闭「存储全部顶点属性增量」时恒为 12（仅位置）；开启时 = 4 × 通道 float 数
+        （位置+法线+切线 xyz 即 36）。必须与着色器里的 ``ShapeKeyDelta`` 行宽一致。
+        """
+        return self.node._resolve_delta_stride(
+            hash_val=logical_hash,
+            vertex_stride=vertex_stride,
+            struct_definition=struct_definition,
+        )
+
+    def _delta_channel_columns(self, runtime_info, num_floats_per_vertex, struct_definition=None):
+        """增量通道列下标。
+
+        关闭「存储全部顶点属性增量」时恒为 ``[0, 1, 2]``（仅位置），与旧版逐字节一致；
+        开启时按顶点数据类型展开（位置 + 法线 + 切线 xyz）。结构体一律按 ``hash_val``
+        逐哈希解析——必须与 ``_update_shader_file`` 注入着色器的那个是同一份，
+        否则数据列与着色器结构体字段会错位。
+        """
+        plan = self.node._resolve_delta_channel_plan(
+            hash_val=runtime_info.get("logical_hash") if runtime_info else None,
+            struct_definition=struct_definition,
+            num_floats_per_vertex=num_floats_per_vertex,
+        )
+        return self.node._channel_plan_columns(plan)
+
     def _write_slot_files(self, logical_hash, runtime_info, hash_slot_data, slot_position_overrides):
         use_packed = self.node.use_packed_Meshess
         use_delta = self.node.store_deltas
@@ -162,9 +189,17 @@ class DirectShapeKeyOutputMixin:
             slot_maps[slot_num] = None
 
             if use_delta:
-                data_to_write = target_data[:, :3] - base_data[:, :3]
+                channel_columns = self._delta_channel_columns(
+                    runtime_info,
+                    num_floats_per_vertex,
+                )
+                data_to_write = target_data[:, channel_columns] - base_data[:, channel_columns]
                 data_to_write[data_to_write == 0] = 0.0
-                diff_mask = ~np.isclose(base_data[:, :3], target_data[:, :3], atol=1e-6).all(axis=1)
+                diff_mask = ~np.isclose(
+                    base_data[:, channel_columns],
+                    target_data[:, channel_columns],
+                    atol=1e-6,
+                ).all(axis=1)
                 if use_packed:
                     packed_data = data_to_write[diff_mask]
                     map_array = np.full(num_vertices, -1, dtype=np.int32)
@@ -204,6 +239,8 @@ class DirectShapeKeyOutputMixin:
         merged_data_parts = []
         next_global_index = 0
         base_data = None
+        # 增量记录每条的 float 宽度：关闭「全部顶点属性增量」时恒为 3（仅位置）
+        delta_channel_width = 3
 
         for slot_num, names_data in sorted(hash_slot_data.items()):
             target_bytes = self._compose_slot_bytes(
@@ -225,9 +262,18 @@ class DirectShapeKeyOutputMixin:
 
             target_data = np.frombuffer(target_bytes, dtype=np.float32).reshape(base_data.shape)
             if use_delta:
-                data_to_write = target_data[:, :3] - base_data[:, :3]
+                channel_columns = self._delta_channel_columns(
+                    runtime_info,
+                    base_data.shape[1],
+                )
+                delta_channel_width = len(channel_columns)
+                data_to_write = target_data[:, channel_columns] - base_data[:, channel_columns]
                 data_to_write[data_to_write == 0] = 0.0
-                diff_mask = ~np.isclose(base_data[:, :3], target_data[:, :3], atol=1e-6).all(axis=1)
+                diff_mask = ~np.isclose(
+                    base_data[:, channel_columns],
+                    target_data[:, channel_columns],
+                    atol=1e-6,
+                ).all(axis=1)
             else:
                 data_to_write = target_data
                 diff_mask = ~np.isclose(base_data, target_data, atol=1e-6).all(axis=1)
@@ -248,7 +294,10 @@ class DirectShapeKeyOutputMixin:
         if merged_data_parts:
             merged_data = np.concatenate(merged_data_parts, axis=0)
         else:
-            merged_data = np.empty((0, 3 if use_delta else base_data.shape[1]), dtype=np.float32)
+            merged_data = np.empty(
+                (0, delta_channel_width if use_delta else base_data.shape[1]),
+                dtype=np.float32,
+            )
 
         data_suffix = "_merged_packed_pos_delta" if use_delta else "_merged_packed"
         data_path = os.path.join(self.meshes_dir, f"{actual_hash}-Position{data_suffix}.buf")
@@ -693,7 +742,7 @@ class DirectShapeKeyOutputMixin:
 
             mode_str = (
                 f"紧凑:{'是' if use_packed else '否'}, "
-                f"增量(仅位置):{'是' if use_delta else '否'}, "
+                f"增量:{self.node._describe_delta_scope(use_delta)}, "
                 f"优化查找:{'是' if use_optimized else '否'}, "
                 f"文件合并:{'是' if merge_slot_files else '否'}"
             )
@@ -785,7 +834,7 @@ class DirectShapeKeyOutputMixin:
 
                 actual_file_hash = hash_to_actual_file_hash.get(logical_hash, logical_hash)
                 base_stride = hash_to_stride.get(hash_prefix, 40)
-                data_stride = 12 if use_delta else base_stride
+                data_stride = self._delta_stride_for(logical_hash, base_stride) if use_delta else base_stride
                 base_resources = hash_to_base_resources.get(hash_prefix, [])
                 primary_base_resource = base_resources[0] if base_resources else f"Resource_{self.node._hash_to_resource_prefix(logical_hash)}_Position"
                 data_section = f"[{derive_shapekey_merged_data_resource_name(primary_base_resource, use_delta)}]"
@@ -812,7 +861,7 @@ class DirectShapeKeyOutputMixin:
                     primary_base_resource = base_resources[0] if base_resources else f"Resource_{self.node._hash_to_resource_prefix(logical_hash)}_Position"
                     if use_delta:
                         res_suffix = "_packed_pos_delta" if use_packed else "_pos_delta"
-                        stride = 12
+                        stride = self._delta_stride_for(logical_hash, base_stride)
                     elif use_packed:
                         res_suffix = "_packed"
                         stride = base_stride

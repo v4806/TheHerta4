@@ -175,6 +175,16 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
         description="不存储完整的顶点坐标，而是存储与基础模型的差值，进一步减小体积。需要 'numpy' 库。",
         default=True
     )
+    store_all_vertex_channels: bpy.props.BoolProperty(
+        name="存储全部顶点属性增量",
+        description=(
+            "开启后按顶点数据类型计算全部通道（位置 + 法线 + 切线 xyz）的增量，而不只位置。"
+            "法线/切线随形态键一起混合，描边壳与光照才能跟随形变；"
+            "关闭时与旧版逐字节一致（仅位置增量）。"
+            "注意：多文件与 NTMI 导出路径暂仍只算位置。需要 'numpy' 库。"
+        ),
+        default=False,
+    )
     use_optimized_lookup: bpy.props.BoolProperty(
         name="优化查找性能",
         description="使用顶点FREQ索引缓冲区替代大量条件分支，显著提升GPU性能。需要 'numpy' 库。",
@@ -729,6 +739,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
 
         layout.prop(self, "use_packed_Meshess")
         layout.prop(self, "store_deltas")
+        layout.prop(self, "store_all_vertex_channels")
         layout.prop(self, "use_optimized_lookup")
         layout.prop(self, "merge_slot_files")
         layout.prop(self, "direct_export_mode")
@@ -1513,7 +1524,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
 
         print(
             f"开始处理缓冲区 (紧凑:{'是' if use_packed else '否'}, "
-            f"增量(仅位置):{'是' if use_delta else '否'}, 文件合并:{'是' if merge_slot_files else '否'})..."
+            f"增量:{self._describe_delta_scope(use_delta)}, 文件合并:{'是' if merge_slot_files else '否'})..."
         )
 
         if merge_slot_files:
@@ -1602,11 +1613,20 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                 output_prefix = os.path.join(output_dir, f"{actual_hash}-Position")
 
                 if use_delta:
-                    data_to_write = shapekey_data[:, :3] - base_data[:, :3]
+                    channel_plan = self._resolve_delta_channel_plan(
+                        hash_val=h,
+                        num_floats_per_vertex=NUM_FLOATS_PER_VERTEX,
+                    )
+                    channel_columns = self._channel_plan_columns(channel_plan)
+                    data_to_write = shapekey_data[:, channel_columns] - base_data[:, channel_columns]
                     filename_suffix = "_pos_delta"
                     if use_packed: filename_suffix = "_packed_pos_delta"
 
-                    pos_diff_mask = ~np.isclose(base_data[:, :3], shapekey_data[:, :3], atol=1e-6).all(axis=1)
+                    pos_diff_mask = ~np.isclose(
+                        base_data[:, channel_columns],
+                        shapekey_data[:, channel_columns],
+                        atol=1e-6,
+                    ).all(axis=1)
                     num_active_vertices = np.sum(pos_diff_mask)
 
                     if num_active_vertices == 0:
@@ -1710,6 +1730,8 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
             merged_data_parts = []
             next_global_index = 0
             processed_slot_count = 0
+            # 增量记录每条的 float 宽度：关闭「全部顶点属性增量」时恒为 3（仅位置）
+            delta_channel_width = 3
 
             for slot in sorted_slots:
                 folder_name = f"Meshes1{slot:03d}"
@@ -1757,8 +1779,18 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                 shapekey_data = np.frombuffer(shapekey_bytes, dtype='f').reshape((num_vertices, num_floats_per_vertex))
 
                 if use_delta:
-                    data_to_write = shapekey_data[:, :3] - base_data[:, :3]
-                    diff_mask = ~np.isclose(base_data[:, :3], shapekey_data[:, :3], atol=1e-6).all(axis=1)
+                    channel_plan = self._resolve_delta_channel_plan(
+                        hash_val=h,
+                        num_floats_per_vertex=num_floats_per_vertex,
+                    )
+                    channel_columns = self._channel_plan_columns(channel_plan)
+                    delta_channel_width = len(channel_columns)
+                    data_to_write = shapekey_data[:, channel_columns] - base_data[:, channel_columns]
+                    diff_mask = ~np.isclose(
+                        base_data[:, channel_columns],
+                        shapekey_data[:, channel_columns],
+                        atol=1e-6,
+                    ).all(axis=1)
                 else:
                     data_to_write = shapekey_data
                     diff_mask = ~np.isclose(base_data, shapekey_data, atol=1e-6).all(axis=1)
@@ -1793,7 +1825,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
             if merged_data_parts:
                 merged_data = np.concatenate(merged_data_parts, axis=0)
             else:
-                empty_width = 3 if use_delta else num_floats_per_vertex
+                empty_width = delta_channel_width if use_delta else num_floats_per_vertex
                 merged_data = np.empty((0, empty_width), dtype=np.float32)
 
             with open(data_path, 'wb') as f:
@@ -2094,6 +2126,154 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
 
         return _DEFAULT_VERTEX_STRUCT_DEFINITION
 
+    # 增量通道规格：通道名 -> 参与混合的 float 分量数。
+    # TANGENT 只取 xyz —— 第 4 个分量是切线手性符号（±1），插值成中间值会让切线基失去意义，
+    # 因此它随其余未选字段一起由「按位拷贝」保留，不参与增量。
+    DELTA_CHANNEL_FLOAT_COUNTS = (("position", 3), ("normal", 3), ("tangent", 3))
+
+    def _resolve_delta_channel_plan(self, hash_val=None, struct_definition=None, num_floats_per_vertex=None):
+        """解析增量通道列计划：``[(通道名, 起始 float 下标, float 分量数), ...]``。
+
+        - 关闭「存储全部顶点属性增量」时恒为 ``[("position", 0, 3)]``，与旧版逐字节一致。
+        - 开启时**按顶点数据类型展开**：``position`` / ``normal`` 各取前 3 个 float，
+          ``tangent`` 取 xyz。数据类型里没有的通道不会出现；超出实际每顶点 float 数的
+          通道会被裁掉（例如手填的 40B 顶点属性定义遇上工作空间 16B 的 IB），
+          避免着色器读到缓冲区之外、也避免写出未声明字段的写回行。
+        """
+        if not bool(getattr(self, "store_all_vertex_channels", False)):
+            return [("position", 0, 3)]
+
+        definition = struct_definition or self._get_vertex_struct_definition(hash_val=hash_val)
+        parsed = self.parse_vertex_struct(definition) if definition else None
+        if not parsed:
+            return [("position", 0, 3)]
+
+        _stride, struct_floats, attributes = parsed
+        limit = int(struct_floats)
+        if num_floats_per_vertex and int(num_floats_per_vertex) > 0:
+            limit = min(limit, int(num_floats_per_vertex))
+
+        wanted = dict(self.DELTA_CHANNEL_FLOAT_COUNTS)
+        plan = []
+        float_offset = 0
+        for attribute in attributes:
+            width = int(attribute.get("size", 0) or 0) // 4
+            name = str(attribute.get("name", "") or "")
+            if width > 0 and name in wanted:
+                count = min(wanted[name], width)
+                if float_offset + count <= limit:
+                    plan.append((name, float_offset, count))
+            float_offset += width
+
+        if not plan or plan[0][0] != "position":
+            return [("position", 0, 3)]
+        return plan
+
+    @staticmethod
+    def _channel_plan_columns(plan):
+        """把通道计划展开成 numpy 列下标列表。"""
+        columns = []
+        for _name, start, count in plan:
+            columns.extend(range(start, start + count))
+        return columns
+
+    @staticmethod
+    def _channel_plan_float_count(plan):
+        """通道计划覆盖的 float 总数（= 增量记录每条的 float 宽度）。"""
+        return sum(count for _name, _start, count in plan)
+
+    @staticmethod
+    def _channel_plan_names(plan):
+        return [name for name, _start, _count in plan]
+
+    def _resolve_delta_stride(self, hash_val=None, vertex_stride=None, struct_definition=None):
+        """增量记录每条的字节步长（旧版恒为 12）。"""
+        num_floats = int(vertex_stride) // 4 if vertex_stride and int(vertex_stride) > 0 else None
+        plan = self._resolve_delta_channel_plan(
+            hash_val=hash_val,
+            struct_definition=struct_definition,
+            num_floats_per_vertex=num_floats,
+        )
+        return 4 * self._channel_plan_float_count(plan)
+
+    def _describe_delta_scope(self, use_delta, hash_val=None):
+        """日志用：本次增量覆盖哪些通道（``否`` / ``仅位置`` / ``全部属性``）。"""
+        if not use_delta:
+            return "否"
+        channel_names = self._channel_plan_names(self._resolve_delta_channel_plan(hash_val=hash_val))
+        return "全部属性" if len(channel_names) > 1 else "仅位置"
+
+    # 增量缓冲声明（v5 合并版是 merged_shapekey_pos_deltas，逐槽版是 shapekey_pos_deltas[MAX_SLOTS]）
+    _DELTA_BUFFER_DECL_RE = re.compile(
+        r"StructuredBuffer<float3>\s+((?:merged_)?shapekey_pos_deltas)\s*(\[[^\]]*\])?\s*(:\s*register\(t\d+\))"
+    )
+    # 模板尾部写回块：由本模块按通道计划决定写哪几行，未开启时只写位置
+    _SHADER_WRITEBACK_BLOCK_RE = re.compile(
+        r"[ \t]*// --- \[PYTHON-MANAGED WRITEBACK START\] ---.*?// --- \[PYTHON-MANAGED WRITEBACK END\] ---",
+        re.DOTALL,
+    )
+
+    @staticmethod
+    def _build_writeback_lines(channel_names):
+        """着色器尾部的写回行。单通道时与旧版逐字符一致。"""
+        lines = ["output.position += total_diff_position;"]
+        if "normal" in channel_names:
+            lines.append("output.normal += total_diff_normal;")
+        if "tangent" in channel_names:
+            # 只写 xyz：第 4 个分量是切线手性符号，必须保持基础网格原值
+            lines.append("output.tangent.xyz += total_diff_tangent;")
+        return lines
+
+    @staticmethod
+    def _build_delta_accumulation_lines(indent, slot_index, element_expr, weight_expr, channel_names):
+        """增量模式的累加行：``element_expr`` 是 ``StructuredBuffer`` 的元素表达式。
+
+        单通道（仅位置）时返回与旧版逐字符一致的一行。
+        """
+        if channel_names == ["position"]:
+            return [f"{indent}total_diff_position += {element_expr} * {weight_expr};"]
+        lines = [f"{indent}ShapeKeyDelta sk_delta_slot{slot_index} = {element_expr};"]
+        for name in channel_names:
+            lines.append(f"{indent}total_diff_{name} += sk_delta_slot{slot_index}.{name} * {weight_expr};")
+        return lines
+
+    @staticmethod
+    def _build_full_vertex_accumulation_lines(indent, element_expr, base_expr, weight_expr, channel_names):
+        """非增量模式的累加行：``源顶点 - 基础顶点``。单通道时与旧版逐字符一致。"""
+        if channel_names == ["position"]:
+            return [
+                f"{indent}total_diff_position += ({element_expr}.position - {base_expr}.position) * {weight_expr};"
+            ]
+        lines = []
+        for name in channel_names:
+            suffix = ".xyz" if name == "tangent" else ""
+            lines.append(
+                f"{indent}total_diff_{name} += "
+                f"({element_expr}.{name}{suffix} - {base_expr}.{name}{suffix}) * {weight_expr};"
+            )
+        return lines
+
+    def _inject_delta_channel_struct(self, content, channel_names):
+        """把增量缓冲从 ``StructuredBuffer<float3>`` 换成按通道展开的结构体。
+
+        只在开启「存储全部顶点属性增量」且通道数 > 1 时调用；关闭时声明原样保留，
+        生成结果与旧版一致。结构体行宽必须等于 INI 里该资源的 stride（4 × 通道 float 数）。
+        """
+        struct_text = "struct ShapeKeyDelta {\n" + "\n".join(
+            f"    float3 {name};" for name in channel_names
+        ) + "\n};"
+
+        def _replace(match):
+            buffer_name = match.group(1)
+            array_suffix = match.group(2) or ""
+            register = match.group(3)
+            return (
+                f"{struct_text}\n"
+                f"StructuredBuffer<ShapeKeyDelta> {buffer_name}{array_suffix} {register}"
+            )
+
+        return self._DELTA_BUFFER_DECL_RE.sub(_replace, content, count=1)
+
     def _update_shader_file(self, shader_path, hash_slot_data, use_packed, use_delta, unique_names, unique_objects, use_optimized=False, merge_slot_files=False, drag_drive_enabled=False, drag_zone_ids=None, drag_click_stages=None, drag_stage_count=1, drag_dirs=None, hash_val=None, source_path=None):
         """把配置注入着色器模板并写到 ``shader_path``。
 
@@ -2109,6 +2289,31 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
             vertex_struct = self._get_vertex_struct_definition(hash_val=hash_val)
             if vertex_struct:
                 content = re.sub(r"struct VertexAttributes\s*\{[^}]*\};", vertex_struct, content, flags=re.DOTALL)
+
+            # 增量通道计划：关闭「存储全部顶点属性增量」时只有位置，后面每一步都走旧版路径，
+            # 生成结果与旧版逐字符一致；开启时按顶点数据类型把法线/切线也带上。
+            workspace_stride = self._get_workspace_position_stride(hash_val) if hash_val else 0
+            channel_plan = self._resolve_delta_channel_plan(
+                hash_val=hash_val,
+                num_floats_per_vertex=(workspace_stride // 4) if workspace_stride > 0 else None,
+            )
+            channel_names = self._channel_plan_names(channel_plan)
+            extra_channels = [name for name in channel_names if name != "position"]
+            if use_delta and extra_channels:
+                # 增量记录不再是单个 float3，改成按通道展开的结构体（步长 = 4 × 通道 float 数）
+                content = self._inject_delta_channel_struct(content, channel_names)
+
+            writeback_lines = self._build_writeback_lines(channel_names)
+            if self._SHADER_WRITEBACK_BLOCK_RE.search(content):
+                content = self._SHADER_WRITEBACK_BLOCK_RE.sub(
+                    lambda _match: (
+                        "    // --- [PYTHON-MANAGED WRITEBACK START] ---\n"
+                        + "\n".join(f"    {line}" for line in writeback_lines)
+                        + "\n    // --- [PYTHON-MANAGED WRITEBACK END] ---"
+                    ),
+                    content,
+                    count=1,
+                )
 
             name_to_freq_def = {name: f"FREQ{i+1}" for i, name in enumerate(unique_names)}
             obj_to_range_defs = {obj: (f"START{i+1}", f"END{i+1}") for i, obj in enumerate(unique_objects)}
@@ -2227,11 +2432,23 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                     logic_lines.append("        {")
 
                     if use_delta:
-                        calc_line = f"total_diff_position += merged_shapekey_pos_deltas[packed_index] * anim_weight_slot{slot_index};"
+                        calc_lines = self._build_delta_accumulation_lines(
+                            "            ",
+                            slot_index,
+                            "merged_shapekey_pos_deltas[packed_index]",
+                            f"anim_weight_slot{slot_index}",
+                            channel_names,
+                        )
                     else:
-                        calc_line = f"total_diff_position += (merged_shapekeys[packed_index].position - base[i].position) * anim_weight_slot{slot_index};"
+                        calc_lines = self._build_full_vertex_accumulation_lines(
+                            "            ",
+                            "merged_shapekeys[packed_index]",
+                            "base[i]",
+                            f"anim_weight_slot{slot_index}",
+                            channel_names,
+                        )
 
-                    logic_lines.append("            " + calc_line)
+                    logic_lines.extend(calc_lines)
                     logic_lines.append("        }")
                     logic_lines.append("    }\n")
             elif use_optimized:
@@ -2258,10 +2475,26 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
 
                     if use_packed:
                         logic_lines.extend([f"        int packed_index = shapekey_maps[{slot_index}][i];", "        if (packed_index != -1)", "        {"])
-                        logic_lines.append(f"            total_diff_position += shapekey_pos_deltas[{slot_index}][packed_index] * anim_weight_slot{slot_index};")
+                        logic_lines.extend(
+                            self._build_delta_accumulation_lines(
+                                "            ",
+                                slot_index,
+                                f"shapekey_pos_deltas[{slot_index}][packed_index]",
+                                f"anim_weight_slot{slot_index}",
+                                channel_names,
+                            )
+                        )
                         logic_lines.append("        }")
                     else:
-                        logic_lines.append(f"        total_diff_position += shapekey_pos_deltas[{slot_index}][i] * anim_weight_slot{slot_index};")
+                        logic_lines.extend(
+                            self._build_delta_accumulation_lines(
+                                "        ",
+                                slot_index,
+                                f"shapekey_pos_deltas[{slot_index}][i]",
+                                f"anim_weight_slot{slot_index}",
+                                channel_names,
+                            )
+                        )
 
                     logic_lines.append("    }")
             else:
@@ -2287,11 +2520,23 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                         indent = "            "
 
                     if use_delta:
-                        calc_line = f"total_diff_position += shapekey_pos_deltas[{slot_index}][{read_idx}] * anim_weight_slot{slot_index};"
+                        calc_lines = self._build_delta_accumulation_lines(
+                            indent,
+                            slot_index,
+                            f"shapekey_pos_deltas[{slot_index}][{read_idx}]",
+                            f"anim_weight_slot{slot_index}",
+                            channel_names,
+                        )
                     else:
-                        calc_line = f"total_diff_position += (shapekeys[{slot_index}][{read_idx}].position - base[i].position) * anim_weight_slot{slot_index};"
+                        calc_lines = self._build_full_vertex_accumulation_lines(
+                            indent,
+                            f"shapekeys[{slot_index}][{read_idx}]",
+                            "base[i]",
+                            f"anim_weight_slot{slot_index}",
+                            channel_names,
+                        )
 
-                    logic_lines.append(indent + calc_line)
+                    logic_lines.extend(calc_lines)
 
                     if use_packed: logic_lines.extend(["        }", "    }\n"])
                     else: logic_lines.extend(["    }\n"])
@@ -2308,7 +2553,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
 
             mode_str = (
                 f"紧凑:{'是' if use_packed else '否'}, "
-                f"增量(仅位置):{'是' if use_delta else '否'}, "
+                f"增量:{self._describe_delta_scope(use_delta, hash_val)}, "
                 f"优化查找:{'是' if use_optimized else '否'}, "
                 f"文件合并:{'是' if merge_slot_files else '否'}"
             )
@@ -2857,7 +3102,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
 
                     mode_str = (
                         f"紧凑:{'是' if use_packed else '否'}, "
-                        f"增量(仅位置):{'是' if use_delta else '否'}, "
+                        f"增量:{self._describe_delta_scope(use_delta)}, "
                         f"优化查找:{'是' if use_optimized else '否'}, "
                         f"文件合并:{'是' if merge_slot_files else '否'}"
                     )
@@ -2945,7 +3190,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
 
                     actual_file_hash = hash_to_actual_file_hash.get(h, h)
                     base_stride = hash_to_stride.get(h_prefix, 40)
-                    data_stride = 12 if use_delta else base_stride
+                    data_stride = self._resolve_delta_stride(h, base_stride) if use_delta else base_stride
                     base_resources = hash_to_base_resources.get(h_prefix, [])
                     primary_base_resource = base_resources[0] if base_resources else f"Resource_{self._hash_to_resource_prefix(h)}_Position"
                     data_section = f"[{derive_shapekey_merged_data_resource_name(primary_base_resource, use_delta)}]"
@@ -2972,7 +3217,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                             stride, filename, section_name = 0, "", ""
                             if use_delta:
                                 res_suffix = "_packed_pos_delta" if use_packed else "_pos_delta"
-                                stride = 12
+                                stride = self._resolve_delta_stride(h, base_stride)
                             elif use_packed:
                                 res_suffix = "_packed"
                                 stride = base_stride

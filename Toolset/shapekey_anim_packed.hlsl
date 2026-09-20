@@ -42,9 +42,9 @@ void main(uint3 threadID : SV_DispatchThreadID)
     // The Blender plugin will dynamically generate the blending logic here.
     // --- [PYTHON-MANAGED LOGIC END] ---
 
+    // --- [PYTHON-MANAGED WRITEBACK START] ---
     output.position += total_diff_position;
-    output.normal += total_diff_normal;
-    output.tangent.xyz += total_diff_tangent;
+    // --- [PYTHON-MANAGED WRITEBACK END] ---
     
     rw_buffer[i] = output;
 }

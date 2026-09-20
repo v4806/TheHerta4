@@ -86,6 +86,28 @@ class _NodeStub:
     def _get_merged_data_file_suffix(self, use_delta):
         return "_merged_packed_pos_delta" if use_delta else "_merged_pos_delta"
 
+    # --- 增量通道计划（本测试只关心签名门控，这里固定为旧版「仅位置」） ---
+    def _describe_delta_scope(self, use_delta, hash_val=None):
+        return "否" if not use_delta else "仅位置"
+
+    def _resolve_delta_stride(self, hash_val=None, vertex_stride=None, struct_definition=None):
+        return 12
+
+    def _resolve_delta_channel_plan(self, hash_val=None, struct_definition=None, num_floats_per_vertex=None):
+        return [("position", 0, 3)]
+
+    @staticmethod
+    def _channel_plan_columns(plan):
+        return [0, 1, 2]
+
+    @staticmethod
+    def _channel_plan_names(plan):
+        return [name for name, _start, _count in plan]
+
+    @staticmethod
+    def _channel_plan_float_count(plan):
+        return sum(count for _name, _start, count in plan)
+
     def _drag_shapekey_click_count_resource_name(self, target_ini_file=None):
         return "ResourceDragShapeKeyClickCount_A"
 

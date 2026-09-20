@@ -54,9 +54,9 @@ void main(uint3 threadID : SV_DispatchThreadID)
 
     // [CRITICAL FIX] Apply the final accumulated differences using pure linear addition,
     // exactly like the old working shader. DO NOT normalize here.
+    // --- [PYTHON-MANAGED WRITEBACK START] ---
     output.position += total_diff_position;
-    output.normal += total_diff_normal;
-    output.tangent.xyz += total_diff_tangent;
+    // --- [PYTHON-MANAGED WRITEBACK END] ---
     // The 'w' component of the tangent remains unchanged from the base mesh.
     
     rw_buffer[i] = output;

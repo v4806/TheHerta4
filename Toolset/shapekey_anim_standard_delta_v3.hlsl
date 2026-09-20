@@ -37,14 +37,19 @@ void main(uint3 threadID : SV_DispatchThreadID)
     VertexAttributes output = rw_buffer[i];
     
     float3 total_diff_position = float3(0.0, 0.0, 0.0);
+    // 法线/切线累加器：仅当「存储全部顶点属性增量」开启时才会被逻辑块填充，
+    // 关闭时恒为 0，写回是逐位无操作（与旧版行为一致）。
+    float3 total_diff_normal = float3(0.0, 0.0, 0.0);
+    float3 total_diff_tangent = float3(0.0, 0.0, 0.0); // 切线增量只到 xyz，w 是手性符号
 
     // --- [PYTHON-MANAGED LOGIC START] ---
     // The Blender plugin will generate blending logic here.
-    // It reads from a float3 buffer and applies it to a float3 position.
+    // It reads from the delta buffer and applies it to the vertex attributes.
     // --- [PYTHON-MANAGED LOGIC END] ---
 
-    // Apply ONLY the position difference. Normal and Tangent remain from the base mesh.
+    // --- [PYTHON-MANAGED WRITEBACK START] ---
     output.position += total_diff_position;
+    // --- [PYTHON-MANAGED WRITEBACK END] ---
     
     rw_buffer[i] = output;
 }
