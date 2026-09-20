@@ -143,12 +143,25 @@ SECOND_OBJECT = "LOD0.aa11bb22-30030-0.Body"
 SECOND_SECTION = "TextureOverride_LOD0.aa11bb22_30030_0"
 
 
+class _FakeObject:
+    """网格物体替身：真实 bpy.types.Object 可哈希，这里按身份实现哈希/相等。"""
+
+    def __init__(self, name=OBJECT_NAME):
+        self.name = name
+        self.type = "MESH"
+
+    def get(self, _key, _default=None):
+        return ""
+
+    def __hash__(self):
+        return id(self)
+
+    def __eq__(self, other):
+        return self is other
+
+
 def _fake_object(name=OBJECT_NAME):
-    return types.SimpleNamespace(
-        name=name,
-        type="MESH",
-        get=lambda _key, _default=None: "",
-    )
+    return _FakeObject(name)
 
 
 def _make_node(**overrides):
@@ -184,7 +197,6 @@ def _make_node(**overrides):
         cs_v=0.0,
         enable_reset=True,
         buffer_tag='abcd1234',
-        active_target_index=0,
         show_targets=True,
         show_glow=True,
         show_breath=True,
@@ -196,11 +208,34 @@ def _make_node(**overrides):
     defaults.update(overrides)
     for key, value in defaults.items():
         setattr(node, key, value)
+    node.target_items = _FakeCollection(node.target_items)
     return node
 
 
 def _item(obj):
     return types.SimpleNamespace(target_object=obj, has_glow=False, has_fx=False)
+
+
+class _FakeCollection(list):
+    """模拟 Blender CollectionProperty 的 add/remove(index)/clear 语义。"""
+
+    def add(self):
+        item = types.SimpleNamespace()
+        self.append(item)
+        return item
+
+    def remove(self, index):
+        del self[index]
+
+    def clear(self):
+        del self[:]
+
+
+class _StubProbe:
+    """材质前缀探测替身：真实实现要 import 材质转资源模块，测试里默认不匹配。"""
+
+    def find_matching_materials(self, _obj, _texture_type):
+        return []
 
 
 def _material_node():
@@ -248,10 +283,24 @@ class _FakeLayout:
 
     def operator(self, idname, **_kwargs):
         self.log.append(("op", idname, ""))
-        return types.SimpleNamespace()
+        return _FakeOperator(self.log, idname)
 
     def prop_search(self, *_args, **_kwargs):
         return self
+
+
+class _FakeOperator:
+    """记录 `op.xxx = yyy` 这类赋值，便于断言每行按钮携带的下标。"""
+
+    def __init__(self, log, idname):
+        object.__setattr__(self, "_log", log)
+        object.__setattr__(self, "_idname", idname)
+
+    def __setattr__(self, name, value):
+        if name.startswith("_"):
+            object.__setattr__(self, name, value)
+            return
+        self._log.append(("op_prop", self._idname, f"{name}={value}"))
 
 
 def _write_ini(path, content):
@@ -295,9 +344,67 @@ class RabbitFXProTests(unittest.TestCase):
         self._temp = tempfile.TemporaryDirectory()
         self.export_dir = self._temp.name
         self.ini_path = os.path.join(self.export_dir, "mod.ini")
+        self._probe_backup = pro._PROBE
+        pro._PROBE = _StubProbe()
 
     def tearDown(self):
+        pro._PROBE = self._probe_backup
         self._temp.cleanup()
+
+    # ──────────────── 目标物体列表（一个大列表） ────────────────
+
+    def test_target_list_is_one_flat_list(self):
+        """所有物体在同一个列表里一行一个，不再按物体分「目标 N」卡片。"""
+        node = _make_node(
+            target_items=[_item(_fake_object()), _item(_fake_object(SECOND_OBJECT))]
+        )
+        layout = _FakeLayout()
+
+        node.draw_buttons(None, layout)
+
+        log = layout.log
+        pickers = [e for e in log if e[0] == "prop" and e[1] == "target_object"]
+        self.assertEqual(len(pickers), 2, "每个物体一行 picker")
+        removes = [e for e in log if e[0] == "op" and e[1] == "ssmt.rabbitfx_pro_remove_at"]
+        self.assertEqual(len(removes), 2, "每行一个移除按钮")
+        remove_indices = [
+            e[2] for e in log if e[0] == "op_prop" and e[1] == "ssmt.rabbitfx_pro_remove_at"
+        ]
+        self.assertEqual(remove_indices, ["index=0", "index=1"])
+        labels = [e[1] for e in log if e[0] == "label"]
+        self.assertFalse([text for text in labels if text.startswith("目标 ")])
+
+    def test_add_selected_operator_appends_into_one_list(self):
+        """「添加选中物体」把选中的物体各加一行到同一个列表里，并去重。"""
+        node = _make_node()
+        first = _fake_object()
+        second = _fake_object(SECOND_OBJECT)
+        context = types.SimpleNamespace(
+            active_node=node, selected_objects=[first, second, first]
+        )
+        operator = pro.SSMT_OT_RabbitFXProAddSelected()
+        operator.report = lambda *_args, **_kwargs: None
+
+        operator.execute(context)
+
+        self.assertEqual(
+            [item.target_object.name for item in node.target_items],
+            [OBJECT_NAME, SECOND_OBJECT],
+        )
+
+    def test_remove_at_operator_removes_that_row(self):
+        node = _make_node(
+            target_items=[_item(_fake_object()), _item(_fake_object(SECOND_OBJECT))]
+        )
+        context = types.SimpleNamespace(active_node=node)
+        operator = pro.SSMT_OT_RabbitFXProRemoveAt()
+        operator.index = 0
+
+        operator.execute(context)
+
+        self.assertEqual(
+            [item.target_object.name for item in node.target_items], [SECOND_OBJECT]
+        )
 
     def test_static_glow_injected_before_run_with_reset(self):
         _write_ini(self.ini_path, MATERIAL_SECTION)

@@ -383,7 +383,6 @@ class SSMTNode_PostProcess_RabbitFXPro(SSMTNode_PostProcess_Base):
 
     # ── 目标物体 ──
     target_items: bpy.props.CollectionProperty(type=RabbitFXProTargetItem)
-    active_target_index: bpy.props.IntProperty(name="当前目标", default=0, min=-1)
 
     # ── 静态发光 ──
     enable_glow: bpy.props.BoolProperty(
@@ -662,7 +661,6 @@ class SSMTNode_PostProcess_RabbitFXPro(SSMTNode_PostProcess_Base):
         row.label(text=f"目标物体列表 ({len(self.target_items)})", icon='OUTLINER_OB_GROUP_INSTANCE')
         row.operator("ssmt.rabbitfx_pro_scan", text="", icon='VIEWZOOM').node_name = self.name
         row.operator("ssmt.rabbitfx_pro_add", text="", icon='ADD')
-        row.operator("ssmt.rabbitfx_pro_remove", text="", icon='REMOVE')
 
         if not self.show_targets:
             return
@@ -679,35 +677,32 @@ class SSMTNode_PostProcess_RabbitFXPro(SSMTNode_PostProcess_Base):
             layout.label(text="点扫描按钮从材质转资源收集 FX 物体", icon='INFO')
             return
 
-        col = layout.column(align=True)
+        # 一个大列表：一行一个物体，不再按物体分卡片。
+        rows = layout.box()
         for index, item in enumerate(self.target_items):
-            box = col.box()
-            header = box.row(align=True)
-            icon = 'TRIA_DOWN' if index == self.active_target_index else 'TRIA_RIGHT'
-            op = header.operator("ssmt.rabbitfx_pro_select", text=f"目标 {index + 1}", icon=icon)
+            row = rows.row(align=True)
+            row.prop(item, "target_object", text="")
+            if item.has_glow:
+                row.label(text="", icon='LIGHT')
+            if item.has_fx:
+                row.label(text="", icon='TEXTURE')
+            op = row.operator("ssmt.rabbitfx_pro_remove_at", text="", icon='X')
             op.index = index
+
             obj = item.target_object
             if obj is None:
-                header.label(text="未选择", icon='ERROR')
+                rows.label(text="未选择物体", icon='ERROR')
                 continue
-            header.label(text=obj.name, icon='OBJECT_DATA')
-            if item.has_glow:
-                header.label(text="", icon='LIGHT')
-            if item.has_fx:
-                header.label(text="", icon='TEXTURE')
-
-            if index == self.active_target_index:
-                box.prop(item, "target_object", text="物体")
-                box.label(
-                    text=(
-                        f"哈希 {_extract_hash_from_object(obj.name) or '—'}"
-                        f"   标识 {_extract_resource_suffix(obj.name) or '—'}"
-                    ),
-                    icon='INFO',
-                )
-                duplicate = _objects_used_by_other_nodes(self, obj)
-                if duplicate:
-                    box.label(text=f"同一物体也被 {duplicate} 接管", icon='ERROR')
+            rows.label(
+                text=(
+                    f"哈希 {_extract_hash_from_object(obj.name) or '—'}"
+                    f"   标识 {_extract_resource_suffix(obj.name) or '—'}"
+                ),
+                icon='INFO',
+            )
+            duplicate = _objects_used_by_other_nodes(self, obj)
+            if duplicate:
+                rows.label(text=f"同一物体也被 {duplicate} 接管", icon='ERROR')
 
     # ──────────────────────── 生成入口 ────────────────────────
 
@@ -1245,7 +1240,6 @@ class SSMT_OT_RabbitFXProScan(bpy.types.Operator):
             item.target_object = obj
             item.has_glow = has_glow
             item.has_fx = has_fx
-        node.active_target_index = min(node.active_target_index, len(node.target_items) - 1)
 
         glow_count = sum(1 for _o, has_glow, _f in found if has_glow)
         fx_count = sum(1 for _o, _g, has_fx in found if has_fx)
@@ -1299,7 +1293,8 @@ def _collect_scan_candidates(node):
 
 class SSMT_OT_RabbitFXProAdd(bpy.types.Operator):
     bl_idname = "ssmt.rabbitfx_pro_add"
-    bl_label = "添加目标"
+    bl_label = "添加一行"
+    bl_description = "在列表末尾加一个空行，再手动指定物体"
     bl_options = {"REGISTER", "UNDO", "INTERNAL"}
 
     def execute(self, context):
@@ -1307,29 +1302,12 @@ class SSMT_OT_RabbitFXProAdd(bpy.types.Operator):
         if node is None:
             return {"CANCELLED"}
         node.target_items.add()
-        node.active_target_index = len(node.target_items) - 1
         return {"FINISHED"}
 
 
-class SSMT_OT_RabbitFXProRemove(bpy.types.Operator):
-    bl_idname = "ssmt.rabbitfx_pro_remove"
-    bl_label = "移除目标"
-    bl_options = {"REGISTER", "UNDO", "INTERNAL"}
-
-    def execute(self, context):
-        node = _active_pro_node(context)
-        if node is None:
-            return {"CANCELLED"}
-        index = node.active_target_index
-        if 0 <= index < len(node.target_items):
-            node.target_items.remove(index)
-            node.active_target_index = max(0, min(index, len(node.target_items) - 1))
-        return {"FINISHED"}
-
-
-class SSMT_OT_RabbitFXProSelect(bpy.types.Operator):
-    bl_idname = "ssmt.rabbitfx_pro_select"
-    bl_label = "选择目标"
+class SSMT_OT_RabbitFXProRemoveAt(bpy.types.Operator):
+    bl_idname = "ssmt.rabbitfx_pro_remove_at"
+    bl_label = "移除该物体"
     bl_options = {"REGISTER", "UNDO", "INTERNAL"}
 
     index: bpy.props.IntProperty(default=0)
@@ -1338,7 +1316,8 @@ class SSMT_OT_RabbitFXProSelect(bpy.types.Operator):
         node = _active_pro_node(context)
         if node is None:
             return {"CANCELLED"}
-        node.active_target_index = -1 if node.active_target_index == self.index else self.index
+        if 0 <= self.index < len(node.target_items):
+            node.target_items.remove(self.index)
         return {"FINISHED"}
 
 
@@ -1362,8 +1341,6 @@ class SSMT_OT_RabbitFXProAddSelected(bpy.types.Operator):
             item.has_glow, item.has_fx = _probe_fx_textures(obj)
             existing.add(obj)
             added += 1
-        if added:
-            node.active_target_index = len(node.target_items) - 1
         self.report({"INFO"}, f"已加入 {added} 个物体" if added else "选中物体已在列表中")
         return {"FINISHED"}
 
@@ -1373,8 +1350,7 @@ _classes = (
     SSMTNode_PostProcess_RabbitFXPro,
     SSMT_OT_RabbitFXProScan,
     SSMT_OT_RabbitFXProAdd,
-    SSMT_OT_RabbitFXProRemove,
-    SSMT_OT_RabbitFXProSelect,
+    SSMT_OT_RabbitFXProRemoveAt,
     SSMT_OT_RabbitFXProAddSelected,
 )
 
