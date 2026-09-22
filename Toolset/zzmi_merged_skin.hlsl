@@ -19,12 +19,19 @@
 //   位置 = Σ w·(R·p + t)；法线/切线 = normalize(Σ w·R·n)，切线 w 分量原样保留。
 // 骨骼矩阵是刚体（正交），所以法线用 R 本身即等价于逆转置。
 //
-// 参数（3DMigoto ini 参数纹理；本 fork 的 x1/y1/z1/w1 落在 IniParams[1]，
-// 见 zzmi_merged_skeleton_attach.hlsl 的实测注释）：
+// 参数（2026-09-22 跨运行时修复）：
+// ini 参数纹理的布局是 **fork 相关**的——本 fork（3Dmigoto-Armor）把
+// x1/y1/z1/w1 放在 IniParams[1]，标准版 3DMigoto 放在 IniParams[0]。
+// 旧实现把索引写死在 [1]，换一套运行时整组读成 0 → 蒙皮不写、几何全零。
+// 现在只保留两个**真正无法从资源推断**的逻辑参数，并在运行时按不变量选组：
 //   x1 = 本 CS 负责的合并几何行数（该 carrier 的导出顶点数）
-//   y1 = 目标起始行（= 前缀行数 + 前面各 carrier 行数之和）
-//   z1 = 前缀行数（仅第一个 carrier 传 3，其余传 0）
-//   w1 = 每行 float 数（= Position 类目 stride / 4 = 10）
+//        —— 只作**选组判据**：它必须等于 src_rows 的元素数（导出侧不变量：
+//        cs-t0 绑的就是本 carrier 的 Position），据此判定本次运行的 ini 参数
+//        落在 [0] 还是 [1]；行数本身改从资源取，不再信任 ini；
+//   y1 = 目标起始行（= 前缀行数 + 前面各 carrier 行数之和）—— 逻辑参数；
+//   z1 = 前缀行数（仅第一个 carrier 传 3，其余传 0）—— 逻辑参数；
+//   w1 = 每行 float 数（= Position 类目 stride / 4 = 10）—— 已废弃，
+//        改由 src_rows 的 stride 推算；ini 里仍照旧写，本 CS 不再读取。
 //
 // 绑定：cs-t0 = 该 carrier 的导出 Position（stride 40 = 位置/法线/切线），
 //       cs-t1 = 该 carrier 的导出 Blend（stride 32 = 4 权重 + 4 索引），
@@ -54,15 +61,17 @@ struct ZZBlend32
 
 StructuredBuffer<ZZVertex40> src_rows : register(t0);
 StructuredBuffer<ZZBlend32> src_blend : register(t1);
-StructuredBuffer<ZZBone3x4> merged_skeleton : register(t2);
+// 【2026-09-22 跨显卡修复】合并骨架现在是 **typed** buffer（16B 元素，每骨 3 个 float4），
+// 不是结构化 48B —— 见 zzmi_merged_skeleton_attach.hlsl 顶部说明。这里必须同步用
+// `Buffer<float4>` 声明并手工按 `bone*3` 取三个 float4，否则一旦启用本 CS 就会复现
+// 同一处「声明步长 vs 视图元素尺寸」不匹配（AMD 驱动按 SBS 取址 → 索引放大 3 倍）。
+Buffer<float4> merged_skeleton : register(t2);
 // 目标 SO：uav_byte_stride = 4 ⇒ 4 字节元素的结构化 UAV
 RWStructuredBuffer<float> dst_rows : register(u0);
 
+// ini 参数纹理。**不在编译期绑定索引**（[0]/[1] 的归属随 fork 变化），
+// 具体取哪一组由 main 里按「资源行数」判据在运行时决定。
 Texture1D<float4> IniParams : register(t120);
-#define ZZ_SKIN_COUNT IniParams[1].x
-#define ZZ_SKIN_DEST_START IniParams[1].y
-#define ZZ_SKIN_PREFIX IniParams[1].z
-#define ZZ_SKIN_FLOATS IniParams[1].w
 
 // 单个顶点 LBS：位置带平移，法线/切线只取 3x3（刚体正交 ⇒ 等价逆转置）
 void zz_skin_vertex(
@@ -92,7 +101,13 @@ void zz_skin_vertex(
         {
             continue;
         }
-        ZZBone3x4 m = merged_skeleton[bone];
+        // 每根骨占 3 个 float4（4x3 矩阵），显式按 bone*3 取 ——
+        // 与骨架的 typed 16B 视图精确匹配，不依赖任何 stride 解释。
+        uint b3 = bone * 3u;
+        ZZBone3x4 m;
+        m.r0 = merged_skeleton[b3 + 0u];
+        m.r1 = merged_skeleton[b3 + 1u];
+        m.r2 = merged_skeleton[b3 + 2u];
         skinned_p += w * (float3(dot(m.r0.xyz, p) + m.r0.w,
                                  dot(m.r1.xyz, p) + m.r1.w,
                                  dot(m.r2.xyz, p) + m.r2.w));
@@ -131,36 +146,58 @@ void zz_write_row(uint row, float3 pos, float3 nrm, float3 tan, float tan_w, uin
 void main(uint3 dispatch_id : SV_DispatchThreadID)
 {
     uint index = dispatch_id.x;
-    uint count = (uint)ZZ_SKIN_COUNT;
-    uint prefix = (uint)ZZ_SKIN_PREFIX;
-    if (index >= max(count, prefix))
+
+    // ---- 资源权威值：按真实资源长度取，损坏/陈旧的 mod 资源不越界读 ----
+    uint src_count = 0;
+    uint src_stride = 0;
+    src_rows.GetDimensions(src_count, src_stride);
+    // Buffer<float4> 的 GetDimensions 返回 float4 元素数 = 骨骼数 * 3
+    uint bone_count = 0;
+    merged_skeleton.GetDimensions(bone_count);
+    bone_count /= 3u;
+
+    if (src_count == 0)
     {
         return;
     }
 
-    uint stride_f = (uint)ZZ_SKIN_FLOATS;
-    if (stride_f < 10)
+    // ---- ini 逻辑参数：只取「目标起始行」与「前缀行数」 ----
+    //
+    // 本 carrier 负责的行数**不从 ini 取**：它必须等于 src_rows 的元素数
+    // （导出侧不变量：cs-t0 绑的就是本 carrier 的 Position，x1 = 其导出顶点数），
+    // 直接用资源值，少一个可被跨运行时读错的外部输入。
+    //
+    // 参数组的选择：ini 参数纹理布局随 fork 变化（本 fork 从 [1] 起、标准版从
+    // [0] 起）。用上面那条不变量做判据——x 分量与资源行数匹配的那一组，必然是
+    // 本段自己设置的那一组。两套运行时因此行为一致。
+    float4 param_b = IniParams[1];
+    float4 param_a = IniParams[0];
+    float4 param = (abs(param_b.x - (float)src_count) < 0.5f) ? param_b : param_a;
+
+    uint dest_start = (uint)param.y;
+    uint prefix = (uint)param.z;
+
+    // 每行 float 数 = 源 Position 类目 stride / 4（导出侧保证源/目的同布局）
+    uint stride_f = src_stride / 4u;
+    if (stride_f < 10u)
     {
-        stride_f = 10;
+        stride_f = 10u;
     }
 
-    // 运行时按真实资源长度做一次保护（损坏/陈旧 mod 资源不越界读）。
-    uint src_count = 0;
-    uint src_stride = 0;
-    src_rows.GetDimensions(src_count, src_stride);
-    uint bone_count = 0;
-    uint bone_stride = 0;
-    merged_skeleton.GetDimensions(bone_count, bone_stride);
+    if (index >= max(src_count, prefix))
+    {
+        return;
+    }
 
     // 1) 本 carrier 负责的合并几何行 → 目标 [dest_start + i]
-    if (index < count)
+    if (index < src_count)
     {
         float3 sp;
         float3 sn;
         float3 st;
         float tw;
         zz_skin_vertex(src_rows[index], src_blend[index], bone_count, sp, sn, st, tw);
-        zz_write_row((uint)ZZ_SKIN_DEST_START + index, sp, sn, st, tw, stride_f);
+        zz_write_row(dest_start + index, sp, sn, st, tw, stride_f);
     }
 
     // 2) 前缀行（渲染 base_vertex 跳过的那几行）与游戏 `draw = 3, 0` 同口径：

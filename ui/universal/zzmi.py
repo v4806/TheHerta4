@@ -5381,9 +5381,19 @@ class ExportZZMI(ExportUnity):
         bones_count = max(c["vg_offset"] + c["vg_count"] for c in self.merged_skeleton_components)
 
         # 每部件每槽 palette 持久副本资源声明（deform VB 段里 copy vs-t0 写入当帧
-        # 内容）。type=stride 必须显式声明：副本要作为 CS 的 cs-t0（SRV）按
-        # StructuredBuffer<ZZBone3x4>（48 字节/骨骼）读取，空声明的 SRV 视图格式
-        # 不受控，会读出垃圾矩阵（蒙皮每帧乱跳）。
+        # 内容）。type=stride 必须显式声明，否则空声明的 SRV 视图格式不受控。
+        #
+        # 【2026-09-22 跨显卡修复】这里的 SRV **实际是 typed 16B 元素**，不是结构化
+        # 48B —— 因为 palette 是 `copy vs-t0` 的目标，加载器会把源视图的 Format
+        # 注入进来（FillInMissingInfo），再在 FillOutBufferDescCommon 用
+        # dxgi_format_size(format)=16 覆盖 stride。所以 attach CS 里 palette 必须声明成
+        # `Buffer<float4>` 并手工按 `bone*3` 取三个 float4（见 Toolset/
+        # zzmi_merged_skeleton_attach.hlsl）。若按 `StructuredBuffer<ZZBone3x4>` 声明，
+        # 声明与视图不匹配即落进未定义区：AMD 驱动按描述符(16)取址 → 骨架 2/3 错位
+        # → 模型爆炸（实测 A 卡骨架合格率仅 1/3，N 卡正常）。
+        # 注意：**不要**给这里加 `format =` —— 加 format 会把 buffer 的
+        # StructureByteStride 改成 16、ByteWidth 缩到 16*vg_count，而 copy vs-t0
+        # 要拷 48*vg_count 字节，会溢出。
         for component in self.merged_skeleton_components:
             for slot in slots:
                 section.append(
@@ -5510,9 +5520,28 @@ class ExportZZMI(ExportUnity):
                 section.append(
                     f"[{self._merged_skeleton_name(skeleton_group, slot)}]"
                 )
-                section.append("type = RWStructuredBuffer")
-                section.append("stride = 48")
-                section.append("array = " + str(bones_count))
+                # 【2026-09-22 跨显卡修复】合并骨架必须是 typed buffer，不能是结构化。
+                #
+                # 游戏的 deform VS 按 **typed 索引** `palette[3*bone + m]` 读取本缓冲
+                # （每根骨 3 个 float4）。若本资源声明成结构化（SBS=48），则出现
+                # 「视图元素尺寸 vs 声明步长」不匹配，落进 D3D11 未定义区：
+                #   · NVIDIA 驱动按视图元素尺寸(16)取址 → (3b+m)*16 = 48b+16m → 正确；
+                #   · AMD 驱动按 buffer 的 StructureByteStride(48)取址 → 骨 b 实际读到
+                #     槽位 3b/3b+1/3b+2 的矩阵混合 → 错位；且 3b+m 越过写入区间时
+                #     越界读返回精确 0 → 顶点塌到原点（实测 A 卡 5939/11111 个顶点为零，
+                #     阈值恰为 ⌈bones_count/3⌉，即「索引被放大 3 倍」的唯一指纹）。
+                #
+                # 改成 typed（format + array=3*bones_count，字节数不变）后，SRV 元素
+                # 尺寸 = 16B，与 `palette[3b+m]` 精确匹配 → 两卡取址一致。
+                #
+                # bind_flags 必须显式声明（EFMI 的 ResourceMergedSkeletonDataRW 同款坑）：
+                # RWBuffer 缺 bind_flags 会导致资源创建失败，且**引用路径不会补** ——
+                # SRV 创建静默失败后绑 NULL，deform 读到全零（实测过一次，骨架内容
+                # 完全正确但 4 个 SO 全部 100% 零）。
+                section.append("type = RWBuffer")
+                section.append("format = R32G32B32A32_FLOAT")
+                section.append("array = " + str(bones_count * 3))
+                section.append("bind_flags = shader_resource unordered_access")
                 section.new_line()
 
         # 逐 (部件, 槽) attach 段（y1 = vg_count；仅由 deform VB 段顶层调用）。
@@ -5622,7 +5651,9 @@ class ExportZZMI(ExportUnity):
                 )
                 continue
             so_prefix_rows = int(group_plan.get("so_prefix_rows", 0) or 0)
-            # 每行 float 数 = SO 行 stride / 4（Position 类目 stride = SO override_byte_stride）
+            # 每行 float 数 = SO 行 stride / 4（Position 类目 stride = SO override_byte_stride）。
+            # 2026-09-22：skin CS 已改为从 src_rows 的 stride 自行推算行宽，这里
+            # 仍照旧写 w1 只为保持 ini 产物形状稳定（shader 不再读取该参数）。
             row_stride = int(group_plan.get("so_stride", 40) or 40)
             row_floats = max(1, row_stride // 4)
             dest_start = so_prefix_rows
@@ -5638,6 +5669,13 @@ class ExportZZMI(ExportUnity):
                         "flags = optimization_level3 all_resources_bound skip_validation"
                     )
                     section.append(f"cs = ./res/{self._merged_skin_shader_filename()}")
+                    # x1 有双重身份，**不要删除、不要改语义**：
+                    # ① 本 carrier 的合并几何行数（导出侧口径）；
+                    # ② skin CS 判定 ini 参数纹理布局（fork 相关：本 fork 从 [1] 起、
+                    #    标准版从 [0] 起）的**选组判据** —— shader 要求 x1 等于
+                    #    src_rows 的元素数（cs-t0 绑的就是本 carrier 的 Position，
+                    #    二者同源），据此挑出本次运行真正生效的那一组参数。
+                    # 缺了它，换一套 3DMigoto 运行时整组参数读成 0 → 蒙皮不写。
                     section.append(f"x1 = {int(draw_count)}")
                     section.append(f"y1 = {int(dest_start)}")
                     section.append(f"z1 = {int(so_prefix_rows if carrier_index == 0 else 0)}")

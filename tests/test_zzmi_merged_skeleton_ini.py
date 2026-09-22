@@ -594,9 +594,24 @@ class ZZSIMergedSkeletonIniTests(unittest.TestCase):
         # 每槽一份合并骨架
         self.assertIn("[ResourceZZMergedSkeleton_G0_s1]", text)
         self.assertIn("[ResourceZZMergedSkeleton_G0_s2]", text)
-        self.assertIn("type = RWStructuredBuffer", text)
-        self.assertIn("stride = 48", text)
-        self.assertIn("array = 156", text)  # 全宽 = max(0+105, 105+51) = 156
+        # 【2026-09-22 跨显卡修复】合并骨架必须是 **typed** RWBuffer，不能是结构化。
+        # 游戏的 deform VS 按 typed 索引 `palette[3*bone+m]` 读本缓冲；若描述符是
+        # 结构化（SBS=48）则「声明步长 vs 视图元素尺寸」不匹配，落进 D3D11 未定义区：
+        # AMD 驱动改用 SBS(48) 算字节偏移 → 索引被放大 3 倍 → 骨号越过写入区间时
+        # 越界读返回精确 0（实测 A 卡 5939/11111 个顶点为零，阈值恰为 ⌈156/3⌉）。
+        self.assertIn("type = RWBuffer", text)
+        self.assertIn("format = R32G32B32A32_FLOAT", text)
+        self.assertIn("array = 468", text)  # 3 × 156（全宽 = max(0+105, 105+51) = 156）
+        # bind_flags 必须显式声明（EFMI 的 ResourceMergedSkeletonDataRW 同款坑）：
+        # RWBuffer 缺 bind_flags 会导致 SRV 创建静默失败 → 绑 NULL → deform 读全零。
+        self.assertIn("bind_flags = shader_resource unordered_access", text)
+        self.assertNotIn("type = RWStructuredBuffer", text)
+        # 骨架资源段内不得再有结构化 stride（array 已按 3× 全宽声明）
+        for group in ("G0_s1", "G0_s2"):
+            block = text.split(f"[ResourceZZMergedSkeleton_{group}]", 1)[1].split("\n[", 1)[0]
+            self.assertIn("type = RWBuffer", block)
+            self.assertIn("bind_flags = shader_resource unordered_access", block)
+            self.assertNotIn("stride = ", block)
         # 无 CB1 校准：不出捕获资源/捕获段/校准引用
         self.assertNotIn("ResourceZZCb1", text)
         self.assertNotIn("Cb1Capture", text)
@@ -666,6 +681,60 @@ class ZZSIMergedSkeletonIniTests(unittest.TestCase):
         self.assertNotIn("ResourceZZMergedSkeleton", present_text)
         self.assertNotIn("= null", present_text)
 
+    def test_merged_skeleton_resource_is_typed_rwbuffer(self):
+        """合并骨架资源必须是 typed RWBuffer + 显式 bind_flags（2026-09-22 跨显卡修复）。
+
+        背景（A 卡模型爆炸的根因）：游戏的 deform VS 按 **typed 索引**
+        `palette[3*bone + m]` 读取合并骨架。若本资源声明成结构化（SBS=48），
+        则「视图元素尺寸(16) vs 声明步长(48)」不匹配，落进 D3D11 未定义区 ——
+        实测 AMD 驱动改用 SBS(48) 算字节偏移，索引被放大 3 倍：骨号 b 实际读到
+        槽位 3b/3b+1/3b+2 的矩阵混合，越过写入区间时越界读返回精确 0
+        （A 卡 5939/11111 个顶点位置为零，阈值恰为 ⌈bones_count/3⌉）；
+        NVIDIA 驱动按视图元素尺寸取址，因此正常。
+
+        修法：改成 typed（format + array = 3 × bones_count，字节数不变），
+        与 `palette[3b+m]` 精确匹配 → 两卡取址一致。
+
+        bind_flags 必须显式写（EFMI 的 ResourceMergedSkeletonDataRW 同款坑）：
+        RWBuffer 缺 bind_flags 会导致 SRV 创建**静默失败**并绑 NULL ——
+        实测过一次：骨架内容完全正确但 4 个 SO 全部 100% 零。
+        """
+        submesh_a = _FakeSubmesh("LOD0.a23aa8a3-42759-0", 0, 105)
+        submesh_b = _FakeSubmesh("LOD0.b20f90ea-19182-0", 105, 51)
+        exporter = _make_exporter(
+            [_FakeDrawIBModel("a23aa8a3", [submesh_a]), _FakeDrawIBModel("b20f90ea", [submesh_b])],
+            merged_vgmap=True,
+        )
+        exporter.merged_skeleton_components, exporter.merged_skeleton_component_id_dict = (
+            exporter._collect_merged_skeleton_components()
+        )
+        builder = _FakeIniBuilder()
+        exporter.add_merged_skeleton_sections(builder)
+        text = "\n".join(_all_builder_lines(builder))
+
+        # 全宽 = max(0+105, 105+51) = 156 槽；typed 元素数 = 156 × 3 = 468
+        # （本 fixture 只有 G0 组：两个部件同组）
+        for group in ("G0_s1", "G0_s2"):
+            self.assertIn(f"[ResourceZZMergedSkeleton_{group}]", text)
+            block = text.split(f"[ResourceZZMergedSkeleton_{group}]", 1)[1].split("\n[", 1)[0]
+            self.assertIn("type = RWBuffer", block)
+            self.assertIn("format = R32G32B32A32_FLOAT", block)
+            self.assertIn("array = 468", block)
+            self.assertIn("bind_flags = shader_resource unordered_access", block)
+            # 不得再有结构化声明残留
+            self.assertNotIn("RWStructuredBuffer", block)
+            self.assertNotIn("stride = ", block)
+        # 声明顺序：type → format → array → bind_flags
+        block = text.split("[ResourceZZMergedSkeleton_G0_s1]", 1)[1].split("\n[", 1)[0]
+        self.assertLess(block.index("type = RWBuffer"), block.index("format = "))
+        self.assertLess(block.index("format = "), block.index("array = "))
+        self.assertLess(block.index("array = "), block.index("bind_flags = "))
+        # palette 侧不得加 format（加 format 会把 SBS 改成 16、ByteWidth 缩到
+        # 16×vg_count，而 copy vs-t0 要拷 48×vg_count 字节 → 溢出）
+        pal = text.split("[ResourceZZPalette_a23aa8a3_s1]", 1)[1].split("\n[", 1)[0]
+        self.assertIn("stride = 48", pal)
+        self.assertNotIn("format = ", pal)
+
     def test_merged_skeleton_sections_per_group(self):
         """组内统一骨架版：每组一套全宽骨架资源；逐部件直拷 attach 到本组；无任何捕获/校准段。"""
         # 组 0（身体）：a23aa8a3(0,105) + b20f90ea(105,51)
@@ -691,14 +760,15 @@ class ZZSIMergedSkeletonIniTests(unittest.TestCase):
         self.assertIn("[ResourceZZMergedSkeleton_G0_s2]", text)
         self.assertIn("[ResourceZZMergedSkeleton_G1_s1]", text)
         self.assertIn("[ResourceZZMergedSkeleton_G1_s2]", text)
-        # 两组各两槽、全宽 array = 全局 max(157+11) = 168（只数骨架资源的 array 行；
-        # palette 副本资源自带 array=vg_count 行，需排除——骨架段结构：header/type/stride/array）
+        # 两组各两槽、全宽 = 全局 max(157+11) = 168 槽；typed 元素数 = 3 × 168 = 504
+        # （只数骨架资源的 array 行；palette 副本资源自带 array=vg_count 行，需排除——
+        #  骨架段结构：header / type / format / array / bind_flags，故取 i+3）
         skeleton_arrays = [
             lines[i + 3]
             for i, line in enumerate(lines)
             if line.startswith("[ResourceZZMergedSkeleton_G")
         ]
-        self.assertEqual(skeleton_arrays, ["array = 168"] * 4)
+        self.assertEqual(skeleton_arrays, ["array = 504"] * 4)
         # 无捕获段、无校准资源、无 cb 引用
         self.assertNotIn("Cb1Capture", text)
         self.assertNotIn("ResourceZZCb1", text)
@@ -776,7 +846,8 @@ class ZZSIMergedSkeletonIniTests(unittest.TestCase):
         exporter.add_merged_skeleton_sections(builder)
         text = "\n".join(_all_builder_lines(builder))
 
-        self.assertIn("array = 51", text)  # max(0+11, 31+20) = 51，而非 sum=31
+        # typed：元素数 = 3 × 槽位数（max(0+11, 31+20) = 51，而非 sum=31）
+        self.assertIn("array = 153", text)
 
     def test_g4_slots_use_runtime_merged_skeleton_bounds(self):
         """G4 的 249..265 槽必须由实际 UAV 长度放行，不能被角色专用常量截断。"""
@@ -786,13 +857,13 @@ class ZZSIMergedSkeletonIniTests(unittest.TestCase):
 
         threads = _zzmi_module.ExportZZMI.MERGED_SKELETON_ATTACH_THREADS
         self.assertIn(f"[numthreads({threads}, 1, 1)]", shader)
-        self.assertIn(
-            "src_palette.GetDimensions(palette_count, palette_stride)", shader
-        )
+        # 【2026-09-22 跨显卡修复】palette 与骨架都改成了 typed（Buffer<float4>），
+        # GetDimensions 只返回元素数，骨骼/槽位数需 /3 还原。
+        self.assertIn("src_palette.GetDimensions(palette_count)", shader)
+        self.assertIn("palette_count /= 3u", shader)
         self.assertIn("vg_map.GetDimensions(vg_map_count)", shader)
-        self.assertIn(
-            "merged_skeleton.GetDimensions(merged_count, merged_stride)", shader
-        )
+        self.assertIn("merged_skeleton.GetDimensions(merged_count)", shader)
+        self.assertIn("merged_count /= 3u", shader)
         self.assertIn("slot < merged_count", shader)
         self.assertNotIn("slot < 249", shader)
 
@@ -827,7 +898,8 @@ class ZZSIMergedSkeletonIniTests(unittest.TestCase):
         self.assertIn("[ResourceZZMergedSkeleton_G4_s1]", text)
         self.assertIn("[ResourceZZMergedSkeleton_G4_s2]", text)
         self.assertEqual(text.count("[ResourceZZMergedSkeleton_G4_s"), 2)
-        self.assertIn("array = 266", text)
+        # typed：元素数 = 3 × 槽位数（266 槽 = 全局 max(249+1, 245+21)）
+        self.assertIn("array = 798", text)
         meshes_path = Path(_FAKE_MOD_FOLDER) / "Meshes"
         add_slots = [
             value[0]
@@ -895,13 +967,20 @@ class ZZSIMergedSkeletonIniTests(unittest.TestCase):
         self.assertIn("[numthreads(64, 1, 1)]", shader)
         self.assertIn("SV_DispatchThreadID", shader)
         self.assertIn("src_rows.GetDimensions(src_count, src_stride)", shader)
-        self.assertIn("merged_skeleton.GetDimensions(bone_count, bone_stride)", shader)
+        # 【2026-09-22 跨显卡修复】骨架改成 typed 后，本 CS 也必须同步：
+        # Buffer<float4> 声明 + GetDimensions 单参 + /3 还原骨骼数 + bone*3 取址
+        self.assertIn("Buffer<float4> merged_skeleton : register(t2);", shader)
+        self.assertNotIn("StructuredBuffer<ZZBone3x4> merged_skeleton", shader)
+        self.assertIn("merged_skeleton.GetDimensions(bone_count)", shader)
+        self.assertIn("bone_count /= 3u", shader)
+        self.assertIn("bone * 3u", shader)
         self.assertIn("bone >= bone_count", shader)
-        # 与 ini 段参数同源：x1 = 行数、y1 = 目标起始行、z1 = 前缀行、w1 = 每行 float 数
-        self.assertIn("IniParams[1].x", shader)
-        self.assertIn("IniParams[1].y", shader)
-        self.assertIn("IniParams[1].z", shader)
-        self.assertIn("IniParams[1].w", shader)
+        # ini 参数按「资源行数」不变量在运行时选组（[0]/[1] 归属随 fork 变化）；
+        # 只用 y1/z1 两个逻辑参数，行数与每行 float 数改从资源取。
+        self.assertIn("IniParams[1]", shader)
+        self.assertIn("IniParams[0]", shader)
+        self.assertIn("param.y", shader)
+        self.assertIn("param.z", shader)
         self.assertIn("float4 t = float4(v.b.z, v.b.w, v.c.x, v.c.y);", shader)
         self.assertEqual(
             _zzmi_module.ExportZZMI._merged_skin_dispatch_count(18776, 3), 294
