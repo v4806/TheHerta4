@@ -78,6 +78,24 @@ class BlueprintExportHelper:
         return disabled_names
 
     @staticmethod
+    def should_bake_disabled_shape_keys() -> bool:
+        """蓝图树中是否有形态键配置节点开启了「烘焙未勾选的形态键」。
+
+        任一节点开启即生效（与直出开关的跨节点同步口径一致）；无有效树或节点时返回 False。
+        """
+        try:
+            tree = BlueprintExportHelper.get_current_blueprint_tree()
+            if not tree:
+                return False
+            shapekey_nodes = BlueprintExportHelper.collect_shapekey_postprocess_nodes(tree)
+        except Exception:
+            return False
+        for node in shapekey_nodes:
+            if bool(getattr(node, "bake_disabled_shape_keys", False)):
+                return True
+        return False
+
+    @staticmethod
     def get_exportable_shape_key_infos(obj, slot_limit: int | None = None) -> list[tuple[int, str, object]]:
         if obj is None or not getattr(obj, "data", None):
             return []
@@ -1770,6 +1788,55 @@ class BlueprintExportHelper:
                 if not changed:
                     break
         return None
+
+    @staticmethod
+    def capture_shapekey_scene_state(force: bool = False) -> dict:
+        """导出前置快照：记录场景原物体此刻的形态键值/静音状态。
+
+        导出流程会为了「基础网格 = 纯基态」把原物体的形态键值清零（含逐槽位轮次把目标键置 1），
+        这份快照既用于导出收尾还原场景，也是「烘焙未勾选形态键」唯一可信的当前值来源
+        （清零发生在前处理之前，副本上读到的值已是 0）。只抓第一次，避免逐轮覆盖。
+        """
+        existing = getattr(BlueprintExportHelper, "_shapekey_scene_state_snapshot", None)
+        if existing and not force:
+            return existing
+
+        snapshot = {}
+        for obj_name in BlueprintExportHelper.shapekey_objects:
+            obj = BlueprintExportHelper._resolve_shapekey_object_in_scene(obj_name)
+            if obj is None or not getattr(getattr(obj, "data", None), "shape_keys", None):
+                continue
+            snapshot[obj.name] = ShapeKeyUtils.capture_shape_key_state(obj)
+        BlueprintExportHelper._shapekey_scene_state_snapshot = snapshot
+        if snapshot:
+            print(f"[ShapeKeyExport] 已记录 {len(snapshot)} 个场景物体的形态键值快照（导出后可还原）")
+        return snapshot
+
+    @staticmethod
+    def get_shapekey_scene_state_snapshot() -> dict:
+        return getattr(BlueprintExportHelper, "_shapekey_scene_state_snapshot", None) or {}
+
+    @staticmethod
+    def restore_shapekey_scene_state() -> int:
+        """把导出前的形态键值快照写回场景原物体；返回还原的物体数。
+
+        没有快照时是空操作（例如非形态键导出），因此可以无条件在导出收尾调用。
+        """
+        snapshot = getattr(BlueprintExportHelper, "_shapekey_scene_state_snapshot", None) or {}
+        BlueprintExportHelper._shapekey_scene_state_snapshot = {}
+        restored = 0
+        for obj_name, state in snapshot.items():
+            obj = BlueprintExportHelper._resolve_shapekey_object_in_scene(obj_name)
+            if obj is None or not getattr(getattr(obj, "data", None), "shape_keys", None):
+                continue
+            try:
+                ShapeKeyUtils.restore_shape_key_state(obj, state)
+                restored += 1
+            except Exception as exc:
+                print(f"[ShapeKeyExport] 还原 {obj_name} 的形态键值失败: {exc}")
+        if restored:
+            print(f"[ShapeKeyExport] 已还原 {restored} 个场景物体的形态键值")
+        return restored
 
     @staticmethod
     def set_all_shapekey_values(value: int, slot_index: int = None):

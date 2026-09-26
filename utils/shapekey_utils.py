@@ -225,6 +225,103 @@ class ShapeKeyUtils:
         return True
 
     @classmethod
+    def bake_disabled_shape_keys_to_basis(cls, obj, disabled_names, stage_label: str = "", value_overrides=None) -> dict:
+        """把未勾选导出形态键的当前数值烘焙进基态，并让其余键保持原有增量。
+
+        ① 全部键置 0 取纯基态坐标；② 只把未勾选（且未 mute）的键按当前值还原，
+        取「基态 + 未勾选贡献」；③ δ = 两者之差；④ 网格顶点与 Basis 键写成新基态，
+        **所有**键坐标 += δ（增量不变，导出键的效果因此不被削掉）；
+        ⑤ 全部键值归零——未勾选键的效果已在基态里，勾选键运行时可驱动，
+        若留着原值，收尾的 ``_apply_shape_keys`` 会把它们再烘一遍（重复计入）。
+
+        ``value_overrides``（``{键名: 值}``）用于覆盖「当前值」：导出流程为了基态采样会在
+        前处理之前把场景值清零，此时副本上读到的是 0，唯一可信的真实值来自导出前快照。
+
+        依赖 depsgraph 求值，因此顶点组限定的形态键、mute、滑杆范围都由 Blender 自己处理。
+        """
+        key_blocks = getattr(getattr(getattr(obj, "data", None), "shape_keys", None), "key_blocks", None)
+        if not key_blocks or len(key_blocks) <= 1:
+            return {"baked_keys": [], "delta_applied": False}
+
+        disabled = {
+            str(name or "").strip()
+            for name in (disabled_names or ())
+            if str(name or "").strip()
+        }
+        non_basis_keys = [
+            key_block
+            for key_block in list(key_blocks)[1:]
+            if not cls.is_basis_shape_key_name(getattr(key_block, "name", ""))
+        ]
+        bake_keys = [
+            key_block
+            for key_block in non_basis_keys
+            if getattr(key_block, "name", "") in disabled
+            and not bool(getattr(key_block, "mute", False))
+        ]
+        if not bake_keys:
+            return {"baked_keys": [], "delta_applied": False}
+
+        def _evaluate_coords():
+            depsgraph = bpy.context.evaluated_depsgraph_get()
+            evaluated_obj = obj.evaluated_get(depsgraph)
+            evaluated_mesh = evaluated_obj.to_mesh()
+            try:
+                coords = numpy.empty((len(evaluated_mesh.vertices), 3), dtype=numpy.float32)
+                evaluated_mesh.vertices.foreach_get("co", coords.ravel())
+            finally:
+                evaluated_obj.to_mesh_clear()
+            return coords
+
+        overrides = dict(value_overrides or {})
+        baked_values = {
+            str(getattr(key_block, "name", "")): float(
+                overrides.get(
+                    str(getattr(key_block, "name", "")),
+                    float(getattr(key_block, "value", 0.0)),
+                )
+            )
+            for key_block in bake_keys
+        }
+        delta_applied = False
+        with cls.temporarily_disable_visible_modifiers(obj):
+            for key_block in non_basis_keys:
+                key_block.value = 0.0
+            cls._update_view_layer()
+            basis_coords = _evaluate_coords()
+
+            for key_block in bake_keys:
+                key_block.value = baked_values[str(getattr(key_block, "name", ""))]
+            cls._update_view_layer()
+            mixed_coords = _evaluate_coords()
+
+            delta = mixed_coords - basis_coords
+            delta_applied = bool(numpy.any(delta))
+
+            if delta_applied:
+                obj.data.vertices.foreach_set("co", mixed_coords.ravel())
+                basis_key = key_blocks[0]
+                if len(basis_key.data) == len(mixed_coords):
+                    basis_key.data.foreach_set("co", mixed_coords.ravel())
+                for key_block in non_basis_keys:
+                    key_coords = numpy.empty((len(key_block.data), 3), dtype=numpy.float32)
+                    key_block.data.foreach_get("co", key_coords.ravel())
+                    if key_coords.shape == delta.shape:
+                        key_coords += delta
+                        key_block.data.foreach_set("co", key_coords.ravel())
+                obj.data.update()
+
+            for key_block in non_basis_keys:
+                key_block.value = 0.0
+            cls._update_view_layer()
+
+        return {
+            "baked_keys": sorted(baked_values),
+            "baked_values": baked_values,
+            "delta_applied": delta_applied,
+        }
+
+    @classmethod
     def remove_non_basis_shape_keys(cls, obj, stage_label: str = "") -> int:
         key_blocks = getattr(getattr(getattr(obj, "data", None), "shape_keys", None), "key_blocks", None)
         if not key_blocks:

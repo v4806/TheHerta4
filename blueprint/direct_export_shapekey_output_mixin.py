@@ -14,9 +14,10 @@ from ..common.mod_path_compat import derive_shapekey_slot_resource_name
 from ..common.mod_path_compat import ensure_resource_alias_section
 from ..utils.log_utils import LOG
 from .direct_export_runtime_utils import apply_position_override_in_place
+from .direct_export_runtime_utils import assemble_drawib_position_bytes
 from .direct_export_runtime_utils import extract_position_bytes_by_indices as _extract_position_bytes_by_indices
 from .direct_export_runtime_utils import iter_drawib_models as _iter_drawib_models
-from .direct_export_shapekey_shared import ShapeKeyDirectExportError, _buffer_to_bytes
+from .direct_export_shapekey_shared import ShapeKeyDirectExportError, _buffer_to_bytes, resolve_use_delta
 
 
 class DirectShapeKeyOutputMixin:
@@ -162,7 +163,7 @@ class DirectShapeKeyOutputMixin:
 
     def _write_slot_files(self, logical_hash, runtime_info, hash_slot_data, slot_position_overrides):
         use_packed = self.node.use_packed_Meshess
-        use_delta = self.node.store_deltas
+        use_delta = resolve_use_delta(self.node)
         actual_hash = runtime_info["actual_hash"]
         base_bytes = runtime_info["base_bytes"]
         struct_definition = self.node._get_vertex_struct_definition()
@@ -229,7 +230,7 @@ class DirectShapeKeyOutputMixin:
         return slot_maps
 
     def _write_merged_slot_files(self, logical_hash, runtime_info, hash_slot_data, slot_position_overrides):
-        use_delta = self.node.store_deltas
+        use_delta = resolve_use_delta(self.node)
         actual_hash = runtime_info["actual_hash"]
         base_bytes = runtime_info["base_bytes"]
         struct_definition = self.node._get_vertex_struct_definition()
@@ -399,6 +400,34 @@ class DirectShapeKeyOutputMixin:
 
         return bytes(slot_bytes)
 
+    def _resolve_drawib_base_position_bytes(
+        self, drawib_model, base_path: str, logical_hash: str
+    ) -> bytes:
+        """取 DrawIB 级基础 Position 字节，与 DrawIB 级 export_indices 同一索引空间。
+
+        优先按子网格顺序拼接 `<unique_str>-Position.buf`（逐子网格写盘的游戏，例如
+        EFMI 多 LOD：同一 DrawIB 的 LOD0/LOD1 各有一个文件，而 `export_indices` 是
+        DrawIB 级的、第二个子网格的索引从第一个子网格顶点数处开始）——不拼接就会用
+        DrawIB 级索引去采样单子网格文件，直接 `IndexError: index N is out of bounds`。
+
+        无法拼接（单个子网格 / 文件缺失 / 步长不一致 / 合并 IB 的游戏）时回退到
+        「按哈希解析出的单个文件」，保持既有行为。
+        """
+        folder_path = os.path.dirname(str(base_path or ""))
+        merged_bytes, submesh_count = assemble_drawib_position_bytes(
+            folder_path,
+            getattr(drawib_model, "submesh_model_list", []) or [],
+        )
+        if merged_bytes:
+            LOG.info(
+                f"直出形态键: DrawIB {logical_hash} 基础 Position 由 {submesh_count} 个子网格缓冲"
+                f"拼接（{len(merged_bytes)} 字节），与 DrawIB 级顶点索引对齐"
+            )
+            return merged_bytes
+
+        with open(base_path, "rb") as file_obj:
+            return file_obj.read()
+
     def _build_runtime_infos(self, unique_hashes):
         runtime_infos = {}
         for logical_hash in unique_hashes:
@@ -416,8 +445,9 @@ class DirectShapeKeyOutputMixin:
                 LOG.warning(f"直出形态键跳过哈希 {logical_hash}: 无法匹配基础 DrawIB 模型")
                 continue
 
-            with open(base_path, "rb") as file_obj:
-                base_bytes = file_obj.read()
+            base_bytes = self._resolve_drawib_base_position_bytes(
+                drawib_model, base_path, logical_hash
+            )
 
             position_stride = self._infer_position_stride(drawib_model, base_bytes)
             vertex_count = int(len(base_bytes) / position_stride) if position_stride > 0 else 0
@@ -462,8 +492,9 @@ class DirectShapeKeyOutputMixin:
             if not shapekey_buffers:
                 continue
 
-            with open(base_path, "rb") as file_obj:
-                base_bytes = file_obj.read()
+            base_bytes = self._resolve_drawib_base_position_bytes(
+                drawib_model, base_path, logical_hash
+            )
 
             position_stride = self._infer_position_stride(drawib_model, base_bytes)
             vertex_count = int(len(base_bytes) / position_stride) if position_stride > 0 else 0

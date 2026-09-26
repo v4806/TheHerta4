@@ -209,6 +209,8 @@ class DirectExportSession:
     def _setup_base_state(self):
         if self.direct_shapekey_nodes:
             BlueprintExportHelper.collect_shapekey_objects(self.tree)
+            # 清零前先记录场景值：收尾要还原，且「烘焙未勾选形态键」只能从这里拿到真实当前值
+            BlueprintExportHelper.capture_shapekey_scene_state()
             BlueprintExportHelper.set_all_shapekey_values(0)
 
         BlueprintExportHelper.set_current_export_index(1)
@@ -512,6 +514,9 @@ class DirectExportSession:
                 BlueprintExportHelper.set_suppress_shapekey_resource_export(False)
                 if has_shapekey:
                     BlueprintExportHelper.set_all_shapekey_values(0)
+                # 收尾把导出前的场景形态键值写回原物体：导出过程中为了基态采样会临时清零，
+                # 不能让它变成对用户场景的破坏（历史行为会在导出后留下全 0 的滑杆）。
+                BlueprintExportHelper.restore_shapekey_scene_state()
                 BlueprintExportHelper.set_current_export_index(1)
 
 

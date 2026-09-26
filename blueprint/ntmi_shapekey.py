@@ -1107,6 +1107,14 @@ class NTMIDirectShapeKeyGenerator(DirectShapeKeyGenerator):
 
 
 def execute_ntmi_shapekey_postprocess(node, output_dir: str, blueprint_model, exporter):
+    if bool(getattr(node, "store_all_vertex_channels", False)):
+        # NTMI 路线是位置专用实现（自建最小 position game type + 自生成着色器 + 固定 12 字节增量步长），
+        # 这里如实告警而非静默忽略：该开关在 NTMI 上当前不生效，产物里法线/切线增量恒为 0。
+        LOG.warning(
+            "NTMI ShapeKey: 「存储全部顶点属性增量」在 NTMI 导出路线暂不支持，"
+            "本次仍只计算位置增量（法线/切线保持基础网格值）；"
+            "需要全通道增量请改用直出形态键导出路线。"
+        )
     generator = NTMIDirectShapeKeyGenerator(
         node=node,
         mod_export_path=output_dir,

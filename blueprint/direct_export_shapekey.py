@@ -14,7 +14,7 @@ from .direct_export_runtime_utils import normalize_runtime_name as _normalize_ru
 from .direct_export_shapekey_output_mixin import DirectShapeKeyOutputMixin
 from .direct_export_shapekey_runtime_mixin import DirectShapeKeyRuntimeMixin
 from .direct_export_shapekey_sampling_mixin import DirectShapeKeySamplingMixin
-from .direct_export_shapekey_shared import ShapeKeyDirectExportError
+from .direct_export_shapekey_shared import ShapeKeyDirectExportError, resolve_use_delta
 from .export_helper import BlueprintExportHelper
 
 
@@ -370,7 +370,7 @@ class DirectShapeKeyGenerator(
         os.makedirs(dest_res_dir, exist_ok=True)
 
         use_packed = self.node.use_packed_Meshess
-        use_delta = self.node.store_deltas
+        use_delta = resolve_use_delta(self.node)
         use_optimized = self.node.use_optimized_lookup
         merge_slot_files = self.node._should_merge_slot_files(use_packed)
         drag_drive_enabled = bool(getattr(self.node, "drag_drive_enabled", False))

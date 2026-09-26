@@ -143,6 +143,21 @@ _HLSL_PAD_TYPE_BY_SIZE = {4: "uint", 8: "uint2", 12: "uint3", 16: "uint4"}
 _DEFAULT_VERTEX_STRUCT_DEFINITION = "struct VertexAttributes {\n    float3 position;\n    float3 normal;\n    float4 tangent;\n};"
 
 
+def _enforce_exclusive_delta_mode(node, keep: str):
+    """「存储顶点增量」与「储存全部顶点属性增量」互斥：勾选一个即取消另一个。"""
+    other = "store_all_vertex_channels" if keep == "store_deltas" else "store_deltas"
+    if bool(getattr(node, keep, False)) and bool(getattr(node, other, False)):
+        setattr(node, other, False)
+
+
+def sync_shapekey_delta_mode(node, _context):
+    _enforce_exclusive_delta_mode(node, "store_deltas")
+
+
+def sync_shapekey_all_channels_mode(node, _context):
+    _enforce_exclusive_delta_mode(node, "store_all_vertex_channels")
+
+
 class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
     INI_PREAMBLE_KEY = "__SSMT_INI_PREAMBLE__"
     bl_idname = 'SSMTNode_PostProcess_ShapeKey'
@@ -172,18 +187,23 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
     )
     store_deltas: bpy.props.BoolProperty(
         name="存储顶点增量",
-        description="不存储完整的顶点坐标，而是存储与基础模型的差值，进一步减小体积。需要 'numpy' 库。",
-        default=True
+        description=(
+            "只存位置增量（与基础模型的差值），进一步减小体积。"
+            "与「存储全部顶点属性增量」互斥；两者都不勾时直接存绝对坐标。需要 'numpy' 库。"
+        ),
+        default=True,
+        update=sync_shapekey_delta_mode,
     )
     store_all_vertex_channels: bpy.props.BoolProperty(
         name="存储全部顶点属性增量",
         description=(
-            "开启后按顶点数据类型计算全部通道（位置 + 法线 + 切线 xyz）的增量，而不只位置。"
+            "存全部通道（位置 + 法线 + 切线 xyz）的增量，而不只位置。"
             "法线/切线随形态键一起混合，描边壳与光照才能跟随形变；"
-            "关闭时与旧版逐字节一致（仅位置增量）。"
+            "与「存储顶点增量」互斥。"
             "注意：多文件与 NTMI 导出路径暂仍只算位置。需要 'numpy' 库。"
         ),
         default=False,
+        update=sync_shapekey_all_channels_mode,
     )
     use_optimized_lookup: bpy.props.BoolProperty(
         name="优化查找性能",
@@ -204,6 +224,16 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
         description="启用后该节点参与直出导出，并与同类节点同步（形态键导出仅支持直出模式）",
         default=True,
         update=sync_shapekey_direct_mode,
+    )
+    bake_disabled_shape_keys: bpy.props.BoolProperty(
+        name="烘焙未勾选的形态键",
+        description=(
+            "开启后，未勾选导出的形态键会按其当前数值烘焙进基础网格（基态），"
+            "其余形态键同步重基以保持各自原有的增量；"
+            "关闭时与旧行为一致（未勾选键的当前数值被丢弃）。"
+            "仅在直出形态键路线生效。"
+        ),
+        default=False,
     )
     drag_drive_enabled: bpy.props.BoolProperty(
         name="拖拽驱动形态键",
@@ -737,12 +767,29 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                 rows=max(4, min(len(self.shapekey_variable_items), 12)),
             )
 
-        layout.prop(self, "use_packed_Meshess")
-        layout.prop(self, "store_deltas")
-        layout.prop(self, "store_all_vertex_channels")
-        layout.prop(self, "use_optimized_lookup")
-        layout.prop(self, "merge_slot_files")
-        layout.prop(self, "direct_export_mode")
+        compute_box = layout.box()
+        compute_box.label(text="计算优化", icon='SORTTIME')
+        compute_box.prop(self, "use_packed_Meshess")
+        compute_box.prop(self, "use_optimized_lookup")
+        compute_box.prop(self, "merge_slot_files")
+
+        storage_box = layout.box()
+        storage_box.label(text="空间优化", icon='PACKAGE')
+        storage_box.prop(self, "store_deltas")
+        storage_box.prop(self, "store_all_vertex_channels")
+        storage_box.label(
+            text=(
+                "增量通道：位置 + 法线 + 切线 xyz"
+                if getattr(self, "store_all_vertex_channels", False)
+                else "增量通道：仅位置"
+            ),
+            icon='INFO',
+        )
+
+        export_box = layout.box()
+        export_box.label(text="导出优化", icon='EXPORT')
+        export_box.prop(self, "direct_export_mode")
+        export_box.prop(self, "bake_disabled_shape_keys")
 
         drive_box = layout.box()
         drive_box.label(text="拖拽驱动形态键", icon='DRIVER')
@@ -1274,6 +1321,18 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
         bare_unique_str = str(ObjectPrefixHelper.parse_prefix_parts(h).get("bare_unique_str", "") or h or "").strip()
         return bare_unique_str.replace('.', '_').replace('-', '_')
 
+    def effective_use_delta(self) -> bool:
+        """是否按增量存储（三态口径）。
+
+        「存储顶点增量」与「储存全部顶点属性增量」互斥且同属增量语义：
+        只勾前者 = 仅位置增量；只勾后者 = 位置 + 法线 + 切线 xyz 增量；
+        两个都不勾 = 直接存绝对坐标。
+        """
+        return bool(
+            getattr(self, "store_deltas", False)
+            or getattr(self, "store_all_vertex_channels", False)
+        )
+
     def _should_merge_slot_files(self, use_packed=None):
         if use_packed is None:
             use_packed = self.use_packed_Meshess
@@ -1512,7 +1571,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
 
     def _process_shapekey_Meshess(self, mod_export_path, slot_to_name_to_objects, hash_to_stride):
         use_packed = self.use_packed_Meshess
-        use_delta = self.store_deltas
+        use_delta = self.effective_use_delta()
         merge_slot_files = self._should_merge_slot_files(use_packed)
 
         if not NUMPY_AVAILABLE:
@@ -1684,7 +1743,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
         return True, hash_to_actual_file_hash
 
     def _process_merged_shapekey_Meshess(self, mod_export_path, slot_to_name_to_objects, hash_to_stride):
-        use_delta = self.store_deltas
+        use_delta = self.effective_use_delta()
         hash_to_actual_file_hash = {}
         hash_to_slots = OrderedDict()
 
@@ -1973,7 +2032,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
 
     def _get_shader_template_name(self):
         use_packed = self.use_packed_Meshess
-        use_delta = self.store_deltas
+        use_delta = self.effective_use_delta()
         use_optimized = self.use_optimized_lookup
         merge_slot_files = self._should_merge_slot_files(use_packed)
 
@@ -2130,15 +2189,22 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
     # TANGENT 只取 xyz —— 第 4 个分量是切线手性符号（±1），插值成中间值会让切线基失去意义，
     # 因此它随其余未选字段一起由「按位拷贝」保留，不参与增量。
     DELTA_CHANNEL_FLOAT_COUNTS = (("position", 3), ("normal", 3), ("tangent", 3))
+    # 名字以此结尾的是布局常量（position_w / normal_w，16 字节步长的补齐位），不参与增量。
+    DELTA_CHANNEL_EXCLUDED_SUFFIX = "_w"
 
     def _resolve_delta_channel_plan(self, hash_val=None, struct_definition=None, num_floats_per_vertex=None):
         """解析增量通道列计划：``[(通道名, 起始 float 下标, float 分量数), ...]``。
 
         - 关闭「存储全部顶点属性增量」时恒为 ``[("position", 0, 3)]``，与旧版逐字节一致。
-        - 开启时**按顶点数据类型展开**：``position`` / ``normal`` 各取前 3 个 float，
-          ``tangent`` 取 xyz。数据类型里没有的通道不会出现；超出实际每顶点 float 数的
-          通道会被裁掉（例如手填的 40B 顶点属性定义遇上工作空间 16B 的 IB），
-          避免着色器读到缓冲区之外、也避免写出未声明字段的写回行。
+        - 开启时**按真实顶点属性定义展开**：结构体里每个 ``float`` 系属性都进计划，
+          分量数按声明宽度（``float2`` 计 2、``float4`` 计 4），因此顶点色、额外 UV、
+          自定义属性都会一起参与增量。
+        - 三处按位复用的例外：已知三通道沿用历史口径各取 xyz（``DELTA_CHANNEL_FLOAT_COUNTS``，
+          tangent 的第 4 个分量是手性符号，做 float 混合没有意义）；``*_w`` 布局常量不参与；
+          非 float 属性（``uint`` / ``half`` 等，例如 R8G8B8A8 顶点色、压缩法线）
+          float 加减法表达不了，一律按位复用（导出日志会点名列出）。
+        - 超出实际每顶点 float 数的通道会被裁掉（例如手填的 40B 顶点属性定义遇上工作空间
+          16B 的 IB），避免着色器读到缓冲区之外、也避免写出未声明字段的写回行。
         """
         if not bool(getattr(self, "store_all_vertex_channels", False)):
             return [("position", 0, 3)]
@@ -2153,14 +2219,17 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
         if num_floats_per_vertex and int(num_floats_per_vertex) > 0:
             limit = min(limit, int(num_floats_per_vertex))
 
-        wanted = dict(self.DELTA_CHANNEL_FLOAT_COUNTS)
+        historical = dict(self.DELTA_CHANNEL_FLOAT_COUNTS)
         plan = []
         float_offset = 0
         for attribute in attributes:
             width = int(attribute.get("size", 0) or 0) // 4
             name = str(attribute.get("name", "") or "")
-            if width > 0 and name in wanted:
-                count = min(wanted[name], width)
+            type_name = str(attribute.get("type", "") or "")
+            is_float_channel = type_name.startswith("float")
+            is_layout_constant = name.endswith(self.DELTA_CHANNEL_EXCLUDED_SUFFIX)
+            if width > 0 and is_float_channel and not is_layout_constant:
+                count = min(historical.get(name, width), width)
                 if float_offset + count <= limit:
                     plan.append((name, float_offset, count))
             float_offset += width
@@ -2168,6 +2237,24 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
         if not plan or plan[0][0] != "position":
             return [("position", 0, 3)]
         return plan
+
+    def _resolve_skipped_delta_channels(self, hash_val=None, struct_definition=None):
+        """本次增量里被按位复用的属性名（非 float 属性 / ``*_w`` 布局常量）。"""
+        definition = struct_definition or self._get_vertex_struct_definition(hash_val=hash_val)
+        parsed = self.parse_vertex_struct(definition) if definition else None
+        if not parsed:
+            return []
+
+        _stride, _floats, attributes = parsed
+        skipped = []
+        for attribute in attributes:
+            name = str(attribute.get("name", "") or "")
+            type_name = str(attribute.get("type", "") or "")
+            if not name:
+                continue
+            if not type_name.startswith("float") or name.endswith(self.DELTA_CHANNEL_EXCLUDED_SUFFIX):
+                skipped.append(name)
+        return skipped
 
     @staticmethod
     def _channel_plan_columns(plan):
@@ -2214,14 +2301,38 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
     )
 
     @staticmethod
-    def _build_writeback_lines(channel_names):
-        """着色器尾部的写回行。单通道时与旧版逐字符一致。"""
-        lines = ["output.position += total_diff_position;"]
-        if "normal" in channel_names:
-            lines.append("output.normal += total_diff_normal;")
-        if "tangent" in channel_names:
-            # 只写 xyz：第 4 个分量是切线手性符号，必须保持基础网格原值
-            lines.append("output.tangent.xyz += total_diff_tangent;")
+    def _delta_channel_type_text(count):
+        """HLSL 类型名：单分量写 ``float``（``float1`` 不是合法类型）。"""
+        return "float" if int(count) == 1 else f"float{int(count)}"
+
+    # 模板自带累加器声明的通道；其余通道由 _build_delta_accumulator_declarations 注入
+    TEMPLATE_DECLARED_DELTA_CHANNELS = ("position", "normal", "tangent")
+
+    @classmethod
+    def _build_writeback_lines(cls, channel_plan):
+        """着色器尾部的写回行（按通道计划逐通道写回）。单通道时与旧版逐字符一致。"""
+        lines = []
+        for name, _start, _count in channel_plan:
+            if name == "tangent":
+                # 只写 xyz：第 4 个分量是切线手性符号，必须保持基础网格原值
+                lines.append("output.tangent.xyz += total_diff_tangent;")
+            else:
+                lines.append(f"output.{name} += total_diff_{name};")
+        return lines
+
+    @classmethod
+    def _build_delta_accumulator_declarations(cls, channel_plan):
+        """为模板未声明的通道注入累加器声明（顶点色、额外 UV、自定义 float 属性）。
+
+        已知三通道由模板自己声明（float3），这里只补新通道，旧产物因此逐字节不变。
+        """
+        lines = []
+        for name, _start, count in channel_plan:
+            if name in cls.TEMPLATE_DECLARED_DELTA_CHANNELS:
+                continue
+            type_text = cls._delta_channel_type_text(count)
+            zeros = ", ".join("0.0" for _ in range(int(count)))
+            lines.append(f"    {type_text} total_diff_{name} = {type_text}({zeros});")
         return lines
 
     @staticmethod
@@ -2253,14 +2364,16 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
             )
         return lines
 
-    def _inject_delta_channel_struct(self, content, channel_names):
+    def _inject_delta_channel_struct(self, content, channel_plan):
         """把增量缓冲从 ``StructuredBuffer<float3>`` 换成按通道展开的结构体。
 
         只在开启「存储全部顶点属性增量」且通道数 > 1 时调用；关闭时声明原样保留，
         生成结果与旧版一致。结构体行宽必须等于 INI 里该资源的 stride（4 × 通道 float 数）。
+        通道宽度按计划取（``float2`` / ``float4`` 等），已知三通道仍是 ``float3``。
         """
         struct_text = "struct ShapeKeyDelta {\n" + "\n".join(
-            f"    float3 {name};" for name in channel_names
+            f"    {self._delta_channel_type_text(count)} {name};"
+            for name, _start, count in channel_plan
         ) + "\n};"
 
         def _replace(match):
@@ -2299,11 +2412,18 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
             )
             channel_names = self._channel_plan_names(channel_plan)
             extra_channels = [name for name in channel_names if name != "position"]
+            if extra_channels:
+                skipped_channels = self._resolve_skipped_delta_channels(hash_val=hash_val)
+                if skipped_channels:
+                    print(
+                        f"[形态键] {hash_val or ''} 以下顶点属性按位复用（不参与增量）: "
+                        f"{', '.join(skipped_channels)}"
+                    )
             if use_delta and extra_channels:
                 # 增量记录不再是单个 float3，改成按通道展开的结构体（步长 = 4 × 通道 float 数）
-                content = self._inject_delta_channel_struct(content, channel_names)
+                content = self._inject_delta_channel_struct(content, channel_plan)
 
-            writeback_lines = self._build_writeback_lines(channel_names)
+            writeback_lines = self._build_writeback_lines(channel_plan)
             if self._SHADER_WRITEBACK_BLOCK_RE.search(content):
                 content = self._SHADER_WRITEBACK_BLOCK_RE.sub(
                     lambda _match: (
@@ -2541,6 +2661,12 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                     if use_packed: logic_lines.extend(["        }", "    }\n"])
                     else: logic_lines.extend(["    }\n"])
 
+            accumulator_declarations = (
+                self._build_delta_accumulator_declarations(channel_plan) if extra_channels else []
+            )
+            if accumulator_declarations:
+                logic_lines = accumulator_declarations + logic_lines
+
             content = re.sub(r"// --- \[PYTHON-MANAGED BLOCK START\] ---.*?// --- \[PYTHON-MANAGED BLOCK END\] ---",
                              f"// --- [PYTHON-MANAGED BLOCK START] ---\n{chr(10).join(define_lines)}\n// --- [PYTHON-MANAGED BLOCK END] ---",
                              content, flags=re.DOTALL)
@@ -2695,7 +2821,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
 
         target_ini_file = ini_files[0]
         use_packed = self.use_packed_Meshess
-        use_delta = self.store_deltas
+        use_delta = self.effective_use_delta()
         use_optimized = self.use_optimized_lookup
         merge_slot_files = self._should_merge_slot_files(use_packed)
 

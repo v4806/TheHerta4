@@ -625,6 +625,10 @@ class PreProcessHelper:
             TimerUtils.end_stage("Preprocess-RestoreShapeKeys")
 
         if capture_shape_keys:
+            TimerUtils.start_stage("Preprocess-BakeDisabledShapeKeys")
+            cls._bake_disabled_shape_keys(copy_names)
+            TimerUtils.end_stage("Preprocess-BakeDisabledShapeKeys")
+
             TimerUtils.start_stage("Preprocess-CaptureDirectShapeKeys")
             cls._capture_direct_shape_key_positions(copy_names)
             TimerUtils.end_stage("Preprocess-CaptureDirectShapeKeys")
@@ -1309,6 +1313,94 @@ class PreProcessHelper:
             LOG.info(f"   ✅ 应用变换: {applied_count} 个物体, 跳过单位变换物体 {skipped_count} 个")
         else:
             LOG.info(f"   ✅ 应用变换: {applied_count} 个物体")
+
+    @classmethod
+    def _bake_disabled_shape_keys(cls, object_names: List[str]):
+        """把关掉勾选的形态键按当前数值烘焙进副本基态（节点开关开启时）。
+
+        必须在「还原形态键值」之后、直出采样之前执行：采样取的基态就等于新基态，
+        每个导出键采样出来仍是「新基态 + 原有增量」，下游无需任何改动。
+        未勾选键的效果进入基态后，副本上的形态键值全部归零，避免收尾
+        ``_apply_shape_keys`` 再把当前混合烘一遍（重复计入）。
+        """
+        try:
+            if not BlueprintExportHelper.should_bake_disabled_shape_keys():
+                LOG.info(
+                    "   ⏭ 烘焙未勾选形态键: 形态键配置节点上的「烘焙未勾选的形态键」未开启，"
+                    "本次跳过（未勾选键的当前数值不会进入基态）"
+                )
+                return
+            disabled_names = BlueprintExportHelper.get_disabled_shape_key_export_names()
+        except Exception as exc:
+            LOG.warning(f"   烘焙未勾选形态键跳过（读取开关/勾选失败）: {exc}")
+            return
+
+        if not disabled_names:
+            LOG.info(
+                "   ⏭ 烘焙未勾选形态键: 形态键配置节点的列表里没有取消勾选的条目"
+                "（列表未刷新时也会是空的），本次跳过"
+            )
+            return
+
+        baked_total = 0
+        snapshot = BlueprintExportHelper.get_shapekey_scene_state_snapshot()
+        # 快照按「场景物体名」存，而副本链上可能用的是虚拟名/链名 → 名字对不上时必须用
+        # 全局「键名 → 当前值」兜底，否则又拿被清成 0 的值去烘（「开关开了但产物没形变」的元凶）。
+        # 同名多物体取绝对值最大的那个值。
+        global_key_values = {}
+        for state in (snapshot or {}).values():
+            for entry in state or []:
+                key_name = str(entry.get("name", "") or "")
+                if not key_name:
+                    continue
+                value = float(entry.get("value", 0.0) or 0.0)
+                if abs(value) >= abs(global_key_values.get(key_name, 0.0)):
+                    global_key_values[key_name] = value
+        copy_to_source = {
+            copy_name: source_name
+            for source_name, copy_name in cls.original_to_copy_map.items()
+        }
+        for obj_name in object_names:
+            obj = bpy.data.objects.get(obj_name)
+            if obj is None or obj.type != 'MESH' or not getattr(obj.data, "shape_keys", None):
+                continue
+
+            # 导出入口为了基态采样会把场景值清零，副本上读到的「当前值」是 0；
+            # 真实当前值只存在于导出前快照里。
+            source_name = copy_to_source.get(obj_name, obj_name)
+            state = snapshot.get(source_name) or snapshot.get(obj_name) or []
+            value_overrides = dict(global_key_values)
+            value_overrides.update({
+                str(entry.get("name", "")): float(entry.get("value", 0.0) or 0.0)
+                for entry in state
+                if str(entry.get("name", ""))
+            })
+
+            try:
+                result = ShapeKeyUtils.bake_disabled_shape_keys_to_basis(
+                    obj,
+                    disabled_names,
+                    f"Preprocess bake disabled shape keys: {obj_name}",
+                    value_overrides=value_overrides,
+                )
+            except Exception as exc:
+                raise RuntimeError(f"前处理中的未勾选形态键烘焙失败: {obj_name} - {exc}") from exc
+
+            baked_keys = result.get("baked_keys") or []
+            if not baked_keys:
+                continue
+
+            baked_total += len(baked_keys)
+            detail = ", ".join(f"{name}={result.get('baked_values', {}).get(name, 0.0):.3f}" for name in baked_keys)
+            LOG.info(f"   {obj_name}: 已把未勾选形态键烘焙进基态[{detail}]")
+
+        if baked_total:
+            LOG.info(f"   ✅ 烘焙未勾选形态键: {baked_total} 个键")
+        else:
+            LOG.info(
+                "   ⏭ 烘焙未勾选形态键: 未勾选键的当前值全为 0（或被 mute / 名字对不上），"
+                "没有可固定进基态的位移"
+            )
 
     @classmethod
     def _apply_shape_keys(cls, object_names: List[str]):

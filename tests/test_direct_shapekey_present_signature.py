@@ -47,12 +47,17 @@ _install_module(
     f"{PKG}.blueprint.direct_export_runtime_utils",
     apply_position_override_in_place=lambda *_args, **_kwargs: None,
     extract_position_bytes_by_indices=lambda *_args, **_kwargs: b"",
+    assemble_drawib_position_bytes=lambda *_args, **_kwargs: (b"", 0),
     iter_drawib_models=lambda *_args, **_kwargs: [],
 )
 _install_module(
     f"{PKG}.blueprint.direct_export_shapekey_shared",
     ShapeKeyDirectExportError=RuntimeError,
     _buffer_to_bytes=lambda value: value,
+    resolve_use_delta=lambda node: bool(
+        getattr(node, "store_deltas", True)
+        or getattr(node, "store_all_vertex_channels", False)
+    ),
 )
 
 module_path = Path(__file__).resolve().parents[1] / "blueprint" / "direct_export_shapekey_output_mixin.py"
