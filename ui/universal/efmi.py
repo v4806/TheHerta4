@@ -2916,6 +2916,79 @@ class ExportEFMI:
                 f"单池共 {total_bones} 槽（跨 LOD 共用同一骨架缓冲）"
             )
 
+    def _entrypoint_mesh_comment_needed(self) -> bool:
+        """蓝图里是否存在「需要 `; [mesh:...]` 聚合注释」的消费方。
+
+        合并骨架把逐绘制注释移进了 `CommandList_Draw_*`，EntryPoint 段里
+        只剩这一行聚合注释。全仓 `[mesh:...]` 读取方清点（2026-09 全面复查）：
+
+        * `node_postprocess_draginteraction_efmi.py::_locate_component` ——
+          **唯一解析逗号分隔形式的读取方**，为它而写；消费侧
+          `_zone_component_allowed` 只在区域配了非空 ``include_objects`` 时才用
+          （未配包含列表、或列表项物体指针全失效，两种情况都直接放行）。
+        * `node_postprocess_object_texture.py`（物体贴图替换与清理）—— 只扫
+          `TextureOverride_*` 段，按串首 LOD 前缀定位；聚合行是它在合并骨架
+          布局下唯一能拿到的映射（只能命中排序后第一个名字，属既有局限）。
+        * `node_postprocess_material.py`（材质转资源）—— 不需要它：
+          `_material_target_section_names` 显式跟随 `Callback_Component_DrawCustom`
+          进 `CommandList_Draw_*`，用那里的逐绘制注释。
+        * `node_postprocess_shapekey.py` / `node_postprocess_uv_offset.py` ——
+          不解析逗号形式（整串当物体名，匹配不上）；形态键另有内存回退。
+
+        所以只有上述两个消费方之一在场才发射——否则每个组件都会往 ini 里写一行
+        几 KB~几十 KB 的导出器内部元数据（实测一个条目 432 个物体名 = 20,410 字符）。
+        """
+        try:
+            chains = getattr(self.blueprint_model, "processing_chains", None) or ()
+        except Exception:
+            return False
+        for chain in chains:
+            for node in getattr(chain, "node_path", None) or ():
+                if getattr(node, "mute", False):
+                    continue
+                bl_idname = getattr(node, "bl_idname", "")
+                if bl_idname == "SSMTNode_PostProcess_ObjectTextureAssign":
+                    return True
+                if bl_idname != "SSMTNode_PostProcess_DragInteraction":
+                    continue
+                for item in getattr(node, "zone_objects", None) or ():
+                    settings = getattr(
+                        getattr(item, "zone_object", None), "ssmt_drag_zone", None
+                    )
+                    if settings is None:
+                        continue
+                    try:
+                        if len(settings.include_objects) > 0:
+                            return True
+                    except (TypeError, ValueError):
+                        continue
+        return False
+
+    def _entrypoint_mesh_comment_enabled(self) -> bool:
+        """门控结果按导出缓存一次（逐组件重扫全部处理链没有意义）。"""
+        cached = getattr(self, "_entrypoint_mesh_comment_cache", None)
+        if cached is None:
+            cached = self._entrypoint_mesh_comment_needed()
+            self._entrypoint_mesh_comment_cache = cached
+        return cached
+
+    def _append_entrypoint_mesh_comment(self, section, submesh_model) -> None:
+        """发射 `; [mesh:...]` 聚合注释——合并骨架下的物体↔组件映射。
+
+        读取方与必要性见 `_entrypoint_mesh_comment_needed`；分号注释对
+        3Dmigoto 运行时零影响（等价既有 `; [mesh:..] [vertex_count:..]` 惯例），
+        蓝图里没有消费方时整行不写。
+        """
+        if not self._entrypoint_mesh_comment_enabled():
+            return
+        mesh_names = sorted({
+            str(getattr(dc, 'obj_name', '') or '')
+            for dc in (getattr(submesh_model, 'drawcall_model_list', None) or [])
+            if str(getattr(dc, 'obj_name', '') or '')
+        })
+        if mesh_names:
+            section.append("; [mesh:" + ",".join(mesh_names) + "]")
+
     def generate_ini_file(self):
         ini_builder = M_IniBuilder()
 
@@ -3022,15 +3095,11 @@ class ExportEFMI:
                 # 的 _locate_component 解析 `; [mesh:...]` 注释，把区域包含列表
                 # 映射到组件；分号注释对 3Dmigoto 运行时零影响，等价既有
                 # `; [mesh:..] [vertex_count:..]` 注释惯例）。
-                _ep_mesh_names = sorted({
-                    str(getattr(dc, 'obj_name', '') or '')
-                    for dc in (getattr(submesh_model, 'drawcall_model_list', None) or [])
-                    if str(getattr(dc, 'obj_name', '') or '')
-                })
-                if _ep_mesh_names:
-                    texture_override_ib_section.append(
-                        "; [mesh:" + ",".join(_ep_mesh_names) + "]"
-                    )
+                # 无消费方（拖拽包含过滤 / 物体贴图替换）时不发射，见
+                # _entrypoint_mesh_comment_needed。
+                self._append_entrypoint_mesh_comment(
+                    texture_override_ib_section, submesh_model
+                )
                 texture_override_ib_section.append(
                     "CommandList\\EFMIv1\\Callback_Component_DrawCustom = ref " + draw_command_name
                 )
