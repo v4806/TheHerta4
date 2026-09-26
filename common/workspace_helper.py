@@ -10,6 +10,10 @@ from ..utils.collection_utils import CollectionColor, CollectionUtils
 from ..utils.json_utils import JsonUtils
 
 
+# LOD0 兜底命中过的 (工作空间, 身份)，只用于一次性日志，避免同一次导出反复刷屏。
+_lod0_fallback_reported_keys: set[str] = set()
+
+
 @dataclass
 class DedupedTextureInfo:
     original_hash: str = field(default="", init=False)
@@ -19,6 +23,9 @@ class DedupedTextureInfo:
 
 
 class WorkSpaceHelper:
+    # 没有 LOD 前缀的身份（旧扁平工作空间遗留 / 手工命名的物体）默认按哪个 LOD 解析。
+    DEFAULT_LOD_NAME = "LOD0"
+
     @staticmethod
     def _has_importable_content(base_folder: str) -> bool:
         if not os.path.isdir(base_folder):
@@ -71,21 +78,49 @@ class WorkSpaceHelper:
         return "", normalized_unique_str
 
     @staticmethod
+    def _report_lod0_fallback(workspace_folder: str, unique_str: str, resolved_path: str) -> None:
+        """LOD0 兜底命中时打印一次（同一工作空间 + 同一身份只报一次，避免刷屏）。"""
+        key = os.path.normcase(os.path.join(workspace_folder, unique_str))
+        if key in _lod0_fallback_reported_keys:
+            return
+        _lod0_fallback_reported_keys.add(key)
+        print(
+            f"[工作空间] '{unique_str}' 没有裸身份目录，按默认 "
+            f"{WorkSpaceHelper.DEFAULT_LOD_NAME} 解析: {resolved_path}"
+        )
+
+    @staticmethod
     def get_submesh_folder_path(unique_str: str) -> str:
+        """解析 unique_str 对应的子网格数据目录。
+
+        带 LOD 前缀（`LOD0.xxx-1-0`）时只在对应 LOD 目录里找；没有 LOD 前缀时
+        先按裸身份找（扁平工作空间 / 根目录部件，保持旧行为），**找不到再按
+        默认 LOD0 兜底**：多 LOD 工作空间里 LOD0 部件的数据在 `LOD0\\<bare>`，
+        而旧扁平工作空间遗留的物体名 / 手工命名的物体没有 LOD 段，不兜底就
+        永远对不上，导出会以「没有找到对应的提取数据」直接中止。
+        """
         lod_name, bare_unique_str = WorkSpaceHelper.parse_lod_unique_str(unique_str)
         workspace_folder = GlobalConfig.path_workspace_folder()
         candidate_base_paths = [workspace_folder, *WorkSpaceHelper.get_workspace_partition_folderpath_list()]
 
-        for base_path in candidate_base_paths:
-            if lod_name:
+        if lod_name:
+            for base_path in candidate_base_paths:
                 candidate_path = os.path.join(base_path, lod_name, bare_unique_str)
-            else:
-                candidate_path = os.path.join(base_path, bare_unique_str)
+                if os.path.isdir(candidate_path):
+                    return candidate_path
+            return os.path.join(workspace_folder, lod_name, bare_unique_str)
+
+        for base_path in candidate_base_paths:
+            candidate_path = os.path.join(base_path, bare_unique_str)
             if os.path.isdir(candidate_path):
                 return candidate_path
 
-        if lod_name:
-            return os.path.join(workspace_folder, lod_name, bare_unique_str)
+        for base_path in candidate_base_paths:
+            candidate_path = os.path.join(base_path, WorkSpaceHelper.DEFAULT_LOD_NAME, bare_unique_str)
+            if os.path.isdir(candidate_path):
+                WorkSpaceHelper._report_lod0_fallback(workspace_folder, unique_str, candidate_path)
+                return candidate_path
+
         return os.path.join(workspace_folder, bare_unique_str)
 
     @staticmethod
@@ -271,6 +306,33 @@ class WorkSpaceHelper:
         }
 
     @staticmethod
+    def get_unwanted_submesh_folder_records(kept_lod_bare_pairs: set[tuple[str, str]]) -> List[Dict[str, str]]:
+        """同 get_unwanted_submesh_folder_list，但返回完整记录（含 lod_name / bare_name）。
+
+        清理 IB 时除了删文件夹，还要按 (lod_name, bare_name) 清工作空间/游戏级配置里
+        的引用（见 common/workspace_config_pruner.py），因此调用方需要身份而不只是路径。
+
+        安全护栏：空保留集合意味着场景为空或对象身份解析失败——此时返回"全部目录"
+        会让调用方一次删光整个工作空间。这里是最后一道防线：宁可一个都不删，由调用方
+        显式报错；清空整个工作空间必须走 get_all_submesh_folder_list 的独立强确认路径。
+        """
+        kept_keys = WorkSpaceHelper._normalize_kept_keys(kept_lod_bare_pairs)
+        if not kept_keys:
+            return []
+        unwanted_records = [
+            record
+            for record in WorkSpaceHelper.get_submesh_folder_records()
+            if (record["lod_name"], record["bare_name"]) not in kept_keys
+        ]
+        unwanted_records.sort(
+            key=lambda record: (
+                os.path.basename(record["folder_path"]).casefold(),
+                record["folder_path"].casefold(),
+            )
+        )
+        return unwanted_records
+
+    @staticmethod
     def get_unwanted_submesh_folder_list(kept_lod_bare_pairs: set[tuple[str, str]]) -> List[str]:
         """返回工作空间中不在 kept 保留集合内的子网格文件夹路径列表（按文件夹名排序）。
 
@@ -281,19 +343,10 @@ class WorkSpaceHelper:
         保留，不会被裸 ("", "aaaabbbb-100-0") 或 ("LOD1", "aaaabbbb-100-0") 保留，
         避免跨 LOD 误留/误删。调用方可用这些路径直接删除文件夹（shutil.rmtree）。
         """
-        kept_keys = WorkSpaceHelper._normalize_kept_keys(kept_lod_bare_pairs)
-        if not kept_keys:
-            # 空保留集合意味着场景为空或对象身份解析失败——此时返回"全部目录"
-            # 会让调用方一次删光整个工作空间。这里是最后一道防线：宁可一个都不删，
-            # 由调用方显式报错；清空整个工作空间必须走 get_all_submesh_folder_list
-            # 的独立强确认路径。
-            return []
-        unwanted_list = []
-        for record in WorkSpaceHelper.get_submesh_folder_records():
-            if (record["lod_name"], record["bare_name"]) not in kept_keys:
-                unwanted_list.append(record["folder_path"])
-        unwanted_list.sort(key=lambda path: (os.path.basename(path).casefold(), path.casefold()))
-        return unwanted_list
+        return [
+            record["folder_path"]
+            for record in WorkSpaceHelper.get_unwanted_submesh_folder_records(kept_lod_bare_pairs)
+        ]
 
     @staticmethod
     def count_kept_submesh_folders(kept_lod_bare_pairs: set[tuple[str, str]]) -> int:

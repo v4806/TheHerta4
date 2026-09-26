@@ -8,6 +8,7 @@ from ..common.global_config import GlobalConfig
 from ..common.global_properties import GlobalProterties
 from ..common.logic_name import LogicName
 from ..common.object_prefix_helper import ObjectPrefixHelper
+from ..common.workspace_config_pruner import WorkspaceConfigPruner
 from ..common.workspace_helper import WorkSpaceHelper
 from ..blueprint.export_helper import BlueprintExportHelper
 
@@ -153,6 +154,43 @@ class SSMT_OT_ClearMergedSkeletonCache(bpy.types.Operator):
         return {'FINISHED'}
 
 
+def _prune_workspace_configs(lod_bare_pairs, dry_run: bool = False) -> dict:
+    """清工作空间/游戏级配置里对这些部件的引用；返回 {相对路径: 删除条数}。
+
+    lod_bare_pairs：只影响「意图类」文件（工作页行 / 别名表 / SkipIBConfig /
+    VSCheckConfig）——传空集时它们一行都不删；「缓存类」文件（Import.json /
+    ComponentName_DrawCallIndexList / DrawIB-Component / 贴图去重表 / 游戏级
+    MarkTextureConfig）一律按磁盘现状判定，所以历史遗留的失效条目也能清掉。
+    dry_run=True 只统计不写盘（确认弹窗预览用）。
+    """
+    return WorkspaceConfigPruner.prune(
+        GlobalConfig.path_workspace_folder(),
+        lod_bare_pairs,
+        game_folder=GlobalConfig.path_current_game_total_workspace_folder(),
+        dry_run=dry_run,
+    )
+
+
+def _deleted_lod_bare_pairs(records, deleted_paths) -> set[tuple[str, str]]:
+    """记录里**确实删除成功**的 (lod_name, bare_name) 集合。"""
+    deleted_keys = {os.path.normcase(str(path)) for path in deleted_paths}
+    return {
+        (record.get("lod_name", ""), record.get("bare_name", ""))
+        for record in records
+        if os.path.normcase(str(record.get("folder_path", ""))) in deleted_keys
+    }
+
+
+def _report_config_prune(removed: dict) -> str:
+    """把清理结果打进控制台并返回给 report 的补充说明。"""
+    for rel_path, count in sorted(removed.items()):
+        print(f"[IB清理] 配置引用已清理: {rel_path}（{count} 条）")
+    removed_total = sum(removed.values())
+    if not removed_total:
+        return ""
+    return f"，并清理了 {len(removed)} 个配置文件里的 {removed_total} 条引用"
+
+
 class SSMT_OT_CleanupUnusedIB(bpy.types.Operator):
     """基于当前场景剩余的 IB，删除工作空间中未使用 IB 的文件夹。
 
@@ -195,6 +233,11 @@ class SSMT_OT_CleanupUnusedIB(bpy.types.Operator):
         return kept_pairs
 
     def _compute_targets(self, context):
+        """返回 (待删记录列表, 场景保留身份数, 命中的工作空间文件夹数)。
+
+        返回**记录**而不是路径：删完文件夹还要按 (lod_name, bare_name) 清配置引用
+        （工作页行、别名表、SkipIBConfig、Import.json、游戏级贴图标记等）。
+        """
         workspace_root = GlobalConfig.path_workspace_folder()
         if not workspace_root or not os.path.isdir(workspace_root):
             return [], 0, 0
@@ -203,13 +246,14 @@ class SSMT_OT_CleanupUnusedIB(bpy.types.Operator):
             # 场景为空 / 身份解析失败：空集合会把"全部目录"当成待删目标，
             # 直接拒绝，绝不允许进入确认流程。
             return [], 0, 0
-        targets = WorkSpaceHelper.get_unwanted_submesh_folder_list(kept_pairs)
+        targets = WorkSpaceHelper.get_unwanted_submesh_folder_records(kept_pairs)
         kept_folder_count = WorkSpaceHelper.count_kept_submesh_folders(kept_pairs)
         return targets, len(kept_pairs), kept_folder_count
 
     def invoke(self, context, event):
-        targets, kept_count, kept_folder_count = self._compute_targets(context)
-        self._targets = targets
+        records, kept_count, kept_folder_count = self._compute_targets(context)
+        self._records = records
+        self._targets = [record["folder_path"] for record in records]
         if kept_count == 0:
             self.report(
                 {'ERROR'},
@@ -217,33 +261,60 @@ class SSMT_OT_CleanupUnusedIB(bpy.types.Operator):
                 "如需清空整个工作空间的 IB 文件夹，请使用「清空全部」",
             )
             return {'CANCELLED'}
-        if targets and kept_folder_count == 0:
+        if self._targets and kept_folder_count == 0:
             self.report(
                 {'ERROR'},
                 "场景中的 IB 身份与当前工作空间没有任何匹配（疑似工作空间选错），"
                 "已拒绝清理；确认要删除工作空间全部 IB 文件夹请使用「清空全部」",
             )
             return {'CANCELLED'}
-        if not targets:
-            self.report({'INFO'}, "当前场景已包含工作空间中的全部 IB，无需清理")
-            return {'FINISHED'}
+        # 预览：按"全部目标都删成功"估一下会清掉多少配置引用（dry_run 不写盘）
+        self._config_preview = _prune_workspace_configs(
+            {
+                (record.get("lod_name", ""), record.get("bare_name", ""))
+                for record in records
+            },
+            dry_run=True,
+        )
+        if not self._targets:
+            if not self._config_preview:
+                self.report({'INFO'}, "当前场景已包含工作空间中的全部 IB，无需清理")
+                return {'FINISHED'}
+            # 没有文件夹可删，但仍有历史遗留的失效配置引用（缓存类）→ 让用户确认
+            return context.window_manager.invoke_confirm(self, event)
         return context.window_manager.invoke_confirm(self, event)
 
     def draw(self, context):
         layout = self.layout
-        layout.label(text=f"将删除 {len(self._targets)} 个未使用的 IB 文件夹：")
-        box = layout.box()
-        for folder_path in self._targets[:10]:
-            box.label(text="· " + os.path.basename(folder_path))
-        if len(self._targets) > 10:
-            box.label(text=f"… 等共 {len(self._targets)} 个")
+        preview = getattr(self, "_config_preview", None) or {}
+        if self._targets:
+            layout.label(text=f"将删除 {len(self._targets)} 个未使用的 IB 文件夹：")
+            box = layout.box()
+            for folder_path in self._targets[:10]:
+                box.label(text="· " + os.path.basename(folder_path))
+            if len(self._targets) > 10:
+                box.label(text=f"… 等共 {len(self._targets)} 个")
+        else:
+            layout.label(text="没有可删除的 IB 文件夹，将只清理失效的配置引用：")
+        preview_total = sum(preview.values())
+        if preview_total:
+            layout.label(
+                text=f"并清理 {len(preview)} 个配置文件里的 {preview_total} 条引用：",
+                icon='INFO',
+            )
+            preview_box = layout.box()
+            for rel_path, count in sorted(preview.items())[:8]:
+                preview_box.label(text=f"· {rel_path}（{count} 条）")
+            if len(preview) > 8:
+                preview_box.label(text=f"… 等共 {len(preview)} 个文件")
         layout.label(text="删除后再次一键导入将不再导入这些 IB", icon='INFO')
 
     def execute(self, context):
-        targets = getattr(self, "_targets", None)
-        if not targets:
-            targets, kept_count, kept_folder_count = self._compute_targets(context)
-            self._targets = targets
+        records = getattr(self, "_records", None)
+        if records is None:
+            records, kept_count, kept_folder_count = self._compute_targets(context)
+            self._records = records
+            self._targets = [record["folder_path"] for record in records]
             if kept_count == 0:
                 self.report(
                     {'ERROR'},
@@ -258,6 +329,7 @@ class SSMT_OT_CleanupUnusedIB(bpy.types.Operator):
                     "已拒绝清理；确认要删除工作空间全部 IB 文件夹请使用「清空全部」",
                 )
                 return {'CANCELLED'}
+        targets = [record["folder_path"] for record in records]
         deleted_paths, failed_paths = WorkSpaceHelper.delete_folder_list(targets)
         for folder_path in failed_paths:
             self.report({'WARNING'}, f"删除失败 {os.path.basename(folder_path)}")
@@ -266,7 +338,14 @@ class SSMT_OT_CleanupUnusedIB(bpy.types.Operator):
             print(f"[IB清理] 已删除: {folder_path}")
         for folder_path in failed_paths:
             print(f"[IB清理] 删除失败: {folder_path}")
-        self.report({'INFO'}, f"已删除 {len(deleted_paths)} 个未使用的 IB 文件夹")
+
+        # 只按**确实删除成功**的部件清「意图类」行；缓存类文件按磁盘现状一并扫
+        removed = _prune_workspace_configs(_deleted_lod_bare_pairs(records, deleted_paths))
+        message = (
+            f"已删除 {len(deleted_paths)} 个未使用的 IB 文件夹"
+            + _report_config_prune(removed)
+        )
+        self.report({'INFO'}, message)
         return {'FINISHED'}
 
 
@@ -291,15 +370,16 @@ class SSMT_OT_ClearAllWorkspaceIB(bpy.types.Operator):
         default=False,
     )
 
-    def _compute_all_targets(self, context):
+    def _compute_all_records(self, context):
         workspace_root = GlobalConfig.path_workspace_folder()
         if not workspace_root or not os.path.isdir(workspace_root):
             return []
-        return WorkSpaceHelper.get_all_submesh_folder_list()
+        return WorkSpaceHelper.get_submesh_folder_records()
 
     def invoke(self, context, event):
         self.confirm_wipe = False  # 每次弹窗都从“未确认”开始，防止属性残留直接放行
-        self._targets = self._compute_all_targets(context)
+        self._records = self._compute_all_records(context)
+        self._targets = [record["folder_path"] for record in self._records]
         if not self._targets:
             self.report({'INFO'}, "工作空间中没有可删除的 IB 子网格文件夹")
             return {'FINISHED'}
@@ -317,15 +397,18 @@ class SSMT_OT_ClearAllWorkspaceIB(bpy.types.Operator):
             box.label(text="· " + os.path.basename(folder_path))
         if len(self._targets) > 10:
             box.label(text=f"… 等共 {len(self._targets)} 个")
+        layout.label(text="并同步清理工作页/别名表/贴图标记等配置引用", icon='INFO')
         layout.prop(self, "confirm_wipe")
 
     def execute(self, context):
         if not getattr(self, "confirm_wipe", False):
             self.report({'ERROR'}, "未勾选确认项，已取消清空操作")
             return {'CANCELLED'}
-        targets = getattr(self, "_targets", None)
-        if not targets:
-            targets = self._compute_all_targets(context)
+        records = getattr(self, "_records", None)
+        if records is None:
+            records = self._compute_all_records(context)
+            self._records = records
+        targets = [record["folder_path"] for record in records]
         deleted_paths, failed_paths = WorkSpaceHelper.delete_folder_list(targets)
         for folder_path in failed_paths:
             self.report({'WARNING'}, f"删除失败 {os.path.basename(folder_path)}")
@@ -334,7 +417,12 @@ class SSMT_OT_ClearAllWorkspaceIB(bpy.types.Operator):
             print(f"[IB清理] 已删除: {folder_path}")
         for folder_path in failed_paths:
             print(f"[IB清理] 删除失败: {folder_path}")
-        self.report({'INFO'}, f"已清空 {len(deleted_paths)} 个 IB 文件夹")
+
+        removed = _prune_workspace_configs(_deleted_lod_bare_pairs(records, deleted_paths))
+        self.report(
+            {'INFO'},
+            f"已清空 {len(deleted_paths)} 个 IB 文件夹" + _report_config_prune(removed),
+        )
         return {'FINISHED'}
 
 
