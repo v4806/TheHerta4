@@ -42,6 +42,16 @@ _fake_bpy = types.SimpleNamespace(
 _install_module("bpy", **_fake_bpy.__dict__)
 _install_module("bmesh")
 
+# tt_color_bake 现在相对依赖 toolkit/at_utils.py（抖动透明档位），
+# 空 __path__ 的假包解析不了，按真实文件登记到同一个假包前缀下。
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+for _real_module in ("at_utils",):
+    _spec = importlib.util.spec_from_file_location(
+        f"{PKG}.toolkit.{_real_module}", _REPO_ROOT / "toolkit" / f"{_real_module}.py")
+    _module = importlib.util.module_from_spec(_spec)
+    sys.modules[_spec.name] = _module
+    _spec.loader.exec_module(_module)
+
 
 module_path = Path(__file__).resolve().parents[1] / "toolkit" / "tt_color_bake.py"
 spec = importlib.util.spec_from_file_location(f"{PKG}.toolkit.tt_color_bake", module_path)

@@ -4,6 +4,8 @@ from pathlib import Path
 import bpy
 import numpy as np
 
+from .at_utils import apply_dithered_transparency, disable_transparent_overlap
+
 try:
     from scipy import ndimage
     SCIPY_AVAILABLE = True
@@ -768,11 +770,8 @@ class TT_OT_execute_channel_composite(bpy.types.Operator):
         output_node = node_tree.nodes.new("ShaderNodeOutputMaterial")
         output_node.location = (220, 0)
 
-        mat.blend_method = "DITHER"   # 抖动透明（用户规则：防半透明排序/边缘伪影，勿用 BLEND）
-        if hasattr(mat, "use_transparency_overlap"):
-            mat.use_transparency_overlap = False
-        elif hasattr(mat, "show_transparent_back"):
-            mat.show_transparent_back = False
+        apply_dithered_transparency(mat)
+        disable_transparent_overlap(mat)
         node_tree.links.new(tex_node.outputs["Color"], diffuse_bsdf.inputs["Color"])
         node_tree.links.new(tex_node.outputs["Alpha"], mix_shader.inputs["Fac"])
         node_tree.links.new(transparent_bsdf.outputs["BSDF"], mix_shader.inputs[1])

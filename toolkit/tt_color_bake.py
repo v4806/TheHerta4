@@ -5,6 +5,8 @@ import traceback
 import bmesh
 from pathlib import Path
 
+from .at_utils import apply_dithered_transparency, disable_transparent_overlap
+
 BAKE_RESOLUTION_DEFAULT_RULES = [
     {"pattern": r"^DiffuseMap_high", "resolution": 4096, "enabled": True},
     {"pattern": r"^DiffuseMap", "resolution": 2048, "enabled": True},
@@ -578,15 +580,8 @@ class TT_OT_bake_color_maps(bpy.types.Operator):
         output_node.location = (260, 0)
 
         # 透明排序用抖动而非混合：避免 BLEND 的排序开销与半透明重叠问题
-        # （4.2+ 称 DITHERED，旧版称 HASHED）
-        try:
-            material.blend_method = 'DITHERED'
-        except TypeError:
-            material.blend_method = 'HASHED'
-        if hasattr(material, "use_transparency_overlap"):
-            material.use_transparency_overlap = False
-        elif hasattr(material, "show_transparent_back"):
-            material.show_transparent_back = False
+        apply_dithered_transparency(material)
+        disable_transparent_overlap(material)
         node_tree.links.new(tex_node.outputs['Color'], diffuse_node.inputs['Color'])
         node_tree.links.new(tex_node.outputs['Alpha'], mix_shader.inputs['Fac'])
         node_tree.links.new(transparent_node.outputs['BSDF'], mix_shader.inputs[1])

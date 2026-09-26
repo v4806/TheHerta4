@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 from collections import defaultdict
 from ..utils.color_attribute_utils import write_color_attribute_data
+from .at_utils import apply_dithered_transparency, disable_transparent_overlap
 
 
 def _alpha_channel_is_effectively_opaque(alpha_channel, *, opaque_threshold: float = 252.0 / 255.0) -> bool:
@@ -82,11 +83,8 @@ class TT_OT_extract_alpha_channel(bpy.types.Operator):
         output_node = node_tree.nodes.new('ShaderNodeOutputMaterial')
         output_node.location = (200, 0)
 
-        mat.blend_method = 'DITHER'   # 抖动透明（用户规则：防半透明排序/边缘伪影，勿用 BLEND）
-        if hasattr(mat, "use_transparency_overlap"):
-            mat.use_transparency_overlap = False
-        elif hasattr(mat, "show_transparent_back"):
-            mat.show_transparent_back = False
+        apply_dithered_transparency(mat)
+        disable_transparent_overlap(mat)
         node_tree.links.new(tex_node.outputs['Color'], diffuse_bsdf.inputs['Color'])
         node_tree.links.new(tex_node.outputs['Alpha'], mix_shader.inputs['Fac'])
         node_tree.links.new(transparent_bsdf.outputs['BSDF'], mix_shader.inputs[1])
