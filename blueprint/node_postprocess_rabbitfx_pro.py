@@ -24,6 +24,15 @@
   （RabbitFX.ini ``[CommandListRun]`` 结尾），这里再显式写一遍作为双保险，
   同时覆盖「只绑定、不 Run」的异常路径。
 
+**命名空间随游戏走**：本节点注入的名字全部取自
+:mod:`blueprint.fx_namespace` 的档案，不再写死 ``RabbitFX``。
+
+* HIMI（崩坏 3）→ ``HI3FX``：变量是小写 ``$\\HI3FX\\h/s/v``，复位必须走
+  ``run = CommandList\\HI3FX\\Reset``（HI3FX 的 ``Run`` 不复位变量，照搬
+  RabbitFX 的「写 0 再 Run」会让后续绘制全黑）；
+* HI3FX 没有 ``SetFXBuffer`` / ``ERun`` / ``ColorShift``，所以 HIMI 下
+  **W-Engine 同步与颜色偏移自动跳过**（面板会标出来）。
+
 INI 语法全部对照官方 mod 说明与随附 demo（v7.8）：
 https://gamebanana.com/mods/531649
 """
@@ -36,6 +45,7 @@ import re
 import uuid
 from collections import OrderedDict
 
+from . import fx_namespace
 from .node_postprocess_base import SSMTNode_PostProcess_Base
 from .node_postprocess_rabbitfx import (
     _extract_hash_from_object,
@@ -46,11 +56,10 @@ NODE_IDNAME = 'SSMTNode_PostProcess_RabbitFXPro'
 MATERIAL_NODE_IDNAME = 'SSMTNode_PostProcess_CustomMaterialAssign'
 LEGACY_MATERIAL_NODE_IDNAME = 'SSMTNode_PostProcess_Material'
 
-FX_NAMESPACE = "RabbitFX"
-GLOW_REF = r"Resource\RabbitFX\Glowmap"
-FXMAP_REF = r"Resource\RabbitFX\FXMap"
+# 下面这些常量只属于 RabbitFX 的 W-Engine 同步 / ColorShift 路径（HI3FX 没有对应
+# 能力，相关分支在 fx_profile 不支持时直接跳过），命名空间相关的名字一律从
+# blueprint/fx_namespace.py 的档案取。
 SET_FX_BUFFER_REF = r"Resource\RabbitFX\SetFXBuffer"
-RUN_LINE = r"run = CommandList\RabbitFX\Run"
 COLOR_SHIFT_LINE = r"run = CommandList\RabbitFX\ColorShift"
 E_RUN_LINE = r"run = CommandList\RabbitFX\ERun"
 UPDATE_BUFFER_LINE = r"pre run = CommandList\RabbitFX\UpdateFXBuffer"
@@ -80,32 +89,16 @@ _VAR_IF_RE = re.compile(r"^if\s+\$rfxpro_", re.IGNORECASE)
 
 _MESH_LINE_RE = re.compile(r"^\s*\[mesh:(?P<name>.+?)\]\s*$", re.IGNORECASE)
 _DRAW_LINE_RE = re.compile(r"^(drawindexed|draw)\s*=", re.IGNORECASE)
-_RUN_LINE_RE = re.compile(r"^run\s*=\s*commandlist\\rabbitfx\\run$", re.IGNORECASE)
 _IF_LINE_RE = re.compile(r"^if\s+", re.IGNORECASE)
-_GLOW_REF_RE = re.compile(
-    r"^Resource\\RabbitFX\\Glowmap\s*=\s*(?:ref\s+)?(?P<name>.+?)\s*$", re.IGNORECASE
-)
-_FXMAP_REF_RE = re.compile(
-    r"^Resource\\RabbitFX\\FXMap\s*=\s*(?:ref\s+)?(?P<name>.+?)\s*$", re.IGNORECASE
-)
 
 
 def _mesh_object_poll(_self, obj):
     return bool(getattr(obj, "type", "") == "MESH")
 
 
-_NTEMIFX_REF_RE = re.compile(
-    r"^Resource\\NTEMIFX\\(?:Glowmap|FXMap)\s*=", re.IGNORECASE
-)
-
-
-def _has_ntemifx_bindings(sections):
-    """配置表里是否存在 NTEMIFX 命名空间的发光/裁切绑定（NTEMI 逻辑）。"""
-    for section_lines in sections.values():
-        for line in section_lines:
-            if _NTEMIFX_REF_RE.match(str(line).strip()):
-                return True
-    return False
+def _binding_namespaces(sections):
+    """配置表里出现过的 FX 命名空间档案（用来告诉作者该表用的是哪一套名字）。"""
+    return fx_namespace.detect_profiles(sections)
 
 
 def _find_material_node_in_tree(node):
@@ -249,20 +242,25 @@ def _find_draw_block_end(lines, start, end):
     return draw_index + 1
 
 
-def _collect_existing_refs(lines, start, end):
+def _collect_existing_refs(lines, start, end, profile):
+    """收集块内已有的发光/FX 别名绑定与 ``Run`` 行位置（按命名空间档案匹配）。
+
+    匹配名字取自档案，所以 HIMI（``Resource\\HI3FX\\GlowMap`` /
+    ``run = CommandList\\HI3FX\\Run``）与 RabbitFX 走的是同一条逻辑。
+    """
     glow_ref = ""
     fxmap_ref = ""
     run_index = -1
     for index in range(start, end):
         stripped = str(lines[index]).strip()
-        if run_index < 0 and _RUN_LINE_RE.match(stripped):
+        if run_index < 0 and profile.run_line_re.match(stripped):
             run_index = index
         if not glow_ref:
-            match = _GLOW_REF_RE.match(stripped)
+            match = profile.glow_ref_re.match(stripped)
             if match and match.group("name").strip().casefold() != "null":
                 glow_ref = match.group("name").strip()
         if not fxmap_ref:
-            match = _FXMAP_REF_RE.match(stripped)
+            match = profile.fxmap_ref_re.match(stripped)
             if match and match.group("name").strip().casefold() != "null":
                 fxmap_ref = match.group("name").strip()
     return glow_ref, fxmap_ref, run_index
@@ -413,21 +411,26 @@ class SSMTNode_PostProcess_RabbitFXPro(SSMTNode_PostProcess_Base):
 
     # ── 静态发光 ──
     enable_glow: bpy.props.BoolProperty(
-        name="静态发光", description="写入 $\\RabbitFX\\H/S/V/brightness/interpolate", default=True
+        name="静态发光",
+        description=(
+            "写入当前游戏的 FX 变量：RabbitFX 是 $\\RabbitFX\\H/S/V/brightness/interpolate，"
+            "HIMI（崩坏 3）是 $\\HI3FX\\h/s/v/brightness/interpolate"
+        ),
+        default=True,
     )
     glow_h: bpy.props.FloatProperty(name="H 色相", default=0.0, min=-360, max=360)
     glow_s: bpy.props.FloatProperty(name="S 饱和度", default=0.0, min=-100, max=100)
     glow_v: bpy.props.FloatProperty(name="V 明度", default=0.0, min=-100, max=100)
     glow_brightness: bpy.props.FloatProperty(
         name="发光强度/光晕范围",
-        description="$\\RabbitFX\\brightness，越大光晕越强",
+        description="$\\RabbitFX\\brightness（HIMI 为 $\\HI3FX\\brightness），越大光晕越强",
         default=8.0,
         min=0,
         max=500,
     )
     glow_interpolate: bpy.props.FloatProperty(
         name="插值",
-        description="$\\RabbitFX\\interpolate，0=原色 1=完全偏移",
+        description="$\\RabbitFX\\interpolate（HIMI 为 $\\HI3FX\\interpolate），0=原色 1=完全偏移",
         default=1.0,
         min=0,
         max=1,
@@ -527,6 +530,27 @@ class SSMTNode_PostProcess_RabbitFXPro(SSMTNode_PostProcess_Base):
         """呼吸灯是否生效（需勾选呼吸灯；发光贴图参数关掉时不会执行 Run）。"""
         return bool(self.enable_breath)
 
+    @property
+    def fx_profile(self):
+        """当前导出逻辑对应的 FX 命名空间档案。
+
+        HIMI（崩坏 3）→ ``HI3FX``；NTEMI → ``NTEMIFX``；其余 → ``RabbitFX``。
+        每次取用都重新解析，切逻辑后不需要重开蓝图。
+        """
+        return fx_namespace.current_profile()
+
+    @property
+    def fx_profile_label(self):
+        """面板上显示用的「命名空间 + 能力」说明。"""
+        profile = self.fx_profile
+        limits = []
+        if not profile.supports_sync:
+            limits.append("无 W-Engine 同步")
+        if not profile.supports_colorshift:
+            limits.append("无颜色偏移")
+        suffix = f"（{'、'.join(limits)}）" if limits else ""
+        return f"FX 命名空间：{profile.key}{suffix}"
+
     def init(self, context):
         super().init(context)
         if not self.buffer_tag:
@@ -542,6 +566,7 @@ class SSMTNode_PostProcess_RabbitFXPro(SSMTNode_PostProcess_Base):
         self._draw_fx_block(layout)     # 内部再画子项同步/颜色偏移
 
         layout.separator()
+        layout.label(text=self.fx_profile_label, icon='INFO')
         layout.prop(self, "enable_reset")
 
     def _draw_glow_block(self, layout):
@@ -636,6 +661,7 @@ class SSMTNode_PostProcess_RabbitFXPro(SSMTNode_PostProcess_Base):
 
     def _draw_sync_block(self, layout):
         """W-Engine 同步（FX 贴图参数的子级）。"""
+        profile = self.fx_profile
         row = layout.row(align=True)
         row.prop(
             self, "show_sync", text="",
@@ -647,17 +673,24 @@ class SSMTNode_PostProcess_RabbitFXPro(SSMTNode_PostProcess_Base):
         if not self.show_sync:
             return
 
+        if not profile.supports_sync:
+            layout.label(
+                text=f"{profile.key} 没有 W-Engine 同步，本项不生成任何行",
+                icon='INFO',
+            )
+
         col = layout.column(align=True)
-        col.enabled = bool(self.enable_sync)
+        col.enabled = bool(self.enable_sync) and profile.supports_sync
         col.prop(self, "sync_blendmode")
         col.prop(self, "sync_brightness_only")
         col.prop(self, "buffer_mode", text="缓冲写法")
         col.prop(self, "sync_source_object", text="提取源")
-        if self.enable_sync:
+        if self.enable_sync and profile.supports_sync:
             layout.label(text="提取源 = 带引擎发光的部件（通常是头发）", icon='INFO')
 
     def _draw_colorshift_block(self, layout):
         """颜色偏移（FX 贴图参数的子级）。"""
+        profile = self.fx_profile
         row = layout.row(align=True)
         row.prop(
             self, "show_colorshift", text="",
@@ -669,13 +702,19 @@ class SSMTNode_PostProcess_RabbitFXPro(SSMTNode_PostProcess_Base):
         if not self.show_colorshift:
             return
 
+        if not profile.supports_colorshift:
+            layout.label(
+                text=f"{profile.key} 没有 ColorShift，本项不生成任何行",
+                icon='INFO',
+            )
+
         col = layout.column(align=True)
-        col.enabled = bool(self.enable_colorshift)
+        col.enabled = bool(self.enable_colorshift) and profile.supports_colorshift
         r = col.row(align=True)
         r.prop(self, "cs_h")
         r.prop(self, "cs_s")
         r.prop(self, "cs_v")
-        if self.enable_colorshift:
+        if self.enable_colorshift and profile.supports_colorshift:
             layout.label(text="FX 贴图 R 通道作为偏移遮罩", icon='INFO')
 
     def _draw_targets(self, layout):
@@ -749,9 +788,17 @@ class SSMTNode_PostProcess_RabbitFXPro(SSMTNode_PostProcess_Base):
         if not self.buffer_tag:
             self.buffer_tag = uuid.uuid4().hex[:8]
 
+        profile = self.fx_profile
         targets = [item for item in self.target_items if item.target_object is not None]
         sync_source = self.sync_source_object if self.enable_sync else None
-        if self.enable_sync and sync_source is None:
+        if self.enable_sync and not profile.supports_sync:
+            # HI3FX 没有 SetFXBuffer / ERun / UpdateFXBuffer，同步整块不可用。
+            print(
+                f"[RabbitFXPro] {profile.key} 没有 W-Engine 同步能力，"
+                "本次导出跳过同步（包括提取源）"
+            )
+            sync_source = None
+        elif self.enable_sync and sync_source is None:
             print(
                 "[RabbitFXPro] 警告: 已开启 W-Engine 同步但未指定「提取源物体」，"
                 "引擎发光色不会被提取"
@@ -810,7 +857,7 @@ class SSMTNode_PostProcess_RabbitFXPro(SSMTNode_PostProcess_Base):
             changed |= self._process_target(sections, item, buffer_name)
         if sync_source is not None:
             changed |= self._process_sync_source(sections, sync_source, buffer_name)
-        if self.enable_sync and changed:
+        if self.enable_sync and self.fx_profile.supports_sync and changed:
             changed |= self._ensure_buffer_resource(sections, buffer_name)
         if changed and self.enable_glow and self._breathing():
             changed |= self._ensure_breath_constants(sections)
@@ -855,26 +902,39 @@ class SSMTNode_PostProcess_RabbitFXPro(SSMTNode_PostProcess_Base):
             for start, end in reversed(blocks):
                 changed |= self._patch_mesh_block(section_lines, start, end, obj.name, buffer_name)
         if not changed:
+            profile = self.fx_profile
             print(
-                f"[RabbitFXPro] 未找到 {obj.name} 的 RabbitFX 贴图绑定，跳过"
+                f"[RabbitFXPro] 未找到 {obj.name} 的 {profile.key} 贴图绑定，跳过"
                 f"（哈希 {hash_val}；确认本节点接在材质转资源之后）"
             )
-            if _has_ntemifx_bindings(sections):
+            if not profile.supports_pro_injection:
                 print(
-                    "[RabbitFXPro] 提示: 该配置表用的是 NTEMIFX 命名空间（NTEMI 逻辑），"
-                    "本节点只注入 RabbitFX 命名空间"
+                    f"[RabbitFXPro] 提示: 当前逻辑的 FX 命名空间是 {profile.key}，"
+                    "本节点只对 RabbitFX / HI3FX 注入参数"
                 )
+            else:
+                others = [
+                    found.key
+                    for found in _binding_namespaces(sections)
+                    if found.key != profile.key
+                ]
+                if others:
+                    print(
+                        f"[RabbitFXPro] 提示: 该配置表里的绑定用的是 "
+                        f"{'、'.join(others)} 命名空间，与当前逻辑的 {profile.key} 不一致，"
+                        "本节点只注入当前逻辑对应的命名空间"
+                    )
         return changed
 
-    @staticmethod
-    def _collect_target_blocks(sections, hash_val, suffix_pattern):
+    def _collect_target_blocks(self, sections, hash_val, suffix_pattern):
         """返回 [(段名, [(块首, 块尾), ...]), ...]，按段内 mesh 注释匹配目标物体。
 
         不限定 ``[TextureOverride_*]``：EFMI 合并骨骼把绘制内容放在
         ``[CommandList_*]`` 回调段里，ZZMI 的 TTL 重建也会另开段，材质转资源
-        写下的 RabbitFX 绑定跟着 mesh 块走，所以只要段里带这个物体的 mesh 块
+        写下的 FX 绑定跟着 mesh 块走，所以只要段里带这个物体的 mesh 块
         就一起处理。
         """
+        profile = self.fx_profile
         result = []
         for section_name, section_lines in sections.items():
             if not section_name.startswith('['):
@@ -890,7 +950,7 @@ class SSMTNode_PostProcess_RabbitFXPro(SSMTNode_PostProcess_Base):
                 (start, end)
                 for start, end in blocks
                 if _find_draw_index(section_lines, start, end) >= 0
-                or _collect_existing_refs(section_lines, start, end)[2] >= 0
+                or _collect_existing_refs(section_lines, start, end, profile)[2] >= 0
             ]
             if usable:
                 result.append((section_name, usable))
@@ -909,14 +969,15 @@ class SSMTNode_PostProcess_RabbitFXPro(SSMTNode_PostProcess_Base):
                 continue
             if suffix_pattern and suffix_pattern not in section_name.replace('-', '_').lower():
                 continue
-            if _collect_existing_refs(section_lines, 0, len(section_lines))[2] < 0:
+            if _collect_existing_refs(section_lines, 0, len(section_lines), profile)[2] < 0:
                 continue
             result.append((section_name, [(0, len(section_lines))]))
         return result
 
     def _patch_mesh_block(self, lines, start, end, object_label, buffer_name):
+        profile = self.fx_profile
         block = _strip_previous_blocks(lines[start:end])
-        glow_ref, fxmap_ref, run_index = _collect_existing_refs(block, 0, len(block))
+        glow_ref, fxmap_ref, run_index = _collect_existing_refs(block, 0, len(block), profile)
         draw_index = _find_draw_index(block, 0, len(block))
         if draw_index < 0:
             return False
@@ -934,7 +995,7 @@ class SSMTNode_PostProcess_RabbitFXPro(SSMTNode_PostProcess_Base):
 
         insert_at = run_index if run_index >= 0 else draw_index
         if param_lines and run_index < 0:
-            param_lines = [*param_lines, RUN_LINE]
+            param_lines = [*param_lines, profile.run_line]
         # ColorShift 必须在 Run 之后（Run 结尾会把 ResourceFXMap 清空）。
         cs_position = (run_index + 1) if run_index >= 0 else (insert_at + len(param_lines))
 
@@ -954,6 +1015,7 @@ class SSMTNode_PostProcess_RabbitFXPro(SSMTNode_PostProcess_Base):
 
     def _build_param_lines(self, glow_ref, fxmap_ref, object_label, buffer_name):
         """返回 (行, 是否写了发光参数, 是否写了 W-Engine 同步参数)。"""
+        profile = self.fx_profile
         lines = []
         wrote_glow = False
         wrote_sync = False
@@ -965,7 +1027,13 @@ class SSMTNode_PostProcess_RabbitFXPro(SSMTNode_PostProcess_Base):
             wrote_glow = True
         elif self.enable_glow:
             print(f"[RabbitFXPro] {object_label}: 没有发光贴图绑定，跳过发光参数")
-        if self.enable_sync and (glow_ref or fxmap_ref):
+        if self.enable_sync and not profile.supports_sync:
+            # HI3FX 没有 SetFXBuffer / ERun / blendmode，硬写只会产生无效指令。
+            print(
+                f"[RabbitFXPro] {object_label}: {profile.key} 没有 W-Engine 同步能力，"
+                "已跳过同步参数"
+            )
+        elif self.enable_sync and (glow_ref or fxmap_ref):
             lines.extend(self._build_sync_lines(buffer_name))
             wrote_sync = True
         if not lines:
@@ -973,12 +1041,13 @@ class SSMTNode_PostProcess_RabbitFXPro(SSMTNode_PostProcess_Base):
         return [_PARAM_BEGIN, *lines, _PARAM_END], wrote_glow, wrote_sync
 
     def _build_static_glow_lines(self):
+        param = self.fx_profile.param
         return [
-            f"$\\RabbitFX\\H = {_format_float(self.glow_h)}",
-            f"$\\RabbitFX\\S = {_format_float(self.glow_s)}",
-            f"$\\RabbitFX\\V = {_format_float(self.glow_v)}",
-            f"$\\RabbitFX\\brightness = {_format_float(self.glow_brightness)}",
-            f"$\\RabbitFX\\interpolate = {_format_float(self.glow_interpolate)}",
+            f"{param('h')} = {_format_float(self.glow_h)}",
+            f"{param('s')} = {_format_float(self.glow_s)}",
+            f"{param('v')} = {_format_float(self.glow_v)}",
+            f"{param('brightness')} = {_format_float(self.glow_brightness)}",
+            f"{param('interpolate')} = {_format_float(self.glow_interpolate)}",
         ]
 
     def _build_breath_lines(self):
@@ -1003,35 +1072,36 @@ class SSMTNode_PostProcess_RabbitFXPro(SSMTNode_PostProcess_Base):
         ]
         bmin = _format_number(self.breath_brightness_min)
         bmax = _format_number(self.breath_brightness_max)
+        param = self.fx_profile.param
         if self.breath_mode == 'SINGLE':
             lines.extend(
                 [
-                    f"$\\RabbitFX\\H = {_format_number(self.breath_h)}",
-                    f"$\\RabbitFX\\S = {_format_number(self.breath_s)}",
-                    f"$\\RabbitFX\\V = {_format_number(self.breath_v)}",
-                    f"$\\RabbitFX\\brightness = {bmin} + ({bmax} - {bmin}) * {glow} / {fps}",
+                    f"{param('h')} = {_format_number(self.breath_h)}",
+                    f"{param('s')} = {_format_number(self.breath_s)}",
+                    f"{param('v')} = {_format_number(self.breath_v)}",
+                    f"{param('brightness')} = {bmin} + ({bmax} - {bmin}) * {glow} / {fps}",
                 ]
             )
         elif self.breath_mode == 'RAINBOW':
             lines.extend(
                 [
-                    f"$\\RabbitFX\\H = {glow} * {_format_number(360.0 / fps)}",
-                    f"$\\RabbitFX\\S = {_format_number(self.breath_s)}",
-                    f"$\\RabbitFX\\V = {_format_number(self.breath_v)}",
-                    f"$\\RabbitFX\\brightness = {bmax}",
+                    f"{param('h')} = {glow} * {_format_number(360.0 / fps)}",
+                    f"{param('s')} = {_format_number(self.breath_s)}",
+                    f"{param('v')} = {_format_number(self.breath_v)}",
+                    f"{param('brightness')} = {bmax}",
                 ]
             )
         else:  # COMBO
             lines.extend(
                 [
-                    f"$\\RabbitFX\\H = {glow} * {_format_number(360.0 / fps)}",
-                    f"$\\RabbitFX\\S = {_format_number(self.breath_s)}",
-                    f"$\\RabbitFX\\V = {_format_number(self.breath_v)}",
-                    f"$\\RabbitFX\\brightness = {glow} * {_format_number(float(self.breath_brightness_max) / fps)}",
+                    f"{param('h')} = {glow} * {_format_number(360.0 / fps)}",
+                    f"{param('s')} = {_format_number(self.breath_s)}",
+                    f"{param('v')} = {_format_number(self.breath_v)}",
+                    f"{param('brightness')} = {glow} * {_format_number(float(self.breath_brightness_max) / fps)}",
                 ]
             )
         lines.extend(
-            [f"$\\RabbitFX\\interpolate = {_format_number(self.breath_interpolate)}", _BREATH_END]
+            [f"{param('interpolate')} = {_format_number(self.breath_interpolate)}", _BREATH_END]
         )
         return lines
 
@@ -1046,51 +1116,70 @@ class SSMTNode_PostProcess_RabbitFXPro(SSMTNode_PostProcess_Base):
         return lines
 
     def _build_colorshift_lines(self, fxmap_ref, object_label):
+        profile = self.fx_profile
         if not self.enable_colorshift:
+            return []
+        if not profile.supports_colorshift:
+            # HI3FX 没有 ColorShift 命令列表，写出来只会是无效指令。
+            print(
+                f"[RabbitFXPro] {object_label}: {profile.key} 没有 ColorShift 能力，"
+                "已跳过颜色偏移"
+            )
             return []
         if not fxmap_ref:
             print(f"[RabbitFXPro] {object_label}: 没有 FXMap 绑定，跳过 ColorShift")
             return []
+        param = profile.param
         return [
             _CS_BEGIN,
-            f"{FXMAP_REF} = ref {fxmap_ref}",
-            f"$\\RabbitFX\\H = {_format_float(self.cs_h)}",
-            f"$\\RabbitFX\\S = {_format_float(self.cs_s)}",
-            f"$\\RabbitFX\\V = {_format_float(self.cs_v)}",
+            f"{profile.fxmap_ref} = ref {fxmap_ref}",
+            f"{param('h')} = {_format_float(self.cs_h)}",
+            f"{param('s')} = {_format_float(self.cs_s)}",
+            f"{param('v')} = {_format_float(self.cs_v)}",
             COLOR_SHIFT_LINE,
             _CS_END,
         ]
 
     def _build_reset_lines(self, block, wrote_glow, wrote_sync, wrote_colorshift):
-        """只复位本节点真正写过的东西；材质转资源已有的复位行不重复写。"""
+        """只复位本节点真正写过的东西；材质转资源已有的复位行不重复写。
+
+        RabbitFX/NTEMIFX：运行时 ``Run`` 结尾自带变量复位，所以写 0 + 再 Run 一次即可。
+        HI3FX：``Run`` **不**复位变量，写 0 会让后续绘制一直吃 ``brightness = 0``
+        （模型变黑），所以改成调 ``CommandList\\HI3FX\\Reset``。
+        """
+        profile = self.fx_profile
         candidates = []
         if wrote_glow:
-            candidates.append(f"{GLOW_REF} = ref null")
+            candidates.append(f"{profile.glow_ref} = ref null")
         if wrote_colorshift:
-            candidates.append(f"{FXMAP_REF} = ref null")
+            candidates.append(f"{profile.fxmap_ref} = ref null")
         if wrote_sync:
             candidates.append(f"{SET_FX_BUFFER_REF} = ref null")
-        if wrote_glow or wrote_colorshift:
-            candidates.extend(
-                [
-                    "$\\RabbitFX\\H = 0",
-                    "$\\RabbitFX\\S = 0",
-                    "$\\RabbitFX\\V = 0",
-                ]
-            )
-        if wrote_glow:
-            candidates.extend(
-                [
-                    "$\\RabbitFX\\brightness = 0",
-                    "$\\RabbitFX\\interpolate = 0",
-                ]
-            )
+        if profile.reset_neutralises_variables:
+            param = profile.param
+            if wrote_glow or wrote_colorshift:
+                candidates.extend(
+                    [
+                        f"{param('h')} = 0",
+                        f"{param('s')} = 0",
+                        f"{param('v')} = 0",
+                    ]
+                )
+            if wrote_glow:
+                candidates.extend(
+                    [
+                        f"{param('brightness')} = 0",
+                        f"{param('interpolate')} = 0",
+                    ]
+                )
+        elif wrote_glow or wrote_colorshift or wrote_sync:
+            candidates.append(profile.reset_line)
         if wrote_sync:
             candidates.append("$\\rabbitfx\\blendmode = 0")
             if self.sync_brightness_only:
                 candidates.append("$\\rabbitfx\\syncbrightnessonly = 0")
         existing = {str(line).strip().casefold() for line in block}
-        lines = [line for line in candidates if line.casefold() not in existing]
+        lines = [line for line in candidates if line and line.casefold() not in existing]
         if not lines:
             return []
         return [_RESET_BEGIN, *lines, _RESET_END]
@@ -1121,8 +1210,9 @@ class SSMTNode_PostProcess_RabbitFXPro(SSMTNode_PostProcess_Base):
         if draw_index < 0:
             return False
         run_index = -1
+        run_line_re = self.fx_profile.run_line_re
         for index in range(0, draw_index):
-            if _RUN_LINE_RE.match(str(block[index]).strip()):
+            if run_line_re.match(str(block[index]).strip()):
                 run_index = index
                 break
 
@@ -1135,7 +1225,7 @@ class SSMTNode_PostProcess_RabbitFXPro(SSMTNode_PostProcess_Base):
             # 3DMigoto 资源拷贝：自定义资源先声明空段，拷贝语句写在绘制段里执行
             # （官方 Resource Copying 文档）。每帧先按 RabbitFX 自己的 FXBuffer
             # 重建一份，再交给 ERun 写入引擎发光色，目标部件只读同一份资源。
-            block_lines.append(f"{buffer_name} = copy Resource\\{FX_NAMESPACE}\\FXBuffer")
+            block_lines.append(f"{buffer_name} = copy Resource\\RabbitFX\\FXBuffer")
             block_lines.append(f"{SET_FX_BUFFER_REF} = ref {buffer_name}")
             block_lines.append(UPDATE_BUFFER_LINE)
             block_lines.append(E_RUN_LINE)

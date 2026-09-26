@@ -8,7 +8,9 @@
 * W-Engine 同步的缓冲资源、copy 行与提取源 ERun；
 * 多个同类节点串联、只改各自列表里的物体；
 * 没有 FX 绑定的物体不改文件；
-* 同一物体被两个同类节点接管时导出前报错。
+* 同一物体被两个同类节点接管时导出前报错；
+* HIMI（崩坏 3）走 HI3FX 命名空间：``$\\HI3FX\\h/s/v`` 注入、复位改走
+  ``CommandList\\HI3FX\\Reset``，同步与 ColorShift 自动跳过。
 """
 
 import importlib.util
@@ -119,6 +121,15 @@ _install_module(
     ObjectPrefixHelper=types.SimpleNamespace(extract_prefix_info=_extract_prefix_info),
 )
 
+_install_module(
+    f"{PKG}.common.logic_name",
+    LogicName=types.SimpleNamespace(HIMI="HIMI", NTEMI="NTEMI"),
+)
+_install_module(
+    f"{PKG}.common.global_config",
+    GlobalConfig=types.SimpleNamespace(logic_name="ZZMI"),
+)
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -132,7 +143,9 @@ def _load(module_name, relative_path):
     return module
 
 
-# 先加载旧的 RabbitFX 节点模块：新节点直接复用它导出的哈希/标识解析函数。
+# FX 命名空间档案要最先加载：材质转资源与 pro 节点都从它取名字。
+fx_namespace = _load("fx_namespace", "blueprint/fx_namespace.py")
+# 再加载旧的 RabbitFX 节点模块：新节点直接复用它导出的哈希/标识解析函数。
 _load("node_postprocess_rabbitfx", "blueprint/node_postprocess_rabbitfx.py")
 pro = _load("node_postprocess_rabbitfx_pro", "blueprint/node_postprocess_rabbitfx_pro.py")
 
@@ -363,9 +376,13 @@ class RabbitFXProTests(unittest.TestCase):
         self.ini_path = os.path.join(self.export_dir, "mod.ini")
         self._probe_backup = pro._PROBE
         pro._PROBE = _StubProbe()
+        # 命名空间按当前逻辑解析，测试之间必须复位，否则会互相污染。
+        self._logic_backup = sys.modules[f"{PKG}.common.global_config"].GlobalConfig.logic_name
+        sys.modules[f"{PKG}.common.global_config"].GlobalConfig.logic_name = "ZZMI"
 
     def tearDown(self):
         pro._PROBE = self._probe_backup
+        sys.modules[f"{PKG}.common.global_config"].GlobalConfig.logic_name = self._logic_backup
         self._temp.cleanup()
 
     # ──────────────── 目标物体列表（一个大列表） ────────────────
@@ -1004,6 +1021,183 @@ class RabbitFXProTests(unittest.TestCase):
             self.assertEqual(pro._probe_fx_textures(plain), (False, False))
         finally:
             pro._PROBE = original
+
+    # ──────────────── HIMI（崩坏 3）→ HI3FX ────────────────
+
+    HIMI_SECTION = (
+        f"[{GLOW_SECTION}]\n"
+        f"[mesh:{MESH_NAME}]\n"
+        "hash = fd054d1d\n"
+        "match_first_index = 0\n"
+        "Resource\\HI3FX\\GlowMap = ref Resource_Glowmap_5_Body\n"
+        "$\\HI3FX\\brightness = 5\n"
+        "run = CommandList\\HI3FX\\Run\n"
+        "drawindexed = 52688, 0, 3\n"
+        "Resource\\HI3FX\\GlowMap = ref null\n"
+        "run = CommandList\\HI3FX\\Reset\n"
+    )
+
+    def _use_himi(self):
+        sys.modules[f"{PKG}.common.global_config"].GlobalConfig.logic_name = "HIMI"
+
+    def test_himi_static_glow_uses_lowercase_hi3fx_params(self):
+        """HIMI 注入的是 $\\HI3FX\\h/s/v（小写），不是 RabbitFX 的 H/S/V。"""
+        self._use_himi()
+        _write_ini(self.ini_path, self.HIMI_SECTION)
+        node = _make_node(target_items=[_item(_fake_object())])
+
+        node.execute_postprocess(self.export_dir)
+        content = _read_ini(self.ini_path)
+
+        self.assertIn(pro._PARAM_BEGIN, content)
+        self.assertIn("$\\HI3FX\\h = 0.0", content)
+        self.assertIn("$\\HI3FX\\s = 0.0", content)
+        self.assertIn("$\\HI3FX\\v = 0.0", content)
+        self.assertIn("$\\HI3FX\\brightness = 8.0", content)
+        self.assertIn("$\\HI3FX\\interpolate = 1.0", content)
+        self.assertNotIn("$\\RabbitFX\\H", content)
+        self.assertNotIn("$\\RabbitFX\\brightness", content)
+        # 参数必须排在 HI3FX 的 Run 之前。
+        self.assertLess(
+            content.index(pro._PARAM_BEGIN),
+            content.index("run = CommandList\\HI3FX\\Run"),
+        )
+
+    def test_himi_reset_uses_hi3fx_reset_command_list(self):
+        """HI3FX 的 Run 不复位变量，所以复位必须走 CommandList\\HI3FX\\Reset。
+
+        照搬 RabbitFX 的「写 0 再 Run 一次」会让 ``$brightness`` 一直停在 0，
+        后续绘制全黑——这里断言 HIMI 下**不**生成任何 ``= 0`` 的复位参数行。
+        """
+        self._use_himi()
+        bind_only = (
+            f"[{GLOW_SECTION}]\n"
+            f"[mesh:{MESH_NAME}]\n"
+            "hash = fd054d1d\n"
+            "Resource\\HI3FX\\GlowMap = ref Resource_Glowmap_5_Body\n"
+            "$\\HI3FX\\brightness = 5\n"
+            "run = CommandList\\HI3FX\\Run\n"
+            "drawindexed = 52688, 0, 3\n"
+        )
+        _write_ini(self.ini_path, bind_only)
+        node = _make_node(target_items=[_item(_fake_object())])
+
+        node.execute_postprocess(self.export_dir)
+        content = _read_ini(self.ini_path)
+
+        reset = content.split(pro._RESET_BEGIN, 1)[1].split(pro._RESET_END, 1)[0]
+        self.assertIn("run = CommandList\\HI3FX\\Reset", reset)
+        self.assertNotIn("$\\HI3FX\\brightness = 0", reset)
+        self.assertNotIn("$\\HI3FX\\h = 0", reset)
+        self.assertNotIn("$\\HI3FX\\interpolate = 0", reset)
+        # 复位排在绘制之后。
+        self.assertLess(
+            content.index("drawindexed = 52688, 0, 3"), content.index(pro._RESET_BEGIN)
+        )
+
+    def test_himi_reset_is_not_duplicated_when_material_node_already_wrote_it(self):
+        """材质转资源已经写过 Reset 时，本节点的复位块被去重掉，不重复写。"""
+        self._use_himi()
+        _write_ini(self.ini_path, self.HIMI_SECTION)
+        node = _make_node(target_items=[_item(_fake_object())])
+
+        node.execute_postprocess(self.export_dir)
+        content = _read_ini(self.ini_path)
+
+        self.assertNotIn(pro._RESET_BEGIN, content)
+        self.assertEqual(content.count("run = CommandList\\HI3FX\\Reset"), 1)
+        self.assertEqual(content.count("Resource\\HI3FX\\GlowMap = ref null"), 1)
+
+    def test_himi_skips_sync_and_colorshift(self):
+        """HI3FX 没有 SetFXBuffer / ERun / ColorShift，两项都不生成任何行。"""
+        self._use_himi()
+        section = (
+            f"[{SECOND_SECTION}]\n"
+            f"[mesh:{SECOND_OBJECT}]\n"
+            "hash = aa11bb22\n"
+            "Resource\\HI3FX\\GlowMap = ref Resource_Glowmap_9_Body\n"
+            "Resource\\HI3FX\\FXMap = ref Resource_FXMap_Body\n"
+            "run = CommandList\\HI3FX\\Run\n"
+            "drawindexed = 100, 0, 0\n"
+        )
+        _write_ini(self.ini_path, section)
+        node = _make_node(
+            enable_sync=True,
+            enable_colorshift=True,
+            cs_h=-105.0,
+            target_items=[_item(_fake_object(SECOND_OBJECT))],
+        )
+
+        node.execute_postprocess(self.export_dir)
+        content = _read_ini(self.ini_path)
+
+        self.assertIn(pro._PARAM_BEGIN, content)
+        self.assertNotIn(pro._CS_BEGIN, content)
+        self.assertNotIn("ColorShift", content)
+        self.assertNotIn("SetFXBuffer", content)
+        self.assertNotIn("FXBuffer", content)
+        self.assertNotIn("blendmode", content)
+
+    def test_himi_breathing_writes_hi3fx_params(self):
+        """呼吸灯同样按命名空间写变量（HIMI 下是 $\\HI3FX\\h）。"""
+        self._use_himi()
+        _write_ini(self.ini_path, self.HIMI_SECTION)
+        node = _make_node(
+            enable_breath=True,
+            breath_mode='RAINBOW',
+            target_items=[_item(_fake_object())],
+        )
+
+        node.execute_postprocess(self.export_dir)
+        content = _read_ini(self.ini_path)
+
+        self.assertIn(pro._BREATH_BEGIN, content)
+        self.assertIn("$\\HI3FX\\h = ", content)
+        self.assertIn("$\\HI3FX\\s = 0", content)
+        self.assertIn("$\\HI3FX\\brightness = 8", content)
+        self.assertNotIn("$\\RabbitFX\\H", content)
+
+    def test_himi_breathing_combo_mode_has_no_rabbitfx_leak(self):
+        """COMBO 模式的三条变量行同样不能漏出 RabbitFX 命名空间。"""
+        self._use_himi()
+        _write_ini(self.ini_path, self.HIMI_SECTION)
+        node = _make_node(
+            enable_breath=True,
+            breath_mode='COMBO',
+            target_items=[_item(_fake_object())],
+        )
+
+        node.execute_postprocess(self.export_dir)
+        content = _read_ini(self.ini_path)
+
+        breath = content.split(pro._BREATH_BEGIN, 1)[1].split(pro._BREATH_END, 1)[0]
+        self.assertNotIn("RabbitFX", breath)
+        self.assertIn("$\\HI3FX\\h = ", breath)
+        self.assertIn("$\\HI3FX\\s = ", breath)
+        self.assertIn("$\\HI3FX\\v = ", breath)
+        self.assertIn("$\\HI3FX\\brightness = ", breath)
+        self.assertIn("$\\HI3FX\\interpolate = ", breath)
+
+    def test_hi3fx_namespace_is_left_untouched_outside_himi(self):
+        """非 HIMI 逻辑（这里是 ZZMI/RabbitFX）不该动 HI3FX 的绑定。"""
+        _write_ini(self.ini_path, self.HIMI_SECTION)
+        node = _make_node(target_items=[_item(_fake_object())])
+
+        node.execute_postprocess(self.export_dir)
+
+        self.assertEqual(_read_ini(self.ini_path), self.HIMI_SECTION)
+
+    def test_profile_label_reports_missing_capabilities(self):
+        """面板上要能看出当前逻辑用的是哪套命名空间、少了哪些能力。"""
+        self._use_himi()
+        node = _make_node()
+        layout = _FakeLayout()
+
+        node.draw_buttons(None, layout)
+
+        labels = [entry[1] for entry in layout.log if entry[0] == "label"]
+        self.assertTrue(any("HI3FX" in text for text in labels), labels)
+        self.assertTrue(any("W-Engine 同步" in text for text in labels))
 
 
 if __name__ == "__main__":

@@ -88,15 +88,28 @@ _install_module(
         EFMI="EFMI",
         NTEMI="NTEMI",
         ZZMI="ZZMI",
+        HIMI="HIMI",
     ),
 )
 
 
-module_path = Path(__file__).resolve().parents[1] / "blueprint" / "node_postprocess_material.py"
-spec = importlib.util.spec_from_file_location(f"{PKG}.blueprint.node_postprocess_material", module_path)
-node_postprocess_material = importlib.util.module_from_spec(spec)
-sys.modules[f"{PKG}.blueprint.node_postprocess_material"] = node_postprocess_material
-spec.loader.exec_module(node_postprocess_material)
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _load_blueprint_module(module_name):
+    """按 {PKG}.blueprint.<name> 加载蓝图模块（相对 import 靠 sys.modules 命中）。"""
+    spec = importlib.util.spec_from_file_location(
+        f"{PKG}.blueprint.{module_name}", ROOT / "blueprint" / f"{module_name}.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+# FX 命名空间档案必须先于材质转资源节点加载（它从档案取命名空间）。
+fx_namespace = _load_blueprint_module("fx_namespace")
+node_postprocess_material = _load_blueprint_module("node_postprocess_material")
 
 
 class _FakeImage:
@@ -279,6 +292,135 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
                 swap_key_prefix="$swapkey", next_swap_key_num=150, used_swap_keys=set(), transparency_sections_to_add=OrderedDict())
             self.assertIn("Resource\\NTEMIFX\\FXMap = ref Resource_FXMap_Generic", sections["[TextureOverride_Generic]"])
             self.assertIn("run = CommandList\\NTEMIFX\\Run", sections["[TextureOverride_Generic]"])
+
+    def _run_material_node(self, temp_dir, section_name, section_lines, materials):
+        obj = _FakeObject("HimiMesh", [], materials)
+        _fake_bpy.data.objects[obj.name] = obj
+        sections = OrderedDict([
+            (section_name, [f"[mesh:{obj.name}]", "hash = 12345678", *section_lines]),
+            ("_config_path", temp_dir),
+        ])
+        node = node_postprocess_material.SSMTNode_PostProcess_Material()
+        node.name = "MaterialNode"
+        node.material_to_resource_override = False
+        node.material_switch_var = "$swapkey150"
+        node.process_texture_override_section(
+            section_name, sections, material_group_to_swapkey={},
+            swap_key_prefix="$swapkey", next_swap_key_num=150,
+            used_swap_keys=set(), transparency_sections_to_add=OrderedDict())
+        return sections[section_name]
+
+    def test_himi_glowmap_uses_hi3fx_namespace(self):
+        """HIMI（崩坏 3）下发光贴图走 HI3FX：Resource\\HI3FX\\GlowMap + CommandList\\HI3FX\\Run。
+
+        参考 SSMT 包里的 ``3Dmigoto\\HI3\\Mods\\HI3FX``：资源别名是
+        ``Resource\\HI3FX\\GlowMap``，调用约定是 ``run = CommandList\\HI3FX\\Run``。
+        """
+        sys.modules[f"{PKG}.common.global_config"].GlobalConfig.logic_name = "HIMI"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            glow_path = os.path.join(temp_dir, "glow.dds")
+            with open(glow_path, "wb") as file_obj:
+                file_obj.write(b"glow")
+            lines = self._run_material_node(
+                temp_dir, "[TextureOverride_Himi]", ["drawindexed = 3, 0, 0"],
+                [("Glowmap_5_Body", glow_path)])
+
+            self.assertIn("Resource\\HI3FX\\GlowMap = ref Resource_Glowmap_5_Body", lines)
+            self.assertIn("run = CommandList\\HI3FX\\Run", lines)
+            # 发光亮度写在 HI3FX 自己的变量上。
+            self.assertIn("$\\HI3FX\\brightness = 5", lines)
+            self.assertNotIn("Resource\\RabbitFX\\Glowmap", "".join(lines))
+
+    def test_himi_fxmap_uses_hi3fx_namespace(self):
+        """HIMI 下裁切贴图同样走 HI3FX 的 FXMap 别名。"""
+        sys.modules[f"{PKG}.common.global_config"].GlobalConfig.logic_name = "HIMI"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fx_path = os.path.join(temp_dir, "fx.dds")
+            with open(fx_path, "wb") as file_obj:
+                file_obj.write(b"fx")
+            lines = self._run_material_node(
+                temp_dir, "[TextureOverride_Himi]", ["drawindexed = 3, 0, 0"],
+                [("FXMap_Body", fx_path)])
+
+            self.assertIn("Resource\\HI3FX\\FXMap = ref Resource_FXMap_Body", lines)
+            self.assertIn("run = CommandList\\HI3FX\\Run", lines)
+
+    def test_himi_reset_uses_hi3fx_reset_not_zeroed_brightness(self):
+        """HIMI 的绘制后复位必须是 CommandList\\HI3FX\\Reset。
+
+        HI3FX 的 ``Run`` 只做 Commit + Bind，不会把 ``$brightness`` 复位；
+        照搬 RabbitFX 的 ``$\\RabbitFX\\brightness = 0`` 会让后续绘制一直吃
+        brightness = 0（模型变黑），所以 HIMI 不能写任何 ``= 0`` 的复位参数。
+        """
+        sys.modules[f"{PKG}.common.global_config"].GlobalConfig.logic_name = "HIMI"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            glow_path = os.path.join(temp_dir, "glow.dds")
+            fx_path = os.path.join(temp_dir, "fx.dds")
+            for path in (glow_path, fx_path):
+                with open(path, "wb") as file_obj:
+                    file_obj.write(os.path.basename(path).encode("ascii"))
+            lines = self._run_material_node(
+                temp_dir, "[TextureOverride_Himi]", ["drawindexed = 3, 0, 0"],
+                [("Glowmap_5_Body", glow_path), ("FXMap_Body", fx_path)])
+            joined = "\n".join(lines)
+
+            self.assertIn("Resource\\HI3FX\\GlowMap = ref null", lines)
+            self.assertIn("Resource\\HI3FX\\FXMap = ref null", lines)
+            self.assertIn("run = CommandList\\HI3FX\\Reset", lines)
+            self.assertNotIn("$\\HI3FX\\brightness = 0", joined)
+            # 复位排在绘制之后。
+            self.assertLess(joined.index("drawindexed"), joined.index("run = CommandList\\HI3FX\\Reset"))
+
+    def test_himi_does_not_emit_settextures(self):
+        """HI3FX 的 SetTextures 在默认不加载的 HI3FX.Remap.ini 里，不能自动写。
+
+        配置表里已经出现 ``Resource\\HI3FX\\`` 绑定时，材质转资源要把别名重新指向
+        新复制出来的资源，但不该顺手写 ``CommandList\\HI3FX\\SetTextures``。
+        """
+        sys.modules[f"{PKG}.common.global_config"].GlobalConfig.logic_name = "HIMI"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            glow_path = os.path.join(temp_dir, "glow.dds")
+            with open(glow_path, "wb") as file_obj:
+                file_obj.write(b"glow")
+            lines = self._run_material_node(
+                temp_dir, "[TextureOverride_Himi]",
+                ["Resource\\HI3FX\\GlowMap = ref Resource-old-Glowmap", "drawindexed = 3, 0, 0"],
+                [("Glowmap_5_Body", glow_path)])
+            joined = "\n".join(lines)
+
+            self.assertIn("Resource\\HI3FX\\GlowMap = ref Resource_Glowmap_5_Body", lines)
+            self.assertNotIn("CommandList\\HI3FX\\SetTextures", joined)
+
+    def test_himi_rerun_does_not_accumulate_generated_lines(self):
+        """重跑幂等：上一轮写下的 HI3FX 行会被清理掉再重写。"""
+        sys.modules[f"{PKG}.common.global_config"].GlobalConfig.logic_name = "HIMI"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            glow_path = os.path.join(temp_dir, "glow.dds")
+            with open(glow_path, "wb") as file_obj:
+                file_obj.write(b"glow")
+            first = self._run_material_node(
+                temp_dir, "[TextureOverride_Himi]", ["drawindexed = 3, 0, 0"],
+                [("Glowmap_5_Body", glow_path)])
+            obj = _fake_bpy.data.objects["HimiMesh"]
+            sections = OrderedDict([
+                ("[TextureOverride_Himi]", list(first)),
+                ("_config_path", temp_dir),
+            ])
+            node = node_postprocess_material.SSMTNode_PostProcess_Material()
+            node.name = "MaterialNode"
+            node.material_to_resource_override = False
+            node.material_switch_var = "$swapkey150"
+            node.process_texture_override_section(
+                "[TextureOverride_Himi]", sections, material_group_to_swapkey={},
+                swap_key_prefix="$swapkey", next_swap_key_num=150,
+                used_swap_keys=set(), transparency_sections_to_add=OrderedDict())
+            second = sections["[TextureOverride_Himi]"]
+            self.assertEqual(first, second)
+            self.assertEqual(
+                sum(line.strip().startswith("Resource\\HI3FX\\GlowMap = ref Resource_")
+                    for line in second),
+                1,
+            )
 
     def test_should_emit_fx_reset_rule(self):
         """规则（2026-09 用户口径）：**每一次绘制都必须自带 FX 复位**。
