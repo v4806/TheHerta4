@@ -10,7 +10,8 @@
 ``RabbitFX``  绝区零 / 崩铁 /      ``Resource\\RabbitFX\\Glowmap``   发光 + 裁切 + W-Engine 同步 +
               原神 / EFMI …        ``$\\RabbitFX\\H``（大写）          ColorShift；``Run`` 结尾自带变量复位
 ``NTEMIFX``   异环 NTEMI           ``Resource\\NTEMIFX\\Glowmap``    只有发光 / 裁切（pro 节点不注入参数）
-``HI3FX``     崩坏 3 HIMI          ``Resource\\HI3FX\\GlowMap``      发光 + 裁切 + dither；
+``HI3FX``     崩坏 3 HIMI          ``Resource\\HI3FX\\GlowMap``      发光 + 裁切（FXMap，二值）+
+                                   ``Resource\\HI3FX\\TTLMap``       抖动半透明（TTLMap）；
                                    ``$\\HI3FX\\h``（小写）            没有同步 / ColorShift；
                                                                       ``Run`` **不**复位变量，复位必须
                                                                       调 ``CommandList\\HI3FX\\Reset``
@@ -24,10 +25,21 @@
 
     Resource\\HI3FX\\FXMap = ref ResourceXxx
     Resource\\HI3FX\\GlowMap = ref ResourceYyy
+    Resource\\HI3FX\\TTLMap = ref ResourceZzz     ; 半透明遮罩（可选，HI3FX v1.1）
     $\\HI3FX\\h = 25
     run = CommandList\\HI3FX\\Run
     ; 绘制之后
     run = CommandList\\HI3FX\\Reset
+
+``ttlmap_name`` 是第二个遮罩通道：``FXMap`` 只做二值裁切（在 shader 里按
+``$fx_cutoff`` 截断成 0/1，中间灰阶也不会变成抖动半透明），``TTLMap`` 才是
+覆盖率 —— 中间值走抖动半透明。两者互不影响，同时绑定时按乘法合成（裁切优先）。
+只有声明了 ``ttlmap_name`` 的命名空间（目前只有 ``HI3FX``）才会产出 TTLMap 引用；
+``RabbitFX`` / ``NTEMIFX`` 没有这个通道，行为与以前完全一致。
+
+这与 ``toolkit/tt_alpha_extract.py`` 的材质前缀是同一套语义：允许半透明时
+抽出的遮罩材质叫 ``TTLMap_*``（走抖动），不允许时叫 ``FXMap_*``（只裁切）——
+材质转资源按前缀分别产出 ``Resource\\HI3FX\\TTLMap`` / ``Resource\\HI3FX\\FXMap``。
 
 与 RabbitFX 的三处硬差别（照搬 RabbitFX 的写法会出问题）：
 
@@ -60,6 +72,7 @@ class FXNamespaceProfile:
         *,
         glow_name="Glowmap",
         fxmap_name="FXMap",
+        ttlmap_name=None,
         param_case="upper",
         run="Run",
         set_textures=None,
@@ -71,6 +84,9 @@ class FXNamespaceProfile:
         self.key = key
         self.glow_name = glow_name
         self.fxmap_name = fxmap_name
+        # 抖动半透明用的第二个遮罩通道；None = 这个运行时没有这个概念，
+        # 材质转资源不会为它产出任何引用行（RabbitFX / NTEMIFX 即此）。
+        self.ttlmap_name = ttlmap_name
         self.param_case = param_case
         self.run = run
         self.set_textures = set_textures
@@ -82,6 +98,9 @@ class FXNamespaceProfile:
         self.resource_prefix = f"Resource\\{key}\\"
         self.glow_ref = f"{self.resource_prefix}{glow_name}"
         self.fxmap_ref = f"{self.resource_prefix}{fxmap_name}"
+        self.ttlmap_ref = (
+            f"{self.resource_prefix}{ttlmap_name}" if ttlmap_name else ""
+        )
         self.run_line = f"run = CommandList\\{key}\\{run}"
         self.set_textures_line = (
             f"run = CommandList\\{key}\\{set_textures}" if set_textures else ""
@@ -96,10 +115,20 @@ class FXNamespaceProfile:
             rf"^{re.escape(self.fxmap_ref)}\s*=\s*(?:ref\s+)?(?P<name>.+?)\s*$",
             re.IGNORECASE,
         )
+        self.ttlmap_ref_re = (
+            re.compile(
+                rf"^{re.escape(self.ttlmap_ref)}\s*=\s*(?:ref\s+)?(?P<name>.+?)\s*$",
+                re.IGNORECASE,
+            )
+            if self.ttlmap_ref
+            else None
+        )
         self.run_line_re = re.compile(rf"^{re.escape(self.run_line)}$", re.IGNORECASE)
         self.any_ref_re = re.compile(
             rf"^{re.escape(self.resource_prefix)}(?:{re.escape(glow_name)}|"
-            rf"{re.escape(fxmap_name)})\s*=",
+            rf"{re.escape(fxmap_name)}"
+            + (rf"|{re.escape(ttlmap_name)}" if ttlmap_name else "")
+            + r")\s*=",
             re.IGNORECASE,
         )
 
@@ -142,6 +171,9 @@ NTEMIFX = FXNamespaceProfile(
 HI3FX = FXNamespaceProfile(
     "HI3FX",
     glow_name="GlowMap",
+    # v1.1 起 HI3FX 有两个遮罩通道：FXMap 只裁切（二值），TTLMap 走抖动半透明。
+    # 材质转资源按材质前缀（FXMap_ / TTLMap_）分别产出这两条引用。
+    ttlmap_name="TTLMap",
     param_case="lower",
     reset="Reset",
     supports_sync=False,

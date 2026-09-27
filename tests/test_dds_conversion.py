@@ -1,8 +1,12 @@
 import importlib.util
+import os
+import shutil
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 def _install_module(name, **attrs):
@@ -31,6 +35,9 @@ _fake_bpy = types.SimpleNamespace(
     ),
     context=types.SimpleNamespace(scene=types.SimpleNamespace(texture_tools_props=types.SimpleNamespace())),
     data=types.SimpleNamespace(images=[]),
+    # 真实 Blender 里 "//" 指工程目录；重连用例只用绝对路径，这里原样返回即可，
+    # 但必须让 "//" 不落进输出目录前缀，否则源文件会被当成工程内文件跳过。
+    path=types.SimpleNamespace(abspath=lambda value: "" if value == "//" else value),
 )
 _install_module("bpy", **_fake_bpy.__dict__)
 
@@ -45,8 +52,11 @@ class DDSConversionTests(unittest.TestCase):
     """测试 DDS 转换工具的格式解析与值保留转换策略"""
 
     def test_flags_format_aware(self):
-        """色彩空间标志随输出格式走：sRGB 输出用 --srgb-in（先解码再编码=恒等，存原值），
-        线性 UNORM 输出用 --ignore-srgb（直接存原值）。避免二次 encode 变亮或误解码变暗。"""
+        """色彩空间标志随输出格式走：sRGB 输出用 --srgb-in（PNG 这类无色彩空间信息的
+        输入先按 sRGB 解码、再由 sRGB 输出编码回去 = 恒等），线性输出用 --ignore-srgb。
+
+        注意边界：--ignore-srgb 只管 WIC 输入/输出，管不了 DDS 自身的 _SRGB 格式语义
+        —— 把已经是 _SRGB 的 DDS 按非 sRGB 规则重编码会净压暗一次（2026-09-27 实测）。"""
         self.assertEqual(["--srgb-in"], dds_conversion._texconv_colorspace_flags("bc7_unorm_srgb"))
         self.assertEqual(["--srgb-in"], dds_conversion._texconv_colorspace_flags("B8G8R8A8_UNORM_SRGB"))
         self.assertEqual(["--ignore-srgb"], dds_conversion._texconv_colorspace_flags("bc7_unorm"))
@@ -131,6 +141,228 @@ class DDSConversionTests(unittest.TestCase):
         self.assertEqual(texture_type, "default")
         self.assertEqual(dds_format, "bc7_unorm")
         self.assertEqual(matched_by, "Default")
+
+
+class _FakeColorspaceSettings:
+    """image.colorspace_settings 替身：可分别让读/写抛异常，用于覆盖兜底路径。"""
+
+    def __init__(self, name="sRGB", fail_on_get=False, fail_on_set=False):
+        self._name = name
+        self.fail_on_get = fail_on_get
+        self.fail_on_set = fail_on_set
+        self.write_count = 0
+
+    @property
+    def name(self):
+        if self.fail_on_get:
+            raise RuntimeError("colorspace 读取失败")
+        return self._name
+
+    @name.setter
+    def name(self, value):
+        self.write_count += 1
+        if self.fail_on_set:
+            raise RuntimeError("colorspace 写入失败")
+        self._name = value
+
+    def peek(self):
+        """绕过可能抛异常的读取口，直接看落到的值。"""
+        return self._name
+
+
+class _FakeImage:
+    """bpy.data.images 元素替身：filepath_raw 跟随 filepath（与真实行为一致）。"""
+
+    def __init__(self, name, filepath, colorspace="sRGB", alpha_mode="NONE", reload_error=None):
+        self.name = name
+        self.source = "FILE"
+        self.filepath = filepath
+        self.colorspace_settings = _FakeColorspaceSettings(colorspace)
+        self.alpha_mode = alpha_mode
+        self.reload_error = reload_error
+        self.reload_count = 0
+
+    @property
+    def filepath_raw(self):
+        return self.filepath
+
+    def reload(self):
+        self.reload_count += 1
+        if self.reload_error:
+            raise self.reload_error
+
+
+class _FakeTexNode:
+    """引用贴图的 ShaderNodeTexImage 替身（刻意用非默认档位，锁定不被重连改写）。"""
+
+    def __init__(self, image, interpolation="Closest", extension="MIRROR", projection="FLAT"):
+        self.type = "TEX_IMAGE"
+        self.image = image
+        self.interpolation = interpolation
+        self.extension = extension
+        self.projection = projection
+
+
+class DDSRelinkPreservesSettingsTests(unittest.TestCase):
+    """重连契约：转换只换容器格式与文件路径，不改动转换前已存在的 Blender 侧配置。
+
+    用户 2026-09-27 明确要求「重连时沿用原本的纹理节点配置」，本条推翻了 b7b1992 的
+    「Blender 显示色彩空间按输出格式的 _srgb 后缀设置」：不再按目标 DDS 格式硬设色彩
+    空间，而是在重连前后做快照/恢复。
+
+    注：改动前本文件没有任何用例断言那条强制覆盖（这正是它能无声存在的原因），所以
+    这里没有「旧断言」需要改写，全部是新增的重连行为锁定。
+    """
+
+    def setUp(self):
+        self.output_dir = tempfile.mkdtemp(prefix="dds_relink_")
+        self.addCleanup(shutil.rmtree, self.output_dir, True)
+        self.addCleanup(setattr, _fake_bpy.data, "images", [])
+
+    def _write_sources(self, *filenames):
+        """在输出目录里造出待转换的源贴图，返回它们的绝对路径。"""
+        paths = []
+        for filename in filenames:
+            target = Path(self.output_dir) / filename
+            target.write_bytes(b"fake-texture-bytes")
+            paths.append(os.path.normpath(str(target)))
+        return paths
+
+    def _run_operator(self, images):
+        """用假 bpy 跑一遍真实 execute()，texconv 换成「直接成功」的桩。"""
+        _fake_bpy.data.images = list(images)
+        props = types.SimpleNamespace(
+            output_dir=self.output_dir,
+            texconv_path="",
+            dds_delete_originals=False,
+            dds_reencode_existing_dds=False,
+            dds_use_custom_rules=False,
+            dds_rules=[],
+        )
+        context = types.SimpleNamespace(scene=types.SimpleNamespace(texture_tools_props=props))
+
+        operator = dds_conversion.TT_OT_convert_to_dds()
+        reports = []
+        operator.report = lambda level, message: reports.append((level, message))
+
+        with mock.patch.object(dds_conversion, "find_texconv", return_value="texconv.exe"), \
+                mock.patch.object(
+                    dds_conversion.subprocess,
+                    "run",
+                    return_value=types.SimpleNamespace(returncode=0, stdout="", stderr=""),
+                ):
+            result = operator.execute(context)
+
+        return result, reports
+
+    @staticmethod
+    def _report_text(reports):
+        return " | ".join(str(message) for _level, message in reports)
+
+    def test_non_color_image_stays_non_color_when_target_is_srgb_format(self):
+        """Non-Color 的图转成 bc7_unorm_srgb 目标后仍是 Non-Color（不再被改成 sRGB）。"""
+        (source_path,) = self._write_sources("DiffuseMap_Body.png")
+        image = _FakeImage("DiffuseMap_Body.png", source_path, colorspace="Non-Color")
+
+        result, _reports = self._run_operator([image])
+
+        self.assertEqual(result, {"FINISHED"})
+        self.assertEqual(image.reload_count, 1)
+        self.assertEqual(image.colorspace_settings.name, "Non-Color")
+        self.assertTrue(image.filepath.endswith(".dds"))
+
+    def test_srgb_image_stays_srgb_when_target_is_linear_format(self):
+        """sRGB 的图转成 bc7_unorm 目标后仍是 sRGB（不再被改成 Non-Color）。"""
+        (source_path,) = self._write_sources("LightMap_Hair.png")
+        image = _FakeImage("LightMap_Hair.png", source_path, colorspace="sRGB")
+
+        result, _reports = self._run_operator([image])
+
+        self.assertEqual(result, {"FINISHED"})
+        self.assertEqual(image.colorspace_settings.name, "sRGB")
+
+    def test_alpha_mode_survives_relink(self):
+        """alpha_mode 在重连前后不变（回归锁定）。"""
+        source_a, source_b = self._write_sources("NormalMap_Face.png", "DiffuseMap_Body.png")
+        packed = _FakeImage("NormalMap_Face.png", source_a, colorspace="Non-Color", alpha_mode="CHANNEL_PACKED")
+        plain = _FakeImage("DiffuseMap_Body.png", source_b, colorspace="sRGB", alpha_mode="NONE")
+
+        result, _reports = self._run_operator([packed, plain])
+
+        self.assertEqual(result, {"FINISHED"})
+        self.assertEqual(packed.alpha_mode, "CHANNEL_PACKED")
+        self.assertEqual(plain.alpha_mode, "NONE")
+
+    def test_texture_node_display_settings_survive_relink(self):
+        """引用该 image 的 ShaderNodeTexImage 节点 interpolation / extension / projection 不变。"""
+        (source_path,) = self._write_sources("DiffuseMap_Body.png")
+        image = _FakeImage("DiffuseMap_Body.png", source_path, colorspace="Non-Color")
+        node = _FakeTexNode(image)
+
+        result, _reports = self._run_operator([image])
+
+        self.assertEqual(result, {"FINISHED"})
+        self.assertIs(node.image, image)
+        self.assertEqual(node.interpolation, "Closest")
+        self.assertEqual(node.extension, "MIRROR")
+        self.assertEqual(node.projection, "FLAT")
+
+    def test_single_image_failure_does_not_block_other_images(self):
+        """转换循环里某张图抛异常时不影响其它图片（原有语义，重连改造后保持）。"""
+        source_a, source_b, source_c = self._write_sources(
+            "DiffuseMap_A.png", "NormalMap_B.png", "LightMap_C.png"
+        )
+        ok_a = _FakeImage("DiffuseMap_A.png", source_a, colorspace="sRGB")
+        broken = _FakeImage(
+            "NormalMap_B.png",
+            source_b,
+            colorspace="Non-Color",
+            alpha_mode="CHANNEL_PACKED",
+            reload_error=RuntimeError("模拟重载失败"),
+        )
+        ok_c = _FakeImage("LightMap_C.png", source_c, colorspace="Non-Color")
+
+        result, reports = self._run_operator([ok_a, broken, ok_c])
+
+        self.assertEqual(result, {"FINISHED"})
+        self.assertTrue(ok_a.filepath.endswith(".dds"))
+        self.assertTrue(ok_c.filepath.endswith(".dds"))
+        self.assertEqual(ok_a.reload_count, 1)
+        self.assertEqual(ok_c.reload_count, 1)
+        # 失败的图不计入「更新了 N 个图片引用」，并且要有一条指名道姓的警告
+        report_text = self._report_text(reports)
+        self.assertIn("更新了 2 个图片引用", report_text)
+        self.assertIn("NormalMap_B.png", report_text)
+        # 重载失败也不该顺手改写它的既有配置（filepath 已经换过了）
+        self.assertEqual(broken.colorspace_settings.name, "Non-Color")
+        self.assertEqual(broken.alpha_mode, "CHANNEL_PACKED")
+
+    def test_fallback_uses_format_colorspace_only_when_snapshot_unreadable(self):
+        """快照取不到有效值时，才退回「按格式设置」的兜底。"""
+        source_srgb, source_linear = self._write_sources("DiffuseMap_Fb.png", "LightMap_Fb.png")
+        unreadable_srgb = _FakeImage("DiffuseMap_Fb.png", source_srgb, colorspace="Non-Color")
+        unreadable_srgb.colorspace_settings.fail_on_get = True
+        unreadable_linear = _FakeImage("LightMap_Fb.png", source_linear, colorspace="sRGB")
+        unreadable_linear.colorspace_settings.fail_on_get = True
+
+        result, _reports = self._run_operator([unreadable_srgb, unreadable_linear])
+
+        self.assertEqual(result, {"FINISHED"})
+        # DiffuseMap -> bc7_unorm_srgb -> 兜底 sRGB；LightMap -> bc7_unorm -> 兜底 Non-Color
+        self.assertEqual(unreadable_srgb.colorspace_settings.peek(), "sRGB")
+        self.assertEqual(unreadable_linear.colorspace_settings.peek(), "Non-Color")
+
+    def test_colorspace_write_failure_is_swallowed(self):
+        """快照值写回失败时按格式兜底；两条路径都失败也不能中断转换循环。"""
+        (source_path,) = self._write_sources("DiffuseMap_Body.png")
+        image = _FakeImage("DiffuseMap_Body.png", source_path, colorspace="Non-Color")
+        image.colorspace_settings.fail_on_set = True
+
+        result, reports = self._run_operator([image])
+
+        self.assertEqual(result, {"FINISHED"})
+        self.assertTrue(image.filepath.endswith(".dds"))
+        self.assertIn("更新了 1 个图片引用", self._report_text(reports))
 
 
 if __name__ == "__main__":

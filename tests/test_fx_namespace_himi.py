@@ -119,6 +119,43 @@ class FXNamespaceProfileTests(unittest.TestCase):
         self.assertIsNotNone(profile.run_line_re.match("RUN = commandlist\\hi3fx\\run"))
         self.assertIsNone(profile.run_line_re.match("run = CommandList\\HI3FX\\Reset"))
 
+    def test_hi3fx_declares_the_ttlmap_channel(self):
+        """HI3FX v1.1 的第二个遮罩通道：``Resource\\HI3FX\\TTLMap``（抖动半透明）。
+
+        与 ``FXMap`` 分工明确：``FXMap``（ps-t61）只做二值裁切，``TTLMap``
+        （ps-t62）才是覆盖率、中间值走抖动。名字必须与
+        ``Mods\\HI3FX\\HI3FX.ini`` 的 ``[ResourceTTLMap]`` + ``CommandListBind`` 一致。
+        """
+        self.assertEqual(fx.HI3FX.ttlmap_ref, "Resource\\HI3FX\\TTLMap")
+        self.assertIsNotNone(fx.HI3FX.ttlmap_ref_re)
+        match = fx.HI3FX.ttlmap_ref_re.match("resource\\hi3fx\\ttlmap = ref Resource_TTLMap_X")
+        self.assertIsNotNone(match)
+        self.assertEqual(match.group("name"), "Resource_TTLMap_X")
+        self.assertIsNone(fx.HI3FX.ttlmap_ref_re.match("Resource\\HI3FX\\FXMap = ref X"))
+
+    def test_only_hi3fx_has_a_ttlmap_channel(self):
+        """RabbitFX / NTEMIFX 没有 TTLMap 这个概念 → 材质转资源不得产出该引用。
+
+        这条是"其它逻辑行为完全不变"的档案侧护栏：``ttlmap_ref`` 为空串、
+        ``ttlmap_ref_re`` 为 None，命名空间探测也不认 TTLMap 行。
+        """
+        for profile in (fx.RABBITFX, fx.NTEMIFX):
+            self.assertEqual(profile.ttlmap_ref, "", profile.key)
+            self.assertIsNone(profile.ttlmap_ref_re, profile.key)
+            self.assertIsNone(
+                profile.any_ref_re.match(f"Resource\\{profile.key}\\TTLMap = ref X"), profile.key
+            )
+        self.assertIsNotNone(
+            fx.HI3FX.any_ref_re.match("Resource\\HI3FX\\TTLMap = ref Resource_TTLMap_X")
+        )
+
+    def test_detect_profiles_sees_a_ttlmap_only_table(self):
+        """只写了 TTLMap 一行的配置表也要被认成 HI3FX（否则 pro 节点认不出命名空间）。"""
+        sections = {
+            "[TextureOverride_A]": ["Resource\\HI3FX\\TTLMap = ref Resource_TTLMap_X"],
+        }
+        self.assertEqual([profile.key for profile in fx.detect_profiles(sections)], ["HI3FX"])
+
     def test_detect_profiles_reports_every_namespace_in_the_table(self):
         sections = {
             "[TextureOverride_A]": [

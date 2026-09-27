@@ -345,6 +345,218 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             self.assertIn("Resource\\HI3FX\\FXMap = ref Resource_FXMap_Body", lines)
             self.assertIn("run = CommandList\\HI3FX\\Run", lines)
 
+    def test_himi_ttlmap_uses_hi3fx_ttlmap_alias(self):
+        """HIMI 的 ``TTLMap_`` 材质走 HI3FX 的第二个遮罩通道 ``Resource\\HI3FX\\TTLMap``。
+
+        HI3FX v1.1 起遮罩拆成两条语义完全分开的通道（见
+        ``Mods\\HI3FX\\HI3FX.ini`` 头部注释）：``FXMap``（ps-t61）在 shader 里被
+        ``$fx_cutoff`` 截断成 0/1，只做裁切；``TTLMap``（ps-t62）才是覆盖率，
+        中间值走抖动半透明。材质前缀就是这套语义（``toolkit/tt_alpha_extract.py``：
+        允许半透明 → ``TTLMap_``，否则 → ``FXMap_``），所以材质转资源按前缀分别
+        产出两条引用行，而 ``run`` 行仍是同一条命令列表（调用方式不变）。
+        """
+        sys.modules[f"{PKG}.common.global_config"].GlobalConfig.logic_name = "HIMI"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ttl_path = os.path.join(temp_dir, "ttl.png")
+            with open(ttl_path, "wb") as file_obj:
+                file_obj.write(b"ttl")
+            lines = self._run_material_node(
+                temp_dir, "[TextureOverride_Himi]", ["drawindexed = 3, 0, 0"],
+                [("TTLMap_遮罩", ttl_path)])
+            joined = "\n".join(lines)
+
+            self.assertIn("Resource\\HI3FX\\TTLMap = ref Resource_TTLMap_", joined)
+            self.assertIn("run = CommandList\\HI3FX\\Run", lines)
+            self.assertIn("Resource\\HI3FX\\TTLMap = ref null", lines)
+            self.assertIn("run = CommandList\\HI3FX\\Reset", lines)
+            # 绘制后复位排在绘制之后。
+            self.assertLess(joined.index("drawindexed"), joined.index("run = CommandList\\HI3FX\\Reset"))
+            # 不许混进 ZZMI 的 TTL 绘制重建协议（CommandList\TTL\Draw 是 ZZMI 专属）。
+            self.assertNotIn("Resource\\TTL\\TransparencyTex", joined)
+            self.assertNotIn("CommandList\\TTL\\Draw", joined)
+            self.assertNotIn("Resource\\RabbitFX\\", joined)
+
+    def test_himi_ttlmap_creates_texture_resource_section(self):
+        """TTLMap 引用行指向的 Resource 段必须真的生成（含 filename），否则是空引用。"""
+        sys.modules[f"{PKG}.common.global_config"].GlobalConfig.logic_name = "HIMI"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ttl_path = os.path.join(temp_dir, "ttl.png")
+            with open(ttl_path, "wb") as file_obj:
+                file_obj.write(b"ttl")
+            obj = _FakeObject("HimiMesh", [], [("TTLMap_遮罩", ttl_path)])
+            _fake_bpy.data.objects[obj.name] = obj
+            sections = OrderedDict([
+                ("[TextureOverride_Himi]", [f"[mesh:{obj.name}]", "hash = 12345678", "drawindexed = 3, 0, 0"]),
+                ("_config_path", temp_dir),
+            ])
+            node = node_postprocess_material.SSMTNode_PostProcess_Material()
+            node.name = "MaterialNode"
+            node.material_to_resource_override = False
+            node.material_switch_var = "$swapkey150"
+            node.process_texture_override_section(
+                "[TextureOverride_Himi]", sections, material_group_to_swapkey={},
+                swap_key_prefix="$swapkey", next_swap_key_num=150,
+                used_swap_keys=set(), transparency_sections_to_add=OrderedDict())
+
+            resource_sections = [name for name in sections if name.startswith("[Resource_TTLMap_")]
+            self.assertEqual(len(resource_sections), 1, sections.keys())
+            self.assertTrue(
+                sections[resource_sections[0]][0].startswith("filename = Textures/"),
+                sections[resource_sections[0]],
+            )
+            # 引用行的资源名与生成的段名必须对得上。
+            ref_line = next(
+                line for line in sections["[TextureOverride_Himi]"]
+                if line.startswith("Resource\\HI3FX\\TTLMap = ref ")
+            )
+            self.assertEqual(ref_line.split("ref ", 1)[1].strip(), resource_sections[0].strip("[]"))
+
+    def test_himi_fxmap_and_ttlmap_are_two_independent_channels(self):
+        """同一物体同时挂 ``FXMap_`` 与 ``TTLMap_``：两条引用行各归各的通道。
+
+        两者不是互斥的：``FXMap`` 给二值裁切、``TTLMap`` 给抖动覆盖率，运行时按
+        乘法合成（裁切优先）。所以材质转资源必须两条都产出，而不是二选一。
+        """
+        sys.modules[f"{PKG}.common.global_config"].GlobalConfig.logic_name = "HIMI"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fx_path = os.path.join(temp_dir, "fx.png")
+            ttl_path = os.path.join(temp_dir, "ttl.png")
+            for path in (fx_path, ttl_path):
+                with open(path, "wb") as file_obj:
+                    file_obj.write(b"x")
+            lines = self._run_material_node(
+                temp_dir, "[TextureOverride_Himi]", ["drawindexed = 3, 0, 0"],
+                [("FXMap_裁切", fx_path), ("TTLMap_遮罩", ttl_path)])
+            joined = "\n".join(lines)
+
+            self.assertIn("Resource\\HI3FX\\FXMap = ref Resource_FXMap_", joined)
+            self.assertIn("Resource\\HI3FX\\TTLMap = ref Resource_TTLMap_", joined)
+            self.assertIn("Resource\\HI3FX\\FXMap = ref null", lines)
+            self.assertIn("Resource\\HI3FX\\TTLMap = ref null", lines)
+            self.assertEqual(
+                sum(line.strip().startswith("Resource\\HI3FX\\FXMap = ref Resource_") for line in lines),
+                1,
+            )
+            self.assertEqual(
+                sum(line.strip().startswith("Resource\\HI3FX\\TTLMap = ref Resource_") for line in lines),
+                1,
+            )
+
+    def test_himi_ttlmap_rerun_does_not_accumulate_generated_lines(self):
+        """重跑幂等：TTLMap 引用行会被清理掉再重写，不会一轮加一条。"""
+        sys.modules[f"{PKG}.common.global_config"].GlobalConfig.logic_name = "HIMI"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ttl_path = os.path.join(temp_dir, "ttl.png")
+            with open(ttl_path, "wb") as file_obj:
+                file_obj.write(b"ttl")
+            first = self._run_material_node(
+                temp_dir, "[TextureOverride_Himi]", ["drawindexed = 3, 0, 0"],
+                [("TTLMap_遮罩", ttl_path)])
+            sections = OrderedDict([
+                ("[TextureOverride_Himi]", list(first)),
+                ("_config_path", temp_dir),
+            ])
+            node = node_postprocess_material.SSMTNode_PostProcess_Material()
+            node.name = "MaterialNode"
+            node.material_to_resource_override = False
+            node.material_switch_var = "$swapkey150"
+            node.process_texture_override_section(
+                "[TextureOverride_Himi]", sections, material_group_to_swapkey={},
+                swap_key_prefix="$swapkey", next_swap_key_num=150,
+                used_swap_keys=set(), transparency_sections_to_add=OrderedDict())
+            second = sections["[TextureOverride_Himi]"]
+            self.assertEqual(first, second)
+            self.assertEqual(
+                sum(line.strip().startswith("Resource\\HI3FX\\TTLMap = ref Resource_")
+                    for line in second),
+                1,
+            )
+
+    def test_other_logics_never_emit_the_ttlmap_channel(self):
+        """TTLMap 通道只有 HI3FX 有：其它逻辑的产出必须与改动前完全一致。
+
+        用最敏感的探针——"只挂 TTLMap_ 材质的物体"：它在 RabbitFX / NTEMIFX 档案下
+        没有对应通道，改动前不参与物体匹配，现在也必须不参与（段落原样保留）。
+        ZZMI 走的是它自己的 ``CommandList\\TTL\\Draw`` 绘制重建协议（既有行为），
+        这里只断言它不会沾上 HI3FX 的命名空间。
+        """
+        for logic in ("GIMI", "EFMI", "NTEMI", "HTMI"):
+            with self.subTest(logic=logic):
+                _fake_bpy.data.objects.clear()
+                node_postprocess_material.clear_name_mapping_cache()
+                sys.modules[f"{PKG}.common.global_config"].GlobalConfig.logic_name = logic
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    ttl_path = os.path.join(temp_dir, "ttl.png")
+                    with open(ttl_path, "wb") as file_obj:
+                        file_obj.write(b"ttl")
+                    lines = self._run_material_node(
+                        temp_dir, "[TextureOverride_Other]", ["drawindexed = 3, 0, 0"],
+                        [("TTLMap_遮罩", ttl_path)])
+                    joined = "\n".join(lines)
+
+                    self.assertNotIn("TTLMap", joined, logic)
+                    self.assertNotIn("Resource\\HI3FX\\", joined, logic)
+                    self.assertEqual(
+                        lines,
+                        ["[mesh:HimiMesh]", "hash = 12345678", "drawindexed = 3, 0, 0"],
+                        logic,
+                    )
+
+    def test_zzmi_ttlmap_keeps_its_own_draw_rebuild_protocol(self):
+        """ZZMI 的 TTLMap 仍旧走它自己的 ``CommandList\\TTL\\Draw`` 绘制重建协议。
+
+        这条与 HI3FX 的 TTLMap 是两回事：前者是 ZZMI 专属的"重画一遍"协议（既有
+        行为，本次未改），后者只是 HI3FX 的第二个遮罩通道。这里断言 ZZMI 下不会
+        沾上 HI3FX 的命名空间——段落在 ZZMI 协议下会被重建，所以整表扫描而不是只看
+        单个段。
+        """
+        _fake_bpy.data.objects.clear()
+        node_postprocess_material.clear_name_mapping_cache()
+        sys.modules[f"{PKG}.common.global_config"].GlobalConfig.logic_name = "ZZMI"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ttl_path = os.path.join(temp_dir, "ttl.png")
+            with open(ttl_path, "wb") as file_obj:
+                file_obj.write(b"ttl")
+            obj = _FakeObject("HimiMesh", [], [("TTLMap_遮罩", ttl_path)])
+            _fake_bpy.data.objects[obj.name] = obj
+            sections = OrderedDict([
+                ("[TextureOverride_Other]",
+                 [f"[mesh:{obj.name}]", "hash = 12345678", "drawindexed = 3, 0, 0"]),
+                ("_config_path", temp_dir),
+            ])
+            node = node_postprocess_material.SSMTNode_PostProcess_Material()
+            node.name = "MaterialNode"
+            node.material_to_resource_override = False
+            node.material_switch_var = "$swapkey150"
+            node.process_texture_override_section(
+                "[TextureOverride_Other]", sections, material_group_to_swapkey={},
+                swap_key_prefix="$swapkey", next_swap_key_num=150,
+                used_swap_keys=set(), transparency_sections_to_add=OrderedDict())
+
+            joined = "\n".join(
+                "\n".join(value) for value in sections.values() if isinstance(value, list)
+            )
+            self.assertIn("Resource\\TTL\\TransparencyTex", joined, "ZZMI 仍走自己的 TTL 协议")
+            self.assertNotIn("Resource\\HI3FX\\", joined)
+            self.assertNotIn("CommandList\\HI3FX\\Run", joined)
+
+    def test_rabbitfx_logics_keep_the_glowmap_output(self):
+        """RabbitFX 逻辑的发光产出逐行不变（改动只加了一条 profile 门控的 TTLMap）。"""
+        sys.modules[f"{PKG}.common.global_config"].GlobalConfig.logic_name = "GIMI"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            glow_path = os.path.join(temp_dir, "glow.dds")
+            with open(glow_path, "wb") as file_obj:
+                file_obj.write(b"glow")
+            lines = self._run_material_node(
+                temp_dir, "[TextureOverride_Gimi]", ["drawindexed = 3, 0, 0"],
+                [("Glowmap_5_Body", glow_path)])
+            joined = "\n".join(lines)
+
+            self.assertIn("Resource\\RabbitFX\\Glowmap = ref Resource_Glowmap_5_Body", joined)
+            self.assertIn("run = CommandList\\RabbitFX\\Run", joined)
+            self.assertIn("$\\RabbitFX\\brightness = 5", joined)
+            self.assertNotIn("TTLMap", joined)
+
     def test_himi_reset_uses_hi3fx_reset_not_zeroed_brightness(self):
         """HIMI 的绘制后复位必须是 CommandList\\HI3FX\\Reset。
 

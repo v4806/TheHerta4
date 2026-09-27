@@ -126,6 +126,18 @@ def _build_image_signature(image: bpy.types.Image):
     return tuple(signature_parts)
 
 
+def _signature_paths(signature) -> tuple:
+    """取签名里的解析路径部分。
+
+    `_build_image_signature()` 的每项是 `(resolved_path, mtime_ns, size)`。路径本身
+    发生变化说明引用被别的功能/算子改写了（重连到另一个文件），而不是同一个文件被
+    外部修改 —— 两者对 colorspace 的处置必须不同。
+    """
+    if not signature:
+        return ()
+    return tuple(str(part[0]) for part in signature if part)
+
+
 def _prime_image_signature_cache():
     global _image_signature_cache
 
@@ -153,15 +165,34 @@ def _log_reload_summary(reloaded_names: list[str]):
     LOG.info(f"[TextureAutoReload] Reloaded {len(reloaded_names)} image(s): {preview_names}")
 
 
-def _reload_image(image: bpy.types.Image) -> bool:
+def _reload_image(image: bpy.types.Image, force_srgb: bool = True) -> bool:
+    """重载图片。
+
+    force_srgb=False 用于「引用路径被改写」的重连场景（例如 DDS 转换把 .png 换成
+    .dds）：仍要重载以显示新文件，但绝不改写 colorspace —— 那属于用户的既有配置。
+    外部改图（路径不变）保持 force_srgb=True 的既有语义。
+    """
     try:
         image.reload()
     except Exception as exc:
         LOG.warning(f"[TextureAutoReload] Failed to reload '{image.name}': {exc}")
         return False
 
-    _ensure_srgb_colorspace(image)
+    if force_srgb:
+        _ensure_srgb_colorspace(image)
     return True
+
+
+def _get_colorspace_name(image: bpy.types.Image) -> str:
+    """安全读取当前色彩空间名（无 colorspace_settings / 读取异常时返回空串）。"""
+    colorspace_settings = getattr(image, "colorspace_settings", None)
+    if colorspace_settings is None:
+        return ""
+
+    try:
+        return str(getattr(colorspace_settings, "name", "") or "")
+    except Exception:
+        return ""
 
 
 def _ensure_srgb_colorspace(image: bpy.types.Image) -> None:
@@ -218,7 +249,16 @@ def _check_and_reload_changed_images():
         if previous_signature == signature:
             continue
 
-        if _reload_image(image):
+        # 解析路径变了 = 引用被别的功能/算子改写（例如 DDS 转换把 .png 重连到 .dds）：
+        # 仍重载以显示新文件，但必须沿用原本的纹理节点配置，不得强制 sRGB。
+        if _signature_paths(previous_signature) != _signature_paths(signature):
+            if _reload_image(image, force_srgb=False):
+                reloaded_names.append(image.name)
+                LOG.info(
+                    f"[TextureAutoReload] Relinked '{image.name}' "
+                    f"(colorspace kept: '{_get_colorspace_name(image)}')"
+                )
+        elif _reload_image(image):
             reloaded_names.append(image.name)
 
         _image_signature_cache[cache_key] = _build_image_signature(image) or signature

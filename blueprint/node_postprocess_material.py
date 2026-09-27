@@ -38,6 +38,12 @@ _FX_RESET_REF_LINES = tuple(
     f"{profile.glow_ref} = ref null" for profile in fx_namespace.ALL_PROFILES
 ) + tuple(
     f"{profile.fxmap_ref} = ref null" for profile in fx_namespace.ALL_PROFILES
+) + tuple(
+    # TTLMap 只有声明了它的命名空间才有（HI3FX）；空字符串要跳过，否则会多出一条
+    # 谁也匹配不上的 " = ref null"。
+    f"{profile.ttlmap_ref} = ref null"
+    for profile in fx_namespace.ALL_PROFILES
+    if profile.ttlmap_ref
 )
 _FX_RESET_PARAM_LINES = tuple(
     f"{profile.param('brightness')} = 0" for profile in fx_namespace.ALL_PROFILES
@@ -1259,9 +1265,14 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
         if self._collect_ps_texture_slot_materials(obj):
             return True
 
+        # 贴图类型 → 材质前缀兜底。TTLMap 只在当前命名空间声明了它（HI3FX）时才算：
+        # 其它运行时没有这个通道，把 TTLMap_ 材质当候选会改变它们既有的物体匹配结果。
+        fallback_texture_types = ["Glowmap", "FXMap"]
+        if fx_namespace.current_profile().ttlmap_ref:
+            fallback_texture_types.append("TTLMap")
         return any(
             self.find_matching_materials(obj, texture_type)
-            for texture_type in ("Glowmap", "FXMap")
+            for texture_type in fallback_texture_types
         )
 
     @staticmethod
@@ -2176,6 +2187,7 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
             
             new_lines_for_this_mesh = []
             generated_zzmi_style, generated_glowmap, generated_fxmap = False, False, False
+            generated_ttlmap = False
             generated_ps_slots = set()
 
             workspace_resource_by_slot = OrderedDict()
@@ -2289,26 +2301,35 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
                     matched_types.append("DiffuseMap->ps-t2")
 
             fxmap_lines = []
-            fxmap_texture_types = ['Glowmap', 'FXMap']
-            for texture_type in fxmap_texture_types:
-                if debug_disable_fx_ttl and texture_type == 'FXMap':
+            # 贴图类型 → 资源别名。TTLMap 是「抖动半透明」专用的第二个遮罩通道，
+            # 只有当前命名空间的档案声明了它（目前只有 HI3FX）才会产出：其它运行时
+            # 没有这个概念，产出这条引用只会跑一个不存在的语义。
+            fxmap_texture_types = [
+                ('Glowmap', fx_profile.glow_ref),
+                ('FXMap', fx_profile.fxmap_ref),
+            ]
+            if fx_profile.ttlmap_ref:
+                fxmap_texture_types.append(('TTLMap', fx_profile.ttlmap_ref))
+            for texture_type, param_name in fxmap_texture_types:
+                if debug_disable_fx_ttl and texture_type in ('FXMap', 'TTLMap'):
                     continue
                 matching_materials = self.find_matching_materials(obj, texture_type)
                 if matching_materials:
                     matched_types.append(texture_type)
                     # 命名空间按当前执行逻辑取档案：RabbitFX / NTEMIFX / HI3FX。
-                    # HIMI（崩坏 3）走 HI3FX：资源别名是 Resource\HI3FX\GlowMap，
-                    # 变量名与 Run 命令列表都跟着换（见 blueprint/fx_namespace.py）。
-                    param_name = (
-                        fx_profile.glow_ref if texture_type == 'Glowmap' else fx_profile.fxmap_ref
-                    )
+                    # HIMI（崩坏 3）走 HI3FX：资源别名是 Resource\HI3FX\GlowMap /
+                    # FXMap / TTLMap，变量名与 Run 命令列表都跟着换
+                    # （见 blueprint/fx_namespace.py）。
                     if texture_type == 'Glowmap': generated_glowmap = True
                     if texture_type == 'FXMap': generated_fxmap = True
+                    if texture_type == 'TTLMap': generated_ttlmap = True
                     generated_lines, next_swap_key_num = self.generate_material_lines(
                         matching_materials, param_name, texture_type, obj, texture_folder, all_sections,
                         object_to_diffuse_swapkey, material_group_to_swapkey,
                         swap_key_prefix, next_swap_key_num, used_swap_keys)
                     fxmap_lines.extend(generated_lines)
+                    # Run 行对三种贴图类型是同一条命令列表：调用/使用方法不变，
+                    # 只是引用行多了一种贴图类型。
                     fxmap_lines.append(fx_profile.run_line)
 
             ntemifx_lines = []
@@ -2349,6 +2370,8 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
                     reset_lines.append(f"{fx_profile.param('brightness')} = 0")
             if generated_fxmap:
                 reset_lines.append(f"{fx_profile.fxmap_ref} = ref null")
+            if generated_ttlmap:
+                reset_lines.append(f"{fx_profile.ttlmap_ref} = ref null")
             if reset_lines:
                 # HI3FX 的 Run 不复位变量，必须用 Reset（它自己会 null 别名 + Clean），
                 # 否则 $brightness 会一直停在 0，后续绘制全黑。
@@ -2358,6 +2381,8 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
                     lines[reset_insert_idx:reset_insert_idx] = reset_lines
         # TTL 是 ZZMI 专属的绘制重建协议；EFMI 等其它逻辑仅执行普通材质转资源
         # 与 FX/Glowmap，不得因为某种 drawindexed 参数恰好能被正则解析就误入 TTL。
+        # 别和 HI3FX 的 TTLMap 混淆：那是**第二个遮罩通道**（抖动半透明），属于
+        # 普通材质转资源，由上面的 FX 段落产出，不涉及这里的绘制重建。
         ttl_supported = GlobalConfig.logic_name == LogicName.ZZMI
         if not debug_disable_fx_ttl and ttl_supported:
             next_swap_key_num = self._process_ttl_sections(
