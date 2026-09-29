@@ -3,6 +3,30 @@
 import bpy
 
 
+# 「添加默认配置」写入的形态键名称表。
+# 帧号不写死：由 「起始帧 - 1」+ 形态键步长 × 序号 推导（默认 起始帧=1、步长=5 ⇒ 5, 10, ... 90）。
+DEFAULT_FRAME_SHAPE_KEY_NAMES = (
+    "胸部下",
+    "胸部上",
+    "胸部左",
+    "胸部右",
+    "胸部变大",
+    "Motion_Key_6",
+    "胸部 L 震动上",
+    "胸部 L 震动下",
+    "胸部 L 震动右",
+    "胸部 L 震动左",
+    "胸部 R 震动上",
+    "胸部 R 震动下",
+    "胸部 R 震动右",
+    "胸部 R 震动左",
+    "下面震动上",
+    "下面震动下",
+    "下面震动右",
+    "下面震动左",
+)
+
+
 class ATP_OT_ObjectToShapeKey(bpy.types.Operator):
     """将两个物体的形状差异转换为形态键"""
     bl_idname = "atp.object_to_shape_key"
@@ -306,9 +330,12 @@ class ATP_OT_AddDefaultFrameShapeKeyPairs(bpy.types.Operator):
         
         props.frame_shape_key_pairs.clear()
 
+        # 起始帧本身是基准帧（第 0 个步长），序列从 起始帧 - 1 + 步长 起按步长排布：
+        # 出厂默认（起始帧=1、形态键步长=5）⇒ 5, 10, 15 ... 90。
+        first_end_frame = start_frame - 1 + frame_step
         default_pairs = [
-            (start_frame + frame_step * (index + 1), str(index + 1))
-            for index in range(5)
+            (first_end_frame + frame_step * index, shape_key_name)
+            for index, shape_key_name in enumerate(DEFAULT_FRAME_SHAPE_KEY_NAMES)
         ]
 
         for end_frame, shape_key_name in default_pairs:
