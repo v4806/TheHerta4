@@ -73,6 +73,10 @@ class SSMTGenerateModBlueprint(bpy.types.Operator):
         if tree and global_properties and getattr(global_properties, "selected_blueprint_name", "") != tree.name:
             global_properties.selected_blueprint_name = tree.name
 
+        # 提前绑定当前导出蓝图，保证本次导出全程都能取到该蓝图自己的输出目录设置
+        if tree:
+            BlueprintExportHelper.set_runtime_blueprint_tree(tree)
+
         return tree
 
     def invoke(self, context, event):

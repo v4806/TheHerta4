@@ -183,7 +183,31 @@ class GlobalConfig:
         return os.path.join(GlobalConfig.path_current_game_total_workspace_folder(), cls.get_workspace_name() + "\\")
     
     @classmethod
+    def _get_output_blueprint_tree(cls):
+        """取当前导出流程绑定的蓝图树；该蓝图未启用独立输出目录时返回 None"""
+        try:
+            from ..blueprint.export_helper import BlueprintExportHelper
+        except Exception:
+            return None
+        tree_name = str(getattr(BlueprintExportHelper, "runtime_blueprint_tree_name", "") or "")
+        if not tree_name:
+            return None
+        tree = bpy.data.node_groups.get(tree_name)
+        if tree is None:
+            return None
+        if not getattr(tree, "use_specific_generate_mod_folder_path", False):
+            return None
+        return tree
+
+    @classmethod
     def path_generate_mod_folder(cls):
+        # 蓝图级独立输出目录优先：当前导出的蓝图自己设置了路径就用它
+        output_tree = cls._get_output_blueprint_tree()
+        if output_tree is not None:
+            tree_path = str(getattr(output_tree, "generate_mod_folder_path", "") or "").strip()
+            if tree_path:
+                return tree_path
+
         # 如果用户勾选了使用指定文件夹，那就返回指定文件夹位置，否则返回我们的默认位置。
         # 但是这里有个问题就是SkipIB和VSCheck不会生成在指定位置。
         if GlobalProterties.use_specific_generate_mod_folder_path():
