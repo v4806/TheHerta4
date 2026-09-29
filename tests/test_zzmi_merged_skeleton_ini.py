@@ -1083,6 +1083,65 @@ class ZZMICrossGroupGuardTests(unittest.TestCase):
         out = self._capture_warnings(exporter)
         self.assertEqual(out, "")
 
+    def test_mixed_known_and_unknown_owners_do_not_crash(self):
+        """回归：越界骨骼里混有「别组骨骼」与「组外未知骨骼」时不得抛 TypeError。
+
+        旧实现在这里对集合 `{1, "未知（不在导出组件范围）"}` 调 `sorted` ⇒
+        `TypeError: '<' not supported between instances of 'str' and 'int'`，
+        整次导出中止（实测用户报错：导出失败横幅 + 该 TypeError）。
+
+        夹具口径（`_register_obj`）：`bone_ids[i]` 是**顶点组 i 的名字**，顶点 i
+        挂在顶点组 i 上 ⇒ 顶点组名集合 == 该对象引用的骨骼 id 集合。
+        """
+        # 组 0 的合法槽 = 0..104；引用 105（组 1 的槽）与 300（不属于任何导出组件）
+        self._register_obj("LOD0.a23aa8a3-42759-0", [0, 105, 300])
+        submesh = _FakeSubmesh("LOD0.a23aa8a3-42759-0", 0, 105, 0)
+        components = [
+            {"draw_ib": "a23aa8a3", "vg_offset": 0, "vg_count": 105, "skeleton_group": 0},
+            {"draw_ib": "b20f90ea", "vg_offset": 105, "vg_count": 2, "skeleton_group": 1},
+        ]
+        exporter = self._make_component_exporter("a23aa8a3", submesh, components)
+        try:
+            out = self._capture_warnings(exporter)
+        except TypeError as exc:  # pragma: no cover - 修复前走这条
+            self.fail(f"跨组守卫不应因类型混排抛 TypeError: {exc}")
+        self.assertIn("禁止跨组别骨骼合并", out)
+        self.assertIn("[105, 300]", out)
+        # 1（组 1，int）与「未知」（str 哨兵）同列一份 —— 修复前正是 `sorted`
+        # 对这两种类型混排炸掉；顺带把多个未知归属去重成一条。
+        self.assertIn("归属组: ['未知（不在导出组件范围）', 1]", out)
+
+    def test_unknown_owner_only_warns_with_unknown_label(self):
+        """只有组外未知骨骼时：文案仍为「未知」，且使用同一个 int 哨兵，不混类型。"""
+        self._register_obj("LOD0.a23aa8a3-42759-0", [0, 300])
+        submesh = _FakeSubmesh("LOD0.a23aa8a3-42759-0", 0, 105, 0)
+        components = [
+            {"draw_ib": "a23aa8a3", "vg_offset": 0, "vg_count": 105, "skeleton_group": 0},
+        ]
+        exporter = self._make_component_exporter("a23aa8a3", submesh, components)
+        out = self._capture_warnings(exporter)
+        self.assertIn("禁止跨组别骨骼合并", out)
+        self.assertIn("[300]", out)
+        self.assertIn("['未知（不在导出组件范围）']", out)
+
+    def test_string_skeleton_group_is_normalized(self):
+        """组号是数字字符串（历史缓存记录）时：守卫与组列表都按 int 归一，不抛 TypeError。"""
+        self._register_obj("LOD0.a23aa8a3-42759-0", [105, 300])
+        submesh = _FakeSubmesh("LOD0.a23aa8a3-42759-0", 0, 105, "0")
+        components = [
+            {"draw_ib": "a23aa8a3", "vg_offset": 0, "vg_count": 105, "skeleton_group": "0"},
+            {"draw_ib": "b20f90ea", "vg_offset": 105, "vg_count": 2, "skeleton_group": "1"},
+        ]
+        exporter = self._make_component_exporter("a23aa8a3", submesh, components)
+        try:
+            out = self._capture_warnings(exporter)
+            groups = exporter._merged_skeleton_groups()
+        except TypeError as exc:  # pragma: no cover - 修复前走这条
+            self.fail(f"组号归一后不应抛 TypeError: {exc}")
+        self.assertIn("禁止跨组别骨骼合并", out)
+        self.assertIn("归属组: ['未知（不在导出组件范围）', 1]", out)
+        self.assertEqual(groups, [0, 1])
+
 
 class ZZSIMissingPartsGuardTests(unittest.TestCase):
     def test_warns_when_part_missing(self):

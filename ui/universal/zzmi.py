@@ -4182,12 +4182,24 @@ class ExportZZMI(ExportUnity):
         ini_builder.append_section(vertexlimit_section)
 
     def _merged_skeleton_groups(self) -> list[int]:
-        """当前导出组件涉及的骨架组列表（升序）。"""
-        return sorted({c["skeleton_group"] for c in self.merged_skeleton_components})
+        """当前导出组件涉及的骨架组列表（升序）。
+
+        组号统一按 `int` 归一后再排序：本轮实测出现过「组号是数字字符串」的组件
+        记录，裸 `sorted` 会对 `str` 与 `int` 混排抛 TypeError；组号本身在下游
+        （`_merged_group_component_ids` / 组命名 / 字典索引）已经一律 `int(...)`
+        处理，因此这里归一不改变任何既有行为。
+        """
+        return sorted({int(c["skeleton_group"]) for c in self.merged_skeleton_components})
 
     # ------------------------------------------------------------------
     # 跨组别引用守卫（无校准模式：禁止跨组别骨骼合并）
     # ------------------------------------------------------------------
+
+    #: 「该骨骼不属于任何导出组件」在守卫内部的**类型统一**哨兵（负数，永不与
+    #: 真实组号 0..N 冲突）。显示文案在打印前替换，不进集合、不参与比较。
+    #: 用类属性（经 `type(self)` 取）而非模块全局：守卫函数内不出现裸名字，
+    #: 轻量 fake 宿主把模块 `__globals__` 换掉时同样解析得到。
+    UNKNOWN_BONE_GROUP = -1
 
     def _collect_drawib_referenced_bone_ids(self, draw_ib: str) -> set[int]:
         """该 DrawIB 全部子网格源对象实际引用（权重>0）的骨骼 id 集合。
@@ -4237,12 +4249,15 @@ class ExportZZMI(ExportUnity):
         """
         if not self.merged_skeleton_components:
             return
+        unknown_group = int(type(self).UNKNOWN_BONE_GROUP)
         # 每组合法骨骼 id 集合 = 该组全部导出组件槽位并集（缺席部件的骨骼不会
         # attach，也不可被引用——同组缺席部件被并入现成对象同样会报警）
         group_legal: dict[int, set[int]] = {}
         id_to_group: dict[int, int] = {}
         for component in self.merged_skeleton_components:
-            skeleton_group = component["skeleton_group"]
+            # 组号先归一成 int：它既做 `group_legal`/`id_to_group` 的键，又直接进
+            # 下面的 `sorted`（混排 str 与 int 会抛 TypeError）。
+            skeleton_group = int(component["skeleton_group"])
             legal = group_legal.setdefault(skeleton_group, set())
             for bone_id in range(
                 component["vg_offset"], component["vg_offset"] + component["vg_count"]
@@ -4252,21 +4267,28 @@ class ExportZZMI(ExportUnity):
 
         for component in self.merged_skeleton_components:
             draw_ib = component["draw_ib"]
-            skeleton_group = component["skeleton_group"]
+            skeleton_group = int(component["skeleton_group"])
             legal = group_legal[skeleton_group]
-            offending = sorted(
-                bone_id
-                for bone_id in self._collect_drawib_referenced_bone_ids(draw_ib)
-                if bone_id not in legal
-            )
+            _refs = self._collect_drawib_referenced_bone_ids(draw_ib)
+            offending = sorted(bone_id for bone_id in _refs if bone_id not in legal)
             if not offending:
                 continue
-            offending_groups = sorted(
-                {
-                    id_to_group.get(bone_id, "未知（不在导出组件范围）")
-                    for bone_id in offending
-                }
-            )
+            # 类型纪律：本集合**只装组号（int）**。归属未知的骨骼一律落进同一个
+            # 哨兵键，最后再换成显示文案——`sorted` 混排 str 与 int 会直接抛
+            # TypeError（实测报错点即此处：`offending` 里既有别组骨骼、又有不在任何
+            # 导出组件范围内的骨骼时，旧实现把两种类型塞进同一个 set ⇒ 整次导出
+            # 中止在守卫里）。`int(...)` 同时兜住「组号是数字字符串」的历史缓存记录。
+            offending_group_ids_set: set[int] = set()
+            for bone_id in offending:
+                owner = id_to_group.get(bone_id, unknown_group)
+                offending_group_ids_set.add(
+                    unknown_group if owner == unknown_group else int(owner)
+                )
+            offending_group_ids = sorted(offending_group_ids_set)
+            offending_groups = [
+                "未知（不在导出组件范围）" if group_id == unknown_group else group_id
+                for group_id in offending_group_ids
+            ]
             print(
                 f"[ZZMI骨骼合并] !!! 禁止跨组别骨骼合并: DrawIB {draw_ib} "
                 f"（骨架组 G{skeleton_group}）的顶点引用了非本组骨骼 id "
