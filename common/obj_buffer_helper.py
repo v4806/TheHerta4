@@ -25,6 +25,49 @@ class ObjBufferHelper:
     '''
 
     @staticmethod
+    def ensure_color_attribute(obj, element_name, d3d11_element=None):
+        """确保物体上有 element_name 这个顶点色属性；没有就按元素格式创建。
+
+        为什么导出前也要做：物体本身没有顶点色时，"重算 COLOR" 在物体上就没有落点
+        （实测表现：这种物体看起来什么都没发生）。格式按 d3d11 元素的 Format 选
+        BYTE_COLOR / FLOAT_COLOR，域与导出读取口径一致用 CORNER。
+        """
+        mesh = getattr(obj, "data", None)
+        if mesh is None:
+            return None
+        collection = getattr(mesh, "color_attributes", None)
+        if collection is None:
+            legacy = getattr(mesh, "vertex_colors", None)
+            if legacy is None:
+                return None
+            if element_name in legacy:
+                return legacy[element_name]
+            created = legacy.new(name=element_name)
+            print("当前obj [" + str(getattr(obj, "name", "?")) + "] 缺少游戏渲染所需的COLOR: [" + element_name + "]，已自动补全")
+            return created
+        existing = collection.get(element_name)
+        if existing is not None:
+            return existing
+        attribute_type = "BYTE_COLOR"
+        normalized_format = str(getattr(d3d11_element, "Format", "") or "").upper()
+        if (
+            normalized_format.endswith("_FLOAT")
+            or normalized_format.endswith("_SNORM")
+            or "16" in normalized_format
+            or "32" in normalized_format
+        ):
+            attribute_type = "FLOAT_COLOR"
+        created = collection.new(name=element_name, type=attribute_type, domain="CORNER")
+        try:
+            index = collection.find(element_name)
+            if index is not None and index >= 0:
+                collection.active_color_index = index
+        except Exception:
+            pass
+        print("当前obj [" + str(getattr(obj, "name", "?")) + "] 缺少游戏渲染所需的COLOR: [" + element_name + "]，已自动补全")
+        return created
+
+    @staticmethod
     def check_and_verify_attributes(obj:bpy.types.Object, d3d11_game_type:D3D11GameType):
         '''
         校验并补全部分元素
@@ -37,22 +80,7 @@ class ObjBufferHelper:
             d3d11_element = d3d11_game_type.ElementNameD3D11ElementDict[d3d11_element_name]
             # 校验并补全所有COLOR的存在
             if d3d11_element_name.startswith("COLOR"):
-                color_coll = obj.data.color_attributes if hasattr(obj.data, 'color_attributes') else obj.data.vertex_colors
-                if d3d11_element_name not in color_coll:
-                    if hasattr(obj.data, 'color_attributes'):
-                        color_attr_type = 'BYTE_COLOR'
-                        normalized_format = str(getattr(d3d11_element, "Format", "") or "").upper()
-                        if (
-                            normalized_format.endswith("_FLOAT")
-                            or normalized_format.endswith("_SNORM")
-                            or "16" in normalized_format
-                            or "32" in normalized_format
-                        ):
-                            color_attr_type = 'FLOAT_COLOR'
-                        obj.data.color_attributes.new(name=d3d11_element_name, type=color_attr_type, domain='CORNER')
-                    else:
-                        obj.data.vertex_colors.new(name=d3d11_element_name)
-                    print("当前obj ["+ obj.name +"] 缺少游戏渲染所需的COLOR: ["+  "COLOR" + "]，已自动补全")
+                ObjBufferHelper.ensure_color_attribute(obj, d3d11_element_name, d3d11_element)
             
             # 校验TEXCOORD是否存在
             if d3d11_element_name.startswith("TEXCOORD"):
@@ -1004,9 +1032,81 @@ class ObjBufferHelper:
 
 
     @staticmethod
+    def _color_property_getter(name, default):
+        """读全局属性，读不到/非法时回退 default（兼容老属性组与测试替身）。"""
+        getter = getattr(GlobalProterties, name, None)
+        if callable(getter):
+            try:
+                value = getter()
+            except Exception:
+                return default
+            if isinstance(default, bool):
+                return bool(value)
+            try:
+                value = float(value)
+            except (TypeError, ValueError):
+                return default
+            if not numpy.isfinite(value):
+                return default
+            return value
+        return default
+
+    @staticmethod
+    def _color_mode():
+        """COLOR 写入方式：OFF / AVERAGE / PER_LOOP（来自 recalculate_color_mode）。"""
+        getter = getattr(GlobalProterties, "recalculate_color_mode", None)
+        if callable(getter):
+            try:
+                return str(getter() or "AVERAGE")
+            except Exception:
+                return "AVERAGE"
+        return "AVERAGE"
+
+    @staticmethod
+    def _color_per_loop_enabled():
+        return ObjBufferHelper._color_mode() == "PER_LOOP"
+
+    @staticmethod
+    def _color_alpha(obj):
+        """写进 COLOR.a 的值 = 描边宽度旋钮（0.5 = 游戏原版；实测游戏原值中位 ≈ 118/255）。
+
+        物体属性 3DMigoto:RecalculateCOLORWidth 优先，否则取全局 recalculate_color_width。
+        """
+        value = float(ObjBufferHelper._color_property_getter("recalculate_color_width", 0.5))
+        try:
+            override = obj.get("3DMigoto:RecalculateCOLORWidth", None)
+            if override is not None:
+                value = float(override)
+        except Exception:
+            pass
+        if not numpy.isfinite(value):
+            value = 0.5
+        return max(0.0, min(1.0, value))
+
+    @staticmethod
     def average_normal_color(obj,indexed_vertices,d3d11GameType:D3D11GameType,dtype):
         '''
         Nico: 算数平均归一化法线，HI3 2.0角色使用的方法
+
+        游戏（HI3 2.0）约定：顶点 COLOR 通道存的不是装饰色，而是**单位长度**的逐位置平滑法线
+        （rgb = n * 0.5 + 0.5，8bit），方向与同一缓冲的 NORMAL 列同空间；alpha 是逐顶点描边宽度遮罩
+        （游戏自带数据里主值 128/255，另有 7~11% 顶点为 0 = 该处不描边）。
+
+        ⇒ 本方法三步：
+          ① 按位置算术平均 + 归一化：硬边处平均向量本身就短（90° 硬边只有 0.707），不归一化会让
+             描边位移按 |mean| 缩水，8bit 量化误差还会被放大成方向噪声（实测最坏 |mean| = 0.03
+             → 15°~30° 角度噪声）。若 recalculate_color_mode = PER_LOOP，则跳过平均、逐顶点直接用
+             自己的 NORMAL。
+          ② **不做坐标变换**：调用点在导出流水线的下游（临时物体已经烘焙了导出空间变换，
+             common/submesh_model.py:353 → utils/export_utils.py:571），此刻的 loop 法线已在导出空间，
+             与最终写进缓冲的 NORMAL 列同空间。对游戏原始 dump 实测：COLOR 与同一顶点 NORMAL 的中位
+             夹角 13.9°（大件）/41.5°（头发），而对"同位置平均法线"只有 2.7°/18.4° —— 差别全部来自
+             "平滑 vs 逐面"，不存在任何 107° 量级的刚性旋转；早期版本多乘的一次 mirrorX·Rx(-90)
+             会让产物 COLOR 与游戏 COLOR 差 101°（描边左右颠倒 / 往模型里侧扩张）。
+          ③ 编码 c=(n+1)/2；alpha = 描边宽度旋钮（recalculate_color_width，默认 0.5 = 游戏原版，
+             物体属性 3DMigoto:RecalculateCOLORWidth 可覆盖）。alpha **不继承输入旧值** ——
+             继承会把上一次写错的值污染到下一次。模式由 recalculate_color_mode 决定
+             （OFF / AVERAGE / PER_LOOP）。
         '''
         if "COLOR" not in d3d11GameType.OrderedFullElementList:
             return indexed_vertices
@@ -1017,6 +1117,14 @@ class ObjBufferHelper:
             allow_calc = True
         if not allow_calc:
             return indexed_vertices
+
+        # 写入前先确认物体本身有这个顶点色属性：没有就创建（否则"重算 COLOR"在物体上没有落点，
+        # 表现就是"改了没反应"）。属性名取游戏类型里第一个 COLOR 元素，格式随该元素的 Format。
+        elements = getattr(d3d11GameType, "ElementNameD3D11ElementDict", None) or {}
+        for element_name in d3d11GameType.OrderedFullElementList:
+            if str(element_name).startswith("COLOR"):
+                ObjBufferHelper.ensure_color_attribute(obj, element_name, elements.get(element_name))
+                break
 
         # 开始重计算COLOR
         TimerUtils.Start("Recalculate COLOR")
@@ -1043,21 +1151,80 @@ class ObjBufferHelper:
             accumulated_normals[position_indices[i]] += numpy.array(val['NORMAL'], dtype=float)
             counts[position_indices[i]] += 1
 
-        # 对所有位置的法线进行一次性规范化处理
+        # 对所有位置的法线求算术平均
         mask = counts > 0
         average_normals = numpy.zeros_like(accumulated_normals)
         average_normals[mask] = (accumulated_normals[mask] / counts[mask][:, None])
 
-        # 归一化到[0,1]，然后映射到颜色值
-        normalized_normals = ((average_normals + 1) / 2 * 255).astype(numpy.uint8)
+        # 归一化平均方向：游戏约定存单位向量，不归一化会让描边位移按 |mean| 缩水
+        average_lengths = numpy.linalg.norm(average_normals, axis=1)
+        unit_normals = numpy.zeros_like(average_normals)
+        has_average_direction = mask & (average_lengths > 1e-6)
+        unit_normals[has_average_direction] = (
+            average_normals[has_average_direction] / average_lengths[has_average_direction][:, None]
+        )
+
+        # 退化位置（同位置的±法线完全抵消，例如零厚度发片）没有可用的平均方向：
+        # 回退到该位置第一条非零的顶点法线——它仍是一条真实表面法线，
+        # 比让方向塌成 8bit 量化噪声更接近原模型。
+        degenerate_positions = mask & ~has_average_direction
+        if degenerate_positions.any():
+            source_normals = numpy.asarray(vb['NORMAL'], dtype=float)
+            source_lengths = numpy.linalg.norm(source_normals, axis=1)
+            usable_vertex_indices = numpy.flatnonzero(source_lengths > 1e-6)
+            # 逆序写入 => 每个位置留下下标最小的那条可用法线
+            first_usable_indices = numpy.full(len(unique_positions), -1, dtype=int)
+            first_usable_indices[position_indices[usable_vertex_indices[::-1]]] = usable_vertex_indices[::-1]
+            has_usable_normal = first_usable_indices >= 0
+            fallback_normals = numpy.zeros_like(unit_normals)
+            fallback_normals[has_usable_normal] = (
+                source_normals[first_usable_indices[has_usable_normal]]
+                / source_lengths[first_usable_indices[has_usable_normal]][:, None]
+            )
+            apply_fallback = degenerate_positions & has_usable_normal
+            unit_normals[apply_fallback] = fallback_normals[apply_fallback]
+
+        # 源数据里的 NaN/Inf 不允许污染输出：留零向量（解码后不产生位移）
+        unit_normals[~numpy.isfinite(unit_normals)] = 0.0
+
+        # 逐 loop 直写模式（开关，默认关）：头发这类带分裂法线/硬边的网格，按位置算术平均会把
+        # 方向抹平；打开后每个导出顶点直接用自己的 NORMAL（同样归一化、同样做导出空间映射）。
+        if ObjBufferHelper._color_per_loop_enabled():
+            raw_normals = numpy.asarray(vb['NORMAL'], dtype=float)
+            raw_lengths = numpy.linalg.norm(raw_normals, axis=1)
+            usable = raw_lengths > 1e-6
+            per_vertex_normals = numpy.zeros_like(raw_normals)
+            per_vertex_normals[usable] = raw_normals[usable] / raw_lengths[usable][:, None]
+            per_vertex_normals[~numpy.isfinite(per_vertex_normals)] = 0.0
+        else:
+            per_vertex_normals = unit_normals[position_indices]
+
+        # COLOR 与 NORMAL 必须同空间：COLOR 是"平滑法线"，只比同一顶点的 NORMAL 平滑一点。
+        # 这里**不做任何坐标变换** —— 导出流水线是"先把导出空间变换烘焙进临时物体，再装配缓冲"：
+        #   common/submesh_model.py:353 _apply_export_rotation_for_logic（HIMI 绕 X −90°）
+        #   → utils/export_utils.py:459/571 才 check_and_verify_attributes + average_normal_color
+        # 所以此刻读到的 loop 法线已经在导出空间里了。早期版本在这里又乘了一次
+        # mirrorX·Rx(-90)，等于对法线多转一次：实测产物 NORMAL 列与游戏 dump 的 NORMAL 中位夹角
+        # 0.51°（同空间），而产物 COLOR 与游戏 COLOR 中位夹角 101.44° —— 描边方向因此整片错位
+        # （表现为左右颠倒 / 往模型里侧扩张）。移除映射后 COLOR 与 NORMAL 列同向。
+
+        # 轮廓线宽度 = COLOR.a（游戏那条描边 VS：外扩 = 归一化法线 × 常量 × COLOR.a）。
+        # 唯一旋钮就是写进去的 alpha 值（默认 0.5 = 游戏原版，物体属性可覆盖）；
+        # **不继承输入里的旧 alpha** —— 继承会把上一次写错的值污染到下一次（这个坑已经踩过）。
+        alpha = int(max(0, min(255, round(ObjBufferHelper._color_alpha(obj) * 255.0))))
+
+        # 编码 c = (n + 1) / 2，8bit
+        normalized_normals = numpy.clip(
+            numpy.rint((per_vertex_normals + 1.0) * 0.5 * 255.0), 0, 255
+        ).astype(numpy.uint8)
 
         # 更新颜色信息
         new_color = []
         for i, val in enumerate(vb):
-            color = [0, 0, 0, val['COLOR'][3]]  # 保留原来的Alpha通道
-            
+            color = [0, 0, 0, alpha]
+
             if mask[position_indices[i]]:
-                color[:3] = normalized_normals[position_indices[i]]
+                color[:3] = normalized_normals[i]
 
             new_color.append(color)
 

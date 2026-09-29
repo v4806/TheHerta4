@@ -157,8 +157,36 @@ class GlobalProterties(bpy.types.PropertyGroup):
 
     recalculate_color: bpy.props.BoolProperty(
         name="算术平均归一化法线存入COLOR(全局)",
-        description="使用算术平均归一化重计算所有模型的COLOR值，勾选此项后无法精细控制具体某个模型是否计算，是偷懒选项,在不勾选时默认使用右键菜单中标记的选项，仅用于HI3 2.0角色修复轮廓线",
+        description="已由「COLOR 写入方式」取代：AVERAGE / PER_LOOP 都算开启。保留字段只为兼容既有 .blend 与调用方，不再出现在 UI 上",
         default=False,
+        options={'HIDDEN'},
+    ) # type: ignore
+
+    # COLOR 写入方式：关 / 按位置算术平均 / 逐 loop 直写。
+    # 合并了原来的两个布尔开关（"算术平均归一化法线存入COLOR(全局)" 与 "COLOR 逐loop直写"）——
+    # 它们本来就是同一件事的两种模式，同时显示会让人以为要各勾一次。
+    recalculate_color_mode: bpy.props.EnumProperty(
+        name="COLOR 写入方式",
+        description="关闭 = 只处理右键标记了 3DMigoto:RecalculateCOLOR 的物体；按位置算术平均 = 同位置法线求平均后归一化（实机验证口径）；逐loop直写 = 每个顶点直接用自己的 NORMAL（头发等带分裂法线/硬边的网格）",
+        items=[
+            ("OFF", "关闭(只按物体标记)", "不全局重算，只处理标记了 3DMigoto:RecalculateCOLOR 的物体"),
+            ("AVERAGE", "按位置算术平均", "同位置法线算术平均 + 归一化，写 COLOR；实机验证口径（对游戏原值中位误差 0.37°）"),
+            ("PER_LOOP", "逐loop直写", "每个导出顶点直接用自己的 NORMAL；适合头发等带分裂法线/硬边的网格"),
+        ],
+        default="AVERAGE",
+    ) # type: ignore
+
+    # 描边宽度：唯一旋钮，值就是写进 COLOR.a 的 alpha。游戏侧 alpha 是逐顶点描边宽度遮罩
+    # （外扩 = 归一化法线方向 × 常量 × COLOR.a），游戏自带数据实测中位 ≈ 118/255 ≈ 0.46，
+    # 所以 0.5 = 游戏原版宽度、0.25 = 细一半、0 = 该模型没有描边。
+    # 之前这里还有一个 "COLOR alpha 基准" 叠加相乘，两个旋钮会让 0.5×0.5 变成四分之一，
+    # 已合并成这一个（物体级覆盖仍用自定义属性 3DMigoto:RecalculateCOLORWidth）。
+    recalculate_color_width: bpy.props.FloatProperty(
+        name="描边宽度(COLOR alpha)",
+        description="写进 COLOR.a 的值：游戏里 alpha 是逐顶点的描边宽度遮罩（外扩 = 归一化法线方向 × 常量 × alpha）。0.5 = 游戏原版宽度，0.25 = 细一半，0 = 该模型没有描边。只对「COLOR 写入方式」非关闭或物体标记了 3DMigoto:RecalculateCOLOR 的模型生效；单个物体可用自定义属性 3DMigoto:RecalculateCOLORWidth 覆盖本值",
+        default=0.5,
+        min=0.0,
+        max=1.0,
     ) # type: ignore
 
     use_specific_generate_mod_folder_path: bpy.props.BoolProperty(
@@ -474,7 +502,17 @@ class GlobalProterties(bpy.types.PropertyGroup):
 
     @classmethod
     def recalculate_color(cls):
-        return cls._instance().recalculate_color
+        """是否全局重算 COLOR：由 recalculate_color_mode 决定（旧布尔字段仅作兼容）。"""
+        mode = getattr(cls._instance(), "recalculate_color_mode", "AVERAGE")
+        return mode in ("AVERAGE", "PER_LOOP")
+
+    @classmethod
+    def recalculate_color_mode(cls):
+        return str(getattr(cls._instance(), "recalculate_color_mode", "AVERAGE") or "AVERAGE")
+
+    @classmethod
+    def recalculate_color_width(cls):
+        return cls._instance().recalculate_color_width
 
     @classmethod
     def use_specific_generate_mod_folder_path(cls):

@@ -425,8 +425,11 @@ class SSMTNode_Result_Output(SSMTNodeBase):
                         "recalculate_tangent",text="向量归一化法线存入TANGENT(全局)")
 
         if GlobalConfig.logic_name == LogicName.HIMI:
-            layout.prop(context.scene.global_properties,
-                        "recalculate_color",text="算术平均归一化法线存入COLOR(全局)")
+            outline_box = layout.box()
+            outline_box.label(text="轮廓线修复(HI3 2.0)：COLOR 通道", icon='COLOR')
+            outline_box.prop(context.scene.global_properties, "recalculate_color_mode", text="")
+            outline_box.prop(context.scene.global_properties,
+                            "recalculate_color_width", text="描边宽度(0.5=游戏原版, 越小越细)")
 
         if LogicName.is_zzmi_family(GlobalConfig.logic_name):
             layout.prop(context.scene.global_properties, "zzz_use_slot_fix")

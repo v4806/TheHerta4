@@ -246,5 +246,308 @@ class ObjBufferHelperBlendIndicesTests(unittest.TestCase):
             )
 
 
+class ObjBufferHelperAverageNormalColorTests(unittest.TestCase):
+    """average_normal_color：COLOR 通道必须写成**单位长度**的逐位置平滑法线。
+
+    游戏（HI3 2.0）约定 rgb = n * 0.5 + 0.5，实测游戏自带数据 |decode(COLOR)| = 0.9988 ~ 1.0；
+    硬边处"平均向量"本身就短（90° 硬边只有 0.707），因此编码前必须归一化，否则描边位移会按
+    |mean| 缩水（实测用户产物 32.4% 顶点长度 < 0.95）。见 common/obj_buffer_helper.py 的 docstring。
+    """
+
+    DTYPE = np.dtype([("POSITION", "<f4", 3), ("NORMAL", "<f4", 3), ("COLOR", "u1", 4)])
+
+    def setUp(self):
+        self._original_recalculate_color = obj_buffer_helper_module.GlobalProterties.recalculate_color
+        obj_buffer_helper_module.GlobalProterties.recalculate_color = lambda: True
+        self._had_width_accessor = hasattr(obj_buffer_helper_module.GlobalProterties, "recalculate_color_width")
+        self._original_width = getattr(obj_buffer_helper_module.GlobalProterties, "recalculate_color_width", None)
+        obj_buffer_helper_module.GlobalProterties.recalculate_color_width = lambda: 0.5
+        self.game_type = types.SimpleNamespace(
+            OrderedFullElementList=["POSITION", "NORMAL", "COLOR"]
+        )
+
+    def tearDown(self):
+        obj_buffer_helper_module.GlobalProterties.recalculate_color = self._original_recalculate_color
+        if self._had_width_accessor:
+            obj_buffer_helper_module.GlobalProterties.recalculate_color_width = self._original_width
+        elif hasattr(obj_buffer_helper_module.GlobalProterties, "recalculate_color_width"):
+            delattr(obj_buffer_helper_module.GlobalProterties, "recalculate_color_width")
+
+    def _vertex(self, position, normal, alpha=200):
+        row = np.zeros((), dtype=self.DTYPE)
+        row["POSITION"] = position
+        row["NORMAL"] = normal
+        row["COLOR"] = (10, 20, 30, alpha)
+        return row.tobytes()
+
+    def _recalculate(self, vertices, game_type=None):
+        return ObjBufferHelper.average_normal_color(
+            obj={},
+            indexed_vertices=vertices,
+            d3d11GameType=game_type or self.game_type,
+            dtype=self.DTYPE,
+        )
+
+    @staticmethod
+    def _decoded(result):
+        colors = np.asarray(result["COLOR"], dtype=np.float64)
+        return colors[:, :3] / 255.0 * 2.0 - 1.0
+
+    def test_hard_edge_average_is_stored_as_unit_vector(self):
+        result = self._recalculate(
+            [
+                self._vertex((0.0, 0.0, 0.0), (1.0, 0.0, 0.0)),
+                self._vertex((0.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
+                self._vertex((1.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+            ]
+        )
+        vectors = self._decoded(result)
+
+        expected = np.array([1.0, 1.0, 0.0]) / np.sqrt(2.0)
+        np.testing.assert_allclose(vectors[0], expected, atol=0.01)
+        np.testing.assert_allclose(vectors[1], expected, atol=0.01)
+        np.testing.assert_allclose(np.linalg.norm(vectors, axis=1), 1.0, atol=0.01)
+        # 非硬边位置写入自身法线方向
+        np.testing.assert_allclose(vectors[2], (0.0, 0.0, 1.0), atol=0.01)
+
+    def test_short_average_is_normalized_not_truncated(self):
+        angle = np.radians(170.0)
+        result = self._recalculate(
+            [
+                self._vertex((0.0, 0.0, 0.0), (1.0, 0.0, 0.0)),
+                self._vertex((0.0, 0.0, 0.0), (np.cos(angle), np.sin(angle), 0.0)),
+            ]
+        )
+        vectors = self._decoded(result)
+
+        # 平均向量长度只有 0.174，修复前会被原样写入（描边位移缩水成 1/6）
+        expected = np.array([1.0 + np.cos(angle), np.sin(angle), 0.0])
+        expected = expected / np.linalg.norm(expected)
+        np.testing.assert_allclose(np.linalg.norm(vectors, axis=1), 1.0, atol=0.01)
+        np.testing.assert_allclose(vectors[0], expected, atol=0.01)
+
+    def test_opposite_normals_fall_back_to_a_real_normal(self):
+        result = self._recalculate(
+            [
+                self._vertex((0.0, 0.0, 0.0), (1.0, 0.0, 0.0)),
+                self._vertex((0.0, 0.0, 0.0), (-1.0, 0.0, 0.0)),
+            ]
+        )
+        vectors = self._decoded(result)
+
+        # 平均向量为零：回退到该位置第一条可用法线，而不是塌成零向量 / 量化噪声
+        np.testing.assert_allclose(vectors[0], (1.0, 0.0, 0.0), atol=0.01)
+        np.testing.assert_allclose(vectors[1], (1.0, 0.0, 0.0), atol=0.01)
+
+    def test_zero_normals_stay_finite(self):
+        result = self._recalculate(
+            [
+                self._vertex((0.0, 0.0, 0.0), (0.0, 0.0, 0.0)),
+                self._vertex((0.0, 0.0, 0.0), (0.0, 0.0, 0.0)),
+            ]
+        )
+        vectors = self._decoded(result)
+
+        self.assertTrue(np.isfinite(vectors).all())
+        np.testing.assert_allclose(vectors, 0.0, atol=0.01)
+
+    def test_unit_input_stays_unit(self):
+        result = self._recalculate(
+            [
+                self._vertex((0.0, 0.0, 0.0), (0.6, 0.8, 0.0)),
+                self._vertex((1.0, 0.0, 0.0), (0.0, 0.6, 0.8)),
+            ]
+        )
+        vectors = self._decoded(result)
+
+        np.testing.assert_allclose(np.linalg.norm(vectors, axis=1), 1.0, atol=0.01)
+        np.testing.assert_allclose(vectors[0], (0.6, 0.8, 0.0), atol=0.01)
+
+    def test_alpha_defaults_to_half_and_is_not_inherited(self):
+        """alpha = 描边宽度旋钮本身：默认 0.5（128/255），且**不继承**输入旧值。
+
+        旧口径是"保留输入 alpha"，那会把上一次写错的值（例如 255）污染到下一次 —— 实机踩过。
+        现在写进去的就是 recalculate_color_width（0.5 = 游戏原版，实测原值中位 ≈ 118/255）。
+        """
+        result = self._recalculate(
+            [
+                self._vertex((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), alpha=17),
+                self._vertex((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), alpha=0),
+            ]
+        )
+
+        self.assertEqual(list(result["COLOR"][:, 3]), [128, 128])
+
+    def test_width_scale_thins_outline_without_changing_direction(self):
+        vertices = [
+            self._vertex((0.0, 0.0, 0.0), (1.0, 0.0, 0.0)),
+            self._vertex((0.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
+            self._vertex((1.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+        ]
+        obj_buffer_helper_module.GlobalProterties.recalculate_color_width = lambda: 1.0
+        base = self._recalculate(vertices)
+        obj_buffer_helper_module.GlobalProterties.recalculate_color_width = lambda: 0.25
+        result = self._recalculate(vertices)
+        vectors = self._decoded(result)
+
+        # 实测口径（ShaderFixes/91f78fc667efbeba 的反汇编）：描边外扩 = 方向 × 常量 × COLOR.a
+        # ⇒ 变细靠 alpha 变小；RGB（单位法线）连长度都不能变，否则 8bit 量化会把方向弄噪
+        np.testing.assert_allclose(np.linalg.norm(vectors, axis=1), 1.0, atol=0.01)
+        expected_dir = np.array([1.0, 1.0, 0.0]) / np.sqrt(2.0)
+        np.testing.assert_allclose(vectors[0] / np.linalg.norm(vectors[0]), expected_dir, atol=0.02)
+        np.testing.assert_allclose(vectors[2] / np.linalg.norm(vectors[2]), (0.0, 0.0, 1.0), atol=0.02)
+        expected_alpha = np.round(base["COLOR"][:, 3].astype(float) * 0.25).astype(int)
+        np.testing.assert_array_equal(result["COLOR"][:, 3].astype(int), expected_alpha)
+
+    def test_width_scale_is_clamped_to_one(self):
+        # >1 会在 8bit 每分量上截断而使方向失真，所以按 1.0 处理
+        obj_buffer_helper_module.GlobalProterties.recalculate_color_width = lambda: 1.5
+
+        vectors = self._decoded(self._recalculate([self._vertex((0.0, 0.0, 0.0), (1.0, 0.0, 0.0))]))
+
+        np.testing.assert_allclose(np.linalg.norm(vectors, axis=1), 1.0, atol=0.01)
+
+    def test_invalid_width_scale_falls_back_to_unit(self):
+        obj_buffer_helper_module.GlobalProterties.recalculate_color_width = lambda: float("nan")
+
+        vectors = self._decoded(self._recalculate([self._vertex((0.0, 0.0, 0.0), (1.0, 0.0, 0.0))]))
+
+        np.testing.assert_allclose(np.linalg.norm(vectors, axis=1), 1.0, atol=0.01)
+
+    def test_per_object_width_override_wins_over_global(self):
+        obj_buffer_helper_module.GlobalProterties.recalculate_color_width = lambda: 1.0
+        base = self._recalculate([self._vertex((0.0, 0.0, 0.0), (1.0, 0.0, 0.0))])
+
+        result = ObjBufferHelper.average_normal_color(
+            obj={"3DMigoto:RecalculateCOLORWidth": 0.25},
+            indexed_vertices=[self._vertex((0.0, 0.0, 0.0), (1.0, 0.0, 0.0))],
+            d3d11GameType=self.game_type,
+            dtype=self.DTYPE,
+        )
+
+        # 物体级覆盖同样作用在 alpha（宽度遮罩）上；RGB 长度保持 1.0
+        np.testing.assert_allclose(np.linalg.norm(self._decoded(result), axis=1), 1.0, atol=0.01)
+        expected = int(round(int(base["COLOR"][0, 3]) * 0.25))
+        self.assertEqual(int(result["COLOR"][0, 3]), expected)
+
+    def test_missing_width_accessor_defaults_to_unit(self):
+        # 旧版调用方（测试替身 / 老属性组）没有这个访问器时不能炸，也不能改宽度
+        if hasattr(obj_buffer_helper_module.GlobalProterties, "recalculate_color_width"):
+            delattr(obj_buffer_helper_module.GlobalProterties, "recalculate_color_width")
+
+        vectors = self._decoded(self._recalculate([self._vertex((0.0, 0.0, 0.0), (1.0, 0.0, 0.0))]))
+
+        np.testing.assert_allclose(np.linalg.norm(vectors, axis=1), 1.0, atol=0.01)
+
+    def test_alpha_is_the_width_knob(self):
+        """写进 COLOR.a 的就是旋钮值本身（不再有"基准 × 系数"两次相乘的坑）。"""
+        for value, expected in ((0.5, 128), (0.25, 64), (1.0, 255), (0.0, 0)):
+            obj_buffer_helper_module.GlobalProterties.recalculate_color_width = lambda v=value: v
+            result = self._recalculate([self._vertex((0.0, 0.0, 0.0), (1.0, 0.0, 0.0))])
+            self.assertEqual(int(result["COLOR"][0, 3]), expected, "width=%s" % value)
+
+    def test_per_loop_mode_keeps_split_normals(self):
+        """同一个位置的两条相反法线：默认（按位置平均）会互相抵消→回退同一条，
+
+        而逐 loop 直写模式下两个顶点各自保留自己的方向。"""
+        vertices = [
+            self._vertex((0.0, 0.0, 0.0), (1.0, 0.0, 0.0)),
+            self._vertex((0.0, 0.0, 0.0), (-1.0, 0.0, 0.0)),
+        ]
+        averaged = self._decoded(self._recalculate(list(vertices)))
+
+        obj_buffer_helper_module.GlobalProterties.recalculate_color_mode = lambda: "PER_LOOP"
+        try:
+            per_loop = self._decoded(self._recalculate(list(vertices)))
+        finally:
+            delattr(obj_buffer_helper_module.GlobalProterties, "recalculate_color_mode")
+
+        np.testing.assert_allclose(averaged[0], averaged[1], atol=0.02)
+        np.testing.assert_allclose(per_loop[0], (1.0, 0.0, 0.0), atol=0.02)
+        np.testing.assert_allclose(per_loop[1], (-1.0, 0.0, 0.0), atol=0.02)
+
+    def test_himi_color_is_written_in_the_exported_normal_space(self):
+        """HIMI：写 COLOR 时**不做**任何额外坐标变换，COLOR 与 NORMAL 列同空间。
+
+        依据（对游戏原始 dump 实测，不经过 Blender）：
+          · 产物 NORMAL 列 vs 游戏 NORMAL：中位夹角 0.51°（同空间）
+          · 产物 COLOR    vs 游戏 COLOR ：中位夹角 101.44°（旧实现多转了 mirrorX·Rx(-90)）
+          · 游戏自身 COLOR vs 同顶点 NORMAL：13.9°（大件）/41.5°（头发）—— 差值只来自"平滑 vs 逐面"
+        流水线顺序也支持这一点：common/submesh_model.py:428 先把导出空间变换烘焙进临时物体，
+        utils/export_utils.py:577 才轮到 average_normal_color ⇒ 此刻 loop 法线已在导出空间。
+        非 HIMI 游戏同样不受影响（本来就没有映射）。
+        """
+        logic = obj_buffer_helper_module.GlobalConfig.logic_name
+        had_flag = hasattr(obj_buffer_helper_module.GlobalConfig, "enable_non_mirror_workflow")
+        previous_flag = getattr(obj_buffer_helper_module.GlobalConfig, "enable_non_mirror_workflow", None)
+        try:
+            for logic_name in ("HIMI", "WWMI"):
+                for mirrored in (True, False):
+                    obj_buffer_helper_module.GlobalConfig.logic_name = logic_name
+                    obj_buffer_helper_module.GlobalConfig.enable_non_mirror_workflow = mirrored
+                    written = self._decoded(self._recalculate([self._vertex((0.0, 0.0, 0.0), (0.0, 1.0, 0.0))]))
+                    np.testing.assert_allclose(written[0], (0.0, 1.0, 0.0), atol=0.02,
+                                               err_msg="%s(非镜像=%s) 不应该改动法线方向" % (logic_name, mirrored))
+        finally:
+            obj_buffer_helper_module.GlobalConfig.logic_name = logic
+            if had_flag:
+                obj_buffer_helper_module.GlobalConfig.enable_non_mirror_workflow = previous_flag
+            elif hasattr(obj_buffer_helper_module.GlobalConfig, "enable_non_mirror_workflow"):
+                delattr(obj_buffer_helper_module.GlobalConfig, "enable_non_mirror_workflow")
+
+    def test_missing_color_attribute_is_created_before_write(self):
+        """物体本身没有顶点色时，重算前必须先创建 COLOR 属性 —— 否则写入没有落点。"""
+
+        class _ColorAttributes:
+            def __init__(self):
+                self.items = {}
+                self.active_color_index = -1
+
+            def get(self, name):
+                return self.items.get(name)
+
+            def new(self, name=None, type=None, domain=None):
+                created = types.SimpleNamespace(name=name, data_type=type, domain=domain)
+                self.items[name] = created
+                return created
+
+            def find(self, name):
+                return 0 if name in self.items else -1
+
+        class _Mesh:
+            def __init__(self):
+                self.color_attributes = _ColorAttributes()
+                self.vertex_colors = None
+
+        class _Obj(dict):
+            def __init__(self):
+                super().__init__()
+                self.name = "NoColorObject"
+                self.data = _Mesh()
+
+        obj = _Obj()
+        result = ObjBufferHelper.average_normal_color(
+            obj=obj,
+            indexed_vertices=[self._vertex((0.0, 0.0, 0.0), (1.0, 0.0, 0.0))],
+            d3d11GameType=self.game_type,
+            dtype=self.DTYPE,
+        )
+
+        self.assertIsNotNone(obj.data.color_attributes.get("COLOR"))
+        self.assertEqual(list(result["COLOR"][:, 3]), [128])
+
+    def test_returns_input_when_disabled(self):
+        obj_buffer_helper_module.GlobalProterties.recalculate_color = lambda: False
+        vertices = [self._vertex((0.0, 0.0, 0.0), (1.0, 0.0, 0.0))]
+
+        self.assertIs(self._recalculate(vertices), vertices)
+
+    def test_returns_input_without_color_element(self):
+        game_type = types.SimpleNamespace(OrderedFullElementList=["POSITION", "NORMAL"])
+        vertices = [self._vertex((0.0, 0.0, 0.0), (1.0, 0.0, 0.0))]
+
+        self.assertIs(self._recalculate(vertices, game_type=game_type), vertices)
+
+
 if __name__ == "__main__":
     unittest.main()
