@@ -967,7 +967,7 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
     background_corner_radius: bpy.props.IntProperty(
         name="背景圆角",
         description="面板背景的圆角半径。0 = 直角，100 = 最大圆角（约半圆）",
-        default=24,
+        default=5,
         min=0,
         max=100,
     )
@@ -1425,6 +1425,49 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
                     matched_tokens.add(kept_token)
                 new_lines.append(line)
             sections[sec_name] = new_lines
+
+        # 4) [Present] 的形态键强度签名：把未分配变量的项从表达式里删掉。
+        # 上游形态键节点会把**所有**形态键（本节点判为未分配的也在内）塞进签名
+        # `$ssmt_sk_sig_* = $Freq_a * 1 + $Freq_b * 3 + ...`，而这条签名正是
+        # `run = CustomShader_*_Anim` 的触发条件。不删掉这些项，未分配形态键就还挂在
+        # 分组动画（自动播放 / 滑块）的驱动链上——它们的 `global persist` 声明已被注释，
+        # 参与签名只剩副作用，游戏内表现为未分组形态键跟着分组一起动。
+        # 权重是互质数、求和本身与顺序无关，删掉恒为 0 的项不影响变化检测。
+        sig_pattern = re.compile(r'^(\s*)(\$ssmt_sk_sig_[^\s=]+)\s*=\s*(.+)$')
+        if '[Present]' in sections:
+            new_lines = []
+            for line in sections['[Present]']:
+                m = sig_pattern.match(line)
+                if not m:
+                    new_lines.append(line)
+                    continue
+                indent, sig_var, expr = m.group(1), m.group(2), m.group(3)
+                sig_token = sig_var.lstrip('$')
+                terms = [t.strip() for t in expr.split(' + ') if t.strip()]
+                kept = []
+                dropped = 0
+                for term in terms:
+                    term_match = re.match(r'^(\$[^\s*]+)', term)
+                    token = (term_match.group(1)[1:] if term_match else "")
+                    if token and token in target_set:
+                        matched_tokens.add(token)
+                        dropped += 1
+                        continue
+                    kept.append(term)
+                if dropped == 0:
+                    new_lines.append(line)
+                    continue
+                if not kept:
+                    # 续行（`$sig = $sig + ...`）没有剩余项：整行丢弃；
+                    # 首行（`$sig = 项...`）则保底成 `$sig = 0`，别让签名变量失去定义。
+                    if any(t.lstrip('$') == sig_token for t in terms):
+                        continue
+                    kept = ["0"]
+                elif len(kept) == 1 and kept[0].lstrip('$') == sig_token:
+                    # 只剩 `$sig = $sig` 的自赋值续行，同样没有意义，丢弃
+                    continue
+                new_lines.append(f"{indent}{sig_var} = " + " + ".join(kept))
+            sections['[Present]'] = new_lines
 
         # 一个匹配行都没有的未分配形态键：多半是变量名刚被刷新、ini 还没重新导出
         unmatched = sorted(target_set - matched_tokens)

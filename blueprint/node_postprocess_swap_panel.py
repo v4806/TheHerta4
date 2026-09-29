@@ -6,6 +6,11 @@
 
 面板中为每个物体切换生成一个按钮（没有滑块），点击按钮的行为与按下该切换对应的
 按键（KeySwap）完全一致：循环切换 $swapkeyX 的值。
+
+当蓝图中存在形态键滑块面板（SSMTNode_PostProcess_ShapeKeyExt 且启用了滑块面板）时，
+本节点不再生成独立的浮动面板，而是把切换按钮附加到滑块面板的左侧，复用滑块面板的
+坐标系与交互状态（位置/缩放/显隐/拖拽/鼠标点击）。若不存在滑块面板，则回退原有的
+独立面板机制。
 """
 
 import math
@@ -140,7 +145,7 @@ class SSMT_OT_SwapPanel_Refresh(bpy.types.Operator):
 class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
     bl_idname = 'SSMTNode_PostProcess_SwapPanel'
     bl_label = '物体切换面板'
-    bl_description = '读取蓝图物体切换节点与 mod 的 KeySwap 配置，生成带按钮的图形切换面板（点击按钮=按下切换按键）'
+    bl_description = '读取蓝图物体切换节点与 mod 的 KeySwap 配置，生成带按钮的图形切换面板（点击按钮=按下切换按键）；若存在形态键滑块面板则按钮附加到其左侧'
 
     def init(self, context):
         super().init(context)
@@ -154,6 +159,12 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
     PRESENT_END = "; ========== SWAP PANEL LOGIC END (appended) [{ns}] =========="
     DUP_GUARD = "SWAP PANEL LOGIC (appended)"
     GUI_GUARD_MARKER = "; @@SSMTSwapPanel:gui_guard:{ns}@@"
+
+    # 附加模式专用标识（用于区分独立面板与附加到滑块面板的按钮）
+    ATTACHED_FLAG = "; @@SSMTSwapPanel:attached_to_slider@@"
+    ATTACHED_PRESENT_BEGIN = "; ========== SWAP PANEL ATTACHED LOGIC (appended) [{ns}] =========="
+    ATTACHED_PRESENT_END = "; ========== SWAP PANEL ATTACHED LOGIC END (appended) [{ns}] =========="
+    ATTACHED_PRESENT_MARKER = "; @@SSMTSwapPanel:attached_present:{ns}@@"
 
     create_cumulative_backup: bpy.props.BoolProperty(name="创建累积备份", default=True)
 
@@ -222,7 +233,7 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
     remark_stroke_color: bpy.props.FloatVectorProperty(
         name="描边颜色", subtype='COLOR', default=(0.0, 0.0, 0.0), min=0.0, max=1.0, size=3
     )
-    remark_stroke_width: bpy.props.IntProperty(name="描边粗细", default=2, min=0, max=20)
+    remark_stroke_width: bpy.props.IntProperty(name="描边粗细", default=4, min=0, max=20)
 
     # ---- 按钮样式（文字图标底色/边框，以及没有图片时的默认按钮图）----
     button_bg_color: bpy.props.FloatVectorProperty(
@@ -237,13 +248,13 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
     )
     button_align: bpy.props.EnumProperty(
         name="按钮对齐",
-        description="按钮组在面板内的水平对齐方式",
+        description="按钮组在面板内的水平对齐方式（仅独立面板模式生效；附加模式下按钮总在滑块面板左侧）",
         items=[('LEFT', "左对齐", ""), ('CENTER', "居中", ""), ('RIGHT', "右对齐", "")],
         default='CENTER',
     )
 
     # ---- 面板背景样式（圆角 + 边框，对背景图应用；自定义背景同样生效）----
-    background_corner_radius: bpy.props.IntProperty(name="背景圆角", default=24, min=0, max=100)
+    background_corner_radius: bpy.props.IntProperty(name="背景圆角", default=5, min=0, max=100)
     background_border_color: bpy.props.FloatVectorProperty(
         name="背景边框色", subtype='COLOR', default=(0.59, 0.75, 0.94), min=0.0, max=1.0, size=3
     )
@@ -284,6 +295,40 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
     def copy(self, node):
         # 复制节点时重置命名空间，避免与源节点共用同一套面板变量/段落
         self.namespace = ""
+
+    # ==========================================
+    # 查找形态键滑块面板（附加模式）
+    # ==========================================
+    def _find_slider_panel_node(self):
+        """在当前蓝图（含嵌套蓝图）中查找启用了滑块面板的形态键扩展节点。
+
+        找到时，本节点的切换按钮会附加到该滑块面板的左侧，复用其坐标系与交互状态。
+        未找到时返回 None，走原有独立面板机制。
+        """
+        tree = getattr(self, "id_data", None)
+        if tree is None:
+            return None
+        return self._find_slider_panel_node_in_tree(tree, set())
+
+    def _find_slider_panel_node_in_tree(self, tree, visited):
+        tree_key = getattr(tree, "name", str(id(tree)))
+        if tree_key in visited:
+            return None
+        visited.add(tree_key)
+        for node in tree.nodes:
+            if getattr(node, "mute", False):
+                continue
+            if node.bl_idname == 'SSMTNode_PostProcess_ShapeKeyExt':
+                if bool(getattr(node, "use_slider_panel", False)):
+                    return node
+            elif node.bl_idname == 'SSMTNode_Blueprint_Nest':
+                blueprint_name = str(getattr(node, "blueprint_name", "") or "")
+                nested = bpy.data.node_groups.get(blueprint_name) if blueprint_name and blueprint_name != "NONE" else None
+                if nested and getattr(nested, "bl_idname", "") == "SSMTBlueprintTreeType":
+                    result = self._find_slider_panel_node_in_tree(nested, visited)
+                    if result is not None:
+                        return result
+        return None
 
     # ==========================================
     # 原地更新：按专有标识移除本面板旧配置
@@ -334,11 +379,13 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
             skipping = False
             present_begin = self.PRESENT_BEGIN.format(ns=ns)
             present_end = self.PRESENT_END.format(ns=ns)
+            attached_begin = self.ATTACHED_PRESENT_BEGIN.format(ns=ns)
+            attached_end = self.ATTACHED_PRESENT_END.format(ns=ns)
             for line in sections['[Present]']:
-                if present_begin in line:
+                if present_begin in line or attached_begin in line:
                     skipping = True
                     continue
-                if present_end in line:
+                if present_end in line or attached_end in line:
                     skipping = False
                     continue
                 if not skipping:
@@ -437,6 +484,19 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
         box_top.label(text="修改设置后点上方按钮即可原地更新，无需重新导出", icon='INFO')
         layout.separator()
 
+        # 提示：是否检测到形态键滑块面板
+        slider_node = self._find_slider_panel_node()
+        # 附加模式：按钮附加到滑块面板左侧，复用其位置/缩放/显隐；
+        # 下列由滑块面板统一负责的设置项在该模式下无效，自动隐藏。
+        attached_mode = slider_node is not None
+        info_box = layout.box()
+        if slider_node is not None:
+            info_box.label(text=f"已检测到形态键滑块面板（{slider_node.name}）", icon='CHECKMARK')
+            info_box.label(text="切换按钮将附加到滑块面板左侧，复用其位置/缩放/显隐", icon='INFO')
+        else:
+            info_box.label(text="未检测到形态键滑块面板，使用独立浮动面板机制", icon='INFO')
+        layout.separator()
+
         # 左右两列：左=基础设置/检测/列表，右=图片资源设置
         split = layout.split(factor=0.5)
         col_left = split.column()
@@ -446,18 +506,20 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
         box = col_left.box()
         box.label(text="快捷键设置", icon='KEYINGSET')
         col = box.column(align=True)
-        col.prop(self, "help_key", text="显示/隐藏面板")
-        col.prop(self, "reset_key", text="重置位置")
-        col.prop(self, "zoom_in_key", text="放大")
-        col.prop(self, "zoom_out_key", text="缩小")
-        col.prop(self, "drag_key", text="拖拽键")
+        if not attached_mode:
+            col.prop(self, "help_key", text="显示/隐藏面板")
+            col.prop(self, "reset_key", text="重置位置")
+            col.prop(self, "zoom_in_key", text="放大")
+            col.prop(self, "zoom_out_key", text="缩小")
+            col.prop(self, "drag_key", text="拖拽键")
         col.prop(self, "gui_only", text="GUI全局模式")
 
         box = col_left.box()
         box.label(text="UI尺寸设置", icon='PROPERTIES')
         col = box.column(align=True)
-        col.prop(self, "panel_default_scale", text="面板默认缩放")
-        col.separator()
+        if not attached_mode:
+            col.prop(self, "panel_default_scale", text="面板默认缩放")
+            col.separator()
         col.prop(self, "button_height", text="按钮高度")
         col.prop(self, "button_width", text="按钮默认宽度")
         col.prop(self, "buttons_per_row", text="每行按钮数")
@@ -465,16 +527,18 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
         row.prop(self, "button_column_spacing", text="列间距")
         row.prop(self, "button_row_spacing", text="行间距")
         col.prop(self, "button_top_padding", text="顶部留白")
-        col.prop(self, "panel_min_height", text="面板最小高度")
+        if not attached_mode:
+            col.prop(self, "panel_min_height", text="面板最小高度")
         col.label(text="按钮/面板背景尺寸按图片比例自动计算", icon='INFO')
 
-        box = col_left.box()
-        box.label(text="角色检测设置", icon='VIEWZOOM')
-        row = box.row(align=True)
-        row.prop_search(self, "target_object", bpy.data, "objects", text="物体", icon='OBJECT_DATA')
-        row.operator("ssmt.swap_panel_parse_object", text="", icon='FILE_REFRESH').node_name = self.name
-        box.prop(self, "detect_hash", text="哈希值")
-        box.prop(self, "detect_index_count", text="IndexCount")
+        if not attached_mode:
+            box = col_left.box()
+            box.label(text="角色检测设置", icon='VIEWZOOM')
+            row = box.row(align=True)
+            row.prop_search(self, "target_object", bpy.data, "objects", text="物体", icon='OBJECT_DATA')
+            row.operator("ssmt.swap_panel_parse_object", text="", icon='FILE_REFRESH').node_name = self.name
+            box.prop(self, "detect_hash", text="哈希值")
+            box.prop(self, "detect_index_count", text="IndexCount")
 
         box = col_left.box()
         box.label(text="物体/贴图切换按钮列表", icon='SHADERFX')
@@ -492,8 +556,9 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
         # ---- 右列（图片资源 + 备注文字图标设置）----
         box = col_right.box()
         box.label(text="面板图片资源（自定义）", icon='TEXTURE')
-        box.prop(self, "background_image", text="背景")
-        box.prop(self, "button_image", text="按钮全局回退")
+        if not attached_mode:
+            box.prop(self, "background_image", text="背景（仅独立面板模式生效）")
+            box.prop(self, "button_image", text="按钮全局回退")
         box.prop(self, "button_border_image", text="按钮边框")
         box.label(text="优先级：单按钮图片 → 全局回退 → 备注文字图标 → 默认按钮", icon='INFO')
         box.label(text="边框会缩放并叠加到所有按钮，建议使用透明PNG", icon='INFO')
@@ -505,40 +570,48 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
                 row.label(text=entry.label or "(无备注)", icon='NONE')
                 row.prop(entry, "image_path", text="")
 
+        # ---- 备注文字图标 + 按钮样式（合并为一个区域；未勾选备注图标或附加模式下按钮样式组隐藏）----
         box = col_right.box()
         box.label(text="备注文字图标（自动生成）", icon='FILE_FONT')
+
+        show_button_style = not attached_mode
         if PIL_AVAILABLE:
             box.prop(self, "use_remark_as_icon", text="用备注生成图标")
-            style_col = box.column(align=True)
-            style_col.active = bool(self.use_remark_as_icon)
-            style_col.prop(self, "remark_font_family", text="字体")
-            style_col.prop(self, "remark_font_size", text="字号")
-            style_row = style_col.row(align=True)
-            style_row.prop(self, "remark_text_color", text="文字色")
-            style_row.prop(self, "remark_stroke_color", text="描边色")
-            style_col.prop(self, "remark_stroke_width", text="描边粗细")
-            box.label(text="备注里输入 / 可强制换行；已单独设置图片的按钮不受影响", icon='INFO')
+            if self.use_remark_as_icon:
+                remark_col = box.column(align=True)
+                remark_col.prop(self, "remark_font_family", text="字体")
+                remark_col.prop(self, "remark_font_size", text="字号")
+                remark_row = remark_col.row(align=True)
+                remark_row.prop(self, "remark_text_color", text="文字色")
+                remark_row.prop(self, "remark_stroke_color", text="描边色")
+                remark_col.prop(self, "remark_stroke_width", text="描边粗细")
+                box.label(text="备注里输入 / 可强制换行；已单独设置图片的按钮不受影响", icon='INFO')
+            else:
+                show_button_style = False
         else:
             box.label(text="未安装 Pillow，无法用备注生成图标", icon='ERROR')
 
-        box = col_right.box()
-        box.label(text="按钮样式（文字图标/默认按钮）", icon='COLOR')
-        style_col = box.column(align=True)
-        style_row = style_col.row(align=True)
-        style_row.prop(self, "button_bg_color", text="背景色")
-        style_row.prop(self, "button_border_color", text="边框色")
-        style_col.prop(self, "button_border_width", text="边框宽度")
-        style_col.prop(self, "button_opacity", text="透明度")
-        style_col.prop(self, "button_align", text="按钮对齐")
+        if show_button_style:
+            if PIL_AVAILABLE:
+                box.separator()
+            box.label(text="按钮样式（文字图标/默认按钮）", icon='COLOR')
+            style_col = box.column(align=True)
+            style_row = style_col.row(align=True)
+            style_row.prop(self, "button_bg_color", text="背景色")
+            style_row.prop(self, "button_border_color", text="边框色")
+            style_col.prop(self, "button_border_width", text="边框宽度")
+            style_col.prop(self, "button_opacity", text="透明度")
+            style_col.prop(self, "button_align", text="按钮对齐")
 
-        box = col_right.box()
-        box.label(text="面板背景样式（圆角/边框）", icon='MATERIAL')
-        bg_col = box.column(align=True)
-        bg_col.prop(self, "background_corner_radius", text="背景圆角")
-        bg_col.prop(self, "background_border_color", text="边框色")
-        bg_col.prop(self, "background_border_width", text="边框宽度")
-        bg_col.prop(self, "background_opacity", text="透明度")
-        box.label(text="对背景图应用圆角/边框（自定义背景同样生效）", icon='INFO')
+        if not attached_mode:
+            box = col_right.box()
+            box.label(text="面板背景样式（圆角/边框）", icon='MATERIAL')
+            bg_col = box.column(align=True)
+            bg_col.prop(self, "background_corner_radius", text="背景圆角")
+            bg_col.prop(self, "background_border_color", text="边框色")
+            bg_col.prop(self, "background_border_width", text="边框宽度")
+            bg_col.prop(self, "background_opacity", text="透明度")
+            box.label(text="对背景图应用圆角/边框（自定义背景同样生效）", icon='INFO')
 
     # ==========================================
     # 扫描 / 解析
@@ -1163,7 +1236,7 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
             print(f"[物体切换面板] 生成文字图标失败: {e}")
             return None
 
-    def _ensure_button_image(self, dest_res_dir, ns, i, source_asset_dir, button):
+    def _ensure_button_image(self, dest_res_dir, ns, i, source_asset_dir, button, style_src=None):
         """生成第 i 个按钮的图标图片，返回路径。
 
         优先级：
@@ -1171,13 +1244,22 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
           2. 全局回退图片（button_image）
           3. 用备注文字自动生成的图标（use_remark_as_icon 且备注非空，需要 Pillow）
           4. 纯色默认按钮图（仍会叠加按钮边框图片）
+
+        style_src：按钮回退图片与文字按钮样式的来源对象。附加模式下传入形态键滑块面板
+        节点，让附加按钮与该面板保持一致（本节点对应设置项在附加模式下已隐藏）；
+        缺省（None）时使用本节点自身的设置。
         """
+        src = style_src if style_src is not None else self
+
+        def _style(name):
+            return getattr(src, name, getattr(self, name))
+
         dest_name = f"swpbtn_{ns}_{i}.png"
         dest_path = os.path.join(dest_res_dir, dest_name)
 
         custom = (button.get("image_path") or "").strip()
         if not custom:
-            custom = (self.button_image or "").strip()
+            custom = (_style("button_image") or "").strip()
         if custom and os.path.isfile(custom):
             shutil.copy2(custom, dest_path)
             return self._apply_button_border_image(dest_path)
@@ -1193,10 +1275,10 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
                 text_color=self.remark_text_color,
                 stroke_width=self.remark_stroke_width,
                 stroke_color=self.remark_stroke_color,
-                bg_color=self.button_bg_color,
-                border_color=self.button_border_color,
-                border_width=self.button_border_width,
-                opacity=self.button_opacity,
+                bg_color=_style("button_bg_color"),
+                border_color=_style("button_border_color"),
+                border_width=_style("button_border_width"),
+                opacity=_style("button_opacity"),
             )
             if generated:
                 return self._apply_button_border_image(generated)
@@ -1207,16 +1289,16 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
                 def _to_rgb(vals):
                     return tuple(int(round(val * 255)) for val in vals)
 
-                bg_rgb = _to_rgb(self.button_bg_color)
-                bd_rgb = _to_rgb(self.button_border_color)
-                btn_alpha = int(255 * max(0.0, min(1.0, self.button_opacity)))
+                bg_rgb = _to_rgb(_style("button_bg_color"))
+                bd_rgb = _to_rgb(_style("button_border_color"))
+                btn_alpha = int(255 * max(0.0, min(1.0, _style("button_opacity"))))
                 img = PILImage.new('RGBA', (384, 64), (0, 0, 0, 0))
                 draw = PILDraw.Draw(img)
                 try:
                     draw.rounded_rectangle([0, 0, 383, 63], radius=12,
                                            fill=bg_rgb + (btn_alpha,),
                                            outline=bd_rgb + (btn_alpha,),
-                                           width=self.button_border_width)
+                                           width=_style("button_border_width"))
                 except Exception:
                     draw.rectangle([0, 0, 383, 63], fill=bg_rgb + (btn_alpha,),
                                    outline=bd_rgb + (btn_alpha,))
@@ -1338,9 +1420,235 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
             return False
         return game == 'ENDFIELD'
 
+    # ==========================================
+    # 附加模式：把切换按钮附加到形态键滑块面板左侧
+    # ==========================================
+    def _generate_attached_panel(self, mod_export_path, target_ini_file, buttons, _in_place=False):
+        """附加模式：不生成独立浮动面板，把切换按钮附加到滑块面板的左侧。
+
+        - 复用滑块面板的坐标系与交互状态：`$img0_x`/`$img0_y`/`$zoom0`/`$help`/
+          `$ui_active`/`$mouse_clicked`/`$is_dragging`/`$click_outside`。
+        - 复用滑块面板的 `[CustomShaderDraw]`（无命名空间），无需单独准备 shader。
+        - 不生成：背景图、独立键位段落、独立检测段、独立 shader 段。
+        - 保留：按钮资源段落、循环切换 CommandList、按钮点击逻辑、GUI 全局模式守卫。
+
+        若原有独立面板配置存在（从独立模式切换过来），会先按本节点命名空间清理掉。
+        """
+        # 附加模式下，按钮的回退图片与文字按钮样式跟随形态键滑块面板节点
+        # （本节点里这几项设置已在 UI 上隐藏，避免出现「隐藏但生成时仍读本节点值」的无效隐藏）
+        slider_style_src = self._find_slider_panel_node()
+
+        ns = self._ensure_namespace()
+        num_buttons = len(buttons)
+        btn_h = self.button_height
+        SCREEN_RATIO_CORRECTION = 0.5625
+
+        # ---- 1. 准备按钮资源（附加模式不需要独立背景图）----
+        try:
+            addon_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            source_asset_dir = os.path.join(addon_dir, "Toolset")
+            dest_res_dir = os.path.join(mod_export_path, "res")
+            os.makedirs(dest_res_dir, exist_ok=True)
+
+            # 确保 draw_2d.hlsl 存在（滑块面板也会复制，两处都做去重即可）
+            shader_src = os.path.join(source_asset_dir, "draw_2d.hlsl")
+            shader_dst = os.path.join(dest_res_dir, "draw_2d.hlsl")
+            if os.path.exists(shader_src) and not os.path.exists(shader_dst):
+                shutil.copy2(shader_src, shader_dst)
+
+            btn_w_list = []
+            for i, b in enumerate(buttons, start=1):
+                img_path = self._ensure_button_image(
+                    dest_res_dir, ns, i, source_asset_dir, b, style_src=slider_style_src
+                )
+                btn_w_i = float(self.button_width or 0.0)
+                if btn_w_i <= 0.0:
+                    btn_w_i = btn_h * 3.0 * SCREEN_RATIO_CORRECTION  # 缺省按 3:1 比例
+                    if img_path and PIL_AVAILABLE:
+                        try:
+                            with PILImage.open(img_path) as img:
+                                w, h = img.size
+                                if h > 0:
+                                    btn_w_i = btn_h * (w / h) * SCREEN_RATIO_CORRECTION
+                        except Exception:
+                            pass
+                btn_w_list.append(btn_w_i)
+        except Exception as e:
+            print(f"[物体切换面板] 附加模式准备按钮资源出错: {e}")
+            return False
+
+        # ---- 2. 读取目标 ini ----
+        result = self._read_ini_to_ordered_dict(target_ini_file)
+        if result is None or not result[0]:
+            return False
+        sections, preserved_tail_content, preserved_driver_content = result
+
+        # ---- 3. 附加模式：总是清理本节点旧配置 ----
+        # 这样无论之前是独立模式还是附加模式，都能被安全覆盖，不会留下孤立段落。
+        self._remove_owned_config(sections, ns)
+        self._remove_gui_only_guards(sections, ns)
+
+        # ---- 4. Constants ----
+        constants_additions = [self.BLOCK_BEGIN.format(ns=ns)]
+        constants_additions.append("; --- Attached Swap Buttons (drawn to the left of the slider panel) ---")
+        constants_additions.append(self.ATTACHED_FLAG)
+        for i in range(1, num_buttons + 1):
+            constants_additions.extend([
+                f"global ${ns}_btn_w{i} = {btn_w_list[i-1]:.4f}",
+                f"global ${ns}_btn_h{i} = {btn_h:.4f}",
+                f"global ${ns}_btn_render_w{i}",
+                f"global ${ns}_btn_render_h{i}",
+                f"global ${ns}_btn_x{i}",
+                f"global ${ns}_btn_y{i}",
+                f"global ${ns}_btn_pressed{i} = 0",
+            ])
+        constants_additions.append(f"; @@{self.PANEL_TAG}:gui_only@@")
+        constants_additions.append(f"global ${ns}_gui_only = {1 if self.gui_only else 0}")
+        for b in buttons:
+            for var_name in (b.get("var_names") or [b["var_name"]]):
+                var_line = f"global persist {var_name} = 0"
+                if var_line not in constants_additions:
+                    constants_additions.append(var_line)
+        constants_additions.append(self.BLOCK_END.format(ns=ns))
+
+        # ---- 5. 资源段落 / 循环切换 CommandList ----
+        other_sections = OrderedDict()
+        for i in range(1, num_buttons + 1):
+            other_sections[f"[ResourceSwapButton{i}_{ns}]"] = [f"filename = ./res/swpbtn_{ns}_{i}.png"]
+
+        for i, b in enumerate(buttons, start=1):
+            command_lines = []
+            var_names = b.get("var_names") or [b["var_name"]]
+            option_counts = b.get("option_counts") or [b["option_count"]]
+            for sub_index, (var_name, option_count) in enumerate(zip(var_names, option_counts), start=1):
+                sub_name = f"CommandListSwap{i}_{sub_index}_{ns}"
+                other_sections[f"[{sub_name}]"] = self._cycle_command_lines(var_name, option_count)
+                command_lines.append(f"run = {sub_name}")
+            other_sections[f"[CommandListSwap{i}_{ns}]"] = command_lines
+
+        # 复用滑块面板的 [CustomShaderDraw]（无命名空间）；若滑块面板尚未写入，则先建好
+        if '[CustomShaderDraw]' not in sections:
+            sections['[CustomShaderDraw]'] = []
+            shader_def = [
+                "hs = null", "ds = null", "gs = null", "cs = null",
+                "vs = ./res/draw_2d.hlsl", "ps = ./res/draw_2d.hlsl",
+                "blend = ADD SRC_ALPHA INV_SRC_ALPHA", "cull = none",
+                "topology = triangle_strip", "o0 = set_viewport bb", "Draw = 4,0", "clear = ps-t100"
+            ]
+            for line in shader_def:
+                sections['[CustomShaderDraw]'].append(line)
+
+        # ---- 6. Present 逻辑：复用滑块面板的可见性/位置/缩放/点击状态 ----
+        present_additions = []
+        present_additions.append(self.ATTACHED_PRESENT_MARKER)
+        present_additions.append("")
+        present_additions.append("; --- Attached swap buttons (rendered alongside the slider panel) ---")
+        present_additions.append("; 复用滑块面板状态：$help / $ui_active / $img0_x / $img0_y / $zoom0 / $mouse_clicked / $is_dragging")
+        present_additions.append("if $help == 1 && $ui_active == 1")
+
+        gap = 0.02  # 按钮组与滑块面板之间的水平间隙
+
+        # 位置计算：按钮从左往右排列在滑块面板左侧
+        for i, _b in enumerate(buttons, start=1):
+            # 每个按钮相对面板顶部的 y 偏移（屏幕比例；与滑块面板同缩放）
+            y_offset_screen_units = self.button_top_padding + (i - 1) * (btn_h + self.button_row_spacing)
+            present_additions.append(f"    ${ns}_btn_render_w{i} = ${ns}_btn_w{i} * $zoom0")
+            present_additions.append(f"    ${ns}_btn_render_h{i} = ${ns}_btn_h{i} * $zoom0")
+            # 按钮右边缘紧贴滑块面板左边缘（面板 x = $img0_x）
+            present_additions.append(f"    ${ns}_btn_x{i} = $img0_x - {gap:.4f} - ${ns}_btn_render_w{i}")
+            present_additions.append(f"    ${ns}_btn_y{i} = $img0_y + {y_offset_screen_units:.4f} * $zoom0")
+
+        # 按钮按下/弹起检测：复用滑块面板的鼠标状态
+        # 注意：滑块面板自身的 Present 块先执行时会因为鼠标落在面板外而设置 $click_outside = 1，
+        # 这里在按钮命中时把它重置为 0，避免点击附加按钮导致面板被关闭。
+        present_additions.append("    ; 附加按钮：按下检测（同时清掉滑块面板设置的 $click_outside）")
+        present_additions.append("    if $mouse_clicked && $is_dragging == 0")
+        for i in range(1, num_buttons + 1):
+            present_additions.append(
+                f"        if cursor_x > ${ns}_btn_x{i} && cursor_x < ${ns}_btn_x{i} + ${ns}_btn_render_w{i} "
+                f"&& cursor_y > ${ns}_btn_y{i} && cursor_y < ${ns}_btn_y{i} + ${ns}_btn_render_h{i}"
+            )
+            present_additions.append(f"            ${ns}_btn_pressed{i} = 1")
+            present_additions.append("            $click_outside = 0")
+            present_additions.append("        endif")
+        present_additions.append("    else")
+        present_additions.append("        if $is_dragging == 0")
+        for i in range(1, num_buttons + 1):
+            present_additions.append(f"            if ${ns}_btn_pressed{i} == 1")
+            present_additions.append(
+                f"                if cursor_x > ${ns}_btn_x{i} && cursor_x < ${ns}_btn_x{i} + ${ns}_btn_render_w{i} "
+                f"&& cursor_y > ${ns}_btn_y{i} && cursor_y < ${ns}_btn_y{i} + ${ns}_btn_render_h{i}"
+            )
+            present_additions.append(f"                    run = CommandListSwap{i}_{ns}")
+            present_additions.append("                endif")
+            present_additions.append(f"                ${ns}_btn_pressed{i} = 0")
+            present_additions.append("            endif")
+        present_additions.append("        endif")
+        present_additions.append("    endif")
+
+        # 渲染按钮
+        for i, b in enumerate(buttons, start=1):
+            present_additions.append(f"\n    ; 渲染附加切换按钮{i} ({b.get('var_name', '')})")
+            present_additions.append(f"    ps-t100 = ResourceSwapButton{i}_{ns}")
+            present_additions.append(f"    x87 = ${ns}_btn_render_w{i}")
+            present_additions.append(f"    y87 = ${ns}_btn_render_h{i}")
+            present_additions.append(f"    z87 = ${ns}_btn_x{i}")
+            present_additions.append(f"    if ${ns}_btn_pressed{i} == 1")
+            present_additions.append(f"        w87 = ${ns}_btn_y{i} + 0.002")
+            active_vars = b.get("var_names") or [b["var_name"]]
+            active_condition = " || ".join(f"{var_name} != 0" for var_name in active_vars)
+            present_additions.append(f"    else if {active_condition}")
+            present_additions.append(f"        w87 = ${ns}_btn_y{i} + 0.001")
+            present_additions.append("    else")
+            present_additions.append(f"        w87 = ${ns}_btn_y{i}")
+            present_additions.append("    endif")
+            present_additions.append("    run = CustomShaderDraw")
+
+        present_additions.append("endif")
+
+        # GUI 全局模式守卫（屏蔽原始 KeySwap 段落）
+        self._apply_gui_only_guards(sections, ns, buttons)
+
+        # ---- 7. 合并写入 ----
+        if '[Constants]' not in sections:
+            sections['[Constants]'] = []
+        for line in constants_additions:
+            if line not in sections['[Constants]']:
+                sections['[Constants]'].append(line)
+
+        for sec_name, lines in other_sections.items():
+            if sec_name not in sections:
+                sections[sec_name] = []
+            for line in lines:
+                if line not in sections[sec_name]:
+                    sections[sec_name].append(line)
+
+        if '[Present]' not in sections:
+            sections['[Present]'] = []
+        sections['[Present]'].append("")
+        sections['[Present]'].append(self.ATTACHED_PRESENT_BEGIN.format(ns=ns))
+        sections['[Present]'].extend(present_additions)
+        sections['[Present]'].append(self.ATTACHED_PRESENT_END.format(ns=ns))
+
+        try:
+            with open(target_ini_file, 'w', encoding='utf-8') as f:
+                f.write("")
+            self._write_ordered_dict_to_ini(sections, target_ini_file, preserved_tail_content, preserved_driver_content)
+            print(f"物体切换面板(附加到形态键滑块面板左侧)已{'原地更新' if _in_place else '合并到'}: {os.path.basename(target_ini_file)}")
+            print(f"共生成 {num_buttons} 个附加切换按钮")
+            return True
+        except Exception as e:
+            print(f"写入INI文件失败: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
     def execute_postprocess(self, mod_export_path, _in_place=False, _ini_path=None):
         """生成 / 原地刷新物体切换面板配置。
 
+        - 若蓝图中存在形态键滑块面板（启用 use_slider_panel），进入附加模式：把切换按钮
+          附加到滑块面板左侧，复用其坐标系与交互状态，不生成独立浮动面板。
+        - 否则走原有独立面板机制。
         - 导出时（_in_place=False）：在 mod 目录 ini 中追加面板配置（含专有标识注释）。
         - 刷新时（_in_place=True）：按专有标识移除本面板旧配置后原地重新生成，无需重新导出整个 mod。
         """
@@ -1354,6 +1662,22 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
 
         print(f"物体切换面板{'原地刷新' if _in_place else '开始执行'}: {target_ini_file}")
 
+        # 1. 收集按钮数据
+        buttons = self._build_button_list(target_ini_file)
+        if not buttons:
+            print("未检测到任何物体切换节点 / [KeySwap_*] 配置，跳过面板生成")
+            return False
+
+        # 2. 检测形态键滑块面板：存在则走附加模式（不生成独立浮动面板）
+        slider_node = self._find_slider_panel_node()
+        if slider_node is not None:
+            print(f"[物体切换面板] 检测到形态键滑块面板节点 '{slider_node.name}'，切换按钮将附加到其左侧")
+            # 附加模式总是替换旧配置，允许从独立模式平滑切换过来（不残留旧的独立面板段落）
+            return self._generate_attached_panel(
+                mod_export_path, target_ini_file, buttons, _in_place=True
+            )
+
+        # ---- 以下为原有独立面板机制 ----
         # 防重复：仅导出时检查（刷新时按标识替换旧配置）
         if not _in_place:
             try:
@@ -1374,16 +1698,11 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
         ns = self._ensure_namespace()
         self.last_mod_ini_path = target_ini_file
 
-        # 1. 收集按钮数据
-        buttons = self._build_button_list(target_ini_file)
-        if not buttons:
-            print("未检测到任何物体切换节点 / [KeySwap_*] 配置，跳过面板生成")
-            return False
         num_buttons = len(buttons)
         buttons_per_row = max(1, min(int(self.buttons_per_row or 1), num_buttons))
         num_rows = max(1, int(math.ceil(num_buttons / float(buttons_per_row))))
 
-        # 2. 复制资源（shader + 背景图 + 按钮图）
+        # 3. 复制资源（shader + 背景图 + 按钮图）
         try:
             addon_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             source_asset_dir = os.path.join(addon_dir, "Toolset")
@@ -1448,7 +1767,7 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
             print(f"准备和复制资源文件时出错: {e}")
             return False
 
-        # 3. 读取目标 ini
+        # 4. 读取目标 ini
         result = self._read_ini_to_ordered_dict(target_ini_file)
         if result is None or not result[0]:
             return False
@@ -1464,7 +1783,7 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
                 return False
         self._remove_gui_only_guards(sections, ns)
 
-        # 4. 生成面板配置（面板背景宽度按「面板高度×背景图片宽高比」推导，保持背景比例）
+        # 5. 生成面板配置（面板背景宽度按「面板高度 × 背景图片宽高比」推导，保持背景比例）
         btn_h = self.button_height
 
         top_padding = self.button_top_padding
@@ -1481,7 +1800,7 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
         else:
             adjusted_panel_bg_width = grid_width + (side_padding * 2)
 
-        # 生成/处理面板背景（圆角+边框）：无论是否自定义背景图都生效
+        # 生成/处理面板背景（圆角 + 边框）：无论是否自定义背景图都生效
         bg_custom = (self.background_image or "").strip()
         self._generate_background_image(os.path.join(dest_res_dir, f"swpbg_{ns}.png"),
                                         adjusted_panel_bg_width, parent_height,
