@@ -15,6 +15,37 @@ from .node_postprocess_base import SSMTNode_PostProcess_Base
 
 NODE_IDNAME = "SSMTNode_PostProcess_DiffuseSwitch"
 
+#: 角色激活标志候选。口径同 ``node_postprocess_custom_material_assign``、
+#: ``anim_driver_base._get_activation_flag``（NTEMI 用 ``$ntmi_active0``）与
+#: ``node_swap_ini`` 的 ``$active0``。
+ACTIVATION_FLAG_CANDIDATES = ("$active0", "$ntmi_active0")
+#: 只认这两种形态（行首 ``;`` 的注释行不算）：``global $active0`` 声明、
+#: ``$active0 = 1`` 置位。两者任一在位即认为门控机制齐全（三件套同进同出：
+#: 声明 + 部件置位 + 主 [Present] 清零）。
+_ACTIVATION_FLAG_DECL_RE = re.compile(
+    r"^[ \t]*global(?:[ \t]+persist)?[ \t]+(\$[A-Za-z_]\w*)",
+    re.IGNORECASE | re.MULTILINE,
+)
+_ACTIVATION_FLAG_SET_RE = re.compile(
+    r"^[ \t]*(\$[A-Za-z_]\w*)[ \t]*=[ \t]*1[ \t]*$", re.MULTILINE
+)
+
+
+def find_activation_flag_in_text(text):
+    """返回 ini 文本里可用的角色激活标志（``$active0`` / ``$ntmi_active0``），没有则空串。
+
+    判据取「门控机制在位」（声明或置位任一）而不是「猜游戏支不支持」：整套机制由
+    导出器在「蓝图存在切换按键」时整体发射。没有这套机制时加
+    ``condition = $active0 == 1`` 会让热键恒假（未声明变量按 0 读），所以宁可不加。
+    """
+    source = text or ""
+    declared = set(_ACTIVATION_FLAG_DECL_RE.findall(source))
+    assigned = set(_ACTIVATION_FLAG_SET_RE.findall(source))
+    for candidate in ACTIVATION_FLAG_CANDIDATES:
+        if candidate in declared or candidate in assigned:
+            return candidate
+    return ""
+
 
 def abs_path(path):
     return Path(bpy.path.abspath(path)).resolve()
@@ -171,6 +202,12 @@ def ensure_keyswap(text, key, state_count, comment="", gui_guard="", var=None):
     condition = f"${var} == 0 || ${var} < {max(2, state_count)}"
     if gui_guard:
         condition = f"({condition}) && {gui_guard}"
+    # 角色门控：与同 ini 的 [KeySwap_*] 物体切换 / 动画驱动 KeyToggle 同口径 ——
+    # 只有角色当帧被绘制过（$active0 = 1）才响应热键，否则同一个键会把别的角色的
+    # 贴图一起切走。缺激活标志时保持原样（加门控会让热键恒假）。
+    activation_flag = find_activation_flag_in_text(text)
+    if activation_flag:
+        condition = f"{activation_flag} == 1 && ({condition})"
     lines = [f"[{section_name}]"]
     if comment:
         lines.append(f"; {comment}")
@@ -696,6 +733,11 @@ class SSMTNode_PostProcess_DiffuseSwitch(SSMTNode_PostProcess_Base):
                 group.uid = uuid.uuid4().hex[:8]
             updated, changed = apply_group(updated, group, path, owner_id)
             target_count += changed
+        if key_metadata and not find_activation_flag_in_text(updated):
+            print(
+                "[贴图切换 V5.1] 未找到角色激活标志（global $active0）：切换热键无法做"
+                "角色门控，同一个键会同时切换其它角色的贴图。"
+            )
         for var, metadata in key_metadata.items():
             updated = ensure_keyswap(
                 updated,

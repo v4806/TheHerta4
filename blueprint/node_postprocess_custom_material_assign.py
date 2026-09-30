@@ -30,6 +30,77 @@ _pick_context = {
 
 _switch_sync_guard = False
 
+#: 角色激活标志候选。口径与 ``anim_driver_base._get_activation_flag``（NTEMI 用
+#: ``$ntmi_active0``）、``node_swap_ini`` 与 ``m_ini_helper.add_branch_key_sections``
+#: 的 ``$active0`` 一致。
+ACTIVATION_FLAG_CANDIDATES = ("$active0", "$ntmi_active0")
+
+#: 只认这两种形态（行首 ``;`` 的注释行不算）：
+#:   ``global $active0`` / ``global persist $active0 = 0`` —— 门控标志的声明；
+#:   ``$active0 = 1``                                      —— 部件 TextureOverride 的置位。
+#: 两者任一在位即认为导出器发射了整套门控机制（三件套同进同出，见 unity.py:66 /
+#: zzmi.py:4099 / wwmi_export.py:444）。
+#: **必须两种都认**：段字典按段名去重，实测产物（克拉蕾.ini）有 12 个 ``[Constants]``，
+#: ``global $active0`` 所在的段会被后面的 ``[Constants]`` 顶掉 —— 只看声明会漏判，
+#: 而置位行在唯一的 ``[TextureOverride_VB_*]`` 段里，字典里一定还在。
+_ACTIVATION_FLAG_DECL_RE = re.compile(
+    r"^[ \t]*global(?:[ \t]+persist)?[ \t]+(\$[A-Za-z_]\w*)",
+    re.IGNORECASE,
+)
+_ACTIVATION_FLAG_SET_RE = re.compile(r"^[ \t]*(\$[A-Za-z_]\w*)[ \t]*=[ \t]*1[ \t]*$")
+
+
+def _iter_ini_lines(sections):
+    """把 ``{段名: [行...]}`` 摊平成行序列（容忍非行列表的簿记键）。"""
+    values = sections.values() if hasattr(sections, "values") else (sections or ())
+    for lines in values:
+        if isinstance(lines, str):
+            yield lines
+            continue
+        for line in list(lines or []):
+            yield line
+
+
+def find_activation_flag_in_sections(sections):
+    """返回待写回 ini 段里可用的角色激活标志，没有则返回空串。
+
+    判据取「门控机制在位」而不是「猜游戏支不支持」：整套机制（``[Constants]
+    global $active0`` + 各部件 ``$active0 = 1`` + 主 ``[Present] post $active0 = 0``）
+    由导出器在「蓝图存在切换按键」时**整体**发射。没有这套机制时给热键加
+    ``condition = $active0 == 1`` 会恒假（未声明变量按 0 读）——按键直接失效，
+    比不加门控更糟，所以这里宁可不加（并告警）。
+    """
+    declared, assigned = set(), set()
+    for line in _iter_ini_lines(sections):
+        text = str(line or "")
+        match = _ACTIVATION_FLAG_DECL_RE.match(text)
+        if match and match.group(1) in ACTIVATION_FLAG_CANDIDATES:
+            declared.add(match.group(1))
+            continue
+        match = _ACTIVATION_FLAG_SET_RE.match(text)
+        if match and match.group(1) in ACTIVATION_FLAG_CANDIDATES:
+            assigned.add(match.group(1))
+    for candidate in ACTIVATION_FLAG_CANDIDATES:
+        if candidate in declared or candidate in assigned:
+            return candidate
+    return ""
+
+
+def _log_missing_activation_flag(section_name):
+    """缺角色激活标志时告警（否则用户只会看到"热键对别的角色也生效"）。"""
+    message = (
+        f"[材质转资源] {section_name} 未做角色门控：本 ini 没有角色激活标志"
+        "（global $active0 / $ntmi_active0），切换热键会同时作用于其它角色。"
+        "要让该键只在角色被绘制时生效，请给本模组任意一个物体切换 / 形态键按键节点后"
+        "重新导出（导出器会随之发射 $active0 门控三件套）。"
+    )
+    try:
+        from ..utils.log_utils import LOG as _LOG
+
+        _LOG.warning(message)
+    except Exception:
+        print(message)
+
 
 def _sync_switch_variable_fields(group, context):
     """同一切换变量的启用状态、备注与按键保持完全一致（限定在所属蓝图内）。
@@ -1816,12 +1887,22 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
         section_name = f"[KeySwap_Diffuse_{variable}]"
         state_count = spec["state_count"]
         values = ",".join(str(index) for index in range(state_count))
+        condition = f"${variable} == 0 || ${variable} < {state_count}"
+        # 角色门控：与同 ini 的 [KeySwap_*] 物体切换 / 动画驱动 KeyToggle 同口径 ——
+        # 只有本部件当帧被绘制过（$active0 = 1）才响应热键。否则同一个键会把别的
+        # 角色的贴图一起切走（实机产物 克拉蕾.ini：39 段 KeySwap 里只有
+        # KeySwap_Diffuse_* 这两段没有门控）。
+        activation_flag = find_activation_flag_in_sections(sections)
+        if activation_flag:
+            condition = f"{activation_flag} == 1 && ({condition})"
+        else:
+            _log_missing_activation_flag(section_name)
         lines = []
         if spec["comment"]:
             lines.append(f"; {spec['comment']}")
         lines.extend(
             [
-                f"condition = ${variable} == 0 || ${variable} < {state_count}",
+                f"condition = {condition}",
                 f"key = {spec['key']}",
                 "type = cycle",
                 f"${variable} = {values}",
