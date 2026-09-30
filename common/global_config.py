@@ -183,42 +183,47 @@ class GlobalConfig:
         return os.path.join(GlobalConfig.path_current_game_total_workspace_folder(), cls.get_workspace_name() + "\\")
     
     @classmethod
+    def set_output_blueprint_tree(cls, tree):
+        """记录本次导出使用的蓝图，仅用于解析输出目录，不影响导出目标蓝图"""
+        cls._output_blueprint_tree_name = str(getattr(tree, "name", "") or "")
+
+    @classmethod
     def _get_output_blueprint_tree(cls):
-        """取当前导出流程绑定的蓝图树；该蓝图未启用独立输出目录时返回 None"""
-        try:
-            from ..blueprint.export_helper import BlueprintExportHelper
-        except Exception:
-            return None
-        tree_name = str(getattr(BlueprintExportHelper, "runtime_blueprint_tree_name", "") or "")
+        """取本次导出使用的蓝图树；不在蓝图导出流程内时返回 None"""
+        tree_name = str(getattr(cls, "_output_blueprint_tree_name", "") or "")
         if not tree_name:
             return None
         tree = bpy.data.node_groups.get(tree_name)
-        if tree is None:
-            return None
-        if not getattr(tree, "use_specific_generate_mod_folder_path", False):
+        if tree is None or getattr(tree, "bl_idname", "") != 'SSMTBlueprintTreeType':
             return None
         return tree
 
     @classmethod
+    def _default_generated_mod_folder(cls):
+        # 确保用的时候直接拿到的就是已经存在的目录
+        ssmt_generated_mod_folder_path = os.path.join(GlobalConfig.path_mods_folder(),"SSMTGeneratedMod\\")
+        generate_mod_folder_path = os.path.join(ssmt_generated_mod_folder_path, cls.get_workspace_name() + "\\")
+        if not os.path.exists(generate_mod_folder_path):
+            os.makedirs(generate_mod_folder_path)
+        return generate_mod_folder_path
+
+    @classmethod
     def path_generate_mod_folder(cls):
-        # 蓝图级独立输出目录优先：当前导出的蓝图自己设置了路径就用它
+        # 蓝图导出：只认当前蓝图自己的输出目录设置，蓝图没设置就用默认目录。
+        # 这里绝不回落到场景全局设置，否则会沿用以前在别的蓝图里留下的路径。
         output_tree = cls._get_output_blueprint_tree()
         if output_tree is not None:
-            tree_path = str(getattr(output_tree, "generate_mod_folder_path", "") or "").strip()
-            if tree_path:
-                return tree_path
+            if getattr(output_tree, "use_specific_generate_mod_folder_path", False):
+                tree_path = str(getattr(output_tree, "generate_mod_folder_path", "") or "").strip()
+                if tree_path:
+                    return tree_path
+            return cls._default_generated_mod_folder()
 
-        # 如果用户勾选了使用指定文件夹，那就返回指定文件夹位置，否则返回我们的默认位置。
+        # 非蓝图导出流程：沿用场景全局设置。
         # 但是这里有个问题就是SkipIB和VSCheck不会生成在指定位置。
         if GlobalProterties.use_specific_generate_mod_folder_path():
             return GlobalProterties.generate_mod_folder_path()
-        else:
-            # 确保用的时候直接拿到的就是已经存在的目录
-            ssmt_generated_mod_folder_path = os.path.join(GlobalConfig.path_mods_folder(),"SSMTGeneratedMod\\")
-            generate_mod_folder_path = os.path.join(ssmt_generated_mod_folder_path, cls.get_workspace_name() + "\\")
-            if not os.path.exists(generate_mod_folder_path):
-                os.makedirs(generate_mod_folder_path)
-            return generate_mod_folder_path
+        return cls._default_generated_mod_folder()
     
     @classmethod
     def path_extract_gametype_folder(cls,draw_ib:str,gametype_name:str):

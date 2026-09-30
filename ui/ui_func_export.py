@@ -73,9 +73,11 @@ class SSMTGenerateModBlueprint(bpy.types.Operator):
         if tree and global_properties and getattr(global_properties, "selected_blueprint_name", "") != tree.name:
             global_properties.selected_blueprint_name = tree.name
 
-        # 提前绑定当前导出蓝图，保证本次导出全程都能取到该蓝图自己的输出目录设置
+        # 记录本次导出使用的蓝图，仅用于解析输出目录。
+        # 这里绝不能改 runtime_blueprint_tree_name：它决定导出目标蓝图，
+        # 一旦被写入就会被后续的蓝图解析当作回落目标，导致一直串到旧蓝图。
         if tree:
-            BlueprintExportHelper.set_runtime_blueprint_tree(tree)
+            GlobalConfig.set_output_blueprint_tree(tree)
 
         return tree
 
