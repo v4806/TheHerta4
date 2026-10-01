@@ -1346,8 +1346,13 @@ class EFMIBoneMapBuilder:
             pool_lo = min(declared_pool_bounds)
             pool_hi = max(declared_pool_bounds)
             b11_violations: list[tuple[str, str, int]] = []
+            # B11 定位诊断（只读附加输出）：哪些 json「本该贡献声明段却缺席」
+            # —— 解析失败、或无 VGMap 键（投影未匹配跳过 / 本次未产出映射 /
+            # 被外部清理）。旧版只报越界引用方，用户必须人工按 VGOffset 反查
+            # 缺席部件；这里把缺席侧一并收集进异常文本。
+            scan_diag: dict[str, list] = {"unreadable": [], "no_vgmap": []}
             for _submesh_dir, submesh_json in EFMIBoneMapBuilder._iter_submesh_jsons(
-                workspace_root
+                workspace_root, diagnostics=scan_diag
             ):
                 unique_str = submesh_json.get("__unique_str__", "")
                 for raw_local, raw_slot in (submesh_json.get("VGMap") or {}).items():
@@ -1367,6 +1372,13 @@ class EFMIBoneMapBuilder:
                     f"{preview}{suffix}（声明段并集 [{pool_lo},{pool_hi})，共 "
                     f"{len(b11_violations)} 项）——引用了无人声明的骨骼槽位"
                     "（含段间/段内空洞），数据损坏或陈旧，中止转换"
+                    + EFMIBoneMapBuilder._describe_declaration_gaps(
+                        workspace_root,
+                        declared_segments,
+                        pool_lo,
+                        pool_hi,
+                        scan_diag,
+                    )
                 )
         cross_lod_collisions = [
             slot for slot, lod_set in slot_lod_prefixes.items()
@@ -1744,7 +1756,7 @@ class EFMIBoneMapBuilder:
         return True
 
     @staticmethod
-    def _iter_submesh_jsons(workspace_root: str):
+    def _iter_submesh_jsons(workspace_root: str, diagnostics: dict | None = None):
         """遍历工作区含 VGMap 的子网格 json（无 bpy；LOD 目录与 TYPE_ 目录两级）。
 
         yield (submesh_dir, submesh_json_dict)；json dict 附加 __unique_str__。
@@ -1752,27 +1764,152 @@ class EFMIBoneMapBuilder:
         - <ws>/LOD0/<bare>/TYPE_*/<bare>.json -> "LOD0.<bare>"
         - <ws>/<bare>/TYPE_*/<bare>.json -> "<bare>"
         submesh_dir = 含 json 的 TYPE_ 目录（供调用方定位 Position/Blend.buf）。
+
+        diagnostics：可选诊断收集器（B11 定位用，纯只读附加输出）。传入 dict 时填写：
+        - diagnostics["unreadable"] += [(json 绝对路径, 异常摘要)]：json 读不出来，
+          该文件既不贡献声明段、也不贡献 VGMap 条目；
+        - diagnostics["no_vgmap"] += [(unique_str, 缺席原因)]：解析成功但**没有
+          VGMap 键**（投影未匹配跳过 / 本次未产出槽位映射 / 被清理过的 json），
+          同样不贡献声明段 —— 这类 json 正是「本该有声明却缺席」的候选方。
+        两条清单只收子网格形态的文件（TYPE_ 目录内、且文件名 == 子网格名），
+        避免把 Config/*.json、Import.json 等无关文件报成缺席方；该收窄**只影响
+        诊断输出**，声明段与 VGMap 的建表语义保持原样。
         """
         if not workspace_root or not os.path.isdir(workspace_root):
             return
+        if diagnostics is not None:
+            unreadable = diagnostics.setdefault("unreadable", [])
+            no_vgmap = diagnostics.setdefault("no_vgmap", [])
+        else:
+            unreadable = None
+            no_vgmap = None
         for dirpath, _dirs, files in os.walk(workspace_root):
             for name in files:
                 if not name.lower().endswith(".json"):
                     continue
                 full = os.path.join(dirpath, name)
+                # 子网格 json 的规范位置是 <ws>/[LODn/]<bare>/TYPE_*/<bare>.json。
+                # 声明段的语义不在下面收窄（非 TYPE_ 位置的 VGMap 仍照旧参与建表，
+                # 避免静默改变 fail-closed 判定），但**诊断清单只收子网格形态的
+                # 文件**：否则 Config/*.json、Import.json、角色级映射表等无关 json
+                # 会把 B11 缺席方清单挤满。
+                in_submesh_dir = os.path.basename(dirpath).startswith("TYPE_")
                 try:
                     with open(full, "r", encoding="utf-8") as f:
                         data = json.load(f)
-                except Exception:
+                except Exception as exc:
+                    if unreadable is not None and in_submesh_dir:
+                        unreadable.append((full, f"{type(exc).__name__}: {exc}"))
                     continue
-                if not isinstance(data, dict) or "VGMap" not in data:
+                if not isinstance(data, dict):
+                    if unreadable is not None and in_submesh_dir:
+                        unreadable.append(
+                            (full, f"顶层不是 JSON 对象（{type(data).__name__}）")
+                        )
                     continue
                 bare = os.path.basename(os.path.dirname(dirpath))          # <bare>
                 lod = os.path.basename(os.path.dirname(os.path.dirname(dirpath)))  # LOD0 | <ws>
                 unique_str = f"{lod}.{bare}" if lod.upper().startswith("LOD") else bare
+                if "VGMap" not in data:
+                    if (
+                        no_vgmap is not None
+                        and in_submesh_dir
+                        and os.path.splitext(name)[0] == bare
+                    ):
+                        no_vgmap.append(
+                            (unique_str, EFMIBoneMapBuilder._vgmap_absence_reason(data))
+                        )
+                    continue
                 data = dict(data)
                 data["__unique_str__"] = unique_str
                 yield dirpath, data
+
+    @staticmethod
+    def _vgmap_absence_reason(payload: dict) -> str:
+        """无 VGMap 键的 json 的状态摘要（B11 缺席方定位用，纯读）。"""
+        if payload.get("EFMILODProjectionSkipped") is True:
+            return "跨 LOD 投影未匹配，已裁决跳过导入"
+        if payload.get("EFMILODProjectionMatched") is True:
+            return "跨 LOD 投影匹配（CPU/无顶点组目标，本就不含 VGMap）"
+        if payload.get("VGMapAlgorithmVersion") or payload.get("VGCount"):
+            return "VGMap 键族被部分清空（半成品/被外部清理）"
+        return "从未写回或已被清理，无任何状态标记"
+
+    @staticmethod
+    def _describe_declaration_gaps(
+        workspace_root: str,
+        declared_segments: list[tuple[int, int]],
+        pool_lo: int,
+        pool_hi: int,
+        scan_diag: dict | None,
+    ) -> str:
+        """B11 定位后缀：无人声明的空洞区间 + 未贡献声明段的 json 清单。
+
+        旧版 B11 报错只给出「越界引用方」（谁引用了不存在的槽位），用户必须自己
+        按 VGOffset 反查「谁本该声明却没声明」。这里把缺席侧直接列出来：
+        - 空洞 = 声明段并集在 [pool_lo, pool_hi) 内的补集，也就是越界引用指向的
+          区间（B11 注释里的「段间/段内空洞」）；
+        - 未计入声明段的 json（解析失败 / 解析成功但无 VGMap 键），缺席方通常是
+          其中的投影未匹配部件、本次未产出映射的部件或被外部清理过的 json。
+        纯读诊断，不改变 fail-closed 语义。
+        """
+        parts: list[str] = []
+        holes: list[tuple[int, int]] = []
+        cursor = pool_lo
+        for seg_start, seg_end in sorted(declared_segments):
+            if seg_end <= cursor:
+                continue
+            if seg_start > cursor:
+                holes.append((cursor, seg_start))
+            cursor = seg_end
+        if cursor < pool_hi:
+            holes.append((cursor, pool_hi))
+        if holes:
+            shown = "、".join(f"[{start},{end})" for start, end in holes[:8])
+            trailer = "…" if len(holes) > 8 else ""
+            parts.append(
+                f"无人声明的槽位空洞 {shown}{trailer}（共 {len(holes)} 段，"
+                "越界引用落于其中）"
+            )
+        unreadable = list((scan_diag or {}).get("unreadable", []) or [])
+        if unreadable:
+            def _brief(path: str) -> str:
+                try:
+                    return os.path.relpath(path, workspace_root)
+                except Exception:
+                    return os.path.basename(path)
+            shown = "、".join(
+                f"{_brief(path)}（{reason}）" for path, reason in unreadable[:5]
+            )
+            trailer = "…" if len(unreadable) > 5 else ""
+            parts.append(
+                f"json 解析失败未计入声明段 {len(unreadable)} 个: {shown}{trailer}"
+            )
+        no_vgmap = list((scan_diag or {}).get("no_vgmap", []) or [])
+        if no_vgmap:
+            shown = "、".join(f"{unique_str}[{reason}]" for unique_str, reason in no_vgmap[:8])
+            trailer = "…" if len(no_vgmap) > 8 else ""
+            parts.append(
+                f"无 VGMap 键未计入声明段 {len(no_vgmap)} 个: {shown}{trailer}"
+            )
+        if not parts:
+            return ""
+        listed_json = bool(unreadable or no_vgmap)
+        if listed_json:
+            tail = (
+                "。缺席方通常就在上面这些 json 里：其声明段整体消失，而其它部件的"
+                "去重借位仍指向它占过的槽位。请在确认没有外部进程反复清理工作区"
+                "json 后，执行「清除骨骼合并VGMap缓存」并重新导入整角色（重建后本表"
+                "按新布局重新对账）"
+            )
+        else:
+            tail = (
+                "。空洞通常来自「声明段整体消失」的部件 json（未写回 / 被清理 / 投影"
+                "跳过），上面的 json 清单为空说明这些文件已从工作区消失或从未生成："
+                "请确认该区间的部件 json 是否存在，再执行「清除骨骼合并VGMap缓存」并"
+                "重新导入整角色（重建后本表按新布局重新对账）"
+            )
+        return "；" + "；".join(parts) + tail
 
     @staticmethod
     def _diffusion_radius(points: numpy.ndarray) -> float:
@@ -5086,6 +5223,8 @@ class EFMISkeletonMergeHelper:
         written = 0
         written_targets: set[str] = set()
         projection_skipped_targets: set[str] = set()
+        # 本次参与编号但未产出槽位映射、已清空旧代际键的目标（见主循环内说明）。
+        stale_cleared: list[str] = []
         for unique_str, entry in submesh_skeletons.items():
             skeleton_buffer = entry[0]
             vg_count = entry[1]
@@ -5102,13 +5241,10 @@ class EFMISkeletonMergeHelper:
                 # 过滤后凭工作空间原文件重建的能力），并发布 BoneMatrix/
                 # InstanceConfig 两份缓存。
                 try:
-                    # 历史缓存键必须清空：旧版可能留有 VGCount=0/VGOffset=0 等
-                    # 半成品，残留会让导入/幂等判定产生歧义。
-                    for stale_key in (
-                        "VGMap", "VGOffset", "VGCount", "VGMapAlgorithmVersion",
-                        "VGMapDedupEnabled",
-                    ):
-                        submesh_json.pop(stale_key, None)
+                    # 历史缓存键必须清空（统一口径见 _clear_stale_vgmap_keys）：
+                    # 旧版可能留有 VGCount=0/VGOffset=0 等半成品，残留会让
+                    # 导入/幂等判定产生歧义。
+                    cls._clear_stale_vgmap_keys(submesh_json)
                     cls._mark_projection_skipped(submesh_json, cross_lod_info)
                     cls._publish_skeleton_source_cache(meta, submesh_json, vg_count)
                 except Exception as e:
@@ -5121,6 +5257,26 @@ class EFMISkeletonMergeHelper:
 
             vg_map = vg_maps.get(unique_str, {})
             if not vg_map:
+                # 本次参与了编号但**没有产出任何槽位映射**（骨骼池读取失败、
+                # 声明顶点组数超过 pool 容量、无有效 BLENDINDICES 等 ——
+                # build_vg_maps 只为有候选骨骼的部件建条目）。旧实现在这里
+                # 直接 continue：json 里上一代的 VGMap/VGOffset/VGCount 被静默
+                # 保留成为「陈旧声明」，与本次新布局的其它部件段并集错配，导出
+                # 侧按 A3/B10/B11 fail-closed 中止（B11 报「引用了无人声明的
+                # 槽位」，病根却是这份 json 从未被清理）。改为明确清空键族并
+                # 提交 json 事务：_efmi_cache_intact 立即判定缓存不完整，下次
+                # ensure 整组重算（自愈），工作区不再残留跨代际的静默声明。
+                try:
+                    cls._clear_stale_vgmap_keys(submesh_json)
+                    cls._atomic_publish_skeleton_transaction(
+                        [], submesh_json, json_path
+                    )
+                except Exception as e:
+                    print(
+                        f"[EFMI骨骼合并] 清理陈旧 VGMap 键失败 {unique_str}: {e}"
+                    )
+                    continue
+                stale_cleared.append(unique_str)
                 continue
 
             # 只要本次写回 VGMap，就撤销任何历史“投影未匹配”标记（策略变更/
@@ -5255,11 +5411,7 @@ class EFMISkeletonMergeHelper:
                 submesh_json = JsonUtils.LoadFromFile(json_path)
                 if not isinstance(submesh_json, dict):
                     continue
-                for stale_key in (
-                    "VGMap", "VGOffset", "VGCount", "VGMapAlgorithmVersion",
-                    "VGMapDedupEnabled",
-                ):
-                    submesh_json.pop(stale_key, None)
+                cls._clear_stale_vgmap_keys(submesh_json)
                 cls._mark_projection_skipped(submesh_json, cross_lod_info)
                 cls._atomic_publish_skeleton_transaction([], submesh_json, json_path)
             except Exception as e:
@@ -5285,6 +5437,14 @@ class EFMISkeletonMergeHelper:
                 f"；按跨 LOD 投影未匹配跳过 {len(projection_skipped_targets)} 个: "
                 f"{'、'.join(shown)}{suffix}"
             )
+        if stale_cleared:
+            shown = sorted(stale_cleared)[:5]
+            suffix = "…" if len(stale_cleared) > 5 else ""
+            message += (
+                f"；{len(stale_cleared)} 个部件本次未产出槽位映射，"
+                f"已清理旧代际 VGMap 键（下次导入整组重算）: "
+                f"{'、'.join(shown)}{suffix}"
+            )
         if unprocessed_count > 0:
             shown = unprocessed_targets[:5]
             suffix = "…" if len(unprocessed_targets) > 5 else ""
@@ -5295,6 +5455,31 @@ class EFMISkeletonMergeHelper:
         # 投影未匹配的目标按“已处理”口径计入 skipped，使外层 processed 对账通过
         skipped += len(projection_skipped_targets)
         return written, skipped, message
+
+    @classmethod
+    def _clear_stale_vgmap_keys(cls, submesh_json: dict) -> None:
+        """清空 VGMap 键族 + F1 源指纹（陈旧声明的唯一清理口径）。
+
+        写回侧的三个「不再持有槽位映射」出口（投影未匹配跳过、本次未产出映射、
+        未收集目标）必须走同一份键族清单：早期实现各写各的 pop 列表，导致
+        `common/efmi_skeleton.py` 主循环 `if not vg_map: continue` 那条路径漏清
+        旧代际键 —— json 里残留上一代布局的 VGMap/VGOffset/VGCount，与本次新
+        布局的其它部件段并集错配，导出侧按 A3/B10/B11 fail-closed 中止（B11
+        报「引用了无人声明的槽位」，病根却是这份 json 没被清理）。
+
+        只改内存 dict；落盘由调用方用 `_atomic_publish_skeleton_transaction`
+        事务提交。清空后 `_efmi_cache_intact` 立即判定缓存不完整，下次 ensure
+        整组重算（自愈），不静默保留跨代际声明。
+        """
+        for stale_key in (
+            "VGMap",
+            "VGOffset",
+            "VGCount",
+            "VGMapAlgorithmVersion",
+            "VGMapDedupEnabled",
+            "EFMIVGMapSourceFingerprint",
+        ):
+            submesh_json.pop(stale_key, None)
 
     @staticmethod
     def _mark_projection_skipped(submesh_json: dict, cross_lod_info: dict | None) -> None:
@@ -5393,10 +5578,6 @@ class EFMISkeletonMergeHelper:
             if cls._parse_lod_name(u) == reference_lod
         }
         cross_lod_info = {"reference_lod": reference_lod}
-        stale_keys = (
-            "VGMap", "VGOffset", "VGCount", "VGMapAlgorithmVersion",
-            "VGMapDedupEnabled",
-        )
         for unique_str in cpu_unique_str_list:
             lod_name = cls._parse_lod_name(unique_str)
             if not lod_name or lod_name == reference_lod:
@@ -5414,9 +5595,9 @@ class EFMISkeletonMergeHelper:
                 failures.append(unique_str)
                 continue
             is_matched = cls._cpu_ib_intersects_baseline(unique_str, baseline_strs)
-            # 清历史键：半成品 VGMap 系列与对侧裁决标记，避免幂等判定歧义。
-            for stale_key in stale_keys:
-                payload.pop(stale_key, None)
+            # 清历史键：半成品 VGMap 系列与对侧裁决标记，避免幂等判定歧义
+            # （统一口径见 _clear_stale_vgmap_keys）。
+            cls._clear_stale_vgmap_keys(payload)
             if is_matched:
                 cls._mark_projection_matched(payload, cross_lod_info)
             else:
