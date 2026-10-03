@@ -9,6 +9,12 @@ def update_group_shape_key_value(self, context):
     at_shape_key_control.on_group_update(self, context)
 
 
+def update_single_shape_key_value(self, context):
+    """单键滑块变动：把所有物体的同名形态键统一写成同一个值"""
+    from . import at_shape_key_control
+    at_shape_key_control.on_single_value_update(self, context)
+
+
 def update_shape_key_value_range(self, context):
     """最小值/最大值变动：列表内所有形态键随之重算"""
     from . import at_shape_key_control
@@ -27,15 +33,15 @@ class ATP_ShapeKeyItem(bpy.types.PropertyGroup):
     is_group: bpy.props.BoolProperty(name="连续形态键分组", default=False)
     label: bpy.props.StringProperty(name="显示名称", default="")
     key_names: bpy.props.StringProperty(name="成员形态键", default="")
-    reference_object: bpy.props.PointerProperty(
-        type=bpy.types.Object,
-        name="参考物体",
-        description="该行滑块绑定的物体：滑块直接控制它上面的同名形态键，并同步到其余选中物体",
-    )
     value: bpy.props.FloatProperty(
-        name="Value",
+        name="值",
         default=0.0,
-        description="刷新时记录的实际形态键值（参考物体失效时用于只读显示）",
+        min=-10.0,
+        max=10.0,
+        soft_min=0.0,
+        soft_max=1.0,
+        update=update_single_shape_key_value,
+        description="把该形态键写成这个值：场景里每一个有这个同名形态键的物体都会一起变",
     )
     group_value: bpy.props.FloatProperty(
         name="GroupValue",
@@ -57,8 +63,6 @@ class ATP_UL_ShapeKeyList(bpy.types.UIList):
     bl_idname = ATP_UL_SHAPEKEY_LIST_IDNAME
 
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
-        from . import at_shape_key_control
-
         if self.layout_type not in {'DEFAULT', 'COMPACT'}:
             layout.alignment = 'CENTER'
             layout.label(text=item.label or item.name, icon='GROUP' if item.is_group else 'SHAPEKEY_DATA')
@@ -71,14 +75,9 @@ class ATP_UL_ShapeKeyList(bpy.types.UIList):
             split.prop(item, "group_value", text="", slider=True)
             return
 
-        # 单键行：滑块直接绑在真实形态键上，显示值即实际值，范围即该键的 slider_min / slider_max
-        reference_object, key_block = at_shape_key_control.resolve_reference(item, context)
-        if key_block is not None:
-            split.label(text=item.label or item.name, icon='SHAPEKEY_DATA')
-            split.prop(key_block, "value", text="", slider=True)
-        else:
-            split.label(text=item.label or item.name, icon='ERROR')
-            split.label(text=f"{item.value:.3f} (无参考物体)")
+        # 单键行：滑块绑在这一行自己的属性上，拖动时由属性回调写进所有同名形态键
+        split.label(text=item.label or item.name, icon='SHAPEKEY_DATA')
+        split.prop(item, "value", text="", slider=True)
 
 
 class ATP_FrameShapeKeyPair(bpy.types.PropertyGroup):
@@ -140,11 +139,6 @@ class ATP_Properties(bpy.types.PropertyGroup):
         min=3,
         max=30,
         description="统一控制器列表的显示高度，超出部分滚动查看",
-    )
-    sk_live_sync: bpy.props.BoolProperty(
-        name="实时同步选中物体",
-        default=True,
-        description="拖动列表滑块时，把参考物体上的形态键值同步到其余选中物体\n关闭后列表只驱动参考物体自身",
     )
     sk_value_min: bpy.props.FloatProperty(
         name="最小值",

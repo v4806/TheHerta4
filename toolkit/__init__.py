@@ -393,13 +393,6 @@ def register():
         except Exception as e:
             print(f"[TheHerta4]   注册AT形态键控制失败: {op_class.__name__} - {e}")
     
-    try:
-        from . import at_shape_key_control
-        at_shape_key_control.register_shape_key_sync()
-        print("[TheHerta4]   已挂载形态键实时同步处理器")
-    except Exception as e:
-        print(f"[TheHerta4]   挂载形态键实时同步处理器失败 - {e}")
-    
     for op_class in at_shape_key_operations_list:
         try:
             bpy.utils.register_class(op_class)
@@ -645,11 +638,6 @@ def unregister():
         except Exception:
             pass
     
-    try:
-        from . import at_shape_key_control
-        at_shape_key_control.unregister_shape_key_sync()
-    except Exception:
-        pass
     
     for op_class in reversed(at_shape_key_control_list):
         try:

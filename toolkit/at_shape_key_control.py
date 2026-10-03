@@ -19,10 +19,6 @@ _suppress_update = False
 # 「相同前缀 + 连续数字编号」形态键的识别模式，例如 Motion_Key_3
 _NAME_PATTERN = re.compile(r'^(.+)_(\d+)$')
 
-# 参考物体上各形态键的上一次取值，用于检测「哪个键被拖动过」
-_REFERENCE_VALUES = {}
-_sync_error_reported = False
-
 
 # ============================================================
 # 名称解析 / 连续形态键分组
@@ -137,8 +133,19 @@ def _iter_shape_key_objects(objects):
             yield obj
 
 
-def selected_shape_key_objects(context):
-    return list(_iter_shape_key_objects(getattr(context, "selected_objects", None)))
+def driving_objects(context):
+    """统一控制器的驱动集合 = 场景里所有带形态键的网格物体。
+
+    这就是「统一控制所有同名形态键」的全部含义：拖动某一行时，凡是**有这个同名
+    形态键**的物体都会被写成同一个值 —— 不看选择、不看活动物体、不看可见性。
+    活动物体排在集合最前（仅影响遍历顺序）；取不到场景物体时退回所选物体，
+    保证任何上下文都不会退化成空集。
+    """
+    active_object = getattr(context, "active_object", None)
+    ordered = _ordered_objects(getattr(getattr(context, "scene", None), "objects", None), active_object)
+    if not ordered:
+        ordered = _ordered_objects(getattr(context, "selected_objects", None), active_object)
+    return ordered
 
 
 def _ordered_objects(objects, active_object=None):
@@ -154,38 +161,6 @@ def get_key_block(obj, key_name):
     if not shape_keys:
         return None
     return shape_keys.key_blocks.get(key_name)
-
-
-def first_object_with_key(objects, key_name):
-    for obj in objects or []:
-        if get_key_block(obj, key_name) is not None:
-            return obj
-    return None
-
-
-def resolve_reference(item, context=None):
-    """定位列表项滑块绑定的 (物体, 键块)。
-
-    优先使用刷新时记录的参考物体；失效时退回当前选择中的第一个持有者。
-    """
-    key_name = item.key_names or item.name
-    if not key_name or item.is_group:
-        return None, None
-
-    candidates = []
-    reference_object = getattr(item, "reference_object", None)
-    if reference_object is not None:
-        candidates.append(reference_object)
-    if context is not None:
-        for obj in selected_shape_key_objects(context):
-            if obj not in candidates:
-                candidates.append(obj)
-
-    for obj in candidates:
-        key_block = get_key_block(obj, key_name)
-        if key_block is not None:
-            return obj, key_block
-    return None, None
 
 
 def collect_shape_key_values(objects):
@@ -260,7 +235,7 @@ def apply_group_values(context, key_names, group_position, value_range=None):
         else:
             fractions[name] = 0.0
 
-    for obj in selected_shape_key_objects(context):
+    for obj in driving_objects(context):
         for name, fraction in fractions.items():
             key_block = get_key_block(obj, name)
             if key_block is None:
@@ -271,12 +246,14 @@ def apply_group_values(context, key_names, group_position, value_range=None):
 
 def apply_shape_key_range(context, props):
     """把当前值域写入列表内所有形态键（并夹取越界的实际值）。"""
+    global _suppress_update
+
     value_range = get_value_range(props)
     if value_range is None:
         return False
 
     value_min, value_max = value_range
-    objects = selected_shape_key_objects(context)
+    objects = driving_objects(context)
     for item in props.shape_key_list:
         for name in item_key_names(item):
             for obj in objects:
@@ -288,8 +265,21 @@ def apply_shape_key_range(context, props):
                 if abs(clamped - float(key_block.value)) > 1e-6:
                     key_block.value = clamped
 
-    # 改值域只是夹取各自的值，不应触发「参考值 -> 其余物体」的联动同步
-    snapshot_reference_values(context)
+    # 值域只夹取各自的值，不做任何跨物体联动；顺便把列表记录值刷新成夹取后的实际值
+    was_suppressed = _suppress_update
+    _suppress_update = True
+    try:
+        for item in props.shape_key_list:
+            if item.is_group:
+                continue  # 分组行的滑块是 group_value，item.value 与它无关
+            names = item_key_names(item)
+            for obj in objects:
+                key_block = get_key_block(obj, names[0]) if names else None
+                if key_block is not None:
+                    item.value = float(key_block.value)
+                    break
+    finally:
+        _suppress_update = was_suppressed
     return True
 
 
@@ -314,6 +304,45 @@ def on_group_update(item, context=None):
     _safe_view_update()
 
 
+def _write_item_value_quiet(item, value):
+    """在抑制回调的前提下把值写回列表项，避免递归触发 update 回调。"""
+    global _suppress_update
+    previous = _suppress_update
+    _suppress_update = True
+    try:
+        item.value = value
+    finally:
+        _suppress_update = previous
+
+
+def on_single_value_update(item, context=None):
+    """单键滑块变动：把这一行的值写到驱动范围内**所有**同名形态键上。
+
+    走属性 update 回调（而不是 depsgraph 处理器）：只要滑块动了就一定会触发，
+    不依赖场景更新事件，也不受动画播放 / 联动开关影响，这是最直接可靠的一条路。
+    """
+    if _suppress_update:
+        return
+    context = context if context is not None else bpy.context
+    props = getattr(getattr(context, "scene", None), "atp_props", None)
+    if props is None:
+        return
+
+    names = item_key_names(item)
+    if not names:
+        return
+
+    value_range = get_value_range(props) or (DEFAULT_VALUE_MIN, DEFAULT_VALUE_MAX)
+    value_min, value_max = value_range
+    value = min(max(float(item.value), value_min), value_max)
+    if abs(value - float(item.value)) > 1e-6:
+        # 越界输入回写滑块本身，否则滑块显示的值和实际写进形态键的值会对不上
+        _write_item_value_quiet(item, value)
+
+    apply_single_values(context, names, value, value_range)
+    _safe_view_update()
+
+
 def on_value_range_update(props, context=None):
     """最小值/最大值变动：列表内所有形态键的滑块范围与实际值随之变化。"""
     if _suppress_update:
@@ -334,111 +363,35 @@ def _safe_view_update():
 
 
 # ============================================================
-# 实时同步（列表滑块绑定的参考物体 -> 其余选中物体）
+# 单键写值（一行 -> 驱动范围内所有同名形态键）
 # ============================================================
 
-def snapshot_reference_values(context=None):
-    """刷新后记录参考值，作为「是否被拖动过」的基准。"""
-    context = context if context is not None else bpy.context
+def apply_single_values(context, key_names, value, value_range=None):
+    """把驱动范围内所有同名形态键统一写成同一个值，返回实际写到的键数量。
+
+    这是统一控制器的核心语义：一行滑块对应一个形态键名，拖动/输入多少，
+    场景里**每一个**有这个同名键的物体就都变成多少。
+    """
     props = getattr(getattr(context, "scene", None), "atp_props", None)
-    if props is None:
-        return
+    if value_range is None:
+        value_range = get_value_range(props) if props is not None else None
+    if value_range is None:
+        value_range = (DEFAULT_VALUE_MIN, DEFAULT_VALUE_MAX)
+    value_min, value_max = value_range
 
-    _REFERENCE_VALUES.clear()
-    for item in props.shape_key_list:
-        if item.is_group:
-            continue
-        reference_object, key_block = resolve_reference(item, context)
-        if reference_object is None or key_block is None:
-            continue
-        _REFERENCE_VALUES[(reference_object.name, key_block.name)] = float(key_block.value)
+    # 显式夹取到值域，不依赖 RNA 对滑块范围的隐式裁剪
+    clamped = min(max(float(value), value_min), value_max)
 
-
-def sync_reference_shape_keys(context=None):
-    """把参考物体上被改动过的形态键值同步到其余选中物体。"""
-    context = context if context is not None else bpy.context
-    props = getattr(getattr(context, "scene", None), "atp_props", None)
-    if props is None or not bool(getattr(props, "sk_live_sync", True)):
-        return 0
-
-    items = [item for item in props.shape_key_list if not item.is_group]
-    if not items:
-        return 0
-
-    objects = selected_shape_key_objects(context)
-    if len(objects) < 2:
-        return 0
-
-    synced = 0
-    for item in items:
-        reference_object, reference_block = resolve_reference(item, context)
-        if reference_object is None or reference_block is None:
-            continue
-        if reference_object not in objects:
-            continue
-
-        cache_key = (reference_object.name, reference_block.name)
-        current = float(reference_block.value)
-        previous = _REFERENCE_VALUES.get(cache_key)
-        _REFERENCE_VALUES[cache_key] = current
-        if previous is None or abs(current - previous) <= 1e-6:
-            continue
-
-        for obj in objects:
-            if obj is reference_object:
+    written = 0
+    for obj in driving_objects(context):
+        for name in key_names:
+            key_block = get_key_block(obj, name)
+            if key_block is None:
                 continue
-            key_block = get_key_block(obj, reference_block.name)
-            if key_block is None or abs(float(key_block.value) - current) <= 1e-6:
-                continue
-            key_block.value = current
-            synced += 1
-    return synced
-
-
-def _on_depsgraph_update(scene, depsgraph=None):
-    global _sync_error_reported
-
-    if _suppress_update:
-        return
-    try:
-        screen = bpy.context.screen
-        if screen is not None and screen.is_animation_playing:
-            return
-    except Exception:
-        pass
-
-    props = getattr(scene, "atp_props", None)
-    if props is None or not bool(getattr(props, "sk_live_sync", True)):
-        return
-    if not props.shape_key_list:
-        return
-
-    try:
-        sync_reference_shape_keys(bpy.context)
-        _sync_error_reported = False
-    except Exception as exc:  # 处理器内异常会刷屏，只报告一次
-        if not _sync_error_reported:
-            _sync_error_reported = True
-            print(f"[TheHerta4] 形态键实时同步失败: {exc}")
-
-
-def register_shape_key_sync():
-    """挂上 depsgraph 处理器（无 bpy.app.handlers 时静默跳过）。"""
-    handlers = getattr(bpy.app, "handlers", None)
-    depsgraph = getattr(handlers, "depsgraph_update_post", None) if handlers is not None else None
-    if depsgraph is None:
-        return False
-    if _on_depsgraph_update not in depsgraph:
-        depsgraph.append(_on_depsgraph_update)
-    return True
-
-
-def unregister_shape_key_sync():
-    handlers = getattr(bpy.app, "handlers", None)
-    depsgraph = getattr(handlers, "depsgraph_update_post", None) if handlers is not None else None
-    if depsgraph is not None and _on_depsgraph_update in depsgraph:
-        depsgraph.remove(_on_depsgraph_update)
-    _REFERENCE_VALUES.clear()
+            set_key_block_range(key_block, value_min, value_max)
+            key_block.value = clamped
+            written += 1
+    return written
 
 
 # ============================================================
@@ -448,8 +401,9 @@ def unregister_shape_key_sync():
 def refresh_shape_key_list(scene_props, objects, active_object=None):
     """重建统一控制器列表：连续形态键合成分组行，其余为单键行。
 
-    单键行的滑块绑定到参考物体上的真实形态键，因此滑块显示的就是实际值，
-    范围也直接取自形态键自身的 slider_min / slider_max。
+    每一行的滑块都绑定在这一行自己的属性上（单键行 = item.value，分组行 =
+    item.group_value），拖动时由属性回调把值写到驱动范围内所有同名形态键。
+    刷新时用第一个持有者的实际值回填，所以滑块显示的就是真实值。
 
     返回找到的全部形态键名集合。
     """
@@ -459,7 +413,6 @@ def refresh_shape_key_list(scene_props, objects, active_object=None):
     key_values = collect_shape_key_values(ordered_objects)
     found_keys = set(key_values.keys())
 
-    _REFERENCE_VALUES.clear()
     _suppress_update = True
     try:
         scene_props.shape_key_list.clear()
@@ -474,7 +427,6 @@ def refresh_shape_key_list(scene_props, objects, active_object=None):
                 item.name = prefix
                 item.label = label
                 item.key_names = SEP.join(names)
-                item.reference_object = None
                 position = derive_group_position(names, key_values, value_range)
                 item.group_value = clamp01(position / len(names))
                 grouped_names.update(names)
@@ -487,13 +439,6 @@ def refresh_shape_key_list(scene_props, objects, active_object=None):
             item.key_names = key_name
             item.value = key_values[key_name]
 
-            reference_object = first_object_with_key(ordered_objects, key_name)
-            item.reference_object = reference_object
-            if reference_object is not None:
-                key_block = get_key_block(reference_object, key_name)
-                if key_block is not None:
-                    _REFERENCE_VALUES[(reference_object.name, key_name)] = float(key_block.value)
-
         index = int(getattr(scene_props, "shape_key_list_index", 0) or 0)
         if index >= len(scene_props.shape_key_list):
             scene_props.shape_key_list_index = max(0, len(scene_props.shape_key_list) - 1)
@@ -504,8 +449,8 @@ def refresh_shape_key_list(scene_props, objects, active_object=None):
 
 
 def refresh_from_context(context):
-    """按当前选择（含活动物体）刷新统一控制器列表。"""
-    targets = list(getattr(context, "selected_objects", None) or [])
+    """按当前场景刷新统一控制器列表（连续形态键自动合并为一行）。"""
+    targets = driving_objects(context)
     return refresh_shape_key_list(
         context.scene.atp_props,
         targets,
@@ -520,22 +465,18 @@ def refresh_from_context(context):
 class ATP_OT_RefreshShapeKeys(bpy.types.Operator):
     bl_idname = "atp.refresh_shape_keys"
     bl_label = "刷新形态键列表"
-    bl_description = "根据当前选中的物体刷新统一形态键控制列表（连续形态键自动合并为一行）"
+    bl_description = "扫描场景里所有物体的形态键，重建统一形态键控制列表（连续形态键自动合并为一行）"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
     def poll(cls, context):
-        return bool(context.selected_objects)
+        return getattr(getattr(context, "scene", None), "atp_props", None) is not None
 
     def execute(self, context):
         props = context.scene.atp_props
-        found_keys = refresh_shape_key_list(
-            props,
-            context.selected_objects,
-            context.active_object,
-        )
+        found_keys = refresh_from_context(context)
         if not found_keys:
-            self.report({'INFO'}, "当前选中物体中没有可控制的形态键。")
+            self.report({'INFO'}, "没有找到可控制的形态键。")
             return {'CANCELLED'}
 
         group_count = len([item for item in props.shape_key_list if item.is_group])

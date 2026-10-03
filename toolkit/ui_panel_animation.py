@@ -47,9 +47,6 @@ class ATP_PT_ShapeKeyTools(bpy.types.Panel):
         options.prop(props, "sk_use_grouping", text="组合连续形态键", icon='GROUP')
         options.prop(props, "sk_list_rows", text="行数")
 
-        sync_row = box.row(align=True)
-        sync_row.prop(props, "sk_live_sync", text="实时同步选中物体", icon='LINKED')
-
         if len(props.shape_key_list) > 0:
             box.template_list(
                 ATP_UL_SHAPEKEY_LIST_IDNAME, "",
@@ -58,7 +55,7 @@ class ATP_PT_ShapeKeyTools(bpy.types.Panel):
                 rows=props.sk_list_rows,
             )
         else:
-            box.label(text="列表为空，请选中网格物体后点击刷新", icon='INFO')
+            box.label(text="列表为空：场景里没有可控制的形态键，点刷新重试", icon='INFO')
 
         index = props.shape_key_list_index
         if 0 <= index < len(props.shape_key_list):
