@@ -65,6 +65,11 @@ _install_module(
         logic_name="NTEMI",
         read_from_main_json_ssmt4=lambda: None,
         path_generate_mod_folder=lambda: "X:/Mods/Out",
+        # PR #18：导出入口用 set/get/restore 给「输出目录蓝图」指针限定作用域
+        # （invoke/execute 的 finally 要能取快照与还原，缺一个就 AttributeError）
+        set_output_blueprint_tree=lambda _tree: None,
+        get_output_blueprint_tree_name=lambda: "",
+        restore_output_blueprint_tree=lambda _tree_name: None,
     ),
 )
 _install_module(f"{PKG}.common.global_key_count_helper", GlobalKeyCountHelper=types.SimpleNamespace(initialize=lambda: None))

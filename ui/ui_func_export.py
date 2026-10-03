@@ -73,16 +73,30 @@ class SSMTGenerateModBlueprint(bpy.types.Operator):
         if tree and global_properties and getattr(global_properties, "selected_blueprint_name", "") != tree.name:
             global_properties.selected_blueprint_name = tree.name
 
-        # 记录本次导出使用的蓝图，仅用于解析输出目录。
+        # 记录本次导出使用的蓝图，仅用于解析输出目录（path_generate_mod_folder）。
         # 这里绝不能改 runtime_blueprint_tree_name：它决定导出目标蓝图，
         # 一旦被写入就会被后续的蓝图解析当作回落目标，导致一直串到旧蓝图。
+        # 该指针由调用方限定作用域：invoke/execute 都会在 finally 里还原，
+        # 见 _invoke_with_output_blueprint / _execute_export。
         if tree:
             GlobalConfig.set_output_blueprint_tree(tree)
 
         return tree
 
     def invoke(self, context, event):
-        """弹窗确认导出目录中的配置表是否覆盖（含后处理节点时）"""
+        """弹窗确认导出目录中的配置表是否覆盖（含后处理节点时）
+
+        _resolve_target_tree 会登记「本次导出使用的蓝图」（决定输出目录），
+        而走到 invoke 不代表一定会进入 execute（用户可以取消弹窗），
+        所以这里同样要用 try/finally 把这个指针还原，不能让它停在弹窗阶段。
+        """
+        previous_output_tree_name = GlobalConfig.get_output_blueprint_tree_name()
+        try:
+            return self._invoke_with_output_blueprint(context, event)
+        finally:
+            GlobalConfig.restore_output_blueprint_tree(previous_output_tree_name)
+
+    def _invoke_with_output_blueprint(self, context, event):
         tree = self._resolve_target_tree(context)
         if not tree:
             return self.execute(context)
@@ -141,6 +155,20 @@ class SSMTGenerateModBlueprint(bpy.types.Operator):
         return None
 
     def execute(self, context):
+        """导出入口：把「输出目录蓝图」指针的作用域严格限定在本次导出内。
+
+        以前只在 _resolve_target_tree 里 set、从不还原，指针会一直留到下一次导出：
+        非蓝图导出（快速局部导出 / NTMI ModImp）只要调用 path_generate_mod_folder()
+        就会命中上一个蓝图，输出目录串到旧蓝图（与「非蓝图导出流程不受影响」矛盾）。
+        这里用 try/finally 覆盖所有路径（含异常与提前 return）。
+        """
+        previous_output_tree_name = GlobalConfig.get_output_blueprint_tree_name()
+        try:
+            return self._execute_export(context)
+        finally:
+            GlobalConfig.restore_output_blueprint_tree(previous_output_tree_name)
+
+    def _execute_export(self, context):
         GlobalConfig.read_from_main_json_ssmt4()
         
         TimerUtils.start_session("Mod导出")
