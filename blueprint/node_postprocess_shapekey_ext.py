@@ -967,7 +967,7 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
     background_corner_radius: bpy.props.IntProperty(
         name="背景圆角",
         description="面板背景的圆角半径。0 = 直角，100 = 最大圆角（约半圆）",
-        default=24,
+        default=5,
         min=0,
         max=100,
     )
@@ -1426,6 +1426,49 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
                 new_lines.append(line)
             sections[sec_name] = new_lines
 
+        # 4) [Present] 的形态键强度签名：把未分配变量的项从表达式里删掉。
+        # 上游形态键节点会把**所有**形态键（本节点判为未分配的也在内）塞进签名
+        # `$ssmt_sk_sig_* = $Freq_a * 1 + $Freq_b * 3 + ...`，而这条签名正是
+        # `run = CustomShader_*_Anim` 的触发条件。不删掉这些项，未分配形态键就还挂在
+        # 分组动画（自动播放 / 滑块）的驱动链上——它们的 `global persist` 声明已被注释，
+        # 参与签名只剩副作用，游戏内表现为未分组形态键跟着分组一起动。
+        # 权重是互质数、求和本身与顺序无关，删掉恒为 0 的项不影响变化检测。
+        sig_pattern = re.compile(r'^(\s*)(\$ssmt_sk_sig_[^\s=]+)\s*=\s*(.+)$')
+        if '[Present]' in sections:
+            new_lines = []
+            for line in sections['[Present]']:
+                m = sig_pattern.match(line)
+                if not m:
+                    new_lines.append(line)
+                    continue
+                indent, sig_var, expr = m.group(1), m.group(2), m.group(3)
+                sig_token = sig_var.lstrip('$')
+                terms = [t.strip() for t in expr.split(' + ') if t.strip()]
+                kept = []
+                dropped = 0
+                for term in terms:
+                    term_match = re.match(r'^(\$[^\s*]+)', term)
+                    token = (term_match.group(1)[1:] if term_match else "")
+                    if token and token in target_set:
+                        matched_tokens.add(token)
+                        dropped += 1
+                        continue
+                    kept.append(term)
+                if dropped == 0:
+                    new_lines.append(line)
+                    continue
+                if not kept:
+                    # 续行（`$sig = $sig + ...`）没有剩余项：整行丢弃；
+                    # 首行（`$sig = 项...`）则保底成 `$sig = 0`，别让签名变量失去定义。
+                    if any(t.lstrip('$') == sig_token for t in terms):
+                        continue
+                    kept = ["0"]
+                elif len(kept) == 1 and kept[0].lstrip('$') == sig_token:
+                    # 只剩 `$sig = $sig` 的自赋值续行，同样没有意义，丢弃
+                    continue
+                new_lines.append(f"{indent}{sig_var} = " + " + ".join(kept))
+            sections['[Present]'] = new_lines
+
         # 一个匹配行都没有的未分配形态键：多半是变量名刚被刷新、ini 还没重新导出
         unmatched = sorted(target_set - matched_tokens)
         return masked_lines, already_masked, unmatched
@@ -1475,6 +1518,66 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
         skipped = sorted(v for v in (freq_params or ()) if cls._normalize_token(v) in excluded)
         kept = {v for v in (freq_params or ()) if v not in skipped}
         return kept, skipped
+
+    # 滑块参数的来源声明（与 _apply_slider_panel 此前内联的扫描口径完全一致）
+    SLIDER_FREQ_PARAM_PATTERN = re.compile(r'^\s*global(?:\s+persist)?\s+(\$Freq_[^\s=]+)')
+
+    def _collect_unassigned_masked_vars(self):
+        """未分配（分组为 0）的形态键名，以及它们对应的 ini 变量名。
+
+        返回 ``(unassigned_names, masked_vars)``；``masked_vars`` 不带 `$` 前缀，
+        与 ``_exclude_disabled_freq_params`` 的入出口径一致。「滑块面板排除未分配
+        形态键」与「未分配形态键屏蔽」共用这一份判定，避免两处口径漂移。
+        """
+        unassigned_names = {
+            entry.shape_key_name
+            for entry in (getattr(self, "play_group_entries", None) or [])
+            if entry.group_index == 0
+        }
+        name_to_var = self._scan_shapekey_name_to_var_map() if unassigned_names else {}
+        masked_vars = {name_to_var[name] for name in unassigned_names if name in name_to_var}
+        return unassigned_names, masked_vars
+
+    def _collect_slider_freq_params(self, sections=None, exclude_vars=None):
+        """收集**会变成滑块**的形态键参数（`_apply_slider_panel` 的唯一产出前提）。
+
+        - 有 ``sections``：按 `[Constants]` 里的 `global $Freq_*` 声明取，即导出 /
+          原地刷新时的真实来源；
+        - 无 ``sections``（纯 UI 场景，供别的节点判断滑块面板会不会出现）：退回本节点
+          上游的形态键变量表，判据与导出路径同源。
+
+        返回 ``(kept, skipped)``，语义与 ``_exclude_disabled_freq_params`` 一致。
+        """
+        if sections is not None:
+            candidates = set()
+            for line in sections.get('[Constants]', []) or []:
+                match = self.SLIDER_FREQ_PARAM_PATTERN.match(line)
+                if match:
+                    candidates.add(match.group(1))
+        else:
+            candidates = {
+                f"${var}" for var in self._scan_shapekey_name_to_var_map().values() if var
+            }
+        return self._exclude_disabled_freq_params(candidates, exclude_vars)
+
+    def will_emit_slider_panel(self, sections=None) -> bool:
+        """本节点本次导出是否**真的**会写出形态键滑块面板。
+
+        只看 ``use_slider_panel`` 是不够的：``_apply_slider_panel`` 在排除未分配形态键
+        之后没有任何 ``$Freq_*`` 参数时会直接返回 False，此时 ini 里既没有滑块面板段落，
+        也没有 ``$img0_x`` / ``$zoom0`` 等共用变量。依赖这些变量的节点（物体切换面板的
+        附加模式）必须按本方法的结论决定能不能复用它们，否则会引用到不存在的变量。
+        """
+        if not bool(getattr(self, "use_slider_panel", False)):
+            return False
+        try:
+            _unassigned_names, masked_vars = self._collect_unassigned_masked_vars()
+            kept, _skipped = self._collect_slider_freq_params(sections, masked_vars)
+        except AttributeError:
+            # 节点未完整初始化（上游未连线等）时无法判定：按「会产出」处理（与引入本方法
+            # 之前的行为一致），真正的产出前提由导出期的 ini 证据校验兜底。
+            return True
+        return bool(kept)
 
     def _build_var_to_group_map(self, freq_vars, shapekey_names):
         """构建 变量 -> 分组编号 的映射，并返回实际使用的分组列表。
@@ -2047,22 +2150,11 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
             print("滑块面板配置已存在于文件中。请手动删除后再生成。")
             return False
 
-        freq_params_temp = set()
-        param_pattern = re.compile(r'^\s*global(?:\s+persist)?\s+(\$Freq_[^\s=]+)')
-        if '[Constants]' in sections:
-            for line in sections['[Constants]']:
-                m = param_pattern.match(line)
-                if m:
-                    freq_params_temp.add(m.group(1))
-
-        if exclude_vars:
-            freq_params_temp, skipped = self._exclude_disabled_freq_params(
-                freq_params_temp, exclude_vars
+        freq_params_temp, skipped = self._collect_slider_freq_params(sections, exclude_vars)
+        if skipped:
+            print(
+                f"[形态键扩展] 滑块面板跳过 {len(skipped)} 个未分配形态键的滑块: {skipped}"
             )
-            if skipped:
-                print(
-                    f"[形态键扩展] 滑块面板跳过 {len(skipped)} 个未分配形态键的滑块: {skipped}"
-                )
 
         group_pattern = re.compile(r'^\$Freq_Group(\d+)$')
         group_var_matches = {}
@@ -2794,10 +2886,8 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
                 return False
 
         # 未分配形态键：先解析出变量名集合，供"按身份还原屏蔽"与"滑块面板排除"共用。
-        unassigned_names = {e.shape_key_name for e in self.play_group_entries if e.group_index == 0}
-        name_to_var = self._scan_shapekey_name_to_var_map() if unassigned_names else {}
-        masked_vars = {name_to_var[n] for n in unassigned_names if n in name_to_var}
-        active_vars = set(name_to_var.values())
+        unassigned_names, masked_vars = self._collect_unassigned_masked_vars()
+        active_vars = set(self._scan_shapekey_name_to_var_map().values()) if unassigned_names else set()
 
         # 处理上次的未分配-已屏蔽标记：仍在屏蔽集合里的保持注释、移回分组的还原、
         # 变量已改名/废弃的保守保持屏蔽（不许旧行复活）。
