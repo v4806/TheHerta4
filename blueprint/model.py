@@ -125,6 +125,22 @@ def _is_postprocess_chain_member(node) -> bool:
     return False
 
 
+def _will_emit_slider_panel(node) -> bool:
+    """节点是否会真的写出形态键滑块面板（供附加模式的顺序校验使用）。
+
+    只勾了 ``use_slider_panel`` 不等于会产出面板：没有可建滑块的形态键参数时
+    ``node_postprocess_shapekey_ext`` 会直接跳过。判定优先问节点自己的
+    ``will_emit_slider_panel()``（与导出代码同源），拿不到时退回开关判定。
+    """
+    predicate = getattr(node, "will_emit_slider_panel", None)
+    if callable(predicate):
+        try:
+            return bool(predicate())
+        except Exception:
+            pass
+    return bool(getattr(node, "use_slider_panel", False))
+
+
 def validate_postprocess_node_constraints(nodes) -> None:
     """验证跨全部已收集 Blueprint 的后处理单实例约束。"""
     active_nodes = [node for node in (nodes or []) if not getattr(node, "mute", False)]
@@ -177,6 +193,32 @@ def validate_postprocess_node_constraints(nodes) -> None:
         raise ValueError(
             "文本追加节点必须位于后处理链最后（它没有输出口，后面不能再接其它节点）"
         )
+
+    # 物体切换面板的「附加模式」复用形态键滑块面板的坐标系与交互状态
+    # （$img0_x / $img0_y / $zoom0 / $help / $ui_active / $mouse_clicked / $is_dragging /
+    #  $click_outside）。滑块面板的 [Present] 段在「单击且光标在面板外」时把
+    # $click_outside 置 1，同帧稍后再判定 $click_outside == 1 && $mouse_clicked == 0
+    # 就隐藏面板；附加块靠 $click_outside = 0 抵消这条判定，只有在同一帧里先跑滑块面板、
+    # 后跑附加块时才有效。因此启用了滑块面板的形态键扩展节点必须排在物体切换面板之前。
+    slider_nodes = [
+        node for node in active_nodes
+        if getattr(node, "bl_idname", "")
+        == "SSMTNode_PostProcess_ShapeKeyExt"
+        and _will_emit_slider_panel(node)
+    ]
+    if slider_nodes:
+        slider_node = slider_nodes[0]
+        slider_index = active_nodes.index(slider_node)
+        for node in active_nodes:
+            if getattr(node, "bl_idname", "") != "SSMTNode_PostProcess_SwapPanel":
+                continue
+            if active_nodes.index(node) < slider_index:
+                raise ValueError(
+                    "物体切换面板节点必须排在启用了滑块面板的形态键扩展节点之后："
+                    f"当前「物体切换面板（{getattr(node, 'name', '未命名')}）」在"
+                    f"「形态键扩展配置（{getattr(slider_node, 'name', '未命名')}）」之前，"
+                    "否则点击滑块面板以外的按钮会连带关闭形态键滑块面板"
+                )
 
     for node in active_nodes:
         validator = getattr(node, "validate_export_configuration", None)

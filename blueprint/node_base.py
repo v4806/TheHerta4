@@ -50,6 +50,20 @@ class SSMTBlueprintTree(NodeTree):
     bl_label = 'SSMT BluePrint'
     bl_icon = 'NODETREE'
 
+    # 每个蓝图各自独立的生成Mod输出目录设置（不再共用场景全局设置）
+    use_specific_generate_mod_folder_path: bpy.props.BoolProperty(
+        name="生成Mod到指定的文件夹中",
+        description="勾选后将生成Mod到你指定的文件夹中（仅对当前蓝图生效）",
+        default=False,
+    ) # type: ignore
+
+    generate_mod_folder_path: bpy.props.StringProperty(
+        name="生成Mod文件夹路径",
+        description="选择的生成Mod的文件夹路径（仅对当前蓝图生效）",
+        default="",
+        subtype='DIR_PATH',
+    ) # type: ignore
+
 
 _NODE_COLOR_INPUT_SOURCE = (0.38, 0.39, 0.40)
 _NODE_COLOR_GROUP = (0.15, 0.16, 0.17)

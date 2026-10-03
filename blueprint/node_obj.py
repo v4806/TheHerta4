@@ -451,12 +451,13 @@ class SSMTNode_Result_Output(SSMTNodeBase):
 
         layout.prop(context.scene.global_properties, "open_mod_folder_after_generate_mod",text="生成Mod后打开Mod所在文件夹")
 
-        layout.prop(context.scene.global_properties, "use_specific_generate_mod_folder_path")
+        output_tree = self.id_data
+        layout.prop(output_tree, "use_specific_generate_mod_folder_path")
 
-        if GlobalProterties.use_specific_generate_mod_folder_path():
+        if getattr(output_tree, "use_specific_generate_mod_folder_path", False):
             box = layout.box()
             box.label(text="当前生成Mod位置文件夹:")
-            box.prop(context.scene.global_properties, "generate_mod_folder_path", text="")
+            box.prop(output_tree, "generate_mod_folder_path", text="")
 
         row = layout.row()
         row.prop(self, "show_vertex_deduplication_panel", 
