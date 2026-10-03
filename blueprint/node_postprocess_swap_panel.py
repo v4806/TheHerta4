@@ -145,7 +145,12 @@ class SSMT_OT_SwapPanel_Refresh(bpy.types.Operator):
 class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
     bl_idname = 'SSMTNode_PostProcess_SwapPanel'
     bl_label = '物体切换面板'
-    bl_description = '读取蓝图物体切换节点与 mod 的 KeySwap 配置，生成带按钮的图形切换面板（点击按钮=按下切换按键）；若存在形态键滑块面板则按钮附加到其左侧'
+    bl_description = (
+        '读取蓝图物体切换节点与 mod 的 KeySwap 配置，生成带按钮的图形切换面板（点击按钮=按下切换按键）。'
+        '若蓝图中存在「确实会产出」滑块面板的形态键扩展节点，则按钮附加到该滑块面板左侧，'
+        '复用其坐标系与交互状态；此时该形态键扩展节点必须排在本节点之前连接（后处理链执行顺序），'
+        '否则点击面板外的按钮会连带把滑块面板关闭（导出前会校验并报错）'
+    )
 
     def init(self, context):
         super().init(context)
@@ -165,6 +170,14 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
     ATTACHED_PRESENT_BEGIN = "; ========== SWAP PANEL ATTACHED LOGIC (appended) [{ns}] =========="
     ATTACHED_PRESENT_END = "; ========== SWAP PANEL ATTACHED LOGIC END (appended) [{ns}] =========="
     ATTACHED_PRESENT_MARKER = "; @@SSMTSwapPanel:attached_present:{ns}@@"
+
+    # 滑块面板真正产出后才存在的标记与「无命名空间」共用变量
+    # （定义见 node_postprocess_shapekey_ext._apply_slider_panel 的 [Constants] 段）
+    SLIDER_PANEL_MARKER = "SLIDER PANEL CUSTOM LOGIC (appended)"
+    SLIDER_PANEL_SHARED_VARS = (
+        "$img0_x", "$img0_y", "$zoom0", "$help", "$ui_active",
+        "$mouse_clicked", "$is_dragging", "$click_outside",
+    )
 
     create_cumulative_backup: bpy.props.BoolProperty(name="创建累积备份", default=True)
 
@@ -300,7 +313,7 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
     # 查找形态键滑块面板（附加模式）
     # ==========================================
     def _find_slider_panel_node(self):
-        """在当前蓝图（含嵌套蓝图）中查找启用了滑块面板的形态键扩展节点。
+        """在当前蓝图（含嵌套蓝图）中查找**确实会产出**滑块面板的形态键扩展节点。
 
         找到时，本节点的切换按钮会附加到该滑块面板的左侧，复用其坐标系与交互状态。
         未找到时返回 None，走原有独立面板机制。
@@ -309,6 +322,23 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
         if tree is None:
             return None
         return self._find_slider_panel_node_in_tree(tree, set())
+
+    @staticmethod
+    def _node_emits_slider_panel(node):
+        """该形态键扩展节点是否**真的**会写出滑块面板。
+
+        只勾了 ``use_slider_panel`` 还不够（详见 ``node_postprocess_shapekey_ext`` 的
+        ``will_emit_slider_panel``）：没有可建滑块的形态键参数时它不产出面板，附加模式
+        引用的 ``$img0_x`` / ``$zoom0`` 等变量在 ini 里根本不存在。判定直接问节点自己，
+        与导出代码同源；节点类型没有该方法（旧版本 / 测试替身）时退回开关判定。
+        """
+        predicate = getattr(node, "will_emit_slider_panel", None)
+        if callable(predicate):
+            try:
+                return bool(predicate())
+            except Exception as error:
+                print(f"[物体切换面板] 判断滑块面板产出前提失败，退回 use_slider_panel: {error}")
+        return bool(getattr(node, "use_slider_panel", False))
 
     def _find_slider_panel_node_in_tree(self, tree, visited):
         tree_key = getattr(tree, "name", str(id(tree)))
@@ -319,7 +349,7 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
             if getattr(node, "mute", False):
                 continue
             if node.bl_idname == 'SSMTNode_PostProcess_ShapeKeyExt':
-                if bool(getattr(node, "use_slider_panel", False)):
+                if self._node_emits_slider_panel(node):
                     return node
             elif node.bl_idname == 'SSMTNode_Blueprint_Nest':
                 blueprint_name = str(getattr(node, "blueprint_name", "") or "")
@@ -329,6 +359,30 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
                     if result is not None:
                         return result
         return None
+
+    @classmethod
+    def _slider_panel_emitted(cls, ini_file_path):
+        """目标 ini 里是否**真的**产出了形态键滑块面板。
+
+        附加模式复用滑块面板的坐标系与交互状态（`$img0_x`/`$img0_y`/`$zoom0`/
+        `$help`/`$ui_active`/`$mouse_clicked`/`$is_dragging`/`$click_outside` 都是
+        **无命名空间**的全局变量）。这些变量只在滑块面板真的写出时才存在；节点勾了开关
+        却没有产出（没有可建滑块的形态键参数、节点不在后处理链上等）时，附加按钮会引用
+        未定义变量，3Dmigoto 侧静默取 0。因此在真正走附加模式之前用 ini 内容做一次证据校验。
+        """
+        try:
+            with open(ini_file_path, 'r', encoding='utf-8') as handle:
+                text = handle.read()
+        except Exception as error:
+            print(f"[物体切换面板] 读取 ini 校验滑块面板产出失败: {error}")
+            return False
+        if cls.SLIDER_PANEL_MARKER not in text:
+            return False
+        for var in cls.SLIDER_PANEL_SHARED_VARS:
+            pattern = rf'^\s*global(?:\s+persist)?\s+{re.escape(var)}\s*(?:=|$)'
+            if not re.search(pattern, text, re.MULTILINE):
+                return False
+        return True
 
     # ==========================================
     # 原地更新：按专有标识移除本面板旧配置
@@ -574,6 +628,9 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
         box = col_right.box()
         box.label(text="备注文字图标（自动生成）", icon='FILE_FONT')
 
+        # 按钮样式（背景色 / 边框色 / 边框宽度 / 透明度 / 对齐）只在附加模式下无意义：
+        # 附加模式的按钮外观由滑块面板统一控制。未勾选「用备注生成图标」时默认纯色按钮图
+        # 仍然读这些参数（见 _ensure_button_image），因此不能跟着 use_remark_as_icon 一起隐藏。
         show_button_style = not attached_mode
         if PIL_AVAILABLE:
             box.prop(self, "use_remark_as_icon", text="用备注生成图标")
@@ -586,8 +643,6 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
                 remark_row.prop(self, "remark_stroke_color", text="描边色")
                 remark_col.prop(self, "remark_stroke_width", text="描边粗细")
                 box.label(text="备注里输入 / 可强制换行；已单独设置图片的按钮不受影响", icon='INFO')
-            else:
-                show_button_style = False
         else:
             box.label(text="未安装 Pillow，无法用备注生成图标", icon='ERROR')
 
@@ -1668,13 +1723,21 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
             print("未检测到任何物体切换节点 / [KeySwap_*] 配置，跳过面板生成")
             return False
 
-        # 2. 检测形态键滑块面板：存在则走附加模式（不生成独立浮动面板）
+        # 2. 检测形态键滑块面板：存在**且确实产出**时走附加模式（不生成独立浮动面板）
         slider_node = self._find_slider_panel_node()
         if slider_node is not None:
-            print(f"[物体切换面板] 检测到形态键滑块面板节点 '{slider_node.name}'，切换按钮将附加到其左侧")
-            # 附加模式总是替换旧配置，允许从独立模式平滑切换过来（不残留旧的独立面板段落）
-            return self._generate_attached_panel(
-                mod_export_path, target_ini_file, buttons, _in_place=True
+            # 附加模式复用的是滑块面板的「无命名空间」全局变量（$img0_x / $zoom0 / $help …），
+            # 它们只在滑块面板真的写出时才有定义：节点勾了开关但没有可建滑块的形态键参数、
+            # 或节点没被连进后处理链时，附加块会引用不存在的变量（3Dmigoto 侧读到 0）。
+            if self._slider_panel_emitted(target_ini_file):
+                print(f"[物体切换面板] 检测到形态键滑块面板节点 '{slider_node.name}'，切换按钮将附加到其左侧")
+                # 附加模式总是替换旧配置，允许从独立模式平滑切换过来（不残留旧的独立面板段落）
+                return self._generate_attached_panel(
+                    mod_export_path, target_ini_file, buttons, _in_place=True
+                )
+            print(
+                f"[物体切换面板] 节点 '{slider_node.name}' 未在本 ini 中产出滑块面板"
+                f"（缺少可建滑块的形态键参数或节点未接入后处理链），改用独立浮动面板"
             )
 
         # ---- 以下为原有独立面板机制 ----

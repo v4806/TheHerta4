@@ -539,5 +539,69 @@ class ModelShaderReplaceMappingTests(unittest.TestCase):
         self.assertEqual(model.shader_replace_object_info_map["ExportB"], [info_b])
 
 
+def _shapekey_ext_node(name="ShapeKeyExt", use_slider_panel=True, emit=None):
+    """构造一个形态键扩展节点替身；emit=None 表示不暴露 will_emit_slider_panel()。"""
+    attrs = {
+        "bl_idname": "SSMTNode_PostProcess_ShapeKeyExt",
+        "name": name,
+        "mute": False,
+        "use_slider_panel": use_slider_panel,
+    }
+    if emit is not None:
+        attrs["will_emit_slider_panel"] = lambda: emit
+    return types.SimpleNamespace(**attrs)
+
+
+def _swap_panel_node(name="SwapPanel"):
+    return types.SimpleNamespace(
+        bl_idname="SSMTNode_PostProcess_SwapPanel",
+        name=name,
+        mute=False,
+    )
+
+
+class SwapPanelSliderOrderTests(unittest.TestCase):
+    """物体切换面板的附加模式依赖「形态键扩展先生成滑块面板」这一执行顺序。"""
+
+    def test_slider_panel_before_swap_panel_is_allowed(self):
+        model_module.validate_postprocess_node_constraints(
+            [_shapekey_ext_node(emit=True), _swap_panel_node()]
+        )
+
+    def test_swap_panel_before_slider_panel_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "物体切换面板节点必须排在.*形态键扩展"):
+            model_module.validate_postprocess_node_constraints(
+                [_swap_panel_node(), _shapekey_ext_node(emit=True)]
+            )
+
+    def test_order_check_uses_position_after_mute_filtering(self):
+        """被静音的节点不参与执行，也不应被当成顺序违法。"""
+        muted_swap = _swap_panel_node(name="MutedSwap")
+        muted_swap.mute = True
+        model_module.validate_postprocess_node_constraints(
+            [muted_swap, _shapekey_ext_node(emit=True), _swap_panel_node()]
+        )
+
+    def test_slider_panel_that_will_not_emit_is_ignored(self):
+        """勾了 use_slider_panel 但不会产出滑块面板时，不存在顺序依赖。"""
+        model_module.validate_postprocess_node_constraints(
+            [_swap_panel_node(), _shapekey_ext_node(use_slider_panel=True, emit=False)]
+        )
+
+    def test_node_without_predicate_falls_back_to_switch(self):
+        model_module.validate_postprocess_node_constraints(
+            [_shapekey_ext_node(emit=None), _swap_panel_node()]
+        )
+        with self.assertRaisesRegex(ValueError, "物体切换面板节点必须排在.*形态键扩展"):
+            model_module.validate_postprocess_node_constraints(
+                [_swap_panel_node(), _shapekey_ext_node(emit=None)]
+            )
+
+    def test_disabled_slider_panel_node_does_not_constrain_order(self):
+        model_module.validate_postprocess_node_constraints(
+            [_swap_panel_node(), _shapekey_ext_node(use_slider_panel=False, emit=None)]
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
