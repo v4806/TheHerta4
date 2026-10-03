@@ -196,6 +196,7 @@ class SSMTGenerateModBlueprint(bpy.types.Operator):
 
             try:
                 execute_direct_export(context=context, tree=tree)
+                self._validate_generated_ini_variables(GlobalConfig.path_generate_mod_folder())
                 export_success = True
             except Exception as e:
                 error_message = f"直出失败: {str(e)}"
@@ -367,6 +368,7 @@ class SSMTGenerateModBlueprint(bpy.types.Operator):
                 )
             blueprint_model.execute_postprocess_nodes(mod_export_path)
             TimerUtils.end_stage("后处理节点")
+            self._validate_generated_ini_variables(mod_export_path)
             export_success = True
 
         except Exception as e:
@@ -483,6 +485,43 @@ class SSMTGenerateModBlueprint(bpy.types.Operator):
             })
 
         return export_plan
+
+    def _validate_generated_ini_variables(self, mod_export_path):
+        """导出收尾自检：产物 ini 里"被引用但未声明"的变量 + 重复全局声明。
+
+        未声明的 ``$var`` 在 3DMigoto 里退化成段内局部变量（跨 run= 不传递），
+        表现为功能静默失效；历史事故（viewport_valid、形态键 Freq_xxx 分叉）
+        都属于这一类。这里只报告、不阻断导出。
+        """
+        try:
+            workspace_name = str(GlobalConfig.get_workspace_name() or "")
+        except Exception:
+            workspace_name = ""
+        # 延迟导入：自检是收尾增强，模块缺失（裁剪/测试桩环境）不得影响导出
+        try:
+            from ..common.ini_variable_validator import (
+                find_primary_ini,
+                format_findings,
+                validate_ini_file,
+            )
+        except ImportError as exc:  # pragma: no cover - 仅裁剪/测试桩环境命中
+            LOG.info(f"⚠️ [INI 校验] 跳过（校验模块不可用）: {exc}")
+            return
+        ini_path = find_primary_ini(mod_export_path, workspace_name)
+        if not ini_path:
+            return
+        try:
+            report = validate_ini_file(ini_path)
+        except Exception as exc:
+            LOG.info(f"⚠️ [INI 校验] 跳过（读取失败）: {exc}")
+            return
+        if report.get("missing"):
+            return
+        LOG.info("")
+        LOG.info("🔎 产物变量声明自检")
+        LOG.info("-" * 40)
+        for line in format_findings(report):
+            LOG.info(line)
 
     def _log_export_plan(self, export_plan: list):
         LOG.info("")

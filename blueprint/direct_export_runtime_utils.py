@@ -1,3 +1,5 @@
+import os
+
 import numpy as np
 
 
@@ -80,3 +82,58 @@ def apply_position_override_in_place(
     source_rows = source_array.reshape(-1, position_stride)
     normalized_indices = np.asarray(export_indices, dtype=np.int64)
     state_rows[normalized_indices] = source_rows
+
+
+def _submesh_position_stride(submesh_model) -> int:
+    game_type = getattr(submesh_model, "d3d11_game_type", None)
+    stride_dict = getattr(game_type, "CategoryStrideDict", {}) or {}
+    try:
+        return int(stride_dict.get("Position", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def assemble_drawib_position_bytes(folder_path: str, submesh_models) -> tuple[bytes, int]:
+    """按 DrawIB 的子网格顺序拼接各子网格的 `<unique_str>-Position.buf`。
+
+    为什么需要：`DrawIBModel._assemble_object_export_context_map` 给出的 `export_indices`
+    是 **DrawIB 级**（每个子网格都加上了前面子网格的顶点数偏移，与
+    `_assemble_category_buffers` 拼接出来的 DrawIB 缓冲一致）。但逐子网格写盘的游戏
+    （EFMI 多 LOD：`LOD0.xxx-Position.buf` / `LOD1.xxx-Position.buf`）在磁盘上**没有**
+    DrawIB 级 Position 文件，按哈希前缀解析只会命中其中一个子网格的文件 —— 用 DrawIB 级
+    索引去采样它就会越界（实测：`index 2179 is out of bounds for axis 0 with size 2179`，
+    2179 正好是第二个子网格的起点）。
+
+    返回 (拼接字节, 子网格数)；无法安全拼接时返回 (b"", 0)，由调用方回退到
+    「按哈希解析单个文件」的旧路径：
+    - 子网格数 < 2（单个子网格本来就是一个文件，索引空间天然一致）；
+    - 任一子网格缺少 `<unique_str>-Position.buf`（合并 IB 的游戏按 DrawIB 命名，走回退）；
+    - 各子网格 Position 步长不一致（混合步长的缓冲无法用单一 stride 描述行）。
+    """
+    normalized_folder = str(folder_path or "").strip()
+    if not normalized_folder or not os.path.isdir(normalized_folder):
+        return b"", 0
+
+    paths: list[str] = []
+    strides: set[int] = set()
+    for submesh_model in submesh_models or ():
+        unique_str = str(getattr(submesh_model, "unique_str", "") or "").strip()
+        if not unique_str:
+            return b"", 0
+        candidate = os.path.join(normalized_folder, unique_str + "-Position.buf")
+        if not os.path.isfile(candidate):
+            return b"", 0
+        stride = _submesh_position_stride(submesh_model)
+        if stride <= 0 or os.path.getsize(candidate) % stride != 0:
+            return b"", 0
+        strides.add(stride)
+        paths.append(candidate)
+
+    if len(paths) < 2 or len(strides) != 1:
+        return b"", 0
+
+    chunks = []
+    for path in paths:
+        with open(path, "rb") as file_obj:
+            chunks.append(file_obj.read())
+    return b"".join(chunks), len(paths)

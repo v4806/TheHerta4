@@ -78,6 +78,24 @@ class BlueprintExportHelper:
         return disabled_names
 
     @staticmethod
+    def should_bake_disabled_shape_keys() -> bool:
+        """蓝图树中是否有形态键配置节点开启了「烘焙未勾选的形态键」。
+
+        任一节点开启即生效（与直出开关的跨节点同步口径一致）；无有效树或节点时返回 False。
+        """
+        try:
+            tree = BlueprintExportHelper.get_current_blueprint_tree()
+            if not tree:
+                return False
+            shapekey_nodes = BlueprintExportHelper.collect_shapekey_postprocess_nodes(tree)
+        except Exception:
+            return False
+        for node in shapekey_nodes:
+            if bool(getattr(node, "bake_disabled_shape_keys", False)):
+                return True
+        return False
+
+    @staticmethod
     def get_exportable_shape_key_infos(obj, slot_limit: int | None = None) -> list[tuple[int, str, object]]:
         if obj is None or not getattr(obj, "data", None):
             return []
@@ -187,11 +205,54 @@ class BlueprintExportHelper:
         return blueprint_trees
 
     @staticmethod
+    def normalize_blueprint_identifier(value) -> str:
+        """把任意来源的蓝图选择值归一成蓝图名字符串。
+
+        ``selected_blueprint_name`` 是枚举属性：Blender 内部存的是**枚举序号**。
+        一旦蓝图被重命名/删除，或者旧存档里的序号对不上当前列表，读取这个属性
+        只会得到空串（部分版本给回 int 序号）并刷屏
+        ``current value ... matches no enum in 'GlobalProterties'`` 警告。
+
+        这里把 int 序号按当前枚举表反查回蓝图名，其余非法输入一律回到空串。
+
+        **字符串一律原样返回，绝不 strip**：蓝图名就是 datablock 名，Blender 允许
+        首尾空白（中文输入法敲空格会打进出全角空格 U+3000），插件自己的
+        「创建新蓝图」对话框也是原样建树。strip 会把 ``'A　'`` 解析成另一个 datablock
+        ``'A'``（或直接解析不到），让下拉框显示的和按钮作用的不再是同一个蓝图。
+
+        **也绝不把非字符串透传给 bpy 集合接口**：``bpy.data.node_groups.get(<int>)``
+        抛的是 SystemError（"returned a result with an exception set"）而不是
+        返回 None，会让面板绘制在解析蓝图名时直接中断。
+        """
+        if value is None or isinstance(value, bool):
+            return ""
+        if isinstance(value, str):
+            return value
+        if isinstance(value, int):
+            items = BlueprintExportHelper.get_blueprint_enum_items()
+            for index, item in enumerate(items):
+                if BlueprintExportHelper._enum_item_number(item, index) == value:
+                    return str(item[0])
+            # 老存档：存的是「与名字绑定的哈希序号」，按旧算法反查回蓝图名
+            for item in items:
+                if BlueprintExportHelper._legacy_blueprint_enum_number(str(item[0])) == value:
+                    return str(item[0])
+            return ""
+        return ""
+
+    @staticmethod
     def get_blueprint_tree_by_name(tree_name):
-        if not tree_name:
+        identifier = BlueprintExportHelper.normalize_blueprint_identifier(tree_name)
+        if not identifier:
             return None
 
-        tree = bpy.data.node_groups.get(tree_name)
+        try:
+            tree = bpy.data.node_groups.get(identifier)
+        except Exception:
+            # 键非法（历史遗留的 int 序号）或数据已被销毁：一律当作「找不到」，
+            # 不让 bpy 的 SystemError 冒到面板绘制/算子执行里。
+            return None
+
         if BlueprintExportHelper._is_valid_blueprint_tree(tree):
             return tree
 
@@ -224,21 +285,38 @@ class BlueprintExportHelper:
         return ""
 
     @staticmethod
-    def _stable_blueprint_enum_number(identifier: str, used_numbers: set[int]) -> int:
-        if identifier == BlueprintExportHelper.BLUEPRINT_NONE_IDENTIFIER:
-            used_numbers.add(BlueprintExportHelper.BLUEPRINT_NONE_ENUM_NUMBER)
-            return BlueprintExportHelper.BLUEPRINT_NONE_ENUM_NUMBER
+    def _blueprint_enum_item_number(index: int) -> int:
+        """蓝图枚举项声明的序号 = **该项在 items 列表里的下标**。
 
+        这里曾经用「与蓝图名绑定的稳定哈希」当序号（想让已存值在列表增删后仍然
+        指向同一个蓝图），但对**动态枚举回调**来说那是错的：Blender 的枚举控件在
+        用户点菜单项时写回的是**项下标**，而不是回调声明的自定义 number。
+        两者不一致时控件就认为当前值非法，症状是：
+
+        * 每次重绘刷 ``current value ... matches no enum in 'GlobalProterties'``；
+        * 下拉框永远显示第一项、点其他蓝图不生效（点完仍是第一项）；
+        * Python 侧读回空串，面板上的删除/重命名因此失去目标。
+
+        序号与下标一致后，UI 写回的值必然对得上某一项，Python 侧也能读回蓝图名。
+
+        代价：列表增删会让已存序号指向相邻蓝图（位置漂移）。插件自身改列表的路径
+        （打开/导入/重命名/删除）都会在改完后立刻按名字重写一次选择，所以只有
+        在 Blender 原生改列表（Outliner 删除、节点编辑器改名）时才会漂移。
+        """
+        return int(index)
+
+    @staticmethod
+    def _legacy_blueprint_enum_number(identifier: str) -> int:
+        """旧版「与名字绑定的哈希序号」，只用于把老存档里存的值迁移回蓝图名。
+
+        历史版本用 blake2s(名字) 当枚举序号，存档里因此是一串大整数。现在序号
+        改回下标（见 ``_blueprint_enum_item_number``），这些遗留值需要按同一算法
+        反查，才能保住用户升级前的蓝图选择。旧实现的碰撞进位（+1）没有复现：
+        31 位哈希撞车概率可忽略。
+        """
         digest = hashlib.blake2s(str(identifier).encode("utf-8"), digest_size=4).digest()
         number = int.from_bytes(digest, "little") & 0x7FFFFFFF
-        if number == BlueprintExportHelper.BLUEPRINT_NONE_ENUM_NUMBER:
-            number = 1
-        while number in used_numbers:
-            number += 1
-            if number > 0x7FFFFFFF:
-                number = 1
-        used_numbers.add(number)
-        return number
+        return number or 1
 
     @staticmethod
     def _enum_item_number(item, fallback_index: int) -> int:
@@ -250,7 +328,24 @@ class BlueprintExportHelper:
         return int(fallback_index)
 
     @staticmethod
+    def _set_selected_blueprint_identifier(global_properties, identifier: str) -> bool:
+        """把校验过的蓝图标识符写回枚举属性；值没变则不写（避免面板绘制期空转）。"""
+        try:
+            if getattr(global_properties, "selected_blueprint_name", None) != identifier:
+                global_properties.selected_blueprint_name = identifier
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
     def ensure_valid_selected_blueprint_name(context=None) -> str:
+        """保证 ``selected_blueprint_name`` 指向一个**当前存在**的蓝图，返回该蓝图名。
+
+        枚举值失效（蓝图被重命名/删除、旧存档序号对不上、items 回调曾异常）
+        时会把下拉框留成空白并刷 RNA 警告，同时让面板上的删除/重命名/打开按钮
+        失去目标。这里统一修复：读原始序号 → 反查蓝图名 → 都不行就回落到
+        「当前优先蓝图」，并把修复结果写回属性，让 UI 和算子看到同一个值。
+        """
         scene = getattr(context, "scene", None) if context else getattr(bpy.context, "scene", None)
         global_properties = getattr(scene, "global_properties", None)
         if global_properties is None:
@@ -263,6 +358,11 @@ class BlueprintExportHelper:
             BlueprintExportHelper._enum_item_number(item, index): item[0]
             for index, item in enumerate(items)
         }
+        # 升级迁移：老存档里的序号是「名字哈希」，按旧算法反查，保住用户原有的选择
+        legacy_hash_to_identifier = {
+            BlueprintExportHelper._legacy_blueprint_enum_number(identifier): identifier
+            for identifier in identifiers
+        }
 
         raw_value = None
         raw_value_available = False
@@ -272,17 +372,35 @@ class BlueprintExportHelper:
         except Exception:
             pass
 
-        if isinstance(raw_value, str) and raw_value in identifier_set:
-            return raw_value
+        def identifier_for_enum_number(number):
+            key = int(number)
+            mapped = str(number_to_identifier.get(key, "") or "")
+            if not mapped:
+                mapped = str(legacy_hash_to_identifier.get(key, "") or "")
+            return mapped if mapped in identifier_set else ""
 
-        try:
-            raw_number = int(raw_value)
-            if raw_number in number_to_identifier:
-                selected_identifier = number_to_identifier[raw_number]
-                global_properties.selected_blueprint_name = selected_identifier
-                return selected_identifier
-        except Exception:
-            pass
+        if isinstance(raw_value, str):
+            # 精确匹配优先：蓝图名可能含首尾空白（全角空格），strip 后是另一个名字
+            if raw_value in identifier_set:
+                return raw_value
+            candidate = raw_value.strip()
+            if candidate and candidate in identifier_set:
+                BlueprintExportHelper._set_selected_blueprint_identifier(global_properties, candidate)
+                return candidate
+            # 兼容旧存档/历史版本：值可能是枚举序号的字符串形式
+            try:
+                mapped = identifier_for_enum_number(int(raw_value))
+            except (TypeError, ValueError):
+                mapped = ""
+            if mapped:
+                BlueprintExportHelper._set_selected_blueprint_identifier(global_properties, mapped)
+                return mapped
+        elif isinstance(raw_value, int) and not isinstance(raw_value, bool):
+            # Blender 存的就是枚举序号：反查回蓝图名（旧值对应的蓝图可能已删除）
+            mapped = identifier_for_enum_number(int(raw_value))
+            if mapped:
+                BlueprintExportHelper._set_selected_blueprint_identifier(global_properties, mapped)
+                return mapped
 
         if not raw_value_available:
             try:
@@ -296,11 +414,24 @@ class BlueprintExportHelper:
         if preferred_name not in identifier_set:
             preferred_name = identifiers[0] if identifiers else BlueprintExportHelper.BLUEPRINT_NONE_IDENTIFIER
 
-        try:
-            global_properties.selected_blueprint_name = preferred_name
-        except Exception:
-            pass
+        BlueprintExportHelper._set_selected_blueprint_identifier(global_properties, preferred_name)
         return preferred_name
+
+    @staticmethod
+    def resolve_blueprint_target_tree(blueprint_name="", context=None):
+        """把面板/算子传入的蓝图名解析成蓝图树（删除、重命名等操作的目标）。
+
+        传入值可能是陈旧的枚举序号、``__NONE__`` 或空串——蓝图在插件算子之外被
+        重命名/删除后，面板按钮带的就正是这种值。此时回退到**已校验的当前选择**，
+        而不是让算子直接取消：否则用户点删除只会得到一句「当前没有蓝图可删除」，
+        看起来就是「删不掉」。
+        """
+        tree = BlueprintExportHelper.get_blueprint_tree_by_name(blueprint_name)
+        if tree is not None:
+            return tree
+
+        fallback_name = BlueprintExportHelper.ensure_valid_selected_blueprint_name(context=context)
+        return BlueprintExportHelper.get_blueprint_tree_by_name(fallback_name)
 
     @staticmethod
     def set_runtime_shapekey_buffer_names(shapekey_names):
@@ -365,6 +496,72 @@ class BlueprintExportHelper:
     @staticmethod
     def should_suppress_shapekey_resource_export() -> bool:
         return bool(BlueprintExportHelper.suppress_shapekey_resource_export)
+
+    @staticmethod
+    def count_exportable_shapekey_blocks(obj) -> int:
+        """物体的可导出形态键数量（不含第 0 个 Basis 键块）。"""
+        if obj is None:
+            return 0
+        data = getattr(obj, "data", None)
+        shape_keys = getattr(data, "shape_keys", None)
+        key_blocks = getattr(shape_keys, "key_blocks", None)
+        if not key_blocks:
+            return 0
+        return max(len(key_blocks) - 1, 0)
+
+    @staticmethod
+    def detect_standard_route_baked_shapekey_objects(
+        original_to_copy_map=None,
+        object_getter=None,
+    ) -> list:
+        """找出「标准前处理把形态键烘焙掉」的源物体（非直出路线静默丢产物的根因证据）。
+
+        标准（非直出）前处理 `blueprint/preprocess.py::_apply_shape_keys` 会把副本上的
+        非 Basis 键块烘焙进网格并移除（`bake_current_shape_key_mix_to_mesh` +
+        `remove_non_basis_shape_keys`）。于是「源物体有形态键、副本一个都不剩」是本轮
+        不可能产出形态键载荷的确证 —— 经典发射器 `M_IniHelper.add_shapekey_ini_sections`
+        据此报警，而不是静默 `return`。
+
+        直出路线同样烘焙副本，但键位置在烘焙**之前**已被采样记录
+        （`_capture_direct_shape_key_positions`），所以调用方必须结合
+        `should_suppress_shapekey_resource_export()` 判断是否真的丢产物。
+
+        Args:
+            original_to_copy_map: 源物体名 → 副本物体名。缺省懒读
+                `PreProcessHelper.original_to_copy_map`（懒导入，避免与 preprocess 循环依赖）。
+            object_getter: 名字 → 物体。缺省 `bpy.data.objects.get`，测试可注入。
+
+        Returns:
+            排序后的源物体名列表（源物体有可导出形态键，而副本已无）。
+        """
+        if object_getter is None:
+            object_getter = bpy.data.objects.get
+
+        if original_to_copy_map is None:
+            original_to_copy_map = {}
+            try:
+                from .preprocess import PreProcessHelper
+
+                original_to_copy_map = dict(
+                    getattr(PreProcessHelper, "original_to_copy_map", {}) or {}
+                )
+            except Exception:
+                original_to_copy_map = {}
+
+        baked_object_names = []
+        for original_name, copy_name in (original_to_copy_map or {}).items():
+            if not original_name or not copy_name:
+                continue
+            original_obj = object_getter(original_name)
+            copy_obj = object_getter(copy_name)
+            if original_obj is None or copy_obj is None:
+                continue
+            if BlueprintExportHelper.count_exportable_shapekey_blocks(original_obj) <= 0:
+                continue
+            if BlueprintExportHelper.count_exportable_shapekey_blocks(copy_obj) <= 0:
+                baked_object_names.append(original_name)
+
+        return sorted(baked_object_names)
 
     @staticmethod
     def set_capture_direct_shapekey_positions(enabled: bool):
@@ -440,11 +637,10 @@ class BlueprintExportHelper:
     def get_blueprint_enum_items(context=None):
         items = []
         preferred_name = BlueprintExportHelper.get_preferred_blueprint_name(context=context)
-        used_numbers = set()
 
-        for tree in BlueprintExportHelper.get_all_blueprint_trees():
+        for index, tree in enumerate(BlueprintExportHelper.get_all_blueprint_trees()):
             description = "当前默认蓝图" if tree.name == preferred_name else "选择该蓝图进行打开或生成 Mod"
-            enum_number = BlueprintExportHelper._stable_blueprint_enum_number(tree.name, used_numbers)
+            enum_number = BlueprintExportHelper._blueprint_enum_item_number(index)
             items.append((tree.name, tree.name, description, 0, enum_number))
 
         if not items:
@@ -633,6 +829,34 @@ class BlueprintExportHelper:
         return ordered_nodes
 
     @staticmethod
+    def scene_object_present(*names: str) -> bool:
+        """任一给定名字（或其 ``.ZZMI_SOURCE`` / ``_copy`` 变体）在场景里有对象。
+
+        阻断修复（t80 §2.2/§2.3）：蓝图声明的部件**未必**在场景里有对象
+        （实测 19 件声明 / 4 个 mesh）——这些部件由生成器的「极限小三角占位」
+        机制在导出期实体化。两个地方必须能区分「源对象不存在（受支持形态）」与
+        「源对象在、但副本引用没更新（真错误）」：
+
+        - `blueprint/export_parallel.py` 的副本引用守卫；
+        - `ui/universal/zzmi.py` 的占位注入（`present` 必须按**场景真实存在**判定）。
+        """
+        candidates: set[str] = set()
+        for name in names:
+            text = str(name or "").strip()
+            if not text:
+                continue
+            candidates.add(text)
+            for suffix in (".ZZMI_SOURCE", "_copy", "_copy_temp", "_temp"):
+                if text.endswith(suffix):
+                    candidates.add(text[: -len(suffix)])
+                else:
+                    candidates.add(text + suffix)
+        for candidate in candidates:
+            if candidate and bpy.data.objects.get(candidate) is not None:
+                return True
+        return False
+
+    @staticmethod
     def collect_connected_object_names(tree) -> list[str]:
         if not tree:
             return []
@@ -779,7 +1003,6 @@ class BlueprintExportHelper:
                 return
             seen_names.add(clean_name)
             object_names.append(clean_name)
-
         for node in BlueprintExportHelper.collect_connected_start_nodes(tree):
             if node.bl_idname == 'SSMTNode_Object_Info':
                 append_name(
@@ -1565,6 +1788,55 @@ class BlueprintExportHelper:
                 if not changed:
                     break
         return None
+
+    @staticmethod
+    def capture_shapekey_scene_state(force: bool = False) -> dict:
+        """导出前置快照：记录场景原物体此刻的形态键值/静音状态。
+
+        导出流程会为了「基础网格 = 纯基态」把原物体的形态键值清零（含逐槽位轮次把目标键置 1），
+        这份快照既用于导出收尾还原场景，也是「烘焙未勾选形态键」唯一可信的当前值来源
+        （清零发生在前处理之前，副本上读到的值已是 0）。只抓第一次，避免逐轮覆盖。
+        """
+        existing = getattr(BlueprintExportHelper, "_shapekey_scene_state_snapshot", None)
+        if existing and not force:
+            return existing
+
+        snapshot = {}
+        for obj_name in BlueprintExportHelper.shapekey_objects:
+            obj = BlueprintExportHelper._resolve_shapekey_object_in_scene(obj_name)
+            if obj is None or not getattr(getattr(obj, "data", None), "shape_keys", None):
+                continue
+            snapshot[obj.name] = ShapeKeyUtils.capture_shape_key_state(obj)
+        BlueprintExportHelper._shapekey_scene_state_snapshot = snapshot
+        if snapshot:
+            print(f"[ShapeKeyExport] 已记录 {len(snapshot)} 个场景物体的形态键值快照（导出后可还原）")
+        return snapshot
+
+    @staticmethod
+    def get_shapekey_scene_state_snapshot() -> dict:
+        return getattr(BlueprintExportHelper, "_shapekey_scene_state_snapshot", None) or {}
+
+    @staticmethod
+    def restore_shapekey_scene_state() -> int:
+        """把导出前的形态键值快照写回场景原物体；返回还原的物体数。
+
+        没有快照时是空操作（例如非形态键导出），因此可以无条件在导出收尾调用。
+        """
+        snapshot = getattr(BlueprintExportHelper, "_shapekey_scene_state_snapshot", None) or {}
+        BlueprintExportHelper._shapekey_scene_state_snapshot = {}
+        restored = 0
+        for obj_name, state in snapshot.items():
+            obj = BlueprintExportHelper._resolve_shapekey_object_in_scene(obj_name)
+            if obj is None or not getattr(getattr(obj, "data", None), "shape_keys", None):
+                continue
+            try:
+                ShapeKeyUtils.restore_shape_key_state(obj, state)
+                restored += 1
+            except Exception as exc:
+                print(f"[ShapeKeyExport] 还原 {obj_name} 的形态键值失败: {exc}")
+        if restored:
+            print(f"[ShapeKeyExport] 已还原 {restored} 个场景物体的形态键值")
+        return restored
 
     @staticmethod
     def set_all_shapekey_values(value: int, slot_index: int = None):

@@ -18,6 +18,7 @@ from ..common.mod_path_compat import find_base_position_resource_name
 from ..common.mod_path_compat import iter_position_buffer_candidates
 from ..common.mod_path_compat import is_stale_texture_override_position_copy_desc_line
 from ..common.object_prefix_helper import ObjectPrefixHelper
+from ..common.safe_write import write_text_if_changed
 try:
     from . import deform_chain
 except ImportError:  # 测试 stub 包无 __path__ 时退化为绝对导入
@@ -194,17 +195,24 @@ class SSMTNode_PostProcess_MultiFile(SSMTNode_PostProcess_Base):
         threads_per_group = max(1, int(threads_per_group or 1))
         return max(1, (vertex_count + threads_per_group - 1) // threads_per_group)
 
-    def _update_shader_file(self, shader_path):
+    def _update_shader_file(self, shader_path, source_path=None):
+        """把配置注入着色器模板并写到 ``shader_path``。
+
+        ``source_path`` 指定读取的模板；缺省时读 ``shader_path`` 自身（旧语义）。
+        生产路径传 ``source_path``：读模板、写目标，输出只由"模板 + 配置"决定，
+        避免读到上一次的注入结果而与播种互相覆盖。
+        """
         try:
-            with open(shader_path, 'r', encoding='utf-8') as f:
+            with open(source_path or shader_path, 'r', encoding='utf-8') as f:
                 content = f.read()
 
             vertex_struct = self._get_vertex_struct_definition()
             if vertex_struct:
                 content = re.sub(r"struct VertexAttributes\s*\{[^}]*\};", vertex_struct, content, flags=re.DOTALL)
 
-            with open(shader_path, 'w', encoding='utf-8') as f:
-                f.write(content)
+            # 内容没变就不写：3DMigoto 的自定义着色器缓存按 .hlsl 的 mtime 配对，
+            # 无条件重写会让编译缓存失效、下次进游戏整族重编译。
+            write_text_if_changed(shader_path, content)
 
             return True
         except Exception as e:
@@ -397,8 +405,13 @@ class SSMTNode_PostProcess_MultiFile(SSMTNode_PostProcess_Base):
                 dest_res_dir = os.path.join(mod_export_path, "res")
                 os.makedirs(dest_res_dir, exist_ok=True)
                 shader_dest_path = os.path.join(dest_res_dir, "merge_anim_packed_delta.hlsl")
-                shutil.copy2(shader_source_path, shader_dest_path)
-                self._update_shader_file(shader_dest_path)
+                # 只播种缺失的模板；已存在则保持原样，由 _update_shader_file 以模板
+                # 为源重新注入。不能用 shutil.copy2：它每轮把目标 mtime 重置成模板的
+                # 旧 mtime，3DMigoto 的 .bin 缓存（按注入后写入时刻对齐）必然错配。
+                if not os.path.exists(shader_dest_path):
+                    with open(shader_source_path, 'r', encoding='utf-8') as f:
+                        write_text_if_changed(shader_dest_path, f.read())
+                self._update_shader_file(shader_dest_path, source_path=shader_source_path)
 
             for ini_file in ini_files:
                 ini_file_path = os.path.join(mod_export_path, ini_file)

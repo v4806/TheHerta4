@@ -378,6 +378,7 @@ class SSMTNode_AnimDriver_ShapeKeySequence(SSMTNode_AnimDriver_Base):
 
         runtime = self._find_runtime_node()
         playback_rate = runtime.playback_rate if runtime else 1
+        frame_var = self._frame_variable_of(runtime)
 
         paused_state = self._resolve_default_play_state(self.default_paused)
         paused_var = self.custom_paused_var.strip()
@@ -430,7 +431,7 @@ class SSMTNode_AnimDriver_ShapeKeySequence(SSMTNode_AnimDriver_Base):
             "[Present]",
             f"; 形态键动画序列 - 自驱动 {drv}",
             f"if {paused_var} == 1",
-            f"    if $swapvar % $speed_auto{idx} == 0",
+            f"    if {frame_var} % $speed_auto{idx} == 0",
             f"        {drv} = {drv} + 1.0",
         ]
 
@@ -469,22 +470,47 @@ class SSMTNode_AnimDriver_ShapeKeySequence(SSMTNode_AnimDriver_Base):
 _load_handler_registered = False
 
 
+def migrate_existing_shapekey_seq_nodes() -> int:
+    """补齐已有形态键序列驱动节点（暂停变量 + 驱动变量）；返回被动过的节点数。
+
+    ``load_post``（打开工程）与 ``register``（插件重载/重新启用）都会调用 —— 后者
+    是必需的：Reload Scripts / 重新启用插件不会触发 ``load_post``，只挂 load_post
+    的话「重载后旧节点没被刷新」。
+    """
+    migrated = 0
+    for tree in getattr(bpy.data, "node_groups", []) or []:
+        if getattr(tree, "bl_idname", "") != 'SSMTBlueprintTreeType':
+            continue
+        for node in getattr(tree, "nodes", []) or []:
+            if getattr(node, "bl_idname", "") != 'SSMTNode_AnimDriver_ShapeKeySequence':
+                continue
+            try:
+                SSMTNode_AnimDriver_Base.migrate_default_play_state_flag(node)
+                SSMTNode_AnimDriver_Base._migrate_dynamic_sockets(node)
+                touched = False
+                if not node.custom_paused_var:
+                    node._ensure_indexed_paused_variable_name("shapekey_seq_paused")
+                    touched = True
+                if not node.driven_variable:
+                    node._ensure_sequence_driver_variable_name()
+                    touched = True
+                if touched:
+                    migrated += 1
+                    print(
+                        f"[AnimDriver] 形态键序列节点 '{node.name}' 变量补填: "
+                        f"{node.custom_paused_var} / {node.driven_variable}"
+                    )
+            except Exception as exc:
+                print(
+                    f"[AnimDriver][警告] 形态键序列节点 "
+                    f"'{getattr(node, 'name', '?')}' 迁移失败: {exc}"
+                )
+    return migrated
+
+
 @bpy.app.handlers.persistent
 def _shapekey_seq_load_handler(dummy):
-    for tree in bpy.data.node_groups:
-        if tree.bl_idname != 'SSMTBlueprintTreeType':
-            continue
-        for node in tree.nodes:
-            if node.bl_idname == 'SSMTNode_AnimDriver_ShapeKeySequence':
-                try:
-                    SSMTNode_AnimDriver_Base.migrate_default_play_state_flag(node)
-                    SSMTNode_AnimDriver_Base._migrate_dynamic_sockets(node)
-                    if not node.custom_paused_var:
-                        node._ensure_indexed_paused_variable_name("shapekey_seq_paused")
-                    if not node.driven_variable:
-                        node._ensure_sequence_driver_variable_name()
-                except Exception:
-                    pass
+    migrate_existing_shapekey_seq_nodes()
 
 
 classes = (
@@ -505,6 +531,8 @@ def register():
     if not _load_handler_registered:
         bpy.app.handlers.load_post.append(_shapekey_seq_load_handler)
         _load_handler_registered = True
+    # 插件（重新）加载时也要迁移：Reload Scripts / 重新启用不会触发 load_post
+    migrate_existing_shapekey_seq_nodes()
 
 
 def unregister():

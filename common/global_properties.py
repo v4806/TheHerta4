@@ -22,11 +22,20 @@ def _get_blueprint_enum_items(self, context):
 
     try:
         from ..blueprint.export_helper import BlueprintExportHelper
-        _blueprint_enum_items_cache = BlueprintExportHelper.get_blueprint_enum_items(context=context)
+        items = BlueprintExportHelper.get_blueprint_enum_items(context=context)
     except Exception:
-        _blueprint_enum_items_cache = [
+        # items 回调抛异常时 Blender 只会拿到空列表：下拉框会塌成「当前没有蓝图」，
+        # 已存的枚举序号同时失效（刷 "current value ... matches no enum" 警告、
+        # 选择显示空白、删除/重命名失去目标）。所以失败时保留上一次成功算出的
+        # 列表，不让一次瞬时异常把用户的选择清掉。
+        items = _blueprint_enum_items_cache
+
+    if not items:
+        items = [
             ("__NONE__", "当前没有蓝图", "当前没有可选蓝图，请先打开蓝图界面或执行一键导入"),
         ]
+
+    _blueprint_enum_items_cache = list(items)
 
     return _blueprint_enum_items_cache
 
@@ -120,6 +129,12 @@ class GlobalProterties(bpy.types.PropertyGroup):
         default=False,
     ) # type: ignore
 
+    efmi_pass_mirror_enabled: bpy.props.BoolProperty(
+        name="多pass贴图槽位镜像（修颜色偏差）",
+        description="默认关（需手动开启）：开启后导出时按工作空间缓存/抓帧推导，把槽位贴图镜像到 G-buffer(t0/t1) 与前向第二层(t12等) 槽位，并注册 pass 标签——修自定义贴图只覆盖第一层、其余 pass 仍读原图导致的颜色偏差。默认关＝回到旧行为（只绑标记槽，不发射镜像赋值与 [ShaderOverride_PassMirror...] 标签段）；导入侧也不再写回 Config/PassLayouts.json。",
+        default=False,
+    ) # type: ignore
+
     recalculate_tangent: bpy.props.BoolProperty(
         name="向量归一化法线存入TANGENT(全局)",
         description="轮廓线专用：将平滑法线写入 TANGENT，而不是生成标准切线空间。使用法线贴图或标准 TBN 光照时不要开启；“重新计算标准切线(TBN)”启用时本选项不会生效。",
@@ -188,6 +203,23 @@ class GlobalProterties(bpy.types.PropertyGroup):
         name="使用融合统一顶点组",
         description="导入时是否导入融合后的顶点组 (Unreal的合并顶点组技术会用到)，一般鸣潮Mod需要勾选来降低制作Mod的复杂度；ZZMI/EFMI 模式下同时作为骨骼合并（Merged Skeleton）开关：勾选 = 导入全局顶点组、导出走合并骨架；不勾选 = 完全维持原路线",
         default=True,
+    ) # type: ignore
+
+    cross_group_merged_vgmap_test: bpy.props.BoolProperty(
+        name="跨组融合统一顶点组测试",
+        description="【实验开关，仅 ZZMI】跨 SkeletonGroup 的融合统一顶点组测试：允许把对象变换（渲染 vs-cb1 对象空间）不同的部件合并进同一个对象。与已验证可用的合并骨骼（使用融合统一顶点组）完全分离，开启不会改变后者的既有行为；跨组部件需要一个逐帧的对象空间换算，未完成前本开关不参与导入/导出决策",
+        default=False,
+    ) # type: ignore
+
+    zzmi_merged_redirect_enabled: bpy.props.BoolProperty(
+        name="启用合并网格自动重定向（实验）",
+        description=(
+            "ZZMI 合并骨架实验开关。关闭（默认）时保留每个合并物体的原始 IB/"
+            "Blend 输入布局，在组内宿主完成当帧重放；开启时才使用跨 DrawIB 的"
+            "RedirectSO 自动重定向。自动重定向在部分游戏帧序下会丢失整块几何，"
+            "只有在需要专门复核该路径时才开启。"
+        ),
+        default=False,
     ) # type: ignore
 
     efmi_lod_group_projection: bpy.props.BoolProperty(
@@ -407,6 +439,16 @@ class GlobalProterties(bpy.types.PropertyGroup):
         return cls._instance().use_rabbitfx_slot
 
     @classmethod
+    def efmi_pass_mirror_enabled(cls):
+        """EFMI 多 pass 贴图槽位镜像总开关（默认关，需手动开启）。
+
+        覆盖两处：导出侧 efmi.py 的镜像赋值/标签注册发射、导入侧
+        ui_func_import_ssmt.py 的 Config/PassLayouts.json 写回。
+        关闭（默认）时两处都不执行，即回到引入本开关前的旧行为。
+        """
+        return cls._bool_attr("efmi_pass_mirror_enabled", False)
+
+    @classmethod
     def generate_branch_mod_gui(cls):
         try:
             from ..blueprint.export_helper import BlueprintExportHelper
@@ -462,6 +504,25 @@ class GlobalProterties(bpy.types.PropertyGroup):
     def set_import_merged_vgmap(cls, value: bool):
         """显式切换合并 VGMap；预生成失败时用于保持导入与后续导出同一模式。"""
         setattr(cls._instance(), "import_merged_vgmap", bool(value))
+
+    @classmethod
+    def cross_group_merged_vgmap_test(cls):
+        """跨组融合统一顶点组测试开关（仅 ZZMI，实验用，默认关闭）。
+
+        与 `import_merged_vgmap`（已验证可用的合并骨骼）**完全分离**：互不影响，
+        关闭本开关时任何既有行为都不变。跨组功能未实现前读取本开关不产生行为。
+        """
+        return cls._bool_attr("cross_group_merged_vgmap_test", False)
+
+    @classmethod
+    def set_cross_group_merged_vgmap_test(cls, value: bool):
+        """显式切换跨组测试开关（实验/测试用）。"""
+        setattr(cls._instance(), "cross_group_merged_vgmap_test", bool(value))
+
+    @classmethod
+    def zzmi_merged_redirect_enabled(cls) -> bool:
+        """Whether to use the experimental cross-DrawIB RedirectSO path."""
+        return cls._bool_attr("zzmi_merged_redirect_enabled", False)
 
     @classmethod
     def efmi_lod_group_projection(cls):

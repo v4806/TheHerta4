@@ -38,6 +38,7 @@ ZZMI（绝区零）骨骼合并支持模块
 """
 
 import hashlib
+import math
 import os
 import re
 
@@ -45,6 +46,21 @@ import numpy
 
 from ..utils.json_utils import JsonUtils
 from .efmi_skeleton import EFMIBoneMapBuilder, EFMISkeletonMergeHelper
+from .zzmi_channel import (
+    ZZMI_CHANNEL_PLAN_VERSION,
+    bone_identity_digest,
+    channel_plan_digest as channel_plan_digest_value,
+    same_frame_matrix_digest,
+    select_channel_plan,
+)
+
+# 骨骼身份摘要口径版本：摘要输入（身份判据）变更时递增。
+# v1：local_vg_id -> 合并骨架全局槽位。
+# F4（复核发现）口径更正：这是 `{本地下标: 全局槽位}` 的规范化哈希 —— 槽位由
+# **当帧 palette 矩阵的 bitwise 去重**派生，**不是**骨名/编号身份、也不是帧
+# 不变量；`BoneIdentityBasis = "local_slot_map"` 自述这一点。真正的骨名身份
+# （`bone_ids`）尚未接入生产链路 ⇒ 通道判定当前全部使用该弱代理。
+ZZMI_BONE_IDENTITY_VERSION = 1
 
 # 每骨骼矩阵的 float 数（4x3 = 48 字节，已实测确认）
 _BONE_MATRIX_FLOATS = 12
@@ -55,7 +71,14 @@ _BONE_MATRIX_FLOATS = 12
 # 必须整批重建以清除污染。
 # v3：拒绝同一 DrawIB 对应多个对象 CB1 实例的歧义缓存；这类 IB 可能同时被
 # 多个相似模型绘制，继续共用一套全局骨架会把修改写入其它实例。
-_ZZMI_VG_MAP_ALGORITHM_VERSION = 3
+# v4：对象变换按绑定窗口（first_constant）解析。旧实现无视窗口读 float 0，把
+# 多对象共享 cb1 数组里**别的对象**的矩阵当分组键，导致同对象空间的部件被拆进
+# 不同 SkeletonGroup/合集（FrameAnalysis-2026-09-16-014450 实证）；必须整批重建。
+# v5（t75）：缓存新增「共享骨图 + 通道骨」判定记录（`ChannelPlan*`：逐部件的
+# 通道全局槽位、本地下标、共享件数、跨部件顶点权重合计、理由与诊断），且
+# VGMap 的**末位浮点**现在也参与通道判定 ⇒ 旧缓存没有这套可复核指纹，
+# 必须整批重建（无该字段的 json 会被 `_zzmi_cache_intact` 拒绝）。
+_ZZMI_VG_MAP_ALGORITHM_VERSION = 5
 # 导出侧也需要知道当前缓存口径，不能只依赖导入阶段的幂等门控。
 ZZMI_VG_MAP_ALGORITHM_VERSION = _ZZMI_VG_MAP_ALGORITHM_VERSION
 
@@ -83,6 +106,11 @@ class ZZMILogParser:
         r"BaseVertexLocation:(\d+)\)$"
     )
     _IA_VB_RE = re.compile(r"^IASetVertexBuffers\(StartSlot:(\d+), NumBuffers:(\d+),")
+    # 常量缓冲绑定行（对象变换 CB1 靠 first_constant 窗口定位）
+    _CB_BIND_RE = re.compile(
+        r"^(\d+): resource=0x[0-9A-Fa-f]+ hash=([0-9a-f]{8}) "
+        r"first_constant=(\d+) num_constants=(\d+)$"
+    )
     _IA_IB_RE = re.compile(r"^IASetIndexBuffer\(.*\) hash=([0-9a-f]{8})$")
     _SO_RE = re.compile(r"^SOSetTargets\(NumBuffers:(\d+),")
     _SRV_RE = re.compile(r"^(V|P|C|G|H|D)SSetShaderResources\(StartSlot:(\d+), NumViews:(\d+),")
@@ -102,6 +130,10 @@ class ZZMILogParser:
         # 记录路径在 dump 被搬走后会失效，因此始终保存逻辑名并延迟解析
         # （get_render_cb1_path 按候选路径逐一回退）。
         self.render_cb1_dumps: dict[str, tuple[str, str]] = {}
+        # 常量缓冲绑定窗口：draw_index -> {stage: {slot: {hash, first_constant,
+        # num_constants}}}。对象变换 CB1 可能来自多对象共享数组，必须用绑定窗口
+        # 才能定位本 draw 的对象矩阵（见 ZZMIBoneMapBuilder.parse_object_transform）。
+        self.cb_bindings: dict[str, dict] = {}
         # 逻辑文件名（根目录 dump 文件名）-> deduped 实际路径
         self.dump_map: dict[str, str] = {}
         self._parse()
@@ -156,6 +188,17 @@ class ZZMILogParser:
                                 info["so"][slot] = res_hash
                             elif kind == "srv" and pending[1] == "V" and slot == 0:
                                 info["vs_t0"] = res_hash
+                            elif kind == "cb":
+                                desc_cb = self._CB_BIND_RE.match(stripped)
+                                if desc_cb:
+                                    stage_slot = self.cb_bindings.setdefault(
+                                        pending_draw, {}
+                                    ).setdefault(pending[1], {})
+                                    stage_slot[int(desc_cb.group(1))] = {
+                                        "hash": desc_cb.group(2),
+                                        "first_constant": int(desc_cb.group(3)),
+                                        "num_constants": int(desc_cb.group(4)),
+                                    }
                         # 注意：不在这里清空 pending——多槽资源描述是连续多行，
                         # 由下一行（无论有无前缀）继续消费或重设。
                     continue
@@ -187,6 +230,14 @@ class ZZMILogParser:
                 srv_match = self._SRV_RE.match(payload)
                 if srv_match:
                     pending = ("srv", srv_match.group(1))
+                    continue
+
+                # 常量缓冲绑定（对象变换 CB1 的窗口起点，单位 = 16 字节常量）
+                cb_match = re.match(
+                    r"^(V|P|C|G|H|D)SSetConstantBuffers1\(StartSlot:(\d+),", payload
+                )
+                if cb_match:
+                    pending = ("cb", cb_match.group(1))
                     continue
 
                 # VS hash
@@ -299,6 +350,21 @@ class ZZMILogParser:
             if os.path.isfile(candidate):
                 return candidate
         return None
+
+    def get_vs_cb_first_constant(self, draw_index: str, slot: int) -> int:
+        """返回该渲染 draw 在 VS 常量缓冲 slot 上的绑定窗口起点（单位 16 字节常量）。
+
+        未记录绑定时返回 0（等价于整块从 0 起，与逐部件 512B dump 的语义一致）。
+        """
+        stage_slots = self.cb_bindings.get(draw_index, {}).get("V", {})
+        binding = stage_slots.get(int(slot)) if stage_slots else None
+        if not binding:
+            return 0
+        try:
+            value = int(binding.get("first_constant", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+        return value if value >= 0 else 0
 
     def get_deform_passes(self) -> dict[str, dict]:
         """识别全部 deform pass（pointlist Draw + SO 输出 + vs-t0 palette + vb0）。
@@ -424,9 +490,56 @@ def assign_skeleton_groups(part_transforms: dict[str, tuple[float, ...] | None])
     return result
 
 
+def _strict_int_or_default(value, default: int = 0) -> int:
+    """严格整数解析（bool 与非整数浮点都拒绝），失败抛异常由调用方兜底。
+
+    与 `_zzmi_cache_intact` 内联的 `_strict_int` 同一口径；这里提到模块级是
+    为了让「v4 缓存就地升级」的准入检查（`_zzmi_cache_usable_for_migration`）
+    与它共用同一套严格性，避免两个函数对"合法整数"的定义漂移。
+    """
+    if isinstance(value, bool):
+        raise TypeError("bool 不是缓存整数")
+    if isinstance(value, float) and not value.is_integer():
+        raise ValueError("非整数浮点值")
+    return int(value)
+
+
+def _serialize_channel_record(record: dict | None) -> dict | None:
+    """把通道计划记录规范化为**纯 JSON 原生类型**（numpy 标量会写出非标准 json）。
+
+    缺失记录返回 None——调用方（导出侧）必须把「缓存缺失」当**显式诊断**处理，
+    绝不静默退回出现次判据。
+    """
+    if not isinstance(record, dict):
+        return None
+    serialized: dict = {}
+    for key in (
+        "channel_slot",
+        "channel_local",
+        "channel_shared_components",
+        "channel_shared_weight",
+    ):
+        value = record.get(key)
+        serialized[key] = None if value is None else int(value)
+    serialized["channel_static_root"] = bool(record.get("channel_static_root"))
+    serialized["channel_reason"] = str(record.get("channel_reason") or "")
+    serialized["channel_diagnostic"] = str(record.get("channel_diagnostic") or "")
+    # F5（复核发现）：身份口径必须**随记录一起落盘**，否则导出侧与人工复核都
+    # 看不到「这条判定用的是骨名身份还是槽号弱代理」。此前这两个字段被静默丢掉
+    # （产物 0 次出现），任何只读缓存的消费者都会把槽号误当骨名身份。
+    serialized["channel_identity_basis"] = str(
+        record.get("channel_identity_basis") or ""
+    )
+    serialized["channel_identity_token"] = str(
+        record.get("channel_identity_token") or ""
+    )
+    serialized["vg_count"] = int(record.get("vg_count") or 0)
+    serialized["vg_offset"] = int(record.get("vg_offset") or 0)
+    return serialized
+
+
 class ZZMIBoneMapBuilder:
     """palette 解析与跨部件 bitwise 去重（同部件绝不去重）。"""
-
     @staticmethod
     def load_palette(palette_path: str) -> numpy.ndarray:
         """读取 palette buf 为 (N, 12) float32 矩阵数组。"""
@@ -439,7 +552,10 @@ class ZZMIBoneMapBuilder:
         return data.reshape(-1, _BONE_MATRIX_FLOATS)
 
     @staticmethod
-    def parse_object_transform(cb1_path: str) -> tuple[float, ...] | None:
+    def parse_object_transform(
+        cb1_path: str,
+        first_constant: int = 0,
+    ) -> tuple[float, ...] | None:
         """从渲染 draw 的 vs-cb1 dump 解析对象→世界矩阵，返回 16 floats 元组（分组键）。
 
         实测布局（FrameAnalysis-2026-08-19-122152 逆向）：逐部件 cb1 块的前 4 个
@@ -447,19 +563,30 @@ class ZZMIBoneMapBuilder:
         palette 矩阵把顶点蒙皮到该对象空间，渲染 VS 再用本矩阵摆到世界——
         两者逐物体 1:1 配对，共享同一份变换的部件才共享同一对象空间。
 
-        只接受 ≤512 字节的逐部件块（实测 176/256/464/512B）：>512B 的 cb1 是
-        **多对象共享变换数组**（draw 用 first_constant 窗口索引），rows 0-3 未必是
-        本 draw 的对象，排除。解析失败返回 None（调用方按独立组兜底 = 不共享，安全方向）。
+        ``first_constant`` 是该 draw 绑定 cb1 时的窗口起点（log 的
+        ``VSSetConstantBuffers1(first_constant=N)``，单位 = 16 字节常量；
+        实测 FrameAnalysis-2026-09-16-014450：同一 4096B 资源被 draw 64/65/66
+        按 first_constant=0/32/64 逐 512B 一窗切给三个不同对象）。**dump 是整块
+        资源**，本 draw 的对象变换只在该窗口内——忽略窗口就会读到别的对象的矩阵
+        （实测 draw 66 在窗口 64 处与 draw 69 逐位同空间，而 float 0 处是 draw 64
+        的对象），把同空间部件误拆成不同 SkeletonGroup。
+
+        窗口取不到（越界/缺文件）返回 None（调用方按独立组兜底 = 不共享，安全方向）；
+        窗口内形态不合法（w 列/行范数 sanity 不过）同样返回 None。
         """
         try:
-            if os.path.getsize(cb1_path) > 512:
-                return None
             data = numpy.fromfile(cb1_path, dtype=numpy.float32)
         except (OSError, ValueError):
             return None
-        if len(data) < 16:
+        try:
+            offset = int(first_constant) * 4
+        except (TypeError, ValueError):
             return None
-        m = data[:16].reshape(4, 4)
+        if offset < 0 or offset + 16 > len(data):
+            # 窗口越界：dump 缺该窗口（旧版只 dump 了逐部件 512B 块）或绑定值异常。
+            # 不得回退到 float 0——那会静默读成其它对象的矩阵。
+            return None
+        m = data[offset:offset + 16].reshape(4, 4)
         # w 列形态：旋转行 w=0、平移行 w=1
         if abs(float(m[3, 3]) - 1.0) > 1e-3:
             return None
@@ -469,7 +596,7 @@ class ZZMIBoneMapBuilder:
         row_norms = numpy.linalg.norm(m[:3, :3].astype(numpy.float64), axis=1)
         if numpy.any((row_norms < 0.05) | (row_norms > 20.0)):
             return None
-        return tuple(float(x) for x in data[:16])
+        return tuple(float(x) for x in data[offset:offset + 16])
 
     @staticmethod
     def build_vg_maps(
@@ -585,6 +712,11 @@ class ZZMIBoneMapBuilder:
 
 class ZZMISkeletonMergeHelper:
     """ZZMI 骨骼合并总流程：定位 FrameAnalysis -> 解析 log -> 反查 deform pass -> 去重 -> 写回工作空间。"""
+
+    # 本次 ensure_skeleton_data 调用里「旧版但可升级」的 DrawIB 集合（阻断修复）。
+    # 每个 DrawIB 的**全部**成员都要一起升级：通道计划是共享骨连通分量的组级
+    # 性质，逐成员单独算会退化（`select_channel_plan` 的单件分量）。
+    _zzmi_legacy_upgrade_draw_ibs: set[str] = set()
 
     @staticmethod
     def _configured_frame_analysis_paths(workspace_root: str) -> list[str]:
@@ -741,8 +873,280 @@ class ZZMISkeletonMergeHelper:
         submesh_dir = os.path.dirname(os.path.dirname(json_path))
         return os.path.join(submesh_dir, "ModImpRuntime", file_name)
 
+    @staticmethod
+    def _parse_first_constant(value) -> int:
+        """解析写回 json 的 CB1 窗口起点；非法值按 0 处理（旧版缓存语义）。"""
+        if isinstance(value, bool):
+            return 0
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return 0
+        return parsed if parsed >= 0 else 0
+
+    # 可以直接升级到当前算法版本的**旧缓存版本**（阻断修复）。
+    #
+    # 背景（t80 §2.4 实测）：版本从 4 抬到 5 后，任何旧工作区一开就死——
+    # 导出侧逐件拒绝 + 合并骨架契约把「全部被拒」升级成整次导出中止，而
+    # "重新一键导入"要求工作区登记的 FrameAnalysis 帧还在（用户那里已被删除）。
+    # v5 相对 v4 **只新增了可由 VGMap 单独推导的派生字段**（ChannelPlan 系列：
+    # channel_slot/channel_local 必须落在既有 VGMap 上；ChannelPlanSlotWeights
+    # 能从 palette 重算），不需要 dump，因此 v4 缓存**可以就地升级**。
+    MIGRATABLE_VG_MAP_ALGORITHM_VERSIONS = (4,)
+
     @classmethod
-    def _zzmi_cache_intact(cls, submesh_json: dict, json_path: str, unique_str: str) -> bool:
+    def _zzmi_cache_usable_for_migration(
+        cls, submesh_json: dict, json_path: str, unique_str: str
+    ) -> bool:
+        """旧版缓存是否满足「仅凭 VGMap 就地升级」的硬条件。
+
+        必须**全部**成立（任何一项缺失都退回整批重建，绝不带着半成品升级）：
+        - ``VGMapAlgorithmVersion`` 在 ``MIGRATABLE_VG_MAP_ALGORITHM_VERSIONS``；
+        - ``SkeletonGroup/DeformDrawIndex/OriginalVertexCount`` 与 ``VGCount/VGOffset``
+          齐备且合法（升级后导出侧守卫仍要读它们）；
+        - ``VGMap`` 完整覆盖 ``0..VGCount-1``、槽位非负（channel_local 必须能落在
+          这张表上，否则派生出来的通道记录与 VGMap 自相矛盾）；
+        - ``BoneMatrixFileName`` 指向的 ModImpRuntime 缓存文件存在且大小达标
+          （升级后的导出要按同一本地下标读它）。
+        """
+        try:
+            cache_version = _strict_int_or_default(
+                submesh_json.get("VGMapAlgorithmVersion", 0)
+            )
+        except (TypeError, ValueError):
+            return False
+        if cache_version not in cls.MIGRATABLE_VG_MAP_ALGORITHM_VERSIONS:
+            return False
+        try:
+            skeleton_group = _strict_int_or_default(submesh_json["SkeletonGroup"])
+            deform_draw_index = _strict_int_or_default(
+                submesh_json["DeformDrawIndex"]
+            )
+            original_vertex_count = _strict_int_or_default(
+                submesh_json["OriginalVertexCount"]
+            )
+            vg_count = _strict_int_or_default(submesh_json["VGCount"])
+            vg_offset = _strict_int_or_default(submesh_json["VGOffset"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        if (
+            skeleton_group < 0
+            or skeleton_group > 0xFFFFFFFF
+            or deform_draw_index < 0
+            or deform_draw_index > 0xFFFFFFFF
+            or original_vertex_count < 0
+            or original_vertex_count > 0xFFFFFFFF
+            or vg_count <= 0
+            or vg_count > 0xFFFFFFFF
+            or vg_offset < 0
+            or vg_offset > 0xFFFFFFFF
+            or vg_offset + vg_count > 0x100000000
+        ):
+            return False
+        vg_map = submesh_json.get("VGMap")
+        if not isinstance(vg_map, dict) or not vg_map:
+            return False
+        try:
+            mapped = {}
+            for key, value in vg_map.items():
+                normalized_key = _strict_int_or_default(key)
+                if normalized_key in mapped:
+                    return False
+                mapped[normalized_key] = _strict_int_or_default(value)
+        except (TypeError, ValueError):
+            return False
+        if len(mapped) != vg_count or set(mapped.keys()) != set(range(vg_count)):
+            return False
+        if any(slot < 0 or slot > 0xFFFFFFFF for slot in mapped.values()):
+            return False
+        bone_matrix_path = cls._runtime_cache_path(
+            submesh_json, json_path, unique_str
+        )
+        if not os.path.isfile(bone_matrix_path):
+            return False
+        if not EFMIBoneMapBuilder.cache_file_size_ok(bone_matrix_path, vg_count):
+            return False
+        return True
+
+    @classmethod
+    def _zzmi_upgrade_legacy_vgmap_cache(cls, groups: dict) -> int:
+        """旧版（v4）缓存**就地升级**到当前算法版本（阻断修复，t80 §2.4）。
+
+        为什么可以在没有 dump 的情况下升级：v5 相对 v4 的**全部**新增字段都是
+        可由既有 ``VGMap`` 单独推导的**派生量**——
+
+        - ``ChannelPlan`` 的 ``channel_slot``/``channel_local`` 必须落在既有 VGMap
+          上（``vg_map[channel_local] == channel_slot``，导出侧的自洽门会复核）；
+        - ``ChannelPlanSlotWeights`` 从 ModImpRuntime 里的 palette + 既有权重口径重算；
+        - 身份摘要来自 ``{本地下标: 全局槽位}``，同样只看 VGMap。
+
+        因此升级**不重跑去重**（不碰全局槽位编号 ⇒ 用户既有配色/几何语义不变），
+        只补字段。**绝不静默**：逐组打印升级记录，返回值 = 升级的 json 份数。
+
+        失败的组不写任何字段（保持 v4 原样），由调用方按既有口径处理。
+        """
+        channel_components = []
+        member_json_cache: dict[str, dict] = {}
+        for draw_ib, group in groups.items():
+            if draw_ib not in cls._zzmi_legacy_upgrade_draw_ibs:
+                continue
+            for member in group["members"]:
+                member_json_path = group["json_paths"].get(member, "")
+                member_json = (
+                    JsonUtils.LoadFromFile(member_json_path)
+                    if member_json_path
+                    else {}
+                )
+                if not isinstance(member_json, dict):
+                    continue
+                member_json_cache[member] = member_json
+                try:
+                    vg_map = {
+                        int(key): int(value)
+                        for key, value in (member_json.get("VGMap") or {}).items()
+                    }
+                    vg_count = int(member_json.get("VGCount") or 0)
+                    vg_offset = int(member_json.get("VGOffset") or 0)
+                    skeleton_group = int(member_json.get("SkeletonGroup") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if not vg_map or vg_count <= 0:
+                    continue
+                channel_components.append(
+                    {
+                        "draw_ib": str(draw_ib),
+                        "vg_map": vg_map,
+                        "vg_count": vg_count,
+                        "vg_offset": vg_offset,
+                        "skeleton_group": skeleton_group,
+                        "slot_weights": cls._legacy_slot_weights(
+                            member_json, group, vg_map, member
+                        ),
+                    }
+                )
+        if not channel_components:
+            return 0
+
+        channel_plan = select_channel_plan(channel_components)
+        plan_digest = channel_plan_digest_value(channel_plan)
+        upgraded = 0
+        for draw_ib, group in groups.items():
+            if draw_ib not in cls._zzmi_legacy_upgrade_draw_ibs:
+                continue
+            record = channel_plan.get(str(draw_ib))
+            serialized = _serialize_channel_record(record)
+            if serialized is None:
+                print(
+                    f"[ZZMI骨骼合并] 警告 {draw_ib}: 旧版缓存就地升级失败"
+                    "（通道计划推不出来），保留 VGMap v4 原样；"
+                    "导出侧会按缓存缺失补算"
+                )
+                continue
+            for member in group["members"]:
+                member_json_path = group["json_paths"].get(member, "")
+                member_json = member_json_cache.get(member) or (
+                    JsonUtils.LoadFromFile(member_json_path)
+                    if member_json_path
+                    else {}
+                )
+                if not member_json_path or not isinstance(member_json, dict):
+                    continue
+                try:
+                    vg_map = {
+                        int(key): int(value)
+                        for key, value in (member_json.get("VGMap") or {}).items()
+                    }
+                except (TypeError, ValueError):
+                    continue
+                if not vg_map:
+                    continue
+                member_json["VGMapAlgorithmVersion"] = _ZZMI_VG_MAP_ALGORITHM_VERSION
+                member_json["ChannelPlanVersion"] = ZZMI_CHANNEL_PLAN_VERSION
+                member_json["ChannelPlan"] = dict(serialized)
+                member_json["ChannelPlanDigest"] = plan_digest
+                member_json["ChannelPlanSlotWeights"] = {
+                    str(slot): int(weight)
+                    for slot, weight in sorted(
+                        cls._legacy_slot_weights(
+                            member_json, group, vg_map, member
+                        ).items()
+                    )
+                }
+                member_json["BoneIdentityVersion"] = ZZMI_BONE_IDENTITY_VERSION
+                member_json["BoneIdentityDigest"] = bone_identity_digest(vg_map)
+                member_json["BoneIdentityBasis"] = "local_slot_map"
+                member_json["BoneIdentityBasisNote"] = (
+                    "local_slot_map：槽位号由当帧 palette 矩阵 bitwise 去重派生，"
+                    "**不是**骨名/编号身份（bone_ids 未接入生产链路）；"
+                    "本字段由 v4→v5 就地升级补齐"
+                )
+                try:
+                    JsonUtils.SaveToFile(member_json_path, member_json)
+                except OSError as error:
+                    print(
+                        f"[ZZMI骨骼合并] 警告 {member}: 旧版缓存升级写盘失败"
+                        f"（{error}），保留 v4 原样"
+                    )
+                    continue
+                upgraded += 1
+            print(
+                f"[ZZMI骨骼合并] 旧版缓存就地升级: {draw_ib} → VGMap "
+                f"v{_ZZMI_VG_MAP_ALGORITHM_VERSION} + ChannelPlan "
+                f"(slot={serialized.get('channel_slot')} "
+                f"local={serialized.get('channel_local')} "
+                f"reason={serialized.get('channel_reason')}，未重跑去重)"
+            )
+        return upgraded
+
+    @classmethod
+    def _legacy_slot_weights(
+        cls,
+        member_json: dict,
+        group: dict,
+        vg_map: dict,
+        member: str,
+    ) -> dict[int, int]:
+        """旧版缓存升级时的「全局槽位 → 跨部件顶点权重合计」。
+
+        v4 缓存里没有 ``ChannelPlanSlotWeights``（那是 v5 新增字段），但
+        ``BoneMatrixFileName`` 指向的 palette 还在工作空间里 ⇒ 用与导入期
+        **同一口径**（行和 → 本地下标 → 全局槽位）重算，保证升级后的排序键
+        与重新导入一致。任何一步失败都返回空表（候选排序退化为按槽位号，
+        仍然确定性，只是权重次级键失效——不得因此让升级整体失败）。
+        """
+        existing = member_json.get("ChannelPlanSlotWeights")
+        if isinstance(existing, dict) and existing:
+            try:
+                return {int(key): int(value) for key, value in existing.items()}
+            except (TypeError, ValueError):
+                return {}
+        palette_path = group.get("palette_path") or ""
+        if not palette_path:
+            json_path = group.get("json_paths", {}).get(member, "")
+            try:
+                palette_path = cls._runtime_cache_path(member_json, json_path, member)
+            except Exception:
+                palette_path = ""
+        if not palette_path or not os.path.isfile(palette_path):
+            return {}
+        try:
+            palette = ZZMIBoneMapBuilder.load_palette(palette_path)
+        except (OSError, ValueError):
+            return {}
+        weights: dict[int, int] = {}
+        for local, slot in vg_map.items():
+            if not (0 <= int(local) < len(palette)):
+                continue
+            row_sum = float(numpy.abs(palette[int(local)]).sum())
+            if not math.isfinite(row_sum) or row_sum <= 0:
+                continue
+            weights[int(slot)] = weights.get(int(slot), 0) + int(round(row_sum))
+        return weights
+
+    @classmethod
+    def _zzmi_cache_intact(
+        cls, submesh_json: dict, json_path: str, unique_str: str
+    ) -> bool:
         """ZZMI 缓存快路径完整性校验（schema + 算法版本 + 映射覆盖 + 缓存文件）。
 
         任何一项缺失都判定缓存不完整，走整批重建——复制骨骼缓存失败或工作空间
@@ -757,11 +1161,8 @@ class ZZMISkeletonMergeHelper:
         - 有当前 dump 时，FrameAnalysisLogSignature 必须与 log.txt 内容一致。
         """
         def _strict_int(value) -> int:
-            if isinstance(value, bool):
-                raise TypeError("bool 不是缓存整数")
-            if isinstance(value, float) and not value.is_integer():
-                raise ValueError("非整数浮点值")
-            return int(value)
+            # 与模块级 `_strict_int_or_default` 同一口径（单一事实源）。
+            return _strict_int_or_default(value)
 
         try:
             cache_version = _strict_int(
@@ -826,6 +1227,34 @@ class ZZMISkeletonMergeHelper:
             return False
         if not EFMIBoneMapBuilder.cache_file_size_ok(bone_matrix_path, vg_count):
             return False
+        # t75：通道计划是**唯一**实例判定口径的输入。缺失 / 版本不符 / 内容
+        # 与 VGMap 不一致的缓存一律拒绝复用——导出侧不得静默退回出现次判据。
+        try:
+            channel_version = _strict_int(
+                submesh_json.get("ChannelPlanVersion", 0) or 0
+            )
+        except (TypeError, ValueError):
+            channel_version = 0
+        if channel_version != ZZMI_CHANNEL_PLAN_VERSION:
+            return False
+        channel_record = submesh_json.get("ChannelPlan")
+        if not isinstance(channel_record, dict):
+            return False
+        try:
+            channel_slot = _strict_int(channel_record.get("channel_slot"))
+            channel_local = _strict_int(channel_record.get("channel_local"))
+            channel_vg_count = _strict_int(channel_record.get("vg_count"))
+            channel_vg_offset = _strict_int(channel_record.get("vg_offset"))
+        except (TypeError, ValueError):
+            return False
+        if channel_slot < 0 or channel_slot > 0xFFFFFFFF:
+            return False
+        if channel_local < 0 or channel_local >= vg_count:
+            return False
+        if channel_vg_count != vg_count or channel_vg_offset != vg_offset:
+            return False
+        if mapped.get(channel_local) != channel_slot:
+            return False
         return True
 
     @staticmethod
@@ -864,8 +1293,51 @@ class ZZMISkeletonMergeHelper:
         )
         return bool(
             os.path.isfile(cb1_path)
-            and ZZMIBoneMapBuilder.parse_object_transform(cb1_path) is not None
+            and ZZMIBoneMapBuilder.parse_object_transform(
+                cb1_path,
+                first_constant=cls._parse_first_constant(
+                    submesh_json.get("ObjectCB1FirstConstant", 0)
+                ),
+            ) is not None
         )
+
+    @classmethod
+    def missing_merged_metadata_exist(
+        cls, workspace_root: str, unique_str_list: list[str]
+    ) -> bool:
+        """请求集内是否有子网格的骨骼合并数据**缺失或不完整**（自愈判据）。
+
+        供导入侧判断「复选框关闭时也必须预生成/修复」：与 EFMI 的同名方法
+        （t15 活性修复）语义一致但更严——EFMI 只判 ``VGMap``/``VGMapAlgorithmVersion``
+        是否缺失；ZZMI 还要判**快路径完整性**（``_zzmi_cache_intact``），因此旧算法
+        版本、缺 ``SkeletonGroup``/``DeformDrawIndex``/``OriginalVertexCount``、
+        palette 缓存缺失/截断、通道计划版本不符等一律算「需要处理」，复选框关闭时
+        的下一次导入也会自愈：能就地升级的就地升级（v4→v5 只需 VGMap，不需要提取
+        文件），其余按当前提取源重建，提取源不在则用工作空间缓存重建。
+
+        刻意**不做**提取源指纹（log.txt 全量哈希）比对：那会让每次导入都哈希整个
+        log；换用新提取文件请重新选择提取源并重新导入（或清缓存后重导入）。
+        只检查请求集内可解析的 json；``GPU-PreSkinning`` 为 False 的 json 不参与判定。
+        """
+        if not workspace_root or not unique_str_list:
+            return False
+        for unique_str in unique_str_list:
+            json_path = cls._resolve_submesh_json_path(workspace_root, unique_str)
+            if not json_path:
+                continue
+            try:
+                payload = JsonUtils.LoadFromFile(json_path)
+            except Exception:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("GPU-PreSkinning") is False:
+                continue
+            if not payload.get("VGMap") or not payload.get("VGMapAlgorithmVersion"):
+                return True
+            if not cls._zzmi_cache_intact(payload, json_path, unique_str):
+                return True
+        return False
 
     @classmethod
     def ensure_skeleton_data(
@@ -905,10 +1377,14 @@ class ZZMISkeletonMergeHelper:
                     resolver = None
         else:
             # dump 目录已被删除：上次导入已把 palette / 对象变换 CB 复制进工作空间
-            # ModImpRuntime，缓存完整的子网格可以脱离 dump 重建。
+            # ModImpRuntime，缓存完整的子网格可以脱离 dump 重建。工作区已记录过提取源
+            # 时**不会**自动改用游戏目录里的其它帧（防跨帧/跨模型混用，见
+            # resolve_frame_analysis_dir）：要换用新的提取文件，请在面板重新选择
+            # 提取源后重新导入。
             print(
-                "[ZZMI骨骼合并] 提示: 未找到 FrameAnalysis 目录（可能已被删除），"
-                "将仅用工作空间缓存重建"
+                "[ZZMI骨骼合并] 提示: 未找到 FrameAnalysis 目录（记录过的提取源已被"
+                "删除/搬走），本次仅用工作空间缓存重建；如需改用新的提取文件，"
+                "请重新选择提取源后重新导入"
             )
 
         # 第一遍：收集每个子网格信息并按 DrawIB 分组（同 DrawIB 的拆分子网格共享
@@ -930,6 +1406,12 @@ class ZZMISkeletonMergeHelper:
         # ModImpRuntime / 旧算法缓存）整批重建，绝不允许带着半成品永久幂等跳过。
         groups: dict[str, dict] = {}
         stale = 0
+        # 阻断修复（t80 §2.4）：本次调用里「旧版但仅凭 VGMap 可升级」的 DrawIB 集合。
+        # 只有**全部成员**都可升级的 DrawIB 才就地升级——通道计划是共享骨连通分量
+        # 的组级性质，半个组升级会让组内两套口径并存。
+        cls._zzmi_legacy_upgrade_draw_ibs = set()
+        _migratable_members: dict[str, set[str]] = {}
+        _group_members: dict[str, set[str]] = {}
         # 无法定位/无法解析 json 的目标（最后按“未处理目标”计入失败报告，
         # 不能让部分完成被报告成完整成功）
         unresolved_targets: list[str] = []
@@ -1007,7 +1489,52 @@ class ZZMISkeletonMergeHelper:
                 cache_intact = False
             if not force and cache_intact:
                 continue  # 该子网格缓存完整（临时计数，见下）
+            # 阻断修复（t80 §2.4）：旧版但**仅凭 VGMap 可升级**的缓存不计入 stale。
+            # v5 相对 v4 只多了可从 VGMap 单独推导的 ChannelPlan 系列字段 ⇒ 不需要
+            # dump、不需要重跑去重，就地升级即可。把它判成 stale 会触发整批重建，
+            # 而重建依赖已删除的 FrameAnalysis/dump（"工作空间缓存重建"只能保住
+            # palette，分组口径会随 CB1 缓存漂移）⇒ 旧工作区一开就死。
+            draw_ib_for_migration = draw_ib
+            _group_members.setdefault(draw_ib_for_migration, set()).add(unique_str)
+            if (
+                not cache_intact
+                and not force
+                and cls._zzmi_cache_usable_for_migration(
+                    submesh_json, json_path, unique_str
+                )
+            ):
+                _migratable_members.setdefault(draw_ib_for_migration, set()).add(
+                    unique_str
+                )
+                continue  # 留到重建阶段统一升级（见下"v4→v5 就地升级"）
             stale += 1
+
+        # 只有**全部成员**都可升级的 DrawIB 才就地升级（组级口径：通道计划是共享骨
+        # 连通分量的性质，半个组升级会让组内两套口径并存）。
+        cls._zzmi_legacy_upgrade_draw_ibs = {
+            draw_ib
+            for draw_ib, members in _migratable_members.items()
+            if members and members == _group_members.get(draw_ib, set())
+        }
+        if cls._zzmi_legacy_upgrade_draw_ibs:
+            # 就地升级（写回工作空间 json，不重跑去重）。**先升级再判定**：
+            # 升级后的组不再需要重建，把它们从候选集里摘掉并重算 stale，避免
+            # "一边升级一边又按慢路径重建"（后者会把全局槽位编号重排）。
+            upgraded_count = cls._zzmi_upgrade_legacy_vgmap_cache(groups)
+            if upgraded_count:
+                exempted = {
+                    member
+                    for draw_ib in cls._zzmi_legacy_upgrade_draw_ibs
+                    for member in groups.get(draw_ib, {}).get("members", [])
+                }
+                stale = max(0, stale - len(exempted))
+                print(
+                    "[ZZMI骨骼合并] 旧版 VGMap 缓存已就地升级到 v"
+                    f"{_ZZMI_VG_MAP_ALGORITHM_VERSION}："
+                    f"{len(cls._zzmi_legacy_upgrade_draw_ibs)} 个 DrawIB / "
+                    f"{upgraded_count} 份 json（补齐 ChannelPlan，未重跑去重）"
+                )
+            cls._zzmi_legacy_upgrade_draw_ibs = set()
 
         up_to_date = len(groups) and stale == 0
         if up_to_date and not force:
@@ -1021,6 +1548,13 @@ class ZZMISkeletonMergeHelper:
                     f"{total} 个子网格已有骨骼合并数据（幂等），但 "
                     f"{len(unresolved_targets)} 个目标无法解析: "
                     f"{'、'.join(shown)}{suffix}"
+                )
+            if cls._zzmi_upgrade_legacy_vgmap_cache(groups):
+                total = sum(len(g["members"]) for g in groups.values())
+                return True, (
+                    f"所有 {total} 个子网格均已有骨骼合并数据；"
+                    f"其中旧版缓存已就地升级到 VGMap v{_ZZMI_VG_MAP_ALGORITHM_VERSION}"
+                    "（补齐 ChannelPlan 系列字段，未重跑去重）。"
                 )
             return True, f"所有 {total} 个子网格均已有骨骼合并数据（幂等跳过）。"
 
@@ -1143,6 +1677,9 @@ class ZZMISkeletonMergeHelper:
             # vg_count 膨胀到 65,536 后因 palette 不足整部件被跳过。
             vg_count = 0
             combined_signatures = {}
+            # t75：逐**局部骨槽**的顶点权重合计（= 该骨在几何里被多少权重引用），
+            # 供通道骨选择当「带顶点权重最多」的次级排序键。同 DrawIB 的成员求和。
+            slot_weights = numpy.zeros(0, dtype=numpy.float64)
             member_parse_failed = False
             for member in group["members"]:
                 member_json_path = group["json_paths"][member]
@@ -1190,6 +1727,30 @@ class ZZMISkeletonMergeHelper:
                 vg_count = max(vg_count, int(valid_indices.max()) + 1)
                 # 导出侧按成员自己的几何行数做 vb1 换绑判定。
                 group["original_vertex_counts"][member] = int(len(blend_indices))
+                # t75：本成员的逐骨权重合计（只在有效通道上累加）。
+                try:
+                    weights_flat = numpy.asarray(
+                        blend_weights, dtype=numpy.float64
+                    ).reshape(-1)
+                    indices_flat = numpy.asarray(
+                        blend_indices, dtype=numpy.int64
+                    ).reshape(-1)
+                    mask_flat = numpy.asarray(valid_mask).reshape(-1)
+                    usable = min(len(weights_flat), len(indices_flat), len(mask_flat))
+                    if usable > 0:
+                        member_sums = numpy.bincount(
+                            indices_flat[:usable][mask_flat[:usable]],
+                            weights=weights_flat[:usable][mask_flat[:usable]],
+                        )
+                        if len(member_sums) > len(slot_weights):
+                            grown = numpy.zeros(len(member_sums), dtype=numpy.float64)
+                            grown[: len(slot_weights)] = slot_weights
+                            slot_weights = grown
+                        slot_weights[: len(member_sums)] += member_sums
+                except Exception:
+                    # 权重缺失只影响通道骨的次级排序键（记账口径），不影响判定
+                    # 可行性：按 0 计入。绝不因此跳过部件。
+                    pass
 
                 position_buf_path = os.path.join(
                     os.path.dirname(member_json_path),
@@ -1233,6 +1794,12 @@ class ZZMISkeletonMergeHelper:
             group["draw_index"] = draw_index
             group["via"] = via
             group["signatures"] = combined_signatures
+            # t75：局部骨槽 → 顶点权重合计（长度 = vg_count，缺失项按 0）。
+            local_weights = numpy.zeros(vg_count, dtype=numpy.float64)
+            if len(slot_weights):
+                usable = min(len(slot_weights), vg_count)
+                local_weights[:usable] = slot_weights[:usable]
+            group["slot_weights"] = local_weights
 
             # 骨架分组键：渲染 draw 的 vs-cb1 对象→世界矩阵（palette 蒙皮到对象空间，
             # 渲染 VS 用 cb1 摆到世界，两者逐物体 1:1 配对）。取该部件渲染 draw 列表中
@@ -1242,6 +1809,7 @@ class ZZMISkeletonMergeHelper:
             # ObjectCB1 缓存（dump 已删除时仍能重建出相同的骨架分组）。同 DrawIB
             # 成员共享同一对象变换，代表子网格缓存缺失时遍历兄弟子网格。
             cb1_cache_paths = []
+            cb1_cache_first_constants: dict[str, int] = {}
             cb1_cache_required = False
             cb1_cache_contract_unknown = False
             for member in group["members"]:
@@ -1271,6 +1839,9 @@ class ZZMISkeletonMergeHelper:
                 )
                 if os.path.isfile(member_cb1):
                     cb1_cache_paths.append(member_cb1)
+                    cb1_cache_first_constants[member_cb1] = cls._parse_first_constant(
+                        member_json.get("ObjectCB1FirstConstant", 0)
+                    )
             cb1_path = ""
             dump_cb1_seen = False
             first_dump_cb1_path = ""
@@ -1286,17 +1857,32 @@ class ZZMISkeletonMergeHelper:
                     dump_cb1_seen = True
                     if not first_dump_cb1_path:
                         first_dump_cb1_path = candidate
-                    transform = ZZMIBoneMapBuilder.parse_object_transform(candidate)
+                    # dump 是整块资源：本 draw 的对象变换在它绑定的 first_constant
+                    # 窗口内。多对象共享数组里 float 0 处是别的对象的矩阵，必须
+                    # 按窗口取，否则同对象空间的部件会被误拆成不同 SkeletonGroup。
+                    first_constant = (
+                        parser.get_vs_cb_first_constant(render_draw, 1)
+                        if parser is not None
+                        else 0
+                    )
+                    transform = ZZMIBoneMapBuilder.parse_object_transform(
+                        candidate,
+                        first_constant=first_constant,
+                    )
                     if transform is not None:
-                        dump_transform_candidates.append((transform, candidate))
+                        dump_transform_candidates.append(
+                            (transform, candidate, first_constant)
+                        )
 
             # 一个 DrawIB 可能在同一帧被多个实例绘制；它们的 IB/VB hash 相同，
             # 但对象 CB1 不同。旧实现无条件取第一个 CB1，随后把所有实例当成
             # 一个 SkeletonGroup，导出时修改其中一个实例会污染另一个。没有额外
             # 的实例选择键时，安全策略是拒绝该 DrawIB 的合并缓存，而不是猜一个。
             unique_dump_transforms = {}
-            for transform, candidate in dump_transform_candidates:
-                unique_dump_transforms.setdefault(transform, candidate)
+            for transform, candidate, candidate_first_constant in dump_transform_candidates:
+                unique_dump_transforms.setdefault(
+                    transform, (candidate, candidate_first_constant)
+                )
             if len(unique_dump_transforms) > 1:
                 group["skip_reason"] = (
                     f"同一 DrawIB 对应 {len(unique_dump_transforms)} 个不同对象 CB1 实例，"
@@ -1310,7 +1896,10 @@ class ZZMISkeletonMergeHelper:
             if unique_dump_transforms:
                 # 必须缓存“实际用于分组”的同一个有效 CB1。旧实现先记住首个
                 # 候选，即使后续候选才有效，也会把错误实例的 CB1 发布到工作空间。
-                group["transform"], cb1_path = next(iter(unique_dump_transforms.items()))
+                # 同时记下该候选的窗口起点：ObjectCB1 缓存保存的是 dump 原始字节，
+                # 无 dump 重建时必须按同一窗口还原同一个对象变换。
+                group["transform"], cb1_pick = next(iter(unique_dump_transforms.items()))
+                cb1_path, group["cb1_first_constant"] = cb1_pick
                 group["cb1_cache_valid"] = True
             if (
                 group["transform"] is None
@@ -1328,7 +1917,14 @@ class ZZMISkeletonMergeHelper:
                 continue
             if group["transform"] is None and not dump_cb1_seen and parser is None:
                 for member_cb1 in cb1_cache_paths:
-                    transform = ZZMIBoneMapBuilder.parse_object_transform(member_cb1)
+                    # ObjectCB1 缓存保存的是 dump 原始字节（整块资源），窗口起点由
+                    # 生成时写回的 ObjectCB1FirstConstant 还原；缺失时按 0 处理
+                    # （旧版缓存来自逐部件 512B 块，窗口恒为 0）。
+                    cache_first_constant = cb1_cache_first_constants.get(member_cb1, 0)
+                    transform = ZZMIBoneMapBuilder.parse_object_transform(
+                        member_cb1,
+                        first_constant=cache_first_constant,
+                    )
                     if transform is not None:
                         group["transform"] = transform
                         group["cb1_cache_valid"] = True
@@ -1428,6 +2024,7 @@ class ZZMISkeletonMergeHelper:
 
         vg_maps: dict[str, dict] = {}
         vg_offsets: dict[str, int] = {}
+        slot_weights_by_draw_ib: dict[str, dict[int, int]] = {}
         for draw_ib in ready_groups:
             group_index = group_of[draw_ib]
             vg_offsets[draw_ib] = group_base[group_index] + local_offsets[draw_ib]
@@ -1435,6 +2032,45 @@ class ZZMISkeletonMergeHelper:
                 local: group_base[group_index] + slot
                 for local, slot in local_maps[draw_ib].items()
             }
+            # t75：把逐**局部**骨槽权重换算到**全局**槽位（通道骨选择用）。
+            local_weights = ready_groups[draw_ib].get("slot_weights")
+            global_weights: dict[int, int] = {}
+            if local_weights is not None:
+                for local, slot in local_maps[draw_ib].items():
+                    if not (0 <= int(local) < len(local_weights)):
+                        continue
+                    weight = float(local_weights[int(local)])
+                    # 合成/损坏的 Blend 权重可能是 NaN/Inf：只做**记账**，一律按 0
+                    # 计入，绝不因为一个坏权重让整批导入失败。
+                    if not math.isfinite(weight) or weight <= 0:
+                        continue
+                    global_slot = group_base[group_index] + int(slot)
+                    global_weights[global_slot] = global_weights.get(
+                        global_slot, 0
+                    ) + int(round(weight))
+            slot_weights_by_draw_ib[draw_ib] = global_weights
+
+        # ------------------------------------------------------------------
+        # t75：共享骨图 + 通道骨判定（唯一判定口径，导入期一次性算好并落盘）
+        # ------------------------------------------------------------------
+        # 「全组共享骨」（旧 `_merged_group_pose_anchor_slot` 的交集判据）会被
+        # 一个与谁都不共骨的部件整组打空（叶瞬光01 G0 的 8c8de427）⇒ 按**共享骨图
+        # 的连通分量**讨论：分量内仍存在 11 个共用槽（含槽 0，五件引用）。
+        # 判定结果（通道全局槽位 / 本地下标 / 共享件数 / 跨部件顶点权重 / 理由 /
+        # 诊断）随 VGMap 一起写回 json，供导出侧直接消费与人工复核。
+        channel_components = [
+            {
+                "draw_ib": draw_ib,
+                "vg_map": vg_maps[draw_ib],
+                "vg_count": int(ready_groups[draw_ib]["vg_count"]),
+                "vg_offset": vg_offsets[draw_ib],
+                "skeleton_group": group_of[draw_ib],
+                "slot_weights": slot_weights_by_draw_ib[draw_ib],
+            }
+            for draw_ib in sorted(vg_maps)
+        ]
+        channel_plan = select_channel_plan(channel_components)
+        channel_plan_digest = channel_plan_digest_value(channel_plan)
 
         # 写回工作空间 json + 复制 palette 缓存（组内所有子网格写相同结果）
         written = 0
@@ -1457,6 +2093,45 @@ class ZZMISkeletonMergeHelper:
                 submesh_json["VGMap"] = {str(k): int(v) for k, v in sorted(vg_map.items())}
                 # 算法版本：快路径幂等判定依据；策略变更时递增版本使旧缓存自动失效
                 submesh_json["VGMapAlgorithmVersion"] = _ZZMI_VG_MAP_ALGORITHM_VERSION
+                # t75 通道计划：唯一判定口径的产物 + 复核素材。缺失/版本不符时
+                # `_zzmi_cache_intact` 拒绝复用（显式重建，不静默退化）。
+                submesh_json["ChannelPlanVersion"] = ZZMI_CHANNEL_PLAN_VERSION
+                submesh_json["ChannelPlan"] = _serialize_channel_record(
+                    channel_plan.get(draw_ib)
+                )
+                submesh_json["ChannelPlanDigest"] = channel_plan_digest
+                # t75/t78：骨骼**身份**摘要与"当帧矩阵"指纹必须分开存（t78 #3）。
+                # F4（复核发现）口径更正：`BoneIdentityDigest` 哈希的是
+                # `{本地下标: 全局槽位}`，而槽位由当帧 palette 矩阵的 bitwise 去重
+                # 派生 ⇒ 它是**当帧矩阵的派生量**，不是帧不变量、**不是**骨名/编号
+                # 身份。`BoneIdentityBasis` 因此必须自述为 `local_slot_map`（弱代理），
+                # 不得让读者以为它是骨名身份；骨名真值（bone_ids）尚未接入生产链路。
+                submesh_json["BoneIdentityVersion"] = ZZMI_BONE_IDENTITY_VERSION
+                submesh_json["BoneIdentityDigest"] = bone_identity_digest(vg_map)
+                submesh_json["BoneIdentityBasis"] = "local_slot_map"
+                submesh_json["BoneIdentityBasisNote"] = (
+                    "local_slot_map：槽位号由当帧 palette 矩阵 bitwise 去重派生，"
+                    "**不是**骨名/编号身份、也不是帧不变量（bone_ids 未接入生产链路）"
+                )
+                palette_bytes = None
+                try:
+                    if group.get("palette_path"):
+                        with open(group["palette_path"], "rb") as palette_file:
+                            palette_bytes = palette_file.read()
+                except OSError:
+                    palette_bytes = None
+                submesh_json["BoneMatrixFrameDigest"] = same_frame_matrix_digest(
+                    palette_bytes
+                )
+                submesh_json["BoneMatrixFrameDigestNote"] = (
+                    "当帧矩阵指纹——只证明同一次抓帧，不是骨骼身份依据（t78）"
+                )
+                submesh_json["ChannelPlanSlotWeights"] = {
+                    str(slot): int(weight)
+                    for slot, weight in sorted(
+                        slot_weights_by_draw_ib.get(draw_ib, {}).items()
+                    )
+                }
                 if frame_analysis_signature:
                     submesh_json["FrameAnalysisLogSignature"] = frame_analysis_signature
                 # 骨架分组（渲染 cb1 对象变换配对）：导出侧把 deform pass 换绑到本组
@@ -1500,10 +2175,17 @@ class ZZMISkeletonMergeHelper:
                         submesh_json["ObjectCB1CacheValid"] = bool(
                             group.get("cb1_cache_valid", False)
                         )
+                        # 窗口起点随缓存一起写回：ObjectCB1 保存的是 dump 原始字节
+                        # （可能是多对象共享数组），无 dump 重建时必须按同一窗口
+                        # 还原同一个对象变换，否则分组会在重建后漂移。
+                        submesh_json["ObjectCB1FirstConstant"] = int(
+                            group.get("cb1_first_constant", 0) or 0
+                        )
                     else:
                         # 显式沉淀“本次没有有效 CB1”；缓存读取必须忽略可能残留的
                         # 旧文件，才能复现 dump 路径的独立分组语义。
                         submesh_json.pop("ObjectCB1FileName", None)
+                        submesh_json.pop("ObjectCB1FirstConstant", None)
                         submesh_json["ObjectCB1CacheValid"] = False
                     EFMISkeletonMergeHelper._atomic_publish_skeleton_transaction(
                         cache_entries,

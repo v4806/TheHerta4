@@ -5,6 +5,8 @@ import types
 import unittest
 from pathlib import Path
 
+from tests import _real_modules
+
 
 def _install_module(name, **attrs):
     module = types.ModuleType(name)
@@ -180,6 +182,9 @@ class ShaderReplaceExportPathTests(unittest.TestCase):
             package = _install_module(package_name)
             package.__path__ = []
 
+        # 真实 common 子模块按 fake 包前缀注册（空 __path__ 假包解析不了相对导入）
+        _real_modules.register_real_common_modules(f"{self.pkg}.common")
+
         _install_module(
             f"{self.pkg}.common.global_config",
             GlobalConfig=types.SimpleNamespace(
@@ -210,6 +215,16 @@ class ShaderReplaceExportPathTests(unittest.TestCase):
         )
         # zzmi.py / efmi.py 新增依赖：utils.json_utils（真实模块，仅 JSON 读写）
         _load_module(f"{self.pkg}.utils.json_utils", "utils/json_utils.py")
+        # m_ini_helper.py 依赖 utils.log_utils（形态键丢弃诊断落 stdout/sink）
+        _install_module(
+            f"{self.pkg}.utils.log_utils",
+            LOG=types.SimpleNamespace(
+                info=lambda *_args, **_kwargs: None,
+                warning=lambda *_args, **_kwargs: None,
+                debug=lambda *_args, **_kwargs: None,
+                error=lambda *_args, **_kwargs: None,
+            ),
+        )
 
         self.shader_replace_section_calls = []
 

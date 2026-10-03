@@ -332,10 +332,14 @@ class THEHERTA3_OT_DeletePersistentBlueprint(bpy.types.Operator):
     def _get_target_tree(self, context):
         from .export_helper import BlueprintExportHelper
 
-        requested_tree_name = str(self.blueprint_name or "").strip()
-        if requested_tree_name == "__NONE__":
-            return None
-        return BlueprintExportHelper.get_selected_blueprint_tree(requested_tree_name, context=context)
+        # 面板传进来的可能是陈旧的枚举序号、__NONE__ 或空串（蓝图在插件算子之外
+        # 被重命名/删除后就是这种值）。交给 helper 统一解析：解析不出来就回退到
+        # 已校验的当前选择，而不是直接取消——否则用户点删除只会看到一句
+        # 「当前没有蓝图可删除」，表现为「删不掉」。
+        return BlueprintExportHelper.resolve_blueprint_target_tree(
+            self.blueprint_name,
+            context=context,
+        )
 
     def invoke(self, context, event):
         target_tree = self._get_target_tree(context)
@@ -374,12 +378,20 @@ class THEHERTA3_OT_DeletePersistentBlueprint(bpy.types.Operator):
             BlueprintExportHelper.runtime_blueprint_tree_name = ""
 
         deleted_blueprint_name = target_tree.name
+        global_properties = getattr(getattr(context, "scene", None), "global_properties", None)
         bpy.data.node_groups.remove(target_tree)
 
-        global_properties = getattr(getattr(context, "scene", None), "global_properties", None)
+        # 删除后原枚举序号必然失效：立刻写回一个仍然存在的蓝图（一个都不剩时写
+        # __NONE__）。否则下拉框会留成空白并持续刷 RNA 警告，删除/重命名也会再次
+        # 失去目标。
         preferred_blueprint_name = BlueprintExportHelper.get_preferred_blueprint_name(context=context)
         if global_properties:
-            global_properties.selected_blueprint_name = preferred_blueprint_name or "__NONE__"
+            try:
+                global_properties.selected_blueprint_name = (
+                    preferred_blueprint_name or BlueprintExportHelper.BLUEPRINT_NONE_IDENTIFIER
+                )
+            except Exception:
+                BlueprintExportHelper.ensure_valid_selected_blueprint_name(context=context)
 
         for window in context.window_manager.windows:
             for area in window.screen.areas:
@@ -409,10 +421,11 @@ class THEHERTA3_OT_RenamePersistentBlueprint(bpy.types.Operator):
     def _get_target_tree(self, context):
         from .export_helper import BlueprintExportHelper
 
-        requested_tree_name = str(self.blueprint_name or "").strip()
-        if requested_tree_name == "__NONE__":
-            return None
-        return BlueprintExportHelper.get_selected_blueprint_tree(requested_tree_name, context=context)
+        # 同删除：允许面板传空值/陈旧值，解析不出来时回退到已校验的当前选择。
+        return BlueprintExportHelper.resolve_blueprint_target_tree(
+            self.blueprint_name,
+            context=context,
+        )
 
     def invoke(self, context, event):
         target_tree = self._get_target_tree(context)

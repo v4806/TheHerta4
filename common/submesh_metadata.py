@@ -14,6 +14,34 @@ from .global_config import GlobalConfig
 from .submesh_json import SubmeshJson
 from .workspace_helper import WorkSpaceHelper
 
+# 没有 LOD 前缀的身份默认按哪个 LOD 解析，与 WorkSpaceHelper.DEFAULT_LOD_NAME 同源。
+# getattr 兜底只为兼容只 stub 了部分属性的测试宿主，不改变生产行为。
+DEFAULT_LOD_NAME = getattr(WorkSpaceHelper, "DEFAULT_LOD_NAME", "LOD0")
+
+
+def _get_import_gametype_name(
+    import_json: dict,
+    unique_str: str,
+    bare_unique_str: str,
+    lod_name: str = "",
+) -> str:
+    """从工作空间 Import.json 取该身份的数据类型名。
+
+    多 LOD 工作空间的键带 LOD 前缀（`LOD0.xxx-1-0`）；身份本身没有 LOD 前缀时
+    （旧扁平工作空间遗留 / 手工命名的物体）按默认 LOD0 的键兜底查一次，与
+    WorkSpaceHelper.get_submesh_folder_path 的 LOD0 目录兜底同口径。
+    显式带 LOD 前缀的身份不做跨 LOD 兜底（LOD1 部件就该查 LOD1 的键）。
+    """
+    key_candidates = [unique_str]
+    if not lod_name:
+        key_candidates.append(f"{DEFAULT_LOD_NAME}.{bare_unique_str}")
+
+    for key in key_candidates:
+        gametype_name = str(import_json.get(key, "") or "")
+        if gametype_name:
+            return gametype_name
+    return ""
+
 
 def check_and_get_submesh_json_path(unique_str: str) -> tuple[bool, str, str]:
     """检查并获取 submesh JSON 文件路径
@@ -25,17 +53,25 @@ def check_and_get_submesh_json_path(unique_str: str) -> tuple[bool, str, str]:
         (是否存在, 错误信息, JSON 文件路径)
     """
     workspace_folder = GlobalConfig.path_workspace_folder()
-    _lod_name, bare_unique_str = WorkSpaceHelper.parse_lod_unique_str(unique_str)
+    lod_name, bare_unique_str = WorkSpaceHelper.parse_lod_unique_str(unique_str)
     unique_str_folder = WorkSpaceHelper.get_submesh_folder_path(unique_str)
     if not os.path.exists(unique_str_folder):
+        tried_hint = (
+            f"已尝试: 裸身份目录 与 默认 {DEFAULT_LOD_NAME} 目录（{unique_str_folder}）\n"
+            if not lod_name
+            else f"已尝试: {lod_name} 目录（{unique_str_folder}）\n"
+        )
         return False, (
             f"unique_str '{unique_str}' 没有找到对应的提取数据。\n"
+            + tried_hint
             + "请确保已从游戏中提取模型并执行「一键导入当前工作空间内容」操作。"
         ), ""
 
     workspace_import_json_path = os.path.join(workspace_folder, "Import.json")
     workspace_import_json = JsonUtils.LoadFromFile(workspace_import_json_path) if os.path.exists(workspace_import_json_path) else {}
-    gametype_name = workspace_import_json.get(unique_str, "")
+    gametype_name = _get_import_gametype_name(
+        workspace_import_json, unique_str, bare_unique_str, lod_name
+    )
 
     if gametype_name:
         submesh_json_path = os.path.join(unique_str_folder, "TYPE_" + gametype_name, bare_unique_str + ".json")
@@ -94,6 +130,12 @@ class SubmeshMetadata:
     vg_map: dict = field(init=False, default_factory=dict)
     # ZZMI VGMap 缓存算法版本；导出侧拒绝陈旧缓存，避免旧分组/门控结果继续生效。
     vg_map_algorithm_version: int = field(init=False, default=0)
+    # t75 通道计划（导入期算好的**唯一**实例判定口径）：通道骨全局槽位/本地下标、
+    # 共享件数、跨部件顶点权重合计、理由与诊断。缺失 = 缓存未刷新（导出侧显式诊断）。
+    channel_plan_version: int = field(init=False, default=0)
+    channel_plan: dict = field(init=False, default_factory=dict)
+    channel_plan_digest: str = field(init=False, default="")
+    channel_plan_slot_weights: dict = field(init=False, default_factory=dict)
     merged_skeleton_metadata_valid: bool = field(init=False, default=True)
     # EFMI 跨 LOD 对应账本：不直接参与槽位编号；投影开启时用于 LOD1 分区
     # 约束、未匹配过滤及自动匹配节点的物体配对，关闭时保留为诊断元数据。
@@ -137,6 +179,19 @@ class SubmeshMetadata:
         self.vg_map = dict(self.submesh_json_dict.get("VGMap", {}) or {})
         self.vg_map_algorithm_version = int(
             self.submesh_json_dict.get("VGMapAlgorithmVersion", 0) or 0
+        )
+        # t75 通道计划（唯一判定口径）；缺失/版本不符由缓存门控拒绝复用。
+        self.channel_plan_version = int(
+            self.submesh_json_dict.get("ChannelPlanVersion", 0) or 0
+        )
+        channel_plan = self.submesh_json_dict.get("ChannelPlan")
+        self.channel_plan = dict(channel_plan) if isinstance(channel_plan, dict) else {}
+        self.channel_plan_digest = str(
+            self.submesh_json_dict.get("ChannelPlanDigest", "") or ""
+        )
+        slot_weights = self.submesh_json_dict.get("ChannelPlanSlotWeights")
+        self.channel_plan_slot_weights = (
+            dict(slot_weights) if isinstance(slot_weights, dict) else {}
         )
         # EFMI 跨 LOD 对应账本（v9 投影写回；行 = target_local -> {local_vg_id: ref_local, ...}）
         corr = self.submesh_json_dict.get("EFMILODCorrespondence", {}) or {}

@@ -44,6 +44,7 @@ for _name in (PKG, f"{PKG}.common", f"{PKG}.utils"):
     _install_package(_name)
 _load_module(f"{PKG}.utils.json_utils", REPO_ROOT / "utils" / "json_utils.py")
 _load_module(f"{PKG}.common.efmi_skeleton", REPO_ROOT / "common" / "efmi_skeleton.py")
+_load_module(f"{PKG}.common.zzmi_channel", REPO_ROOT / "common" / "zzmi_channel.py")
 _zzmi = _load_module(f"{PKG}.common.zzmi_skeleton", REPO_ROOT / "common" / "zzmi_skeleton.py")
 
 ZZMIBoneMapBuilder = _zzmi.ZZMIBoneMapBuilder

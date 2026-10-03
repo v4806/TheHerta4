@@ -221,12 +221,35 @@ class SSMTNode_AnimDriver_AccumulativeTrigger(SSMTNode_AnimDriver_Base):
         except (AttributeError, TypeError):
             setattr(self, migration_key, True)
 
+    def _ensure_accumulator_variable_name(self):
+        """确保累计变量名存在并**填入输入框**（与暂停变量同规则）。
+
+        此前只有 ``draw_buttons`` 里的回退 label 显示 ``$accumulator{idx}``，输入框
+        始终是空的 —— 与其它动画驱动节点（暂停变量/连续索引变量/形态键序列驱动
+        变量都会在 init 时回填预分配名）不一致。
+        """
+        current_value = str(getattr(self, "accumulator_variable", "") or "").strip()
+        if current_value:
+            self.accumulator_variable = self._normalize_variable_name(current_value, "")
+            return self.accumulator_variable
+
+        preferred = f"accumulator{self._read_safe_index()}"
+        used_names = self._collect_anim_driver_variable_names()
+        if preferred not in used_names:
+            self.accumulator_variable = f"${preferred}"
+            return self.accumulator_variable
+
+        allocated = self._allocate_unique_anim_driver_variable_name("accumulator")
+        self.accumulator_variable = f"${allocated}"
+        return self.accumulator_variable
+
     def init(self, context):
         self.inputs.new('SSMTSocketAnimDriver', ANIM_DRIVER_INPUT_SOCKET_NAME)
         self.outputs.new('SSMTSocketAnimDriver', ANIM_DRIVER_OUTPUT_SOCKET_NAME)
         self.width = 420
         self._assign_next_available_index()
         self._ensure_paused_variable_name("accumulative_trigger_paused")
+        self._ensure_accumulator_variable_name()
         self._mark_play_state_migrated()
 
     def copy(self, node):
@@ -234,7 +257,13 @@ class SSMTNode_AnimDriver_AccumulativeTrigger(SSMTNode_AnimDriver_Base):
         self.custom_paused_var = ""
         self.accumulator_variable = ""
         self._ensure_paused_variable_name("accumulative_trigger_paused")
+        self._ensure_accumulator_variable_name()
         self._mark_play_state_migrated()
+
+    def update(self):
+        super().update()
+        # 旧蓝图（保存时输入框还是空的）在这里补上累计变量名
+        self._ensure_accumulator_variable_name()
 
     def draw_buttons(self, context, layout):
         safe_idx = self._read_safe_index()
@@ -351,6 +380,7 @@ class SSMTNode_AnimDriver_AccumulativeTrigger(SSMTNode_AnimDriver_Base):
         idx = self._read_safe_index()
         runtime = self._find_runtime_node()
         playback_rate = runtime.playback_rate if runtime else 1
+        frame_var = self._frame_variable_of(runtime)
         paused_var = self._normalize_variable_name(
             self.custom_paused_var, f"$accumulative_trigger_paused{idx}"
         )
@@ -393,7 +423,7 @@ class SSMTNode_AnimDriver_AccumulativeTrigger(SSMTNode_AnimDriver_Base):
         lines.extend([
             "[Present]",
             f"if {paused_var} == 1",
-            f"    if $swapvar % $speed_auto{idx} == 0",
+            f"    if {frame_var} % $speed_auto{idx} == 0",
         ])
 
         for variable_name, comparison_op, compare_value, increment_value in conditions:
@@ -436,21 +466,47 @@ class SSMTNode_AnimDriver_AccumulativeTrigger(SSMTNode_AnimDriver_Base):
 _load_handler_registered = False
 
 
-@bpy.app.handlers.persistent
-def _accumulative_trigger_load_handler(dummy):
-    for tree in bpy.data.node_groups:
-        if tree.bl_idname != 'SSMTBlueprintTreeType':
+def migrate_existing_accumulative_nodes() -> int:
+    """补齐已有累计触发节点（暂停变量 + 累计变量）；返回被动过的节点数。
+
+    ``load_post``（打开工程）与 ``register``（插件重载/重新启用）都会调用 —— 后者
+    是必需的：Reload Scripts / 重新启用插件不会触发 ``load_post``，只挂 load_post
+    的话「重载后旧节点没被刷新」。
+    """
+    migrated = 0
+    for tree in getattr(bpy.data, "node_groups", []) or []:
+        if getattr(tree, "bl_idname", "") != 'SSMTBlueprintTreeType':
             continue
-        for node in tree.nodes:
-            if node.bl_idname != 'SSMTNode_AnimDriver_AccumulativeTrigger':
+        for node in getattr(tree, "nodes", []) or []:
+            if getattr(node, "bl_idname", "") != 'SSMTNode_AnimDriver_AccumulativeTrigger':
                 continue
             try:
                 SSMTNode_AnimDriver_Base.migrate_default_play_state_flag(node)
                 SSMTNode_AnimDriver_Base._migrate_dynamic_sockets(node)
+                touched = False
                 if not node.custom_paused_var:
                     node._ensure_indexed_paused_variable_name("accumulative_trigger_paused")
-            except Exception:
-                pass
+                    touched = True
+                if not str(getattr(node, "accumulator_variable", "") or "").strip():
+                    node._ensure_accumulator_variable_name()
+                    touched = True
+                if touched:
+                    migrated += 1
+                    print(
+                        f"[AnimDriver] 累计触发节点 '{node.name}' 变量补填: "
+                        f"{node.custom_paused_var} / {node.accumulator_variable}"
+                    )
+            except Exception as exc:
+                print(
+                    f"[AnimDriver][警告] 累计触发节点 "
+                    f"'{getattr(node, 'name', '?')}' 迁移失败: {exc}"
+                )
+    return migrated
+
+
+@bpy.app.handlers.persistent
+def _accumulative_trigger_load_handler(dummy):
+    migrate_existing_accumulative_nodes()
 
 
 classes = (
@@ -474,6 +530,8 @@ def register():
     if not _load_handler_registered:
         bpy.app.handlers.load_post.append(_accumulative_trigger_load_handler)
         _load_handler_registered = True
+    # 插件（重新）加载时也要迁移：Reload Scripts / 重新启用不会触发 load_post
+    migrate_existing_accumulative_nodes()
 
 
 def unregister():

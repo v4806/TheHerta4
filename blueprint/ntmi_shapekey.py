@@ -14,6 +14,7 @@ import numpy as np
 from .direct_export_shapekey import DirectShapeKeyGenerator
 from .direct_export_shapekey_shared import ShapeKeyDirectExportError
 from ..common.d3d11_gametype import D3D11GameType
+from ..common.safe_write import write_text_if_changed
 from ..utils.log_utils import LOG
 from .ntmi_layout_adapter import (
     iter_name_variants,
@@ -223,8 +224,16 @@ class NTMIShapeKeyNodeAdapter:
         drag_stage_count=1,
         drag_dirs=None,
         hash_val=None,
+        source_path=None,
     ):
-        del unique_objects, use_packed, use_delta, use_optimized, merge_slot_files, hash_val
+        # 调用方（``DirectShapeKeyGenerator.generate``）走的是「读模板、写目标」的
+        # 通用契约，因此会传 ``source_path``；本适配器**不读模板**——着色器源码在
+        # 下面按区域布局现算（``shader_source``），只把结果幂等写回 ``shader_path``。
+        # 也就是说这里 ``source_path`` 语义上是惰性的：**只需能接住**（否则崩铁
+        # NTEMI 直出形态键导出会在调用点抛 TypeError，而本适配器又无法像
+        # ``SSMTNode_PostProcess_ShapeKey`` 那样用 ``source_path or shader_path``
+        # 去读盘），并不参与读盘，故与其它未使用形参一起显式丢弃。
+        del unique_objects, use_packed, use_delta, use_optimized, merge_slot_files, hash_val, source_path
         num_slots = max(hash_slot_data.keys()) if hash_slot_data else 0
         zone_ids = list(drag_zone_ids or []) if drag_drive_enabled else []
         click_stages = list(drag_click_stages or []) if drag_drive_enabled else []
@@ -354,7 +363,8 @@ class NTMIShapeKeyNodeAdapter:
                 "}",
             ]
         )
-        Path(shader_path).write_text(shader_source, encoding="utf-8")
+        # 内容没变就不写：保持 .hlsl 的 mtime，避免无谓地作废 3DMigoto 编译缓存
+        write_text_if_changed(shader_path, shader_source)
         return True
 
     def _parse_classification_text_final(self, text_content):
@@ -1097,6 +1107,14 @@ class NTMIDirectShapeKeyGenerator(DirectShapeKeyGenerator):
 
 
 def execute_ntmi_shapekey_postprocess(node, output_dir: str, blueprint_model, exporter):
+    if bool(getattr(node, "store_all_vertex_channels", False)):
+        # NTMI 路线是位置专用实现（自建最小 position game type + 自生成着色器 + 固定 12 字节增量步长），
+        # 这里如实告警而非静默忽略：该开关在 NTMI 上当前不生效，产物里法线/切线增量恒为 0。
+        LOG.warning(
+            "NTMI ShapeKey: 「存储全部顶点属性增量」在 NTMI 导出路线暂不支持，"
+            "本次仍只计算位置增量（法线/切线保持基础网格值）；"
+            "需要全通道增量请改用直出形态键导出路线。"
+        )
     generator = NTMIDirectShapeKeyGenerator(
         node=node,
         mod_export_path=output_dir,

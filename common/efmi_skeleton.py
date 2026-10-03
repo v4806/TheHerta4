@@ -68,6 +68,9 @@ _BONE_MATRIX_FLOATS = 12
 _BONE_SEGMENT_FLOAT4 = 256 * 3
 # instance config 中骨骼段偏移所在的 float4 行（第 6 行）
 _INSTANCE_CONFIG_BONE_OFFSET_ROW = 5
+# 没有 LOD 前缀的身份默认按哪个 LOD 解析（与 common/workspace_helper.DEFAULT_LOD_NAME
+# 同口径；本模块刻意不依赖 bpy，因此不直接 import 那个模块里的常量）。
+_DEFAULT_LOD_NAME = "LOD0"
 # 写回 json 的算法版本。旧版只保存 VGMap，没有扩散采样判据，不能继续
 # 作为当前策略的幂等缓存使用；版本不匹配时 ensure_skeleton_data 自动重算。
 # v15：全零骨骼仍不参与跨 Component 去重，但会保留独立稳定槽位，使 VGMap
@@ -1062,6 +1065,56 @@ class EFMIBoneMapBuilder:
         return table
 
     @staticmethod
+    def _split_lod_identity(unique_str: str) -> tuple[str, str]:
+        """拆分身份里的 LOD 前缀（`LOD0.xxx-1-0` -> ("LOD0", "xxx-1-0")；裸身份 -> ("", 身份)）。"""
+        text = str(unique_str or "")
+        if "." in text:
+            head, tail = text.split(".", 1)
+            if head.upper().startswith("LOD") and head[3:].isdigit() and tail:
+                return head, tail
+        return "", text
+
+    @staticmethod
+    def _identity_matches(unique_str: str, component_unique_str: str) -> bool:
+        """工作区 json 身份（`__unique_str__`）是否对应当前组件身份（含 LOD0 兜底）。
+
+        裸身份（旧扁平工作空间遗留 / 手工命名的物体）与 `LOD0.<bare>` 互认，
+        与 WorkSpaceHelper.get_submesh_folder_path 的目录兜底、以及
+        ui/ntmi_modimp/runtime_cache.prefix_identity_matches 的「裸前缀按 LOD0
+        兼容」同口径；显式带 LOD 前缀的组件身份只认完全相同的身份（LOD1 部件
+        不能借 LOD0 的 json）。
+        """
+        if unique_str == component_unique_str:
+            return True
+        if not component_unique_str:
+            return False
+        lod_name, bare = EFMIBoneMapBuilder._split_lod_identity(component_unique_str)
+        if lod_name or not bare:
+            return False
+        return unique_str == f"{_DEFAULT_LOD_NAME}.{bare}"
+
+    @staticmethod
+    def _find_component_record(workspace_root: str, component_unique_str: str):
+        """按身份定位工作区组件 json（精确身份优先，裸身份再按 LOD0 兜底）。
+
+        返回 (submesh_dir, submesh_json)；找不到返回 None。兜底命中时 json 的
+        `__unique_str__` 带 LOD 前缀而传入身份是裸的——身份段 / VGMap / 强度
+        全部取自 json 本身，与传入字符串无关，因此可直接使用。
+        """
+        fallback = None
+        for submesh_dir, submesh_json in EFMIBoneMapBuilder._iter_submesh_jsons(
+            workspace_root
+        ):
+            unique_str = str(submesh_json.get("__unique_str__", "") or "")
+            if unique_str == component_unique_str:
+                return submesh_dir, submesh_json
+            if fallback is None and EFMIBoneMapBuilder._identity_matches(
+                unique_str, component_unique_str
+            ):
+                fallback = (submesh_dir, submesh_json)
+        return fallback
+
+    @staticmethod
     def build_per_mesh_identity_map(
         workspace_root: str,
         component_unique_str: str,
@@ -1092,23 +1145,27 @@ class EFMIBoneMapBuilder:
         table = EFMIBoneMapBuilder.get_dualset_export_table_cached(
             workspace_root, recompute_strength
         )
-        # 定位组件 C 的身份段 [vg_offset, vg_offset+vg_count) 与其 VGMap 引用槽
+        # 定位组件 C 的身份段 [vg_offset, vg_offset+vg_count) 与其 VGMap 引用槽。
+        # 身份匹配含 LOD0 兜底（裸身份 ↔ `LOD0.<bare>`）：物体/组件身份可能没有
+        # LOD 前缀（旧扁平工作空间遗留 / 手工命名），而工作区 json 一律带 LOD0
+        # 前缀；不兜底就会误报「找不到组件的 VGOffset/VGCount」。
         seg = None
         ref_slots: list[int] = []
-        for _dir, submesh_json in EFMIBoneMapBuilder._iter_submesh_jsons(
-            workspace_root
-        ):
-            if submesh_json.get("__unique_str__") == component_unique_str:
-                offset = int(submesh_json.get("VGOffset", 0) or 0)
-                count = int(submesh_json.get("VGCount", 0) or 0)
-                seg = (offset, offset + count)
-                vg_map = submesh_json.get("VGMap") or {}
-                ref_slots = sorted({int(v) for v in vg_map.values()})
-                break
+        record = EFMIBoneMapBuilder._find_component_record(
+            workspace_root, component_unique_str
+        )
+        if record is not None:
+            submesh_json = record[1]
+            offset = int(submesh_json.get("VGOffset", 0) or 0)
+            count = int(submesh_json.get("VGCount", 0) or 0)
+            seg = (offset, offset + count)
+            vg_map = submesh_json.get("VGMap") or {}
+            ref_slots = sorted({int(v) for v in vg_map.values()})
         if seg is None:
             raise RuntimeError(
                 f"[EFMI双套导出] 找不到组件 {component_unique_str} 的 "
                 "VGOffset/VGCount（工作区不一致或缓存陈旧），中止导出"
+                f"（已按 裸身份 与 默认 {_DEFAULT_LOD_NAME} 身份查找）"
             )
         result: dict[int, int] = {}
         for slot in ref_slots:
@@ -4256,11 +4313,21 @@ class EFMISkeletonMergeHelper:
         1. Import.json 记录了 unique_str 的数据类型 → `<子网格>/TYPE_<gametype>/<bare>.json`；
         2. 否则：子网格目录下只有一个 TYPE_ 目录含 json 时直接用；多个则拒绝（返回空）。
         unique_str 形如 `LOD0.<drawib>-<n>-<i>` 或 `<drawib>-<n>-<i>`。
+
+        没有 LOD 前缀的身份（旧扁平工作空间遗留 / 手工命名的物体）按默认 LOD0
+        兜底：先找裸身份目录，找不到再找 `LOD0/<bare>`（与
+        WorkSpaceHelper.get_submesh_folder_path 的目录兜底同口径）。
         """
         lod_name = ""
         bare = unique_str
         if "." in unique_str and unique_str.split(".", 1)[0].upper().startswith("LOD"):
             lod_name, bare = unique_str.split(".", 1)
+
+        # 每轮只用一个 LOD 身份：裸身份优先，整轮都没命中时才轮到 LOD0 兜底，
+        # 避免同一身份在裸目录与 LOD0 目录各命中一次被判成"多分区歧义"。
+        lod_passes = [[lod_name] if lod_name else [""]]
+        if not lod_name:
+            lod_passes.append([_DEFAULT_LOD_NAME])
 
         # 分区工作空间不会把分区名编码进 import_key；调用方仍传全局根目录。
         # 因此必须在这里沿与 WorkSpaceHelper 相同的 Config.json 契约枚举分区，
@@ -4283,49 +4350,64 @@ class EFMISkeletonMergeHelper:
             base_candidates.extend(os.path.abspath(entry.path) for entry in partition_entries)
 
         found: list[str] = []
-        for candidate_base in base_candidates:
-            base = os.path.join(candidate_base, lod_name) if lod_name else candidate_base
-            submesh_dir = os.path.join(base, bare)
-            if not os.path.isdir(submesh_dir):
-                continue
+        for lod_candidates in lod_passes:
+            for candidate_base in base_candidates:
+                for candidate_lod in lod_candidates:
+                    base = os.path.join(candidate_base, candidate_lod) if candidate_lod else candidate_base
+                    submesh_dir = os.path.join(base, bare)
+                    if not os.path.isdir(submesh_dir):
+                        continue
 
-            import_json = {}
-            # 根目录映射先读，分区自己的映射后读并覆盖同名项。
-            for import_root in (workspace_root, candidate_base):
-                import_json_path = os.path.join(import_root, "Import.json")
-                if not os.path.isfile(import_json_path):
-                    continue
-                try:
-                    loaded = JsonUtils.LoadFromFile(import_json_path)
-                except Exception:
-                    loaded = None
-                if isinstance(loaded, dict):
-                    import_json.update(loaded)
-            gametype = str(
-                import_json.get(unique_str, "") or import_json.get(bare, "") or ""
-            ).strip()
+                    import_json = {}
+                    # 根目录映射先读，分区自己的映射后读并覆盖同名项。
+                    for import_root in (workspace_root, candidate_base):
+                        import_json_path = os.path.join(import_root, "Import.json")
+                        if not os.path.isfile(import_json_path):
+                            continue
+                        try:
+                            loaded = JsonUtils.LoadFromFile(import_json_path)
+                        except Exception:
+                            loaded = None
+                        if isinstance(loaded, dict):
+                            import_json.update(loaded)
 
-            if gametype:
-                candidate = os.path.join(
-                    submesh_dir, "TYPE_" + gametype, bare + ".json"
-                )
-                if os.path.isfile(candidate):
-                    found.append(os.path.abspath(candidate))
-                    continue
+                    # 多 LOD 工作空间的键带 LOD 前缀；本轮身份（含 LOD0 兜底轮）
+                    # 对应的键都要试，否则会退化成"扫 TYPE_ 目录"的兜底路径。
+                    import_keys = [unique_str]
+                    for key_lod in lod_candidates:
+                        key = f"{key_lod}.{bare}" if key_lod else bare
+                        if key not in import_keys:
+                            import_keys.append(key)
+                    gametype = ""
+                    for key in import_keys:
+                        gametype = str(import_json.get(key, "") or "").strip()
+                        if gametype:
+                            break
 
-            try:
-                type_directories = os.listdir(submesh_dir)
-            except OSError:
-                continue
-            local_found = []
-            for dirname in type_directories:
-                if not dirname.startswith("TYPE_"):
-                    continue
-                candidate = os.path.join(submesh_dir, dirname, bare + ".json")
-                if os.path.isfile(candidate):
-                    local_found.append(os.path.abspath(candidate))
-            if len(local_found) == 1:
-                found.extend(local_found)
+                    if gametype:
+                        candidate = os.path.join(
+                            submesh_dir, "TYPE_" + gametype, bare + ".json"
+                        )
+                        if os.path.isfile(candidate):
+                            found.append(os.path.abspath(candidate))
+                            continue
+
+                    try:
+                        type_directories = os.listdir(submesh_dir)
+                    except OSError:
+                        continue
+                    local_found = []
+                    for dirname in type_directories:
+                        if not dirname.startswith("TYPE_"):
+                            continue
+                        candidate = os.path.join(submesh_dir, dirname, bare + ".json")
+                        if os.path.isfile(candidate):
+                            local_found.append(os.path.abspath(candidate))
+                    if len(local_found) == 1:
+                        found.extend(local_found)
+
+            if found:
+                break
 
         unique_found = sorted(set(found), key=str.casefold)
         return unique_found[0] if len(unique_found) == 1 else ""

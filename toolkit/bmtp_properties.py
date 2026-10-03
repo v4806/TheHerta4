@@ -75,7 +75,7 @@ class BMTP_Properties(bpy.types.PropertyGroup):
     wt_cleanup: bpy.props.BoolProperty(name="清理目标顶点组", default=True,
                                        description="在传递权重前，清空目标物体上所有现有的顶点组")
     wt_use_selected_groups: bpy.props.BoolProperty(name="只传递列表中选中的顶点组", default=False,
-                                                    description="只传递列表中选中的顶点组，其他顶点组会被暂时排除")
+                                                    description="只传递列表中选中的顶点组：传递前临时移除源物体与目标物体上的其他顶点组，传递结束后还原")
     wt_vertex_groups: bpy.props.CollectionProperty(type=BMTP_UL_VertexGroupItem, name="顶点组列表")
     wt_vertex_groups_index: bpy.props.IntProperty(name="顶点组列表索引", default=0)
     wt_use_shapekey_positions: bpy.props.BoolProperty(name="使用形态键位置", default=False,

@@ -1684,12 +1684,13 @@ class TestEFMIClickExportLinkage(unittest.TestCase):
         # t29 F1：_load_click_export_module 内的 _set_logic_name("") 亦需恢复
         self.addCleanup(_restore_logic_name)
 
-    def _make_ce_node(self, zone=0, cycle=0, targets=("swapkey1",)):
+    def _make_ce_node(self, zone=0, cycle=0, targets=("swapkey1",), values=""):
         ce = self.ce_mod.SSMTNode_AnimDriver_ClickExport.__new__(
             self.ce_mod.SSMTNode_AnimDriver_ClickExport
         )
         ce.click_zone_id = zone
         ce.cycle_length = cycle
+        ce.click_values = values
         ce.click_target_list = [
             types.SimpleNamespace(variable_name=t) for t in targets
         ]
@@ -1754,6 +1755,38 @@ class TestEFMIClickExportLinkage(unittest.TestCase):
             dtype=np.uint32,
         ).reshape(-1, 4)
         np.testing.assert_array_equal(sync_map[0], [5, 0, 2, 0])
+
+    def test_click_export_value_list_drives_cycle_and_skips_seed(self):
+        """「开关值」模式跨节点契约：列表长度即循环档数（覆盖 cycle_length=7），
+        且不播种（列表值 → 点击计数不可逆，重启回列表首项）→ 播种条目数 0。"""
+        ce = self._make_ce_node(zone=0, cycle=7, values="0 0 1")
+        self._install_cross_tree_env([ce])
+        consumer = _make_sk_consumer([_make_sk_item(zone=0, stage=2)])
+        anim_driver = types.SimpleNamespace(
+            bl_idname="SSMTNode_PostProcess_AnimDriver",
+            mute=False,
+            blueprint_name="AnimTree1",
+        )
+        node = _make_efmi_node()
+        object.__setattr__(
+            node, "id_data", types.SimpleNamespace(nodes=[consumer, anim_driver])
+        )
+        exporter = self.mod.DragInteractionEFMIExporter(node)
+
+        self.assertEqual(exporter._collect_click_export_drivers(), [(0, 3, "")])
+        self.assertEqual(exporter._click_export_seed_entries(), [])
+        # 布局：zone0 档位 = max(形态键 2, 列表 3 - 1) = 2 → total = 4 + 2 = 6
+        total, bases, counts = exporter._drag_drive_buffer_layout()
+        self.assertEqual(counts, [2])
+        self.assertEqual(bases, [0])
+        self.assertEqual(total, 6)
+        # 驱动 CS 段播种条目数 0（y157 = 0，无 x158/y158 变量行）
+        td = _make_efmi_mod_dir()
+        exporter.execute(str(td))
+        sections = _read_ini_sections(td / "main.ini")
+        drive_cs = "\n".join(sections["[CustomShaderEFMIDragShapeKeyDrive_A]"])
+        self.assertIn("y157 = 0", drive_cs)
+        self.assertNotIn("y158 = $swapkey1", drive_cs)
 
     def test_click_export_readback_segment_efmi(self):
         """点击回读段族：ClickExport 在 EFMI 模式生成 booted/seed_pending 门控
@@ -3275,12 +3308,13 @@ class TestEFMIFinalFindings(unittest.TestCase):
         sections = _read_ini_sections(td / "main.ini")
         return td, sections
 
-    def _make_ce_node(self, zone=0, cycle=0, targets=("swapkey1",)):
+    def _make_ce_node(self, zone=0, cycle=0, targets=("swapkey1",), values=""):
         ce = self.ce_mod.SSMTNode_AnimDriver_ClickExport.__new__(
             self.ce_mod.SSMTNode_AnimDriver_ClickExport
         )
         ce.click_zone_id = zone
         ce.cycle_length = cycle
+        ce.click_values = values
         ce.click_target_list = [
             types.SimpleNamespace(variable_name=t) for t in targets
         ]

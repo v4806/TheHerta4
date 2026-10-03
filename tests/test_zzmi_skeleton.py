@@ -42,6 +42,7 @@ for _name in (PKG, f"{PKG}.common", f"{PKG}.utils"):
     _install_package(_name)
 _load_module(f"{PKG}.utils.json_utils", REPO_ROOT / "utils" / "json_utils.py")
 _efmi = _load_module(f"{PKG}.common.efmi_skeleton", REPO_ROOT / "common" / "efmi_skeleton.py")
+_load_module(f"{PKG}.common.zzmi_channel", REPO_ROOT / "common" / "zzmi_channel.py")
 _zzmi = _load_module(f"{PKG}.common.zzmi_skeleton", REPO_ROOT / "common" / "zzmi_skeleton.py")
 
 EFMIBoneMapBuilder = _efmi.EFMIBoneMapBuilder
@@ -689,6 +690,112 @@ class MovedDumpDedupedFallbackTests(unittest.TestCase):
             self.assertEqual(parser.get_render_cb1_path("000010"), str(real))
 
 
+class SharedCb1WindowTests(unittest.TestCase):
+    """回归 FrameAnalysis-2026-09-16-014450：多对象共享 cb1 数组按窗口取对象变换。
+
+    同一 4096B 资源被 draw 64/65/66 按 first_constant=0/32/64 逐 512B 一窗切给
+    三个对象。旧实现无视窗口读 float 0（= 别的对象的矩阵），把**本来同对象空间**
+    的部件拆进不同 SkeletonGroup/合集。这里断言：两个 draw 各绑自己的窗口、
+    窗口内 16 floats 逐位相同 → 解析出同一分组键 → 同一骨架组。
+    """
+
+    # 两个不同对象的对象变换（平移不同）
+    TF_A = (
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        599.68475, 1.51398, 0.14267, 1.0,
+    )
+    TF_SHARED = (
+        -0.13356, -0.98743, 0.08457, 0.0,
+        0.25211, -0.11638, -0.96068, 0.0,
+        0.95844, -0.10698, 0.26448, 0.0,
+        599.99939, 0.95109, -0.00280, 1.0,
+    )
+
+    def _write_shared_cb1(self, path):
+        """4096B 共享数组：窗口 0 = 对象 A、窗口 64 = 本部件对象。"""
+        rows = numpy.zeros((256, 4), dtype=numpy.float32)
+        rows[0:4] = numpy.array(self.TF_A, dtype=numpy.float32).reshape(4, 4)
+        rows[64:68] = numpy.array(self.TF_SHARED, dtype=numpy.float32).reshape(4, 4)
+        rows.tofile(path)
+
+    def _write_per_object_cb1(self, path):
+        """512B 逐部件块：对象变换在 float 0。"""
+        rows = numpy.zeros((32, 4), dtype=numpy.float32)
+        rows[0:4] = numpy.array(self.TF_SHARED, dtype=numpy.float32).reshape(4, 4)
+        rows.tofile(path)
+
+    def test_window_makes_same_object_space_parts_share_one_group(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dump = root / "dump"
+            deduped = dump / "deduped"
+            deduped.mkdir(parents=True)
+            shared = deduped / "aaaa0001.buf"      # 4096B 共享数组
+            per_object = deduped / "bbbb0002.buf"  # 512B 逐部件块
+            self._write_shared_cb1(shared)
+            self._write_per_object_cb1(per_object)
+            log = dump / "log.txt"
+            log.write_text(
+                "000066 IASetIndexBuffer(pIndexBuffer:0x1, Format:57, "
+                "Offset:0) hash=cdb2cc7d\n"
+                "000066 VSSetConstantBuffers1(StartSlot:1, NumBuffers:1, "
+                "ppConstantBuffers:0x1, pFirstConstant:0x2, pNumConstants:0x3)\n"
+                "       1: resource=0x0000017AD0994738 hash=a394978d "
+                "first_constant=64 num_constants=32\n"
+                "000066 DrawIndexedInstanced(IndexCountPerInstance:30177, "
+                "InstanceCount:1, StartIndexLocation:0, BaseVertexLocation:0, "
+                "StartInstanceLocation:0)\n"
+                "000066 3DMigoto Dumping Buffer "
+                f"000066-vs-cb1=a394978d-vs=c280f6945b23a42a.buf -> {shared}\n"
+                "000069 IASetIndexBuffer(pIndexBuffer:0x2, Format:57, "
+                "Offset:0) hash=2825da1e\n"
+                "000069 VSSetConstantBuffers1(StartSlot:1, NumBuffers:1, "
+                "ppConstantBuffers:0x1, pFirstConstant:0x2, pNumConstants:0x3)\n"
+                "       1: resource=0x0000017AD098B978 hash=0c8934aa "
+                "first_constant=0 num_constants=32\n"
+                "000069 DrawIndexedInstanced(IndexCountPerInstance:44646, "
+                "InstanceCount:1, StartIndexLocation:0, BaseVertexLocation:0, "
+                "StartInstanceLocation:0)\n"
+                "000069 3DMigoto Dumping Buffer "
+                f"000069-vs-cb1=0c8934aa-vs=c280f6945b23a42a.buf -> {per_object}\n",
+                encoding="utf-8",
+            )
+
+            parser = ZZMILogParser(str(log))
+
+            # 窗口起点按 draw 分开记录（旧实现根本不采这个字段）
+            self.assertEqual(parser.get_vs_cb_first_constant("000066", 1), 64)
+            self.assertEqual(parser.get_vs_cb_first_constant("000069", 1), 0)
+            # 未记录绑定的 draw 缺省 0（= 逐部件 512B dump 语义）
+            self.assertEqual(parser.get_vs_cb_first_constant("000070", 1), 0)
+
+            transform_shared = ZZMIBoneMapBuilder.parse_object_transform(
+                str(shared),
+                first_constant=parser.get_vs_cb_first_constant("000066", 1),
+            )
+            transform_per_object = ZZMIBoneMapBuilder.parse_object_transform(
+                str(per_object),
+                first_constant=parser.get_vs_cb_first_constant("000069", 1),
+            )
+            self.assertEqual(
+                transform_shared,
+                tuple(float(x) for x in numpy.array(self.TF_SHARED, dtype=numpy.float32)),
+            )
+            # 旧实现读 float 0 会得到 TF_A —— 断言窗口确实换掉了答案
+            self.assertNotEqual(
+                transform_shared,
+                tuple(float(x) for x in numpy.array(self.TF_A, dtype=numpy.float32)),
+            )
+            # 同对象空间 → 同一 SkeletonGroup（修好前这里是两组）
+            groups = _zzmi.assign_skeleton_groups({
+                "cdb2cc7d": transform_shared,
+                "2825da1e": transform_per_object,
+            })
+            self.assertEqual(groups["cdb2cc7d"], groups["2825da1e"])
+
+
 def _make_zzmi_dump_and_workspace(root: Path):
     """构造最小 ZZMI dump + 工作空间：两个部件共享同一对象变换 CB。
 
@@ -968,7 +1075,10 @@ class ZZMIWorkspaceCacheOnlyTests(unittest.TestCase):
         rejected = _read_zzmi_json(self.ws, "aaaa1111-100-0")
         accepted = _read_zzmi_json(self.ws, "bbbb2222-200-0")
         self.assertNotIn("VGMapAlgorithmVersion", rejected)
-        self.assertEqual(accepted.get("VGMapAlgorithmVersion"), 3)
+        self.assertEqual(
+            accepted.get("VGMapAlgorithmVersion"),
+            _zzmi.ZZMI_VG_MAP_ALGORITHM_VERSION,
+        )
         self.assertIn("不同对象 CB1 实例", message)
 
     def test_dump_deleted_rebuilds_from_workspace_cache_only(self):
@@ -1055,7 +1165,10 @@ class ZZMIWorkspaceCacheOnlyTests(unittest.TestCase):
         self.assertTrue(ok2, message2)
         for bare in before:
             rebuilt = _read_zzmi_json(self.ws, bare)
-            self.assertEqual(rebuilt["VGMapAlgorithmVersion"], 3)
+            self.assertEqual(
+                rebuilt["VGMapAlgorithmVersion"],
+                _zzmi.ZZMI_VG_MAP_ALGORITHM_VERSION,
+            )
             self.assertEqual(rebuilt["VGMap"], before[bare]["VGMap"])
             self.assertEqual(rebuilt["SkeletonGroup"], before[bare]["SkeletonGroup"])
             self.assertIs(rebuilt.get("ObjectCB1CacheValid"), True)
@@ -1727,6 +1840,100 @@ class ZZMISiblingCacheTests(unittest.TestCase):
             for bare in self.bares
         }
         self.assertEqual(cache_groups, dump_groups)
+
+
+class ZZMIMergedMetadataGateTests(unittest.TestCase):
+    """生成侧与开关无关（用户要求）+ 自愈的判据单测。
+
+    导入侧门控（ui/ui_func_import_ssmt.py）为
+    ``zzmi_merged_consumption or zzmi_merged_metadata_missing``——即复选框关闭
+    时，只要请求集内还有子网格缺合并元数据（或数据不完整），本次导入也必须
+    修复性反查/升级落盘。本类钉住这一半判据（`missing_merged_metadata_exist`）：
+    首次导入/清缓存后/旧版缓存必须为 True，数据完整后必须为 False（幂等，开关
+    关闭时不会重复解析提取文件）。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="zzmi_meta_gate_")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.dump, self.ws, self.unique_strs = _make_zzmi_dump_and_workspace(
+            Path(self.tmp)
+        )
+
+    def _missing(self) -> bool:
+        return ZZMISkeletonMergeHelper.missing_merged_metadata_exist(
+            str(self.ws), self.unique_strs
+        )
+
+    def test_missing_before_generation_and_present_after(self):
+        # 首次导入（新工作空间）：没有任何 VGMap ⇒ 必须触发预生成
+        self.assertTrue(self._missing())
+        ok, message = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs
+        )
+        self.assertTrue(ok, message)
+        # 数据完整后幂等：复选框关闭时不会因为本判据重复反查提取文件
+        self.assertFalse(self._missing())
+
+    def test_clear_cache_makes_metadata_missing_again(self):
+        ok, message = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs
+        )
+        self.assertTrue(ok, message)
+        self.assertFalse(self._missing())
+
+        # 用户执行「清除骨骼合并VGMap缓存」：即使复选框关闭，下次导入也必须
+        # 重新反查（有新提取文件用新的，没有则用工作空间缓存）。
+        _efmi.EFMISkeletonMergeHelper.clear_vgmap_cache(str(self.ws))
+        self.assertTrue(self._missing())
+
+        shutil.rmtree(self.dump)
+        ok2, message2 = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs
+        )
+        self.assertTrue(ok2, message2)
+        self.assertFalse(self._missing())
+        for bare in ("aaaa1111-100-0", "bbbb2222-200-0"):
+            runtime = self.ws / "LOD0" / bare / "ModImpRuntime"
+            self.assertTrue((runtime / f"{bare}-BoneMatrix.buf").is_file())
+            self.assertTrue((runtime / f"{bare}-ObjectCB1.buf").is_file())
+
+    def test_incomplete_cache_is_self_healed_without_dump(self):
+        """旧算法版本的「存在但不完整」数据也必须自愈，且不需要提取文件。"""
+        ok, message = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs
+        )
+        self.assertTrue(ok, message)
+        self.assertFalse(self._missing())
+
+        # 把缓存降级成 v4（缺 ChannelPlan 系列字段）：快路径完整性不再成立
+        for bare in ("aaaa1111-100-0", "bbbb2222-200-0"):
+            payload = _read_zzmi_json(self.ws, bare)
+            payload["VGMapAlgorithmVersion"] = 4
+            for key in ("ChannelPlan", "ChannelPlanVersion", "ChannelPlanSlotWeights"):
+                payload.pop(key, None)
+            _write_zzmi_json(self.ws, bare, payload)
+        self.assertTrue(
+            self._missing(),
+            "旧算法版本的缓存必须被判为需要处理（复选框关闭时也要自愈）",
+        )
+
+        # 提取文件已删除：v4→v5 只凭 VGMap 就地升级，不得要求重新提取
+        shutil.rmtree(self.dump)
+        ok2, message2 = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs
+        )
+        self.assertTrue(ok2, message2)
+        # 就地升级（v4→v5 只补 ChannelPlan，不需要提取文件）：两份 json 必须
+        # 已经带上当前算法版本与通道计划记录
+        for bare in ("aaaa1111-100-0", "bbbb2222-200-0"):
+            payload = _read_zzmi_json(self.ws, bare)
+            self.assertEqual(
+                payload["VGMapAlgorithmVersion"],
+                _zzmi.ZZMI_VG_MAP_ALGORITHM_VERSION,
+            )
+            self.assertIsInstance(payload.get("ChannelPlan"), dict)
+        self.assertFalse(self._missing())
 
 
 if __name__ == "__main__":

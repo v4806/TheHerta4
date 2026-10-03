@@ -9,6 +9,10 @@ OBJECT_SWAP_PREFIX = "swapkey"
 SHAPEKEY_PREFIX = "Freq_"
 CONTINUOUS_SHAPEKEY_INDEX_PREFIX = "continuous_shapekey_frame"
 UV_OFFSET_PREFIX = "uv_offset"
+#: 「运行时间」动画驱动节点的帧计数器变量前缀（按节点 auto_index 命名）。
+#: 全部运行时间节点都用这一族名字（不再有共享的 ``swapvar`` 兼容别名），
+#: 因此不会与历史产物里的 ``$swapvar`` / Velo 桥接的 ``$swapvar_*`` 交叉冲突。
+ANIM_DRIVER_FRAME_PREFIX = "anim_frame"
 
 _SAFE_NAME_RE = re.compile(r"[^a-zA-Z0-9_]")
 
@@ -111,7 +115,13 @@ def _join_csv(values: Iterable[str]) -> str:
     return ",".join(values)
 
 
-def _iter_blueprint_nodes():
+def _iter_blueprint_nodes(tree=None):
+    """遍历蓝图节点；``tree`` 给定时只遍历该树（不传则扫全部蓝图树）。"""
+    if tree is not None:
+        for node in getattr(tree, "nodes", []) or []:
+            yield node
+        return
+
     node_groups = getattr(getattr(bpy, "data", None), "node_groups", None)
     if not node_groups:
         return
@@ -163,6 +173,198 @@ def _iter_shapekey_item_variable_names(item):
         yield custom_name
     if assigned_name:
         yield assigned_name
+
+
+# ---------------------------------------------------------------------------
+# 「所有权」与「引用」的区分（预分配 _1 后缀 bug 的根因修复）
+# ---------------------------------------------------------------------------
+# 一个变量名只能被一个节点**声明**（owner）。动画驱动节点的「驱动变量」列表
+# （driven_variable_list / click_target_list / target_list / condition_list /
+# shapekey_items[].variable …）只是**引用**别的节点已经声明的变量，它自己不声明
+# 那个名字。
+#
+# 历史实现把两者混进同一个计数器（_collect_used_variable_name_counts），于是
+# 形态键节点做预分配时会把「驱动节点想驱动的那个基名」当成别人已占用 →
+# 退到 Freq_xxx_1；而驱动节点保存的仍是基名 → 两边永久错开：导出后驱动写一个
+# 没人声明的变量（3DMigoto 视为局部变量 → 跨段失效），形态键着色器读另一个变量，
+# 「拖拽/动画驱动 ↔ 形态键变量」整条联动静默死掉。
+#
+# 正确口径：冲突检测只看 owner；引用名由 build_shape_key_reference_alias_map()
+# 在导出时解析成 owner 的权威名。
+
+# 节点上「自己声明」的标量变量字段（owner）。
+_OWNER_SCALAR_VARIABLE_FIELDS = (
+    "custom_var_name",
+    "assigned_variable_name",
+    "custom_continuous_index_variable_name",
+    "assigned_continuous_index_variable_name",
+    "custom_paused_var",
+    "custom_frame_variable_name",
+    "assigned_frame_variable_name",
+    "accumulator_variable",
+    "drag_mode_variable_name",
+    "ui_detected_variable_name",
+    "ui_zone_variable_name",
+)
+
+# 节点上的「引用别人变量」的集合字段（reference）。元素字段名见
+# _REFERENCE_ITEM_FIELDS。
+_REFERENCE_COLLECTION_FIELDS = (
+    "driven_variable_list",
+    "click_target_list",
+    "pause_target_list",
+    "target_list",
+    "else_target_list",
+    "condition_list",
+    "shapekey_items",
+    "continuous_shapekey_items",
+)
+
+# 引用型集合元素里可能承载变量名的字段。
+_REFERENCE_ITEM_FIELDS = ("variable_name", "variable")
+
+# driven_variable 是「自声明」的节点类型（形态键序列驱动把它当自增帧计数器，
+# 由该节点自己 global persist 声明）；其余驱动类型的 driven_variable 是迁移前的
+# 遗留「目标变量」引用。
+_DRIVEN_VARIABLE_IS_OWNED_TYPES = ("SSMTNode_AnimDriver_ShapeKeySequence",)
+
+
+def _iter_reference_item_variable_names(item):
+    for field in _REFERENCE_ITEM_FIELDS:
+        raw = getattr(item, field, None)
+        if raw is None:
+            continue
+        name = normalize_variable_name(raw)
+        if name:
+            yield name
+
+
+def _iter_node_reference_variable_names(node):
+    """产出节点上「引用别人变量」的名字（不含自己声明的）。"""
+    bl_idname = str(getattr(node, "bl_idname", "") or "")
+    if bl_idname not in _DRIVEN_VARIABLE_IS_OWNED_TYPES:
+        legacy = normalize_variable_name(getattr(node, "driven_variable", "") or "")
+        if legacy:
+            yield legacy
+    for field in _REFERENCE_COLLECTION_FIELDS:
+        for item in getattr(node, field, None) or []:
+            yield from _iter_reference_item_variable_names(item)
+
+
+def _iter_node_owned_variable_names(node):
+    """产出节点上「自己声明」的名字（owner）。"""
+    bl_idname = str(getattr(node, "bl_idname", "") or "")
+    if bl_idname in _DRIVEN_VARIABLE_IS_OWNED_TYPES:
+        owned = normalize_variable_name(getattr(node, "driven_variable", "") or "")
+        if owned:
+            yield owned
+    for field in _OWNER_SCALAR_VARIABLE_FIELDS:
+        name = normalize_variable_name(getattr(node, field, "") or "")
+        if name:
+            yield name
+
+
+def _collect_owner_variable_name_counts(context=None) -> Counter:
+    """只统计「被某个节点声明」的变量名。
+
+    与 _collect_used_variable_name_counts 的差别：不把动画驱动的目标变量引用算进来。
+    分配器必须用这份计数判冲突，否则引用名会把 owner 挤到 _N 后缀（见上方注释）。
+    """
+    counts = Counter()
+
+    for node in _iter_blueprint_nodes() or ():
+        bl_idname = getattr(node, "bl_idname", "")
+
+        if bl_idname == "SSMTNode_PostProcess_ShapeKey":
+            for item in getattr(node, "shapekey_variable_items", []):
+                counts.update(_iter_shapekey_item_variable_names(item))
+            continue
+
+        if bl_idname == "SSMTNode_PostProcess_UVOffset":
+            for item in getattr(node, "uv_offset_variable_items", []):
+                counts.update(_iter_uv_offset_item_variable_names(item))
+            continue
+
+        owned_names = tuple(_iter_node_owned_variable_names(node))
+        if owned_names:
+            counts.update(owned_names)
+
+    return counts
+
+
+def build_shape_key_reference_alias_map(context=None) -> dict:
+    """构建「形态键基名 → 该形态键真正分配的变量名」别名表。
+
+    只有当权威名与基名不同、且基名本身没有被任何 owner 占用时才登记
+    （基名被占用说明那是真正的同名去重，不该被别名改写）。
+    同一个基名对应多个形态键时视为歧义，不登记（交给导出校验告警）。
+    """
+    owners = _collect_owner_variable_name_counts(context)
+    candidates = {}
+    ambiguous = set()
+
+    for node in _iter_blueprint_nodes() or ():
+        if getattr(node, "bl_idname", "") != "SSMTNode_PostProcess_ShapeKey":
+            continue
+        for item in getattr(node, "shapekey_variable_items", []) or []:
+            shape_key_name = str(getattr(item, "shape_key_name", "") or "").strip()
+            if not shape_key_name:
+                continue
+            actual = normalize_variable_name(getattr(item, "custom_variable_name", "") or "")
+            if not actual:
+                actual = normalize_variable_name(getattr(item, "assigned_variable_name", "") or "")
+            if not actual:
+                continue
+            base = f"{SHAPEKEY_PREFIX}{_sanitize_name(shape_key_name, fallback='shape')}"
+            if base == actual:
+                continue
+            if base in owners:
+                # 基名属于别的 owner：这是合法的同名去重，不做别名改写
+                continue
+            previous = candidates.get(base)
+            if previous is not None and previous != actual:
+                ambiguous.add(base)
+                continue
+            candidates[base] = actual
+
+    for base in ambiguous:
+        candidates.pop(base, None)
+    return candidates
+
+
+def resolve_reference_variable_name(name: str, alias_map: Optional[dict] = None) -> str:
+    """把一个引用名解析成权威 owner 名；没有别名时原样返回（无 $ 前缀）。"""
+    normalized = normalize_variable_name(name)
+    if not normalized:
+        return ""
+    if alias_map is None:
+        alias_map = build_shape_key_reference_alias_map()
+    return alias_map.get(normalized, normalized)
+
+
+_REFERENCE_TOKEN_RE = re.compile(r"\$([A-Za-z_][A-Za-z0-9_]*)")
+
+
+def rewrite_reference_variables_in_text(text: str, alias_map: Optional[dict] = None) -> str:
+    """把文本里所有 ``$引用名`` 改写成权威 owner 名（只在别名命中时改写）。
+
+    用于动画驱动段这类「整体生成、事后无法逐个字段回改」的产物：驱动节点保存的
+    可能是旧基名，而形态键节点已经拿了 _N 名，这里在发射前把引用对齐。
+    """
+    source = str(text or "")
+    if not source:
+        return source
+    if alias_map is None:
+        alias_map = build_shape_key_reference_alias_map()
+    if not alias_map:
+        return source
+
+    def _replace(match):
+        token = match.group(1)
+        resolved = alias_map.get(token)
+        return f"${resolved}" if resolved else match.group(0)
+
+    return _REFERENCE_TOKEN_RE.sub(_replace, source)
 
 
 def _iter_uv_offset_item_variable_names(item):
@@ -269,6 +471,33 @@ def ensure_object_swap_variable_name(node, context=None) -> str:
         return candidate
 
 
+def ensure_anim_driver_frame_variable_name(node, context=None) -> str:
+    """「运行时间」动画驱动节点的帧计数器变量名（预分配，按 auto_index 命名）。
+
+    为什么要预分配：运行时间节点此前硬编码 ``global persist $swapvar``，N 个节点
+    就 N 份同名声明 —— 同值要靠归并、异值要靠分叉（分叉还要段内改名，极易出错）。
+    改成每节点一个预分配名后，同名声明从源头消失，归一逻辑对这类重复不再触发。
+
+    名字已存在时直接返回（**不重新分配**）；新分配时避开其它 owner 已占用的名字。
+    """
+    current = normalize_variable_name(getattr(node, "assigned_frame_variable_name", "") or "")
+    if current:
+        _collect_used_variable_name_counts(context)
+        return current
+
+    used_counts = _collect_owner_variable_name_counts(context)
+    base = f"{ANIM_DRIVER_FRAME_PREFIX}{int(getattr(node, 'auto_index', 0) or 0)}"
+    candidate = base
+    suffix = 1
+    while _is_name_used_by_other_owner(candidate, used_counts):
+        candidate = f"{base}_{suffix}"
+        suffix += 1
+    node.assigned_frame_variable_name = candidate
+    used_counts[candidate] += 1
+    _sync_variable_usage_cache(used_counts, context=context)
+    return candidate
+
+
 def validate_unique_object_swap_variable_names(nodes, context=None) -> None:
     """校验每个物体切换节点最终生效的变量名在本次导出中唯一。"""
     owners = {}
@@ -299,8 +528,15 @@ def allocate_shape_key_variable_name(
     context=None,
     owned_names: Optional[Iterable[str]] = None,
 ) -> str:
+    """给形态键分配导出变量名。
+
+    冲突检测只针对**owner**（_collect_owner_variable_name_counts）：动画驱动
+    /点击导出保存的「目标变量」只是引用，绝不能把形态键挤到 _N 后缀——否则
+    驱动引用名与形态键实际变量名永久错开，导出后联动整条失效（见模块上方
+    「所有权与引用的区分」注释）。
+    """
     preferred_normalized = normalize_variable_name(preferred or "")
-    used_counts = _collect_used_variable_name_counts(context)
+    used_counts = _collect_owner_variable_name_counts(context)
     owned_counts = _normalize_owned_counts(owned_names)
 
     if preferred_normalized:
@@ -318,6 +554,40 @@ def allocate_shape_key_variable_name(
         if not _is_name_used_by_other_owner(indexed, used_counts, owned_counts):
             return indexed
         suffix += 1
+
+
+def shape_key_base_variable_name(shape_key_name: str) -> str:
+    """形态键在**当前命名规则**下的基名（不含冲突后缀）。
+
+    只反映命名函数（``cjk_to_ascii`` / ``_sanitize_name``）的输出，与「有没有被
+    别的 owner 占用」无关。预分配刷新靠它区分两件事：
+
+    * 旧名既不是基名、也不是「基名_N」 → 命名规则变了（装上/卸下 pypinyin、
+      ``cjk_to_ascii`` 升级），允许按新规则刷新已分配名；
+    * 旧名 == 基名 或 「基名_N」 → 命名规则没变，差异只可能来自「基名被别的
+      owner 占了」这种冲突去重，**绝不允许**改写已分配名（否则别的蓝图树一增
+      一减就会把本树的变量名改掉，驱动/导出引用全部错位）。
+    """
+    return f"{SHAPEKEY_PREFIX}{_sanitize_name(shape_key_name, fallback='shape')}"
+
+
+def get_referenced_variable_names(context=None, tree=None) -> set[str]:
+    """所有「引用别人变量」的名字（驱动/点击目标/条件等），不含 owner 声明。
+
+    导出期的预分配名自愈（``heal_forked_shape_key_variable_names``）只允许在
+    「基名确实还被某处引用」时才把 ``基名_N`` 拉回基名：那种情况是历史 bug
+    （引用名挤占 owner）留下的分叉，必须对齐；没有引用时后缀只是历史冲突残留，
+    拉回去就等于改写了一个已分配的变量名。
+
+    ``tree`` 给定时只扫该树 —— 自愈必须**按树**判定：别的蓝图树（别的
+    workspace）的引用名不该决定本树的变量名，否则变量名又会随别的树一增一减
+    而变。跨树的引用对齐由 ``build_shape_key_reference_alias_map`` 在发射前
+    完成，不依赖这里的自愈。
+    """
+    names: set[str] = set()
+    for node in _iter_blueprint_nodes(tree):
+        names.update(_iter_node_reference_variable_names(node))
+    return names
 
 
 def get_node_variable_name(node, context=None) -> str:

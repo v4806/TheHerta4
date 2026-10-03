@@ -3,9 +3,12 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
+
+from tests import _real_modules
 
 
 def _install_module(name, **attrs):
@@ -21,6 +24,10 @@ def _install_module(name, **attrs):
 PKG = "_sk_dragdrive_test_pkg"
 for package_name in (PKG, f"{PKG}.blueprint", f"{PKG}.common"):
     _install_module(package_name)
+
+# 真实 common 子模块按 fake 包前缀注册（空 __path__ 假包解析不了相对导入）
+_real_modules.register_real_common_modules(f"{PKG}.common")
+_safe_write = sys.modules[f"{PKG}.common.safe_write"]
 
 _fake_bpy = types.SimpleNamespace(
     types=types.SimpleNamespace(PropertyGroup=object, Operator=object, UIList=object, Node=object),
@@ -69,6 +76,8 @@ _install_module(
     cjk_to_ascii=lambda value: str(value or ""),
     is_pinyin_available=lambda **_kwargs: False,
     reset_pinyin_cache=lambda *_args, **_kwargs: None,
+    shape_key_base_variable_name=lambda name: f"Freq_{name}",
+    get_referenced_variable_names=lambda *_args, **_kwargs: set(),
 )
 _install_module(
     f"{PKG}.common.mod_path_compat",
@@ -92,6 +101,14 @@ _spec = importlib.util.spec_from_file_location(f"{PKG}.blueprint.node_postproces
 _module = importlib.util.module_from_spec(_spec)
 sys.modules[_spec.name] = _module
 _spec.loader.exec_module(_module)
+
+
+def _read_text(path):
+    with open(path, encoding="utf-8") as file_obj:
+        return file_obj.read()
+
+
+_write_text_if_changed = _safe_write.write_text_if_changed
 
 _TEMPLATES = {
     "merged_delta": "shapekey_anim_packed_delta_v5_merged.hlsl",
@@ -136,7 +153,11 @@ class ShapeKeyDragDriveTests(unittest.TestCase):
         if not os.path.exists(src):
             self.skipTest(f"template missing: {src}")
         dest = os.path.join(self.out_dir, template_name)
-        shutil.copy2(src, dest)
+        # 与生产路径一致：只在缺失时播种模板，随后**以模板为源**注入到目标。
+        # 生产侧已不再用 shutil.copy2 —— 它会每轮重置目标 mtime，使 3DMigoto
+        # 的编译缓存必然错配。
+        if not os.path.exists(dest):
+            _write_text_if_changed(dest, _read_text(src))
         self.node._update_shader_file(
             dest,
             {1: {"Breast_L": ["obj1"], "Breast_R": ["obj2"]}, 2: {"Hip": ["obj3"]}},
@@ -148,6 +169,7 @@ class ShapeKeyDragDriveTests(unittest.TestCase):
             merge_slot_files=(template_name in ("shapekey_anim_packed_delta_v5_merged.hlsl", "shapekey_anim_packed_v5_merged.hlsl")),
             drag_drive_enabled=True,
             drag_zone_ids=self.node._drag_drive_zone_ids(["Breast_L", "Breast_R", "Hip"]),
+            source_path=src,
         )
         with open(dest, encoding="utf-8") as f:
             return f.read()
@@ -167,6 +189,39 @@ class ShapeKeyDragDriveTests(unittest.TestCase):
     def test_default_dir_is_no_direction_mapped_to_slot_4(self):
         node = _make_node({"A": 0, "B": 2})
         self.assertEqual(node._drag_drive_dirs(["A", "B"]), [4, 4])
+
+    def test_regenerating_same_config_does_not_retouch_shader_file(self):
+        """形态键着色器是**动态生成**的；同一配置重复导出必须不重写文件。
+
+        3DMigoto 按 ``.hlsl`` 的 mtime 与 ``<stage>_5_0.<flags>.bin`` 配对
+        （``CompareFileTime`` 必须精确相等）。若每次导出都重写，即使生成内容
+        完全相同，mtime 也会被刷新、编译缓存整族失效，下次进游戏/F10 全量重编译。
+
+        这里直接走生产路径（``shutil.copy2`` 模板 → ``_update_shader_file`` 注入）
+        连跑两次，断言第二次不触碰文件。
+        """
+        template = "shapekey_anim_packed_delta_v5_merged.hlsl"
+        target = os.path.join(self.out_dir, template)
+
+        self._generate(template)
+        self.assertTrue(os.path.isfile(target))
+        with open(target, "rb") as file_obj:
+            bytes_first = file_obj.read()
+        mtime_first = os.path.getmtime(target)
+
+        time.sleep(0.05)
+        content_second = self._generate(template)
+        mtime_second = os.path.getmtime(target)
+
+        self.assertEqual(
+            mtime_first, mtime_second,
+            "同配置重复导出不得刷新着色器 mtime（否则 3DMigoto 编译缓存失效）",
+        )
+        with open(target, "rb") as file_obj:
+            self.assertEqual(bytes_first, file_obj.read(), "磁盘字节不得变化")
+        # 同时确认生成本身是确定性的（内容一致才有资格谈"不变就不写"）
+        with open(target, encoding="utf-8") as file_obj:
+            self.assertEqual(file_obj.read(), content_second)
 
     def test_negative_dir_maps_to_no_direction_slot(self):
         node = _make_node(
@@ -302,6 +357,50 @@ class ShapeKeyDragDriveTests(unittest.TestCase):
             content = f.read()
         self.assertNotIn("ShapeKeyDrive", content)
         self.assertIn("IniParams[100 + freq_idx_slot0].x", content)
+
+    def test_no_zone_bound_still_emits_full_length_lookup_arrays(self):
+        """开了拖拽驱动但一个区域都没绑：三张查找表必须满长度，不得发 [1] 占位。
+
+        回归：旧实现在「无任何区域绑定」时发
+        ``static const uint SHAPEKEY_ZONE_IDS[1] = { 0xFFFFFFFFu };``
+        而取值逻辑仍按 ``freq_idx``（0..len(unique_names)-1）索引三张表 →
+        HLSL 不做边界检查 → 越界读常量缓冲，读到垃圾 zone/slot →
+        ``anim_weight`` 被 ``ShapeKeyDrive[垃圾]`` 顶掉，表现为面板变量
+        拉不动对应形态键（联动"看起来坏了"）。
+        """
+        node = _make_node({"A": -1, "B": -1, "C": -1})
+        src = os.path.abspath(os.path.join("Toolset", "shapekey_anim_packed_delta_v5_merged.hlsl"))
+        if not os.path.exists(src):
+            self.skipTest("template missing")
+        dest = os.path.join(self.out_dir, "nozone.hlsl")
+        node._update_shader_file(
+            dest,
+            {1: {"A": ["obj1"], "B": ["obj1"], "C": ["obj1"]}},
+            True,
+            True,
+            ["A", "B", "C"],
+            ["obj1"],
+            use_optimized=True,
+            merge_slot_files=True,
+            drag_drive_enabled=True,
+            drag_zone_ids=node._drag_drive_zone_ids(["A", "B", "C"]),
+            drag_click_stages=node._drag_drive_click_stages(["A", "B", "C"]),
+            drag_dirs=node._drag_drive_dirs(["A", "B", "C"]),
+            source_path=src,
+        )
+        with open(dest, encoding="utf-8") as f:
+            content = f.read()
+        sentinel = "0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu"
+        self.assertIn(f"static const uint SHAPEKEY_ZONE_IDS[3] = {{ {sentinel} }};", content)
+        # 档位/槽位表沿用既有十进制写法（与既有测试基线一致）
+        decimal_sentinel = "4294967295, 4294967295, 4294967295"
+        self.assertIn(f"static const uint SHAPEKEY_ND_STAGE_IDS[3] = {{ {decimal_sentinel} }};", content)
+        self.assertIn(f"static const uint SHAPEKEY_SLOT_IDS[3] = {{ {decimal_sentinel} }};", content)
+        self.assertNotIn("SHAPEKEY_ZONE_IDS[1]", content)
+        self.assertNotIn("SHAPEKEY_SLOT_IDS[1]", content)
+        # 未绑定 → FREQ 走变量回退（面板变量直控形态键）
+        self.assertIn("#define FREQ1 IniParams[100].x", content)
+        self.assertIn("#define FREQ3 IniParams[102].x", content)
 
     def test_drag_drive_fields_hidden_when_toggle_off(self):
         node = _make_node({"A": 2})

@@ -743,6 +743,82 @@ class VertexGroupUtils:
         # print("blendindices_dict: " + str(blendindices_dict[2][0]))
 
         return blendweights_dict, blendindices_dict
+
+    @classmethod
+    def get_blendweights_blendindices_for_layout(
+        cls,
+        mesh,
+        channel_count: int,
+        normalize_weights: bool = True,
+    ):
+        """按目标 GPU Blend 布局提取每个顶点的索引和权重。
+
+        ZZMI 的同组部件可能分别使用 BI4、BI8、BI16。合并到一个目标 IB 时按目标
+        通道数取**权重最强的 N 个**：等宽原样、升宽补零、**降宽自动丢弃最弱的**
+        并在下面重新归一化——2026-09-21 用户裁定：与其它所有游戏路径（v1 / v3 /
+        v4_fast）保持同一口径，绝不因为权重平滑产生的尾巴中断整个导出（平滑会
+        制造大量极小尾巴，逐个顶点人工检查不现实）。丢弃量由上层
+        （`common/obj_buffer_helper.py` 的 ZZMI 合并分支）汇总后大声报告：重新
+        归一化会把幸存权重放大、顶点位置随之偏移，若某顶点被丢掉的权重占比很大，
+        仍应回 Blender 用 清理 Clean → 限制总影响数 Limit Total → 归一化 All 修好。
+
+        排序用 `(-weight, group_id)` 稳定 tie-break，保证跨 Blender 版本与合并
+        顺序结果一致。返回值保持旧接口（semantic index 0 的二维数组）。
+        """
+        try:
+            channel_count = int(channel_count)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid Blend channel count: {channel_count!r}") from exc
+        if channel_count <= 0:
+            raise ValueError("Blend channel count must be positive")
+
+        loops = mesh.loops
+        vertices = mesh.vertices
+        loop_count = len(loops)
+        vertex_count = len(vertices)
+        loop_vertex_indices = numpy.empty(loop_count, dtype=numpy.int64)
+        loops.foreach_get("vertex_index", loop_vertex_indices)
+
+        indices_by_vertex = numpy.zeros((vertex_count, channel_count), dtype=numpy.uint32)
+        weights_by_vertex = numpy.zeros((vertex_count, channel_count), dtype=numpy.float32)
+        for vertex in vertices:
+            influences = []
+            for assignment in vertex.groups:
+                try:
+                    group_id = int(assignment.group)
+                    weight = float(assignment.weight)
+                except (TypeError, ValueError):
+                    continue
+                if group_id < 0 or not numpy.isfinite(weight) or weight <= 0.0:
+                    continue
+                influences.append((weight, group_id))
+            # Stable tie break by group id makes output deterministic across Blender
+            # versions and independent of the order in which groups were joined.
+            influences.sort(key=lambda item: (-item[0], item[1]))
+            # 2026-09-21 用户裁定（修正旧口径）：有效影响数超过目标通道数时**自动保留
+            # 最强的 N 个**，并在下面按**幸存权重之和**重新归一化——与其它所有游戏
+            # 路径（v1 / v3 / v4_fast）同款，不再中断导出。丢失量由上层汇总后报告。
+            selected = influences[:channel_count]
+            if not selected:
+                # A malformed/unweighted vertex must still be a valid rigid vertex;
+                # zero-weight all-zero rows are interpreted differently by some ZZZ
+                # shaders and can send the vertex to the origin.
+                indices_by_vertex[vertex.index, 0] = 0
+                weights_by_vertex[vertex.index, 0] = 1.0
+                continue
+            total = sum(weight for weight, _group_id in selected)
+            divisor = total if normalize_weights and total > 0.0 else 1.0
+            for slot, (weight, group_id) in enumerate(selected):
+                indices_by_vertex[vertex.index, slot] = group_id
+                weights_by_vertex[vertex.index, slot] = weight / divisor
+
+        valid = (loop_vertex_indices >= 0) & (loop_vertex_indices < vertex_count)
+        loop_indices = numpy.zeros((loop_count, channel_count), dtype=numpy.uint32)
+        loop_weights = numpy.zeros((loop_count, channel_count), dtype=numpy.float32)
+        if numpy.any(valid):
+            loop_indices[valid] = indices_by_vertex[loop_vertex_indices[valid]]
+            loop_weights[valid] = weights_by_vertex[loop_vertex_indices[valid]]
+        return {0: loop_weights}, {0: loop_indices}
     
 
 

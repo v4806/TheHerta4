@@ -26,6 +26,8 @@ from .variable_registry import (
     cjk_to_ascii,
     is_pinyin_available,
     reset_pinyin_cache,
+    shape_key_base_variable_name,
+    get_referenced_variable_names,
 )
 from ..common.mod_path_compat import collect_base_position_resource_map
 from ..common.mod_path_compat import derive_shapekey_base_resource_name
@@ -37,6 +39,7 @@ from ..common.mod_path_compat import derive_shapekey_slot_resource_name
 from ..common.mod_path_compat import ensure_resource_alias_section
 from ..common.mod_path_compat import resolve_hash_buffer_candidate
 from ..common.object_prefix_helper import ObjectPrefixHelper
+from ..common.safe_write import write_text_if_changed
 
 
 class ShapeKeyVariableItem(bpy.types.PropertyGroup):
@@ -140,6 +143,21 @@ _HLSL_PAD_TYPE_BY_SIZE = {4: "uint", 8: "uint2", 12: "uint3", 16: "uint4"}
 _DEFAULT_VERTEX_STRUCT_DEFINITION = "struct VertexAttributes {\n    float3 position;\n    float3 normal;\n    float4 tangent;\n};"
 
 
+def _enforce_exclusive_delta_mode(node, keep: str):
+    """「存储顶点增量」与「储存全部顶点属性增量」互斥：勾选一个即取消另一个。"""
+    other = "store_all_vertex_channels" if keep == "store_deltas" else "store_deltas"
+    if bool(getattr(node, keep, False)) and bool(getattr(node, other, False)):
+        setattr(node, other, False)
+
+
+def sync_shapekey_delta_mode(node, _context):
+    _enforce_exclusive_delta_mode(node, "store_deltas")
+
+
+def sync_shapekey_all_channels_mode(node, _context):
+    _enforce_exclusive_delta_mode(node, "store_all_vertex_channels")
+
+
 class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
     INI_PREAMBLE_KEY = "__SSMT_INI_PREAMBLE__"
     bl_idname = 'SSMTNode_PostProcess_ShapeKey'
@@ -169,8 +187,23 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
     )
     store_deltas: bpy.props.BoolProperty(
         name="存储顶点增量",
-        description="不存储完整的顶点坐标，而是存储与基础模型的差值，进一步减小体积。需要 'numpy' 库。",
-        default=True
+        description=(
+            "只存位置增量（与基础模型的差值），进一步减小体积。"
+            "与「存储全部顶点属性增量」互斥；两者都不勾时直接存绝对坐标。需要 'numpy' 库。"
+        ),
+        default=True,
+        update=sync_shapekey_delta_mode,
+    )
+    store_all_vertex_channels: bpy.props.BoolProperty(
+        name="存储全部顶点属性增量",
+        description=(
+            "存全部通道（位置 + 法线 + 切线 xyz）的增量，而不只位置。"
+            "法线/切线随形态键一起混合，描边壳与光照才能跟随形变；"
+            "与「存储顶点增量」互斥。"
+            "注意：多文件与 NTMI 导出路径暂仍只算位置。需要 'numpy' 库。"
+        ),
+        default=False,
+        update=sync_shapekey_all_channels_mode,
     )
     use_optimized_lookup: bpy.props.BoolProperty(
         name="优化查找性能",
@@ -183,11 +216,24 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
         default=False
     )
     # 直出开关和同蓝图中的其他 ShapeKey 后处理节点同步，避免槽位资源生成策略不一致。
+    # 默认勾选（True）：形态键导出只走直出路线；经典（非直出）路线会把键块在标准前处理里
+    # 烘焙掉（blueprint/preprocess.py `_apply_shape_keys`），产物无形态键且原先静默无告警。
+    # 本默认值只决定**新建**节点的初始勾选；已保存的 .blend 里各节点保存的取值不变。
     direct_export_mode: bpy.props.BoolProperty(
         name="直出模式",
-        description="启用后该节点参与直出导出，并与同类节点同步",
-        default=False,
+        description="启用后该节点参与直出导出，并与同类节点同步（形态键导出仅支持直出模式）",
+        default=True,
         update=sync_shapekey_direct_mode,
+    )
+    bake_disabled_shape_keys: bpy.props.BoolProperty(
+        name="烘焙未勾选的形态键",
+        description=(
+            "开启后，未勾选导出的形态键会按其当前数值烘焙进基础网格（基态），"
+            "其余形态键同步重基以保持各自原有的增量；"
+            "关闭时与旧行为一致（未勾选键的当前数值被丢弃）。"
+            "仅在直出形态键路线生效。"
+        ),
+        default=False,
     )
     drag_drive_enabled: bpy.props.BoolProperty(
         name="拖拽驱动形态键",
@@ -359,33 +405,54 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                     if shape_key_name not in newly_created_names:
                         backfilled_count += 1
                 else:
-                    # 已存在预分配：用当前规则重算“理想名”，判断是否需要刷新。
-                    # 会触发刷新的场景：
+                    # 已存在预分配：**已分配就不再重新分配**。
+                    # 只有命名函数本身对该形态键的输出变了才允许刷新：
                     #   * 之前生成时 pypinyin 未安装，中文形态键名被 _sanitize_name 剥离，
                     #     只剩后缀（如 "摇摆_001" -> "Freq__001"）；装上 pypinyin 后
                     #     能正确转换（"Freq_yaobai_001"）。
                     #   * 反过来 pypinyin 被卸载，需要回落到 uXXXX 编码。
                     #   * cjk_to_ascii 实现升级导致转换结果变化。
-                    # 重算时把本项自身已占用的名字作为 owned 排除，避免自我冲突。
-                    ideal_assigned = allocate_shape_key_variable_name(
-                        shape_key_name,
-                        owned_names=owned_names,
+                    # 旧名已经是当前基名（或它的 _N 变体）时，说明差异只可能来自
+                    # 「基名被别的 owner 占了」的冲突去重 —— 那不是命名变化，改写它
+                    # 会让变量名随别的蓝图树一增一减而变，驱动/导出引用全部错位。
+                    base_assigned = shape_key_base_variable_name(shape_key_name)
+                    naming_output_unchanged = (
+                        old_assigned == base_assigned
+                        or old_assigned.startswith(f"{base_assigned}_")
                     )
-                    if ideal_assigned != old_assigned:
-                        existing.assigned_variable_name = ideal_assigned
-                        # 仅当 custom 仍等于旧 assigned（即未被用户手动修改）时才同步更新，
-                        # 否则保留用户自定义输入。
-                        if old_custom == old_assigned:
-                            existing.custom_variable_name = ideal_assigned
-                        print(
-                            f"[ShapeKey] 已刷新变量名: '{shape_key_name}' "
-                            f"'{old_assigned}' -> '{ideal_assigned}'"
+                    if naming_output_unchanged:
+                        if old_assigned != base_assigned:
+                            print(
+                                f"[ShapeKey] 保留已分配变量名 '{old_assigned}'"
+                                f"（'{shape_key_name}' 当前基名 '{base_assigned}'；"
+                                f"已分配的变量不再重新分配，如需改名请手动修改「导出变量」）"
+                            )
+                        if not old_custom:
+                            # 名字没变但 custom 是空的：按老逻辑回填
+                            existing.custom_variable_name = old_assigned
+                            backfilled_count += 1
+                    else:
+                        # 命名规则变了：用当前规则重算“理想名”。
+                        # 重算时把本项自身已占用的名字作为 owned 排除，避免自我冲突。
+                        ideal_assigned = allocate_shape_key_variable_name(
+                            shape_key_name,
+                            owned_names=owned_names,
                         )
-                        refreshed_count += 1
-                    elif not old_custom:
-                        # 名字没变但 custom 是空的：按老逻辑回填
-                        existing.custom_variable_name = old_assigned
-                        backfilled_count += 1
+                        if ideal_assigned != old_assigned:
+                            existing.assigned_variable_name = ideal_assigned
+                            # 仅当 custom 仍等于旧 assigned（即未被用户手动修改）时才同步更新，
+                            # 否则保留用户自定义输入。
+                            if old_custom == old_assigned:
+                                existing.custom_variable_name = ideal_assigned
+                            print(
+                                f"[ShapeKey] 已刷新变量名: '{shape_key_name}' "
+                                f"'{old_assigned}' -> '{ideal_assigned}'"
+                            )
+                            refreshed_count += 1
+                        elif not old_custom:
+                            # 名字没变但 custom 是空的：按老逻辑回填
+                            existing.custom_variable_name = old_assigned
+                            backfilled_count += 1
 
                 rebuilt_items.append(existing)
 
@@ -428,6 +495,57 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
         if refreshed_count:
             print(f"[ShapeKey] 已自动刷新 {refreshed_count} 个形态键变量名")
         return created_count, backfilled_count
+
+    def heal_forked_shape_key_variable_names(self):
+        """把被「驱动引用名」挤到 _N 的预分配名拉回基名。
+
+        历史 bug：variable_registry 把动画驱动/点击导出的「目标变量」也算作已占用，
+        形态键预分配只能退到 ``Freq_xxx_1``；驱动侧保存的仍是 ``Freq_xxx`` →
+        两边永久错开（自锁：重算理想名恒返回 _N，用户再点预分配也回不去）。
+        分配口径已修正为「只跟 owner 比」；这里在导出前做一次**非破坏性**归一：
+        只改「旧名 == 理想名 + _N」的条目，不增删条目、不动用户手改过的名字
+        （custom != assigned 时只改 assigned）。返回 [(形态键名, 旧名, 新名)]。
+
+        额外门槛：只有基名**确实还被某处引用**（驱动/点击目标等，且限于本节点
+        所在的这棵树）时才归一。没有引用时那个 ``_N`` 只是历史冲突残留，拉回
+        基名等于改写一个已分配的变量名 —— 违反「已分配就不再重新分配」，也会让
+        变量名随别的蓝图树一增一减而变。
+        """
+        changed = []
+        try:
+            referenced_names = get_referenced_variable_names(tree=getattr(self, "id_data", None))
+        except Exception:
+            referenced_names = set()
+        for item in getattr(self, "shapekey_variable_items", None) or []:
+            shape_key_name = str(getattr(item, "shape_key_name", "") or "").strip()
+            if not shape_key_name:
+                continue
+            old_assigned = normalize_variable_name(getattr(item, "assigned_variable_name", "") or "")
+            if not old_assigned:
+                continue
+            old_custom = normalize_variable_name(getattr(item, "custom_variable_name", "") or "")
+            owned_names = (
+                getattr(item, "assigned_variable_name", ""),
+                getattr(item, "custom_variable_name", ""),
+            )
+            ideal = allocate_shape_key_variable_name(shape_key_name, owned_names=owned_names)
+            if ideal == old_assigned:
+                continue
+            # 只处理「带 _N 后缀 → 去后缀基名」这一种分叉；其它差异交给导出校验告警
+            if not old_assigned.startswith(f"{ideal}_"):
+                continue
+            # 基名没人引用 ⇒ 旧后缀不是「引用名挤占」留下的分叉，保留已分配名
+            if ideal not in referenced_names:
+                continue
+            item.assigned_variable_name = ideal
+            if old_custom == old_assigned:
+                item.custom_variable_name = ideal
+            changed.append((shape_key_name, old_assigned, ideal))
+        if changed:
+            print(f"[ShapeKey] 变量名分叉自愈 {len(changed)} 项（驱动引用不再挤占预分配基名）:")
+            for shape_key_name, old_name, new_name in changed:
+                print(f"    '{shape_key_name}': {old_name} -> {new_name}")
+        return changed
 
     def _is_shape_key_export_enabled(self, shape_key_name) -> bool:
         """形态键未在映射列表中时默认视为勾选；仅显式取消勾选的条目才不导出。"""
@@ -649,11 +767,29 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                 rows=max(4, min(len(self.shapekey_variable_items), 12)),
             )
 
-        layout.prop(self, "use_packed_Meshess")
-        layout.prop(self, "store_deltas")
-        layout.prop(self, "use_optimized_lookup")
-        layout.prop(self, "merge_slot_files")
-        layout.prop(self, "direct_export_mode")
+        compute_box = layout.box()
+        compute_box.label(text="计算优化", icon='SORTTIME')
+        compute_box.prop(self, "use_packed_Meshess")
+        compute_box.prop(self, "use_optimized_lookup")
+        compute_box.prop(self, "merge_slot_files")
+
+        storage_box = layout.box()
+        storage_box.label(text="空间优化", icon='PACKAGE')
+        storage_box.prop(self, "store_deltas")
+        storage_box.prop(self, "store_all_vertex_channels")
+        storage_box.label(
+            text=(
+                "增量通道：位置 + 法线 + 切线 xyz"
+                if getattr(self, "store_all_vertex_channels", False)
+                else "增量通道：仅位置"
+            ),
+            icon='INFO',
+        )
+
+        export_box = layout.box()
+        export_box.label(text="导出优化", icon='EXPORT')
+        export_box.prop(self, "direct_export_mode")
+        export_box.prop(self, "bake_disabled_shape_keys")
 
         drive_box = layout.box()
         drive_box.label(text="拖拽驱动形态键", icon='DRIVER')
@@ -1185,6 +1321,18 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
         bare_unique_str = str(ObjectPrefixHelper.parse_prefix_parts(h).get("bare_unique_str", "") or h or "").strip()
         return bare_unique_str.replace('.', '_').replace('-', '_')
 
+    def effective_use_delta(self) -> bool:
+        """是否按增量存储（三态口径）。
+
+        「存储顶点增量」与「储存全部顶点属性增量」互斥且同属增量语义：
+        只勾前者 = 仅位置增量；只勾后者 = 位置 + 法线 + 切线 xyz 增量；
+        两个都不勾 = 直接存绝对坐标。
+        """
+        return bool(
+            getattr(self, "store_deltas", False)
+            or getattr(self, "store_all_vertex_channels", False)
+        )
+
     def _should_merge_slot_files(self, use_packed=None):
         if use_packed is None:
             use_packed = self.use_packed_Meshess
@@ -1423,7 +1571,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
 
     def _process_shapekey_Meshess(self, mod_export_path, slot_to_name_to_objects, hash_to_stride):
         use_packed = self.use_packed_Meshess
-        use_delta = self.store_deltas
+        use_delta = self.effective_use_delta()
         merge_slot_files = self._should_merge_slot_files(use_packed)
 
         if not NUMPY_AVAILABLE:
@@ -1435,7 +1583,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
 
         print(
             f"开始处理缓冲区 (紧凑:{'是' if use_packed else '否'}, "
-            f"增量(仅位置):{'是' if use_delta else '否'}, 文件合并:{'是' if merge_slot_files else '否'})..."
+            f"增量:{self._describe_delta_scope(use_delta)}, 文件合并:{'是' if merge_slot_files else '否'})..."
         )
 
         if merge_slot_files:
@@ -1524,11 +1672,20 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                 output_prefix = os.path.join(output_dir, f"{actual_hash}-Position")
 
                 if use_delta:
-                    data_to_write = shapekey_data[:, :3] - base_data[:, :3]
+                    channel_plan = self._resolve_delta_channel_plan(
+                        hash_val=h,
+                        num_floats_per_vertex=NUM_FLOATS_PER_VERTEX,
+                    )
+                    channel_columns = self._channel_plan_columns(channel_plan)
+                    data_to_write = shapekey_data[:, channel_columns] - base_data[:, channel_columns]
                     filename_suffix = "_pos_delta"
                     if use_packed: filename_suffix = "_packed_pos_delta"
 
-                    pos_diff_mask = ~np.isclose(base_data[:, :3], shapekey_data[:, :3], atol=1e-6).all(axis=1)
+                    pos_diff_mask = ~np.isclose(
+                        base_data[:, channel_columns],
+                        shapekey_data[:, channel_columns],
+                        atol=1e-6,
+                    ).all(axis=1)
                     num_active_vertices = np.sum(pos_diff_mask)
 
                     if num_active_vertices == 0:
@@ -1586,7 +1743,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
         return True, hash_to_actual_file_hash
 
     def _process_merged_shapekey_Meshess(self, mod_export_path, slot_to_name_to_objects, hash_to_stride):
-        use_delta = self.store_deltas
+        use_delta = self.effective_use_delta()
         hash_to_actual_file_hash = {}
         hash_to_slots = OrderedDict()
 
@@ -1632,6 +1789,8 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
             merged_data_parts = []
             next_global_index = 0
             processed_slot_count = 0
+            # 增量记录每条的 float 宽度：关闭「全部顶点属性增量」时恒为 3（仅位置）
+            delta_channel_width = 3
 
             for slot in sorted_slots:
                 folder_name = f"Meshes1{slot:03d}"
@@ -1679,8 +1838,18 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                 shapekey_data = np.frombuffer(shapekey_bytes, dtype='f').reshape((num_vertices, num_floats_per_vertex))
 
                 if use_delta:
-                    data_to_write = shapekey_data[:, :3] - base_data[:, :3]
-                    diff_mask = ~np.isclose(base_data[:, :3], shapekey_data[:, :3], atol=1e-6).all(axis=1)
+                    channel_plan = self._resolve_delta_channel_plan(
+                        hash_val=h,
+                        num_floats_per_vertex=num_floats_per_vertex,
+                    )
+                    channel_columns = self._channel_plan_columns(channel_plan)
+                    delta_channel_width = len(channel_columns)
+                    data_to_write = shapekey_data[:, channel_columns] - base_data[:, channel_columns]
+                    diff_mask = ~np.isclose(
+                        base_data[:, channel_columns],
+                        shapekey_data[:, channel_columns],
+                        atol=1e-6,
+                    ).all(axis=1)
                 else:
                     data_to_write = shapekey_data
                     diff_mask = ~np.isclose(base_data, shapekey_data, atol=1e-6).all(axis=1)
@@ -1715,7 +1884,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
             if merged_data_parts:
                 merged_data = np.concatenate(merged_data_parts, axis=0)
             else:
-                empty_width = 3 if use_delta else num_floats_per_vertex
+                empty_width = delta_channel_width if use_delta else num_floats_per_vertex
                 merged_data = np.empty((0, empty_width), dtype=np.float32)
 
             with open(data_path, 'wb') as f:
@@ -1863,7 +2032,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
 
     def _get_shader_template_name(self):
         use_packed = self.use_packed_Meshess
-        use_delta = self.store_deltas
+        use_delta = self.effective_use_delta()
         use_optimized = self.use_optimized_lookup
         merge_slot_files = self._should_merge_slot_files(use_packed)
 
@@ -2016,14 +2185,255 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
 
         return _DEFAULT_VERTEX_STRUCT_DEFINITION
 
-    def _update_shader_file(self, shader_path, hash_slot_data, use_packed, use_delta, unique_names, unique_objects, use_optimized=False, merge_slot_files=False, drag_drive_enabled=False, drag_zone_ids=None, drag_click_stages=None, drag_stage_count=1, drag_dirs=None, hash_val=None):
+    # 增量通道规格：通道名 -> 参与混合的 float 分量数。
+    # TANGENT 只取 xyz —— 第 4 个分量是切线手性符号（±1），插值成中间值会让切线基失去意义，
+    # 因此它随其余未选字段一起由「按位拷贝」保留，不参与增量。
+    DELTA_CHANNEL_FLOAT_COUNTS = (("position", 3), ("normal", 3), ("tangent", 3))
+    # 名字以此结尾的是布局常量（position_w / normal_w，16 字节步长的补齐位），不参与增量。
+    DELTA_CHANNEL_EXCLUDED_SUFFIX = "_w"
+
+    def _resolve_delta_channel_plan(self, hash_val=None, struct_definition=None, num_floats_per_vertex=None):
+        """解析增量通道列计划：``[(通道名, 起始 float 下标, float 分量数), ...]``。
+
+        - 关闭「存储全部顶点属性增量」时恒为 ``[("position", 0, 3)]``，与旧版逐字节一致。
+        - 开启时**按真实顶点属性定义展开**：结构体里每个 ``float`` 系属性都进计划，
+          分量数按声明宽度（``float2`` 计 2、``float4`` 计 4），因此顶点色、额外 UV、
+          自定义属性都会一起参与增量。
+        - 三处按位复用的例外：已知三通道沿用历史口径各取 xyz（``DELTA_CHANNEL_FLOAT_COUNTS``，
+          tangent 的第 4 个分量是手性符号，做 float 混合没有意义）；``*_w`` 布局常量不参与；
+          非 float 属性（``uint`` / ``half`` 等，例如 R8G8B8A8 顶点色、压缩法线）
+          float 加减法表达不了，一律按位复用（导出日志会点名列出）。
+        - 超出实际每顶点 float 数的通道会被裁掉（例如手填的 40B 顶点属性定义遇上工作空间
+          16B 的 IB），避免着色器读到缓冲区之外、也避免写出未声明字段的写回行。
+        """
+        if not bool(getattr(self, "store_all_vertex_channels", False)):
+            return [("position", 0, 3)]
+
+        definition = struct_definition or self._get_vertex_struct_definition(hash_val=hash_val)
+        parsed = self.parse_vertex_struct(definition) if definition else None
+        if not parsed:
+            return [("position", 0, 3)]
+
+        _stride, struct_floats, attributes = parsed
+        limit = int(struct_floats)
+        if num_floats_per_vertex and int(num_floats_per_vertex) > 0:
+            limit = min(limit, int(num_floats_per_vertex))
+
+        historical = dict(self.DELTA_CHANNEL_FLOAT_COUNTS)
+        plan = []
+        float_offset = 0
+        for attribute in attributes:
+            width = int(attribute.get("size", 0) or 0) // 4
+            name = str(attribute.get("name", "") or "")
+            type_name = str(attribute.get("type", "") or "")
+            is_float_channel = type_name.startswith("float")
+            is_layout_constant = name.endswith(self.DELTA_CHANNEL_EXCLUDED_SUFFIX)
+            if width > 0 and is_float_channel and not is_layout_constant:
+                count = min(historical.get(name, width), width)
+                if float_offset + count <= limit:
+                    plan.append((name, float_offset, count))
+            float_offset += width
+
+        if not plan or plan[0][0] != "position":
+            return [("position", 0, 3)]
+        return plan
+
+    def _resolve_skipped_delta_channels(self, hash_val=None, struct_definition=None):
+        """本次增量里被按位复用的属性名（非 float 属性 / ``*_w`` 布局常量）。"""
+        definition = struct_definition or self._get_vertex_struct_definition(hash_val=hash_val)
+        parsed = self.parse_vertex_struct(definition) if definition else None
+        if not parsed:
+            return []
+
+        _stride, _floats, attributes = parsed
+        skipped = []
+        for attribute in attributes:
+            name = str(attribute.get("name", "") or "")
+            type_name = str(attribute.get("type", "") or "")
+            if not name:
+                continue
+            if not type_name.startswith("float") or name.endswith(self.DELTA_CHANNEL_EXCLUDED_SUFFIX):
+                skipped.append(name)
+        return skipped
+
+    @staticmethod
+    def _channel_plan_columns(plan):
+        """把通道计划展开成 numpy 列下标列表。"""
+        columns = []
+        for _name, start, count in plan:
+            columns.extend(range(start, start + count))
+        return columns
+
+    @staticmethod
+    def _channel_plan_float_count(plan):
+        """通道计划覆盖的 float 总数（= 增量记录每条的 float 宽度）。"""
+        return sum(count for _name, _start, count in plan)
+
+    @staticmethod
+    def _channel_plan_names(plan):
+        return [name for name, _start, _count in plan]
+
+    def _resolve_delta_stride(self, hash_val=None, vertex_stride=None, struct_definition=None):
+        """增量记录每条的字节步长（旧版恒为 12）。"""
+        num_floats = int(vertex_stride) // 4 if vertex_stride and int(vertex_stride) > 0 else None
+        plan = self._resolve_delta_channel_plan(
+            hash_val=hash_val,
+            struct_definition=struct_definition,
+            num_floats_per_vertex=num_floats,
+        )
+        return 4 * self._channel_plan_float_count(plan)
+
+    def _describe_delta_scope(self, use_delta, hash_val=None):
+        """日志用：本次增量覆盖哪些通道（``否`` / ``仅位置`` / ``全部属性``）。"""
+        if not use_delta:
+            return "否"
+        channel_names = self._channel_plan_names(self._resolve_delta_channel_plan(hash_val=hash_val))
+        return "全部属性" if len(channel_names) > 1 else "仅位置"
+
+    # 增量缓冲声明（v5 合并版是 merged_shapekey_pos_deltas，逐槽版是 shapekey_pos_deltas[MAX_SLOTS]）
+    _DELTA_BUFFER_DECL_RE = re.compile(
+        r"StructuredBuffer<float3>\s+((?:merged_)?shapekey_pos_deltas)\s*(\[[^\]]*\])?\s*(:\s*register\(t\d+\))"
+    )
+    # 模板尾部写回块：由本模块按通道计划决定写哪几行，未开启时只写位置
+    _SHADER_WRITEBACK_BLOCK_RE = re.compile(
+        r"[ \t]*// --- \[PYTHON-MANAGED WRITEBACK START\] ---.*?// --- \[PYTHON-MANAGED WRITEBACK END\] ---",
+        re.DOTALL,
+    )
+
+    @staticmethod
+    def _delta_channel_type_text(count):
+        """HLSL 类型名：单分量写 ``float``（``float1`` 不是合法类型）。"""
+        return "float" if int(count) == 1 else f"float{int(count)}"
+
+    # 模板自带累加器声明的通道；其余通道由 _build_delta_accumulator_declarations 注入
+    TEMPLATE_DECLARED_DELTA_CHANNELS = ("position", "normal", "tangent")
+
+    @classmethod
+    def _build_writeback_lines(cls, channel_plan):
+        """着色器尾部的写回行（按通道计划逐通道写回）。单通道时与旧版逐字符一致。"""
+        lines = []
+        for name, _start, _count in channel_plan:
+            if name == "tangent":
+                # 只写 xyz：第 4 个分量是切线手性符号，必须保持基础网格原值
+                lines.append("output.tangent.xyz += total_diff_tangent;")
+            else:
+                lines.append(f"output.{name} += total_diff_{name};")
+        return lines
+
+    @classmethod
+    def _build_delta_accumulator_declarations(cls, channel_plan):
+        """为模板未声明的通道注入累加器声明（顶点色、额外 UV、自定义 float 属性）。
+
+        已知三通道由模板自己声明（float3），这里只补新通道，旧产物因此逐字节不变。
+        """
+        lines = []
+        for name, _start, count in channel_plan:
+            if name in cls.TEMPLATE_DECLARED_DELTA_CHANNELS:
+                continue
+            type_text = cls._delta_channel_type_text(count)
+            zeros = ", ".join("0.0" for _ in range(int(count)))
+            lines.append(f"    {type_text} total_diff_{name} = {type_text}({zeros});")
+        return lines
+
+    @staticmethod
+    def _build_delta_accumulation_lines(indent, slot_index, element_expr, weight_expr, channel_names):
+        """增量模式的累加行：``element_expr`` 是 ``StructuredBuffer`` 的元素表达式。
+
+        单通道（仅位置）时返回与旧版逐字符一致的一行。
+        """
+        if channel_names == ["position"]:
+            return [f"{indent}total_diff_position += {element_expr} * {weight_expr};"]
+        lines = [f"{indent}ShapeKeyDelta sk_delta_slot{slot_index} = {element_expr};"]
+        for name in channel_names:
+            lines.append(f"{indent}total_diff_{name} += sk_delta_slot{slot_index}.{name} * {weight_expr};")
+        return lines
+
+    @staticmethod
+    def _build_full_vertex_accumulation_lines(indent, element_expr, base_expr, weight_expr, channel_names):
+        """非增量模式的累加行：``源顶点 - 基础顶点``。单通道时与旧版逐字符一致。"""
+        if channel_names == ["position"]:
+            return [
+                f"{indent}total_diff_position += ({element_expr}.position - {base_expr}.position) * {weight_expr};"
+            ]
+        lines = []
+        for name in channel_names:
+            suffix = ".xyz" if name == "tangent" else ""
+            lines.append(
+                f"{indent}total_diff_{name} += "
+                f"({element_expr}.{name}{suffix} - {base_expr}.{name}{suffix}) * {weight_expr};"
+            )
+        return lines
+
+    def _inject_delta_channel_struct(self, content, channel_plan):
+        """把增量缓冲从 ``StructuredBuffer<float3>`` 换成按通道展开的结构体。
+
+        只在开启「存储全部顶点属性增量」且通道数 > 1 时调用；关闭时声明原样保留，
+        生成结果与旧版一致。结构体行宽必须等于 INI 里该资源的 stride（4 × 通道 float 数）。
+        通道宽度按计划取（``float2`` / ``float4`` 等），已知三通道仍是 ``float3``。
+        """
+        struct_text = "struct ShapeKeyDelta {\n" + "\n".join(
+            f"    {self._delta_channel_type_text(count)} {name};"
+            for name, _start, count in channel_plan
+        ) + "\n};"
+
+        def _replace(match):
+            buffer_name = match.group(1)
+            array_suffix = match.group(2) or ""
+            register = match.group(3)
+            return (
+                f"{struct_text}\n"
+                f"StructuredBuffer<ShapeKeyDelta> {buffer_name}{array_suffix} {register}"
+            )
+
+        return self._DELTA_BUFFER_DECL_RE.sub(_replace, content, count=1)
+
+    def _update_shader_file(self, shader_path, hash_slot_data, use_packed, use_delta, unique_names, unique_objects, use_optimized=False, merge_slot_files=False, drag_drive_enabled=False, drag_zone_ids=None, drag_click_stages=None, drag_stage_count=1, drag_dirs=None, hash_val=None, source_path=None):
+        """把配置注入着色器模板并写到 ``shader_path``。
+
+        ``source_path`` 指定读取的模板；缺省（None）时读 ``shader_path`` 自身，
+        保持旧调用方语义。生产路径必须传 ``source_path``：读模板、写目标，输出
+        只由"模板 + 配置"决定。若读写同一路径，本函数会读到自己上一次的注入
+        结果，与"按模板重算"的播种互相覆盖，文件每轮都在两个状态间反复横跳。
+        """
         try:
-            with open(shader_path, 'r', encoding='utf-8') as f:
+            with open(source_path or shader_path, 'r', encoding='utf-8') as f:
                 content = f.read()
 
             vertex_struct = self._get_vertex_struct_definition(hash_val=hash_val)
             if vertex_struct:
                 content = re.sub(r"struct VertexAttributes\s*\{[^}]*\};", vertex_struct, content, flags=re.DOTALL)
+
+            # 增量通道计划：关闭「存储全部顶点属性增量」时只有位置，后面每一步都走旧版路径，
+            # 生成结果与旧版逐字符一致；开启时按顶点数据类型把法线/切线也带上。
+            workspace_stride = self._get_workspace_position_stride(hash_val) if hash_val else 0
+            channel_plan = self._resolve_delta_channel_plan(
+                hash_val=hash_val,
+                num_floats_per_vertex=(workspace_stride // 4) if workspace_stride > 0 else None,
+            )
+            channel_names = self._channel_plan_names(channel_plan)
+            extra_channels = [name for name in channel_names if name != "position"]
+            if extra_channels:
+                skipped_channels = self._resolve_skipped_delta_channels(hash_val=hash_val)
+                if skipped_channels:
+                    print(
+                        f"[形态键] {hash_val or ''} 以下顶点属性按位复用（不参与增量）: "
+                        f"{', '.join(skipped_channels)}"
+                    )
+            if use_delta and extra_channels:
+                # 增量记录不再是单个 float3，改成按通道展开的结构体（步长 = 4 × 通道 float 数）
+                content = self._inject_delta_channel_struct(content, channel_plan)
+
+            writeback_lines = self._build_writeback_lines(channel_plan)
+            if self._SHADER_WRITEBACK_BLOCK_RE.search(content):
+                content = self._SHADER_WRITEBACK_BLOCK_RE.sub(
+                    lambda _match: (
+                        "    // --- [PYTHON-MANAGED WRITEBACK START] ---\n"
+                        + "\n".join(f"    {line}" for line in writeback_lines)
+                        + "\n    // --- [PYTHON-MANAGED WRITEBACK END] ---"
+                    ),
+                    content,
+                    count=1,
+                )
 
             name_to_freq_def = {name: f"FREQ{i+1}" for i, name in enumerate(unique_names)}
             obj_to_range_defs = {obj: (f"START{i+1}", f"END{i+1}") for i, obj in enumerate(unique_objects)}
@@ -2039,34 +2449,43 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
             if drag_drive_enabled:
                 define_lines.append(f"Buffer<float> ShapeKeyDrive : register(t{self.DRAG_DRIVE_REGISTER});")
                 define_lines.append(f"Buffer<uint> ShapeKeyClickCount : register(t{self.DRAG_CLICK_COUNT_REGISTER});")
-                if any(zone >= 0 for zone in zone_ids):
-                    ids_text = ", ".join(str(zone) if zone >= 0 else "0xFFFFFFFFu" for zone in zone_ids)
-                    define_lines.append(f"static const uint SHAPEKEY_ZONE_IDS[{len(zone_ids)}] = {{ {ids_text} }};")
-                    stage_list = list(click_stages) if len(click_stages) == len(zone_ids) else [1] * len(zone_ids)
-                    dir_list = list(drag_dirs) if len(drag_dirs) == len(zone_ids) else [4] * len(zone_ids)
-                    nd_stage_ids = []
-                    slot_ids = []
-                    for idx, zone in enumerate(zone_ids):
-                        if zone < 0 or zone >= len(zone_bases):
-                            nd_stage_ids.append(0xFFFFFFFF)
-                            slot_ids.append(0xFFFFFFFF)
-                            continue
-                        d = dir_list[idx] if idx < len(dir_list) else 4
-                        if d >= 0 and d < 4:
-                            nd_stage_ids.append(0xFFFFFFFF)
-                            slot_ids.append(zone_bases[zone] + d)
-                        else:
-                            stage = max(1, stage_list[idx] if idx < len(stage_list) else 1)
-                            nd_stage_ids.append(stage)
-                            slot_ids.append(zone_bases[zone] + 4 + (stage - 1))
-                    nd_text = ", ".join(str(v) if v >= 0 else "0xFFFFFFFFu" for v in nd_stage_ids)
-                    define_lines.append(f"static const uint SHAPEKEY_ND_STAGE_IDS[{len(zone_ids)}] = {{ {nd_text} }};")
-                    slot_text = ", ".join(str(v) if v >= 0 else "0xFFFFFFFFu" for v in slot_ids)
-                    define_lines.append(f"static const uint SHAPEKEY_SLOT_IDS[{len(zone_ids)}] = {{ {slot_text} }};")
-                else:
-                    define_lines.append("static const uint SHAPEKEY_ZONE_IDS[1] = { 0xFFFFFFFFu };")
-                    define_lines.append("static const uint SHAPEKEY_ND_STAGE_IDS[1] = { 0xFFFFFFFFu };")
-                    define_lines.append("static const uint SHAPEKEY_SLOT_IDS[1] = { 0xFFFFFFFFu };")
+                # 数组长度必须覆盖全部 FREQ 索引：freq_idx 取自 vertex_freq_indices，
+                # 取值范围 0..len(unique_names)-1，而下方取值逻辑无条件按 freq_idx 索引
+                # 三张表。历史实现只在「至少一个区域被绑定」时才发满长度数组，否则发
+                # [1] 占位 —— 于是「开了拖拽驱动但一个区域都没绑」的工程会越界读常量
+                # 缓冲（HLSL 不做边界检查），读到垃圾 zone/slot → 面板变量被
+                # ShapeKeyDrive[垃圾] 顶掉，表现为形态键不受滑块控制/跳变。
+                # 这里恒发满长度数组，未绑定项填 0xFFFFFFFF（走变量回退分支）。
+                array_len = max(len(zone_ids), len(unique_names), 1)
+                zone_text = ", ".join(
+                    str(zone_ids[i])
+                    if i < len(zone_ids) and 0 <= int(zone_ids[i]) < len(zone_bases)
+                    else "0xFFFFFFFFu"
+                    for i in range(array_len)
+                )
+                define_lines.append(f"static const uint SHAPEKEY_ZONE_IDS[{array_len}] = {{ {zone_text} }};")
+                stage_list = list(click_stages) if len(click_stages) == array_len else [1] * array_len
+                dir_list = list(drag_dirs) if len(drag_dirs) == array_len else [4] * array_len
+                nd_stage_ids = []
+                slot_ids = []
+                for idx in range(array_len):
+                    zone = int(zone_ids[idx]) if idx < len(zone_ids) else -1
+                    if zone < 0 or zone >= len(zone_bases):
+                        nd_stage_ids.append(0xFFFFFFFF)
+                        slot_ids.append(0xFFFFFFFF)
+                        continue
+                    d = dir_list[idx] if idx < len(dir_list) else 4
+                    if d >= 0 and d < 4:
+                        nd_stage_ids.append(0xFFFFFFFF)
+                        slot_ids.append(zone_bases[zone] + d)
+                    else:
+                        stage = max(1, stage_list[idx] if idx < len(stage_list) else 1)
+                        nd_stage_ids.append(stage)
+                        slot_ids.append(zone_bases[zone] + 4 + (stage - 1))
+                nd_text = ", ".join(str(v) if v >= 0 else "0xFFFFFFFFu" for v in nd_stage_ids)
+                define_lines.append(f"static const uint SHAPEKEY_ND_STAGE_IDS[{array_len}] = {{ {nd_text} }};")
+                slot_text = ", ".join(str(v) if v >= 0 else "0xFFFFFFFFu" for v in slot_ids)
+                define_lines.append(f"static const uint SHAPEKEY_SLOT_IDS[{array_len}] = {{ {slot_text} }};")
             for i, name in enumerate(unique_names):
                 zone = zone_ids[i] if i < len(zone_ids) else -1
                 if drag_drive_enabled and zone >= 0:
@@ -2133,11 +2552,23 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                     logic_lines.append("        {")
 
                     if use_delta:
-                        calc_line = f"total_diff_position += merged_shapekey_pos_deltas[packed_index] * anim_weight_slot{slot_index};"
+                        calc_lines = self._build_delta_accumulation_lines(
+                            "            ",
+                            slot_index,
+                            "merged_shapekey_pos_deltas[packed_index]",
+                            f"anim_weight_slot{slot_index}",
+                            channel_names,
+                        )
                     else:
-                        calc_line = f"total_diff_position += (merged_shapekeys[packed_index].position - base[i].position) * anim_weight_slot{slot_index};"
+                        calc_lines = self._build_full_vertex_accumulation_lines(
+                            "            ",
+                            "merged_shapekeys[packed_index]",
+                            "base[i]",
+                            f"anim_weight_slot{slot_index}",
+                            channel_names,
+                        )
 
-                    logic_lines.append("            " + calc_line)
+                    logic_lines.extend(calc_lines)
                     logic_lines.append("        }")
                     logic_lines.append("    }\n")
             elif use_optimized:
@@ -2164,10 +2595,26 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
 
                     if use_packed:
                         logic_lines.extend([f"        int packed_index = shapekey_maps[{slot_index}][i];", "        if (packed_index != -1)", "        {"])
-                        logic_lines.append(f"            total_diff_position += shapekey_pos_deltas[{slot_index}][packed_index] * anim_weight_slot{slot_index};")
+                        logic_lines.extend(
+                            self._build_delta_accumulation_lines(
+                                "            ",
+                                slot_index,
+                                f"shapekey_pos_deltas[{slot_index}][packed_index]",
+                                f"anim_weight_slot{slot_index}",
+                                channel_names,
+                            )
+                        )
                         logic_lines.append("        }")
                     else:
-                        logic_lines.append(f"        total_diff_position += shapekey_pos_deltas[{slot_index}][i] * anim_weight_slot{slot_index};")
+                        logic_lines.extend(
+                            self._build_delta_accumulation_lines(
+                                "        ",
+                                slot_index,
+                                f"shapekey_pos_deltas[{slot_index}][i]",
+                                f"anim_weight_slot{slot_index}",
+                                channel_names,
+                            )
+                        )
 
                     logic_lines.append("    }")
             else:
@@ -2193,14 +2640,32 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                         indent = "            "
 
                     if use_delta:
-                        calc_line = f"total_diff_position += shapekey_pos_deltas[{slot_index}][{read_idx}] * anim_weight_slot{slot_index};"
+                        calc_lines = self._build_delta_accumulation_lines(
+                            indent,
+                            slot_index,
+                            f"shapekey_pos_deltas[{slot_index}][{read_idx}]",
+                            f"anim_weight_slot{slot_index}",
+                            channel_names,
+                        )
                     else:
-                        calc_line = f"total_diff_position += (shapekeys[{slot_index}][{read_idx}].position - base[i].position) * anim_weight_slot{slot_index};"
+                        calc_lines = self._build_full_vertex_accumulation_lines(
+                            indent,
+                            f"shapekeys[{slot_index}][{read_idx}]",
+                            "base[i]",
+                            f"anim_weight_slot{slot_index}",
+                            channel_names,
+                        )
 
-                    logic_lines.append(indent + calc_line)
+                    logic_lines.extend(calc_lines)
 
                     if use_packed: logic_lines.extend(["        }", "    }\n"])
                     else: logic_lines.extend(["    }\n"])
+
+            accumulator_declarations = (
+                self._build_delta_accumulator_declarations(channel_plan) if extra_channels else []
+            )
+            if accumulator_declarations:
+                logic_lines = accumulator_declarations + logic_lines
 
             content = re.sub(r"// --- \[PYTHON-MANAGED BLOCK START\] ---.*?// --- \[PYTHON-MANAGED BLOCK END\] ---",
                              f"// --- [PYTHON-MANAGED BLOCK START] ---\n{chr(10).join(define_lines)}\n// --- [PYTHON-MANAGED BLOCK END] ---",
@@ -2209,12 +2674,12 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                              f"// --- [PYTHON-MANAGED LOGIC START] ---\n{chr(10).join(logic_lines)}    // --- [PYTHON-MANAGED LOGIC END] ---",
                              content, flags=re.DOTALL)
 
-            with open(shader_path, 'w', encoding='utf-8') as f:
-                f.write(content)
+            # 内容没变就不写：保持 .hlsl 的 mtime，3DMigoto 的着色器编译缓存才继续命中
+            write_text_if_changed(shader_path, content)
 
             mode_str = (
                 f"紧凑:{'是' if use_packed else '否'}, "
-                f"增量(仅位置):{'是' if use_delta else '否'}, "
+                f"增量:{self._describe_delta_scope(use_delta, hash_val)}, "
                 f"优化查找:{'是' if use_optimized else '否'}, "
                 f"文件合并:{'是' if merge_slot_files else '否'}"
             )
@@ -2356,7 +2821,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
 
         target_ini_file = ini_files[0]
         use_packed = self.use_packed_Meshess
-        use_delta = self.store_deltas
+        use_delta = self.effective_use_delta()
         use_optimized = self.use_optimized_lookup
         merge_slot_files = self._should_merge_slot_files(use_packed)
 
@@ -2391,6 +2856,15 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
 
             all_unique_names = list(OrderedDict.fromkeys(name for slot_data in slot_to_name_to_objects.values() for name in slot_data.keys()))
             all_unique_objects = list(OrderedDict.fromkeys(obj for slot_data in slot_to_name_to_objects.values() for name_data in slot_data.values() for obj in name_data))
+
+            # 变量名自愈（非破坏性）：动画驱动/点击导出的「目标变量」只是引用，
+            # 历史版本误当作占用，把形态键预分配挤成了 Freq_xxx_1，与驱动保存的
+            # 基名永久错开。分配口径已修正；这里在导出前把已分叉的名字拉回基名，
+            # 让「再导出一次」就自动修好，不要求用户先点预分配。
+            try:
+                self.heal_forked_shape_key_variable_names()
+            except Exception as exc:
+                print(f"[ShapeKey][警告] 变量名分叉自愈失败（不影响导出；驱动侧引用会在发射前对齐）: {exc}")
 
             hash_to_base_resources = {}
             resource_pattern = re.compile(r'\[(Resource_?([a-f0-9]{8}(?:[_-][a-f0-9]+)*)_?Position(\d*))\]')
@@ -2595,7 +3069,13 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
             hash_to_shader_paths = {}
             for hash_val in unique_hashes:
                 shader_dest_path = os.path.join(dest_res_dir, f"shapekey_anim_{hash_val}.hlsl")
-                shutil.copy2(shader_source_path, shader_dest_path)
+                # 只播种**从未注入过**的模板；目标已存在则保持原样，交给
+                # _update_shader_file 以模板为源重新注入。这样文件只在"注入结果
+                # 真的变了"时被写，mtime 稳定，3DMigoto 的编译缓存才继续命中。
+                # 不能用 shutil.copy2：它每轮都把目标 mtime 重置成模板的旧 mtime。
+                if not os.path.exists(shader_dest_path):
+                    with open(shader_source_path, 'r', encoding='utf-8') as f:
+                        write_text_if_changed(shader_dest_path, f.read())
                 hash_to_shader_paths[hash_val] = shader_dest_path
                 print(f"已创建独立着色器文件: shapekey_anim_{hash_val}.hlsl")
 
@@ -2634,6 +3114,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                         drag_stage_count=self._drag_drive_stage_count(),
                         drag_dirs=self._drag_drive_dirs(hash_unique_names) if drag_drive_enabled else None,
                         hash_val=hash_val,
+                        source_path=shader_source_path,
                     ):
                         print(f"更新哈希 {hash_val} 的着色器文件失败")
 
@@ -2747,7 +3228,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
 
                     mode_str = (
                         f"紧凑:{'是' if use_packed else '否'}, "
-                        f"增量(仅位置):{'是' if use_delta else '否'}, "
+                        f"增量:{self._describe_delta_scope(use_delta)}, "
                         f"优化查找:{'是' if use_optimized else '否'}, "
                         f"文件合并:{'是' if merge_slot_files else '否'}"
                     )
@@ -2835,7 +3316,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
 
                     actual_file_hash = hash_to_actual_file_hash.get(h, h)
                     base_stride = hash_to_stride.get(h_prefix, 40)
-                    data_stride = 12 if use_delta else base_stride
+                    data_stride = self._resolve_delta_stride(h, base_stride) if use_delta else base_stride
                     base_resources = hash_to_base_resources.get(h_prefix, [])
                     primary_base_resource = base_resources[0] if base_resources else f"Resource_{self._hash_to_resource_prefix(h)}_Position"
                     data_section = f"[{derive_shapekey_merged_data_resource_name(primary_base_resource, use_delta)}]"
@@ -2862,7 +3343,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                             stride, filename, section_name = 0, "", ""
                             if use_delta:
                                 res_suffix = "_packed_pos_delta" if use_packed else "_pos_delta"
-                                stride = 12
+                                stride = self._resolve_delta_stride(h, base_stride)
                             elif use_packed:
                                 res_suffix = "_packed"
                                 stride = base_stride

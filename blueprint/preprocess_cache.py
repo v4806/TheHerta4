@@ -22,7 +22,12 @@ class PreProcessCache:
     CACHE_VERSION = 3
     # 继续把前处理缓存限定在“单物体副本”粒度，避免批量 bundle 把未连到输出的旧对象也一并加载回来。
     ENABLE_CACHE_BUNDLES = False
-    PIPELINE_HASH_VERSION = 1
+    # v2：直出形态键新增「烘焙未勾选的形态键」——副本网格与形态键数据都变了
+    # （未勾选键的贡献被烘进基态、其余键重基），旧缓存里没有这份位移，
+    # 命中旧缓存会让烘焙整段不执行（导出无预兆地少一段形变）。故整体失效一次。
+    PIPELINE_HASH_VERSION = 2
+    # 「烘焙未勾选形态键」实现版本：算法/取值口径变化时递增，让缓存随开关与勾选一起失效。
+    SHAPEKEY_BAKE_REVISION = 2
     COPY_HASH_PROP = "_ssmt_preprocess_hash"
     COPY_SOURCE_PROP = "_ssmt_preprocess_source"
     COPY_REQUESTED_PROP = "_ssmt_preprocess_requested"
@@ -304,6 +309,22 @@ class PreProcessCache:
             pass
 
     @classmethod
+    def _shapekey_bake_signature(cls) -> str:
+        """未勾选形态键烘焙的输入签名：开关状态 + 未勾选键名。
+
+        前处理副本的网格与形态键数据取决于这两者，必须掺进对象哈希，
+        否则切换勾选或开关后会命中按旧口径烘焙的副本。
+        """
+        try:
+            from .export_helper import BlueprintExportHelper
+
+            enabled = bool(BlueprintExportHelper.should_bake_disabled_shape_keys())
+            names = sorted(BlueprintExportHelper.get_disabled_shape_key_export_names()) if enabled else []
+        except Exception:
+            return "shapekey-bake=unavailable"
+        return f"shapekey-bake={'on' if enabled else 'off'}:{','.join(names)}:rev{cls.SHAPEKEY_BAKE_REVISION}"
+
+    @classmethod
     def compute_object_hash(cls, obj_name: str) -> str:
         obj, source_obj_name = cls.resolve_source_object(obj_name)
         if obj is None:
@@ -312,6 +333,7 @@ class PreProcessCache:
         hasher = hashlib.sha256()
 
         hasher.update(f"pipeline-v{cls.PIPELINE_HASH_VERSION}".encode('utf-8'))
+        hasher.update(cls._shapekey_bake_signature().encode('utf-8'))
         hasher.update(source_obj_name.encode('utf-8'))
         hasher.update(obj.type.encode('utf-8'))
         hasher.update(struct.pack('<?', GlobalProterties.enable_non_mirror_workflow()))

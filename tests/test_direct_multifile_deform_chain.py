@@ -6,6 +6,8 @@ import unittest
 from collections import OrderedDict
 from pathlib import Path
 
+from tests import _real_modules
+
 
 def _install_module(name, **attrs):
     module = types.ModuleType(name)
@@ -19,6 +21,9 @@ PKG = "_direct_multifile_deform_chain_test_pkg"
 for package_name in (PKG, f"{PKG}.blueprint", f"{PKG}.common", f"{PKG}.utils"):
     package = _install_module(package_name)
     package.__path__ = []
+
+# 真实 common 子模块按 fake 包前缀注册（空 __path__ 假包解析不了相对导入）
+_real_modules.register_real_common_modules(f"{PKG}.common")
 
 _install_module("bpy")
 _install_module(f"{PKG}.common.global_config", GlobalConfig=types.SimpleNamespace(logic_name="ZZMI"))
@@ -72,6 +77,18 @@ deform_chain = _load("blueprint.deform_chain", "blueprint/deform_chain.py")
 direct_multifile = _load("blueprint.direct_export_multifile", "blueprint/direct_export_multifile.py")
 
 
+def _stub_update_shader_file(shader_path, source_path=None):
+    """生产调用点会传 ``source_path``（读模板、写目标）。
+
+    这里**显式列出形参**、而不是用 ``**_kwargs`` 吞掉一切关键字实参：吞参会把
+    「调用方传了被调方不接受的实参」这类缺陷静默吃掉（NTMI 适配器就因缺
+    ``source_path`` 在崩铁直出形态键路径上必抛 TypeError，而当时的桩全是
+    ``**_kwargs``，测试照不出来）。调用点新增实参时，本桩会以 TypeError 暴露。
+    """
+    del shader_path, source_path
+    return True
+
+
 class DirectMultiFileDeformChainTests(unittest.TestCase):
     def test_direct_multifile_and_shapekey_share_v3_chain(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -85,7 +102,8 @@ class DirectMultiFileDeformChainTests(unittest.TestCase):
                 active_value=1,
                 comment="",
                 _get_shader_source_path=lambda: str(shader_source),
-                _update_shader_file=lambda _path: True,
+                # 显式形参（不用 **_kwargs 吞参）：调用点新增实参必须在这里暴露
+                _update_shader_file=_stub_update_shader_file,
                 _hash_to_resource_prefix=lambda value: value.replace("-", "_"),
                 _compute_dispatch_group_count=lambda *_args, **_kwargs: 2,
                 _write_ordered_dict_to_ini=lambda *_args, **_kwargs: None,

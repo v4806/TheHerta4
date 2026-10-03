@@ -5,6 +5,8 @@ import unittest
 from collections import OrderedDict
 from pathlib import Path
 
+from tests import _real_modules
+
 
 def _install_module(name, **attrs):
     module = types.ModuleType(name)
@@ -15,6 +17,8 @@ def _install_module(name, **attrs):
 
 
 PKG = "_node_postprocess_multifile_test_pkg"
+# 真实 common 子模块按 fake 包前缀注册（空 __path__ 假包解析不了相对导入）
+_real_modules.register_real_common_modules(f"{PKG}.common")
 for package_name in (PKG, f"{PKG}.blueprint", f"{PKG}.common"):
     package = _install_module(package_name)
     package.__path__ = []

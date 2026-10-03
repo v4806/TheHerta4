@@ -14,38 +14,156 @@ from ..common.mod_path_compat import derive_shapekey_slot_resource_name
 from ..common.mod_path_compat import ensure_resource_alias_section
 from ..utils.log_utils import LOG
 from .direct_export_runtime_utils import apply_position_override_in_place
+from .direct_export_runtime_utils import assemble_drawib_position_bytes
 from .direct_export_runtime_utils import extract_position_bytes_by_indices as _extract_position_bytes_by_indices
 from .direct_export_runtime_utils import iter_drawib_models as _iter_drawib_models
-from .direct_export_shapekey_shared import ShapeKeyDirectExportError, _buffer_to_bytes
+from .direct_export_shapekey_shared import ShapeKeyDirectExportError, _buffer_to_bytes, resolve_use_delta
 
 
 class DirectShapeKeyOutputMixin:
     _PRESENT_RUN_BEGIN = "; --- SSMT DIRECT SHAPEKEY PRESENT BEGIN ---"
     _PRESENT_RUN_END = "; --- SSMT DIRECT SHAPEKEY PRESENT END ---"
 
+    #: 形态键强度签名：每帧把本帧所有强度/开关变量按固定权重求和，与上一帧比较，
+    #: 没变化就整段跳过 dispatch。一次 dispatch 要读 ~36MB、写 ~9MB 顶点缓冲
+    #: （14033 组 × 16 线程），静止（没有动画、没按 Alt 拖拽）时输入完全没变，
+    #: 重算一遍是纯显存带宽浪费 —— 装大量同类模组时这是最大的 GPU 开销。
+    #: 权重取互不相同的质数：任意单个强度变化都会改变加权和（避免两项抵消）。
+    _SK_SIGNATURE_WEIGHTS = (
+        1, 3, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53,
+        59, 61, 67, 71, 73, 79, 83, 89, 97, 101, 103, 107, 109,
+        113, 127, 131, 137, 139, 149, 151, 157, 163, 167, 173,
+        179, 181, 191, 193, 197, 199, 211, 223, 227, 229, 233,
+    )
+    #: 单条 INI 表达式里最多塞多少个强度项（3DMigoto 行缓冲有限，超长行会被截断）
+    _SK_SIGNATURE_TERMS_PER_LINE = 16
+
     def _uses_active_guard(self):
         key_map = getattr(getattr(self, "blueprint_model", None), "keyname_mkey_dict", None)
         return bool(key_map)
 
-    def _build_present_run_block(self, unique_hashes):
+    @staticmethod
+    def _drag_mode_variable_for(drag_drive_resource):
+        """从拖拽驱动资源名推出「拖拽系统本帧在臂动」的门控变量。
+
+        资源名形如 ``ResourceDragShapeKeyDrive_{ns}``（拖拽节点命名），对应变量
+        ``$ssmtdrag_mode_{ns}``（Alt 按住时为 1）。拖拽驱动缓冲每帧都在变，
+        签名看不出来，必须用它强制 dispatch。拿不到就返回空串（不加这一项）。
+        """
+        text = str(drag_drive_resource or "").strip()
+        prefix = "ResourceDragShapeKeyDrive_"
+        if not text.startswith(prefix):
+            return ""
+        namespace = text[len(prefix):].strip()
+        return f"$ssmtdrag_mode_{namespace}" if namespace else ""
+
+    def _sk_signature_var_names(self, unique_hashes):
+        """签名变量的名字（按 hash 前缀区分，多个形态键节点互不干扰）。"""
+        suffix = ""
+        for logical_hash in unique_hashes:
+            suffix = str(self.node._extract_hash_prefix(logical_hash) or "")
+            if suffix:
+                break
+        safe_suffix = re.sub(r"[^0-9A-Za-z_]", "_", suffix) or "0"
+        return f"$ssmt_sk_sig_{safe_suffix}", f"$ssmt_sk_sig_prev_{safe_suffix}"
+
+    def _build_signature_lines(self, signature_var, signature_vars):
+        """把签名拆成若干条有界长度的赋值（超长表达式行可能被 3DMigoto 截断）。"""
+        params = []
+        for name in signature_vars or ():
+            text = str(name or "").strip()
+            if text and text not in params:
+                params.append(text)
+        if not params:
+            return []
+
+        step = max(1, int(self._SK_SIGNATURE_TERMS_PER_LINE))
+        weights = self._SK_SIGNATURE_WEIGHTS
+        lines = []
+        for chunk_index in range(0, len(params), step):
+            chunk = params[chunk_index:chunk_index + step]
+            terms = " + ".join(
+                f"{param} * {weights[(chunk_index + offset) % len(weights)]}"
+                for offset, param in enumerate(chunk)
+            )
+            if chunk_index == 0:
+                lines.append(f"{signature_var} = {terms}")
+            else:
+                lines.append(f"{signature_var} = {signature_var} + {terms}")
+        return lines
+
+    def _build_present_run_block(self, unique_hashes, signature_vars=None, drag_active_var=""):
+        """[Present] 里的形态键 dispatch 块。
+
+        带 ``signature_vars`` 时先算签名，只有签名变化（或有拖拽在驱动形态键）才
+        真的 dispatch；没有签名变量（旧调用点）时保持原样无条件 dispatch。
+        """
+        signature_lines = []
+        if signature_vars:
+            signature_var, _prev_var = self._sk_signature_var_names(unique_hashes)
+            signature_lines = self._build_signature_lines(signature_var, signature_vars)
+
         lines = [self._PRESENT_RUN_BEGIN]
-        if self._uses_active_guard():
-            lines.extend([
-                'if $active0 == 1',
-                *[f"    run = CustomShader_{logical_hash}_Anim" for logical_hash in unique_hashes],
-                'endif',
-            ])
-        else:
+        guard_open = ['if $active0 == 1'] if self._uses_active_guard() else []
+        indent = "    " * len(guard_open)
+
+        if signature_lines:
+            signature_var, prev_var = self._sk_signature_var_names(unique_hashes)
+            condition = f"{signature_var} != {prev_var}"
+            if drag_active_var:
+                condition = f"{condition} || {drag_active_var} == 1"
+            lines.extend(guard_open)
+            lines.extend(f"{indent}{line}" for line in signature_lines)
+            lines.append(f"{indent}if {condition}")
             lines.extend(
-                f"run = CustomShader_{logical_hash}_Anim"
+                f"{indent}    run = CustomShader_{logical_hash}_Anim"
                 for logical_hash in unique_hashes
             )
+            lines.append(f"{indent}    {prev_var} = {signature_var}")
+            lines.append(f"{indent}endif")
+            if guard_open:
+                lines.append("endif")
+        else:
+            lines.extend(guard_open)
+            lines.extend(
+                f"{indent}run = CustomShader_{logical_hash}_Anim"
+                for logical_hash in unique_hashes
+            )
+            if guard_open:
+                lines.append("endif")
         lines.append(self._PRESENT_RUN_END)
         return lines
 
+    def _delta_stride_for(self, logical_hash, vertex_stride, struct_definition=None):
+        """增量资源在 INI 里声明的 stride。
+
+        关闭「存储全部顶点属性增量」时恒为 12（仅位置）；开启时 = 4 × 通道 float 数
+        （位置+法线+切线 xyz 即 36）。必须与着色器里的 ``ShapeKeyDelta`` 行宽一致。
+        """
+        return self.node._resolve_delta_stride(
+            hash_val=logical_hash,
+            vertex_stride=vertex_stride,
+            struct_definition=struct_definition,
+        )
+
+    def _delta_channel_columns(self, runtime_info, num_floats_per_vertex, struct_definition=None):
+        """增量通道列下标。
+
+        关闭「存储全部顶点属性增量」时恒为 ``[0, 1, 2]``（仅位置），与旧版逐字节一致；
+        开启时按顶点数据类型展开（位置 + 法线 + 切线 xyz）。结构体一律按 ``hash_val``
+        逐哈希解析——必须与 ``_update_shader_file`` 注入着色器的那个是同一份，
+        否则数据列与着色器结构体字段会错位。
+        """
+        plan = self.node._resolve_delta_channel_plan(
+            hash_val=runtime_info.get("logical_hash") if runtime_info else None,
+            struct_definition=struct_definition,
+            num_floats_per_vertex=num_floats_per_vertex,
+        )
+        return self.node._channel_plan_columns(plan)
+
     def _write_slot_files(self, logical_hash, runtime_info, hash_slot_data, slot_position_overrides):
         use_packed = self.node.use_packed_Meshess
-        use_delta = self.node.store_deltas
+        use_delta = resolve_use_delta(self.node)
         actual_hash = runtime_info["actual_hash"]
         base_bytes = runtime_info["base_bytes"]
         struct_definition = self.node._get_vertex_struct_definition()
@@ -72,9 +190,17 @@ class DirectShapeKeyOutputMixin:
             slot_maps[slot_num] = None
 
             if use_delta:
-                data_to_write = target_data[:, :3] - base_data[:, :3]
+                channel_columns = self._delta_channel_columns(
+                    runtime_info,
+                    num_floats_per_vertex,
+                )
+                data_to_write = target_data[:, channel_columns] - base_data[:, channel_columns]
                 data_to_write[data_to_write == 0] = 0.0
-                diff_mask = ~np.isclose(base_data[:, :3], target_data[:, :3], atol=1e-6).all(axis=1)
+                diff_mask = ~np.isclose(
+                    base_data[:, channel_columns],
+                    target_data[:, channel_columns],
+                    atol=1e-6,
+                ).all(axis=1)
                 if use_packed:
                     packed_data = data_to_write[diff_mask]
                     map_array = np.full(num_vertices, -1, dtype=np.int32)
@@ -104,7 +230,7 @@ class DirectShapeKeyOutputMixin:
         return slot_maps
 
     def _write_merged_slot_files(self, logical_hash, runtime_info, hash_slot_data, slot_position_overrides):
-        use_delta = self.node.store_deltas
+        use_delta = resolve_use_delta(self.node)
         actual_hash = runtime_info["actual_hash"]
         base_bytes = runtime_info["base_bytes"]
         struct_definition = self.node._get_vertex_struct_definition()
@@ -114,6 +240,8 @@ class DirectShapeKeyOutputMixin:
         merged_data_parts = []
         next_global_index = 0
         base_data = None
+        # 增量记录每条的 float 宽度：关闭「全部顶点属性增量」时恒为 3（仅位置）
+        delta_channel_width = 3
 
         for slot_num, names_data in sorted(hash_slot_data.items()):
             target_bytes = self._compose_slot_bytes(
@@ -135,9 +263,18 @@ class DirectShapeKeyOutputMixin:
 
             target_data = np.frombuffer(target_bytes, dtype=np.float32).reshape(base_data.shape)
             if use_delta:
-                data_to_write = target_data[:, :3] - base_data[:, :3]
+                channel_columns = self._delta_channel_columns(
+                    runtime_info,
+                    base_data.shape[1],
+                )
+                delta_channel_width = len(channel_columns)
+                data_to_write = target_data[:, channel_columns] - base_data[:, channel_columns]
                 data_to_write[data_to_write == 0] = 0.0
-                diff_mask = ~np.isclose(base_data[:, :3], target_data[:, :3], atol=1e-6).all(axis=1)
+                diff_mask = ~np.isclose(
+                    base_data[:, channel_columns],
+                    target_data[:, channel_columns],
+                    atol=1e-6,
+                ).all(axis=1)
             else:
                 data_to_write = target_data
                 diff_mask = ~np.isclose(base_data, target_data, atol=1e-6).all(axis=1)
@@ -158,7 +295,10 @@ class DirectShapeKeyOutputMixin:
         if merged_data_parts:
             merged_data = np.concatenate(merged_data_parts, axis=0)
         else:
-            merged_data = np.empty((0, 3 if use_delta else base_data.shape[1]), dtype=np.float32)
+            merged_data = np.empty(
+                (0, delta_channel_width if use_delta else base_data.shape[1]),
+                dtype=np.float32,
+            )
 
         data_suffix = "_merged_packed_pos_delta" if use_delta else "_merged_packed"
         data_path = os.path.join(self.meshes_dir, f"{actual_hash}-Position{data_suffix}.buf")
@@ -260,6 +400,34 @@ class DirectShapeKeyOutputMixin:
 
         return bytes(slot_bytes)
 
+    def _resolve_drawib_base_position_bytes(
+        self, drawib_model, base_path: str, logical_hash: str
+    ) -> bytes:
+        """取 DrawIB 级基础 Position 字节，与 DrawIB 级 export_indices 同一索引空间。
+
+        优先按子网格顺序拼接 `<unique_str>-Position.buf`（逐子网格写盘的游戏，例如
+        EFMI 多 LOD：同一 DrawIB 的 LOD0/LOD1 各有一个文件，而 `export_indices` 是
+        DrawIB 级的、第二个子网格的索引从第一个子网格顶点数处开始）——不拼接就会用
+        DrawIB 级索引去采样单子网格文件，直接 `IndexError: index N is out of bounds`。
+
+        无法拼接（单个子网格 / 文件缺失 / 步长不一致 / 合并 IB 的游戏）时回退到
+        「按哈希解析出的单个文件」，保持既有行为。
+        """
+        folder_path = os.path.dirname(str(base_path or ""))
+        merged_bytes, submesh_count = assemble_drawib_position_bytes(
+            folder_path,
+            getattr(drawib_model, "submesh_model_list", []) or [],
+        )
+        if merged_bytes:
+            LOG.info(
+                f"直出形态键: DrawIB {logical_hash} 基础 Position 由 {submesh_count} 个子网格缓冲"
+                f"拼接（{len(merged_bytes)} 字节），与 DrawIB 级顶点索引对齐"
+            )
+            return merged_bytes
+
+        with open(base_path, "rb") as file_obj:
+            return file_obj.read()
+
     def _build_runtime_infos(self, unique_hashes):
         runtime_infos = {}
         for logical_hash in unique_hashes:
@@ -277,8 +445,9 @@ class DirectShapeKeyOutputMixin:
                 LOG.warning(f"直出形态键跳过哈希 {logical_hash}: 无法匹配基础 DrawIB 模型")
                 continue
 
-            with open(base_path, "rb") as file_obj:
-                base_bytes = file_obj.read()
+            base_bytes = self._resolve_drawib_base_position_bytes(
+                drawib_model, base_path, logical_hash
+            )
 
             position_stride = self._infer_position_stride(drawib_model, base_bytes)
             vertex_count = int(len(base_bytes) / position_stride) if position_stride > 0 else 0
@@ -323,8 +492,9 @@ class DirectShapeKeyOutputMixin:
             if not shapekey_buffers:
                 continue
 
-            with open(base_path, "rb") as file_obj:
-                base_bytes = file_obj.read()
+            base_bytes = self._resolve_drawib_base_position_bytes(
+                drawib_model, base_path, logical_hash
+            )
 
             position_stride = self._infer_position_stride(drawib_model, base_bytes)
             vertex_count = int(len(base_bytes) / position_stride) if position_stride > 0 else 0
@@ -533,8 +703,29 @@ class DirectShapeKeyOutputMixin:
             rebuilt_present_lines.append(present_lines[line_index])
             line_index += 1
 
-        rebuilt_present_lines.extend(self._build_present_run_block(unique_hashes))
+        # 签名变量：本帧所有形态键强度（+ 基础网格切换开关）。没变化就不 dispatch，
+        # 拖拽臂动（Alt）期间强制 dispatch —— 拖拽驱动缓冲每帧都在变，签名看不出来。
+        signature_vars = sorted({
+            str(param).strip() for param in shapekey_freq_params.values() if str(param).strip()
+        })
+        if "$ssmt_sk_base_mesh" in vars_to_define:
+            signature_vars.append("$ssmt_sk_base_mesh")
+        rebuilt_present_lines.extend(self._build_present_run_block(
+            unique_hashes,
+            signature_vars=signature_vars,
+            drag_active_var=self._drag_mode_variable_for(drag_drive_resource),
+        ))
         sections['[Present]'] = rebuilt_present_lines
+
+        if signature_vars:
+            signature_var, prev_var = self._sk_signature_var_names(unique_hashes)
+            for declaration in (
+                f"global {signature_var} = 0",
+                # 初值 -1：第一帧必然与签名不同 → 至少 dispatch 一次
+                f"global {prev_var} = -1",
+            ):
+                if declaration not in constants_lines:
+                    constants_lines.append(declaration)
 
         compute_blocks_to_add = OrderedDict()
         for logical_hash in unique_hashes:
@@ -582,7 +773,7 @@ class DirectShapeKeyOutputMixin:
 
             mode_str = (
                 f"紧凑:{'是' if use_packed else '否'}, "
-                f"增量(仅位置):{'是' if use_delta else '否'}, "
+                f"增量:{self.node._describe_delta_scope(use_delta)}, "
                 f"优化查找:{'是' if use_optimized else '否'}, "
                 f"文件合并:{'是' if merge_slot_files else '否'}"
             )
@@ -674,7 +865,7 @@ class DirectShapeKeyOutputMixin:
 
                 actual_file_hash = hash_to_actual_file_hash.get(logical_hash, logical_hash)
                 base_stride = hash_to_stride.get(hash_prefix, 40)
-                data_stride = 12 if use_delta else base_stride
+                data_stride = self._delta_stride_for(logical_hash, base_stride) if use_delta else base_stride
                 base_resources = hash_to_base_resources.get(hash_prefix, [])
                 primary_base_resource = base_resources[0] if base_resources else f"Resource_{self.node._hash_to_resource_prefix(logical_hash)}_Position"
                 data_section = f"[{derive_shapekey_merged_data_resource_name(primary_base_resource, use_delta)}]"
@@ -701,7 +892,7 @@ class DirectShapeKeyOutputMixin:
                     primary_base_resource = base_resources[0] if base_resources else f"Resource_{self.node._hash_to_resource_prefix(logical_hash)}_Position"
                     if use_delta:
                         res_suffix = "_packed_pos_delta" if use_packed else "_pos_delta"
-                        stride = 12
+                        stride = self._delta_stride_for(logical_hash, base_stride)
                     elif use_packed:
                         res_suffix = "_packed"
                         stride = base_stride

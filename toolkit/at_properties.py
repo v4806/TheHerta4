@@ -3,29 +3,82 @@
 import bpy
 
 
-def update_shape_key_value(self, context):
-    """当UI滑块变动时，更新所有选中物体上对应的形态键值"""
-    shape_key_name = self.name
-    new_value = self.value
-    
-    for obj in context.selected_objects:
-        if obj.type == 'MESH' and obj.data.shape_keys:
-            if shape_key_name in obj.data.shape_keys.key_blocks:
-                obj.data.shape_keys.key_blocks[shape_key_name].value = new_value
-                obj.data.update_tag()
+def update_group_shape_key_value(self, context):
+    """连续形态键分组滑块变动：按顺序整体填充组内形态键"""
+    from . import at_shape_key_control
+    at_shape_key_control.on_group_update(self, context)
+
+
+def update_shape_key_value_range(self, context):
+    """最小值/最大值变动：列表内所有形态键随之重算"""
+    from . import at_shape_key_control
+    at_shape_key_control.on_value_range_update(self, context)
+
+
+def update_shape_key_grouping(self, context):
+    """切换连续形态键合并后立即重建列表"""
+    from . import at_shape_key_control
+    at_shape_key_control.refresh_from_context(context)
 
 
 class ATP_ShapeKeyItem(bpy.types.PropertyGroup):
-    """用于在UI列表中存储一个形态键信息的属性组"""
+    """统一控制器列表的一行：单个形态键，或一组连续形态键"""
     name: bpy.props.StringProperty()
+    is_group: bpy.props.BoolProperty(name="连续形态键分组", default=False)
+    label: bpy.props.StringProperty(name="显示名称", default="")
+    key_names: bpy.props.StringProperty(name="成员形态键", default="")
+    reference_object: bpy.props.PointerProperty(
+        type=bpy.types.Object,
+        name="参考物体",
+        description="该行滑块绑定的物体：滑块直接控制它上面的同名形态键，并同步到其余选中物体",
+    )
     value: bpy.props.FloatProperty(
         name="Value",
-        min=0.0,
-        soft_min=0.0,
         default=0.0,
-        update=update_shape_key_value,
-        description="统一控制所有同名形态键的值"
+        description="刷新时记录的实际形态键值（参考物体失效时用于只读显示）",
     )
+    group_value: bpy.props.FloatProperty(
+        name="GroupValue",
+        min=0.0,
+        max=1.0,
+        soft_min=0.0,
+        soft_max=1.0,
+        default=0.0,
+        update=update_group_shape_key_value,
+        description="连续形态键分组的整体拖动位置 0~1；组内第 i 个键填充 group_value × N - i（截断到 0~1）",
+    )
+
+
+ATP_UL_SHAPEKEY_LIST_IDNAME = "ATP_UL_SHAPEKEY_LIST"
+
+
+class ATP_UL_ShapeKeyList(bpy.types.UIList):
+    """统一形态键控制列表（可滚动）"""
+    bl_idname = ATP_UL_SHAPEKEY_LIST_IDNAME
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        from . import at_shape_key_control
+
+        if self.layout_type not in {'DEFAULT', 'COMPACT'}:
+            layout.alignment = 'CENTER'
+            layout.label(text=item.label or item.name, icon='GROUP' if item.is_group else 'SHAPEKEY_DATA')
+            return
+
+        split = layout.split(factor=0.45, align=True)
+
+        if item.is_group:
+            split.label(text=item.label or item.name, icon='GROUP')
+            split.prop(item, "group_value", text="", slider=True)
+            return
+
+        # 单键行：滑块直接绑在真实形态键上，显示值即实际值，范围即该键的 slider_min / slider_max
+        reference_object, key_block = at_shape_key_control.resolve_reference(item, context)
+        if key_block is not None:
+            split.label(text=item.label or item.name, icon='SHAPEKEY_DATA')
+            split.prop(key_block, "value", text="", slider=True)
+        else:
+            split.label(text=item.label or item.name, icon='ERROR')
+            split.label(text=f"{item.value:.3f} (无参考物体)")
 
 
 class ATP_FrameShapeKeyPair(bpy.types.PropertyGroup):
@@ -75,6 +128,36 @@ class ATP_Properties(bpy.types.PropertyGroup):
     
     shape_key_list: bpy.props.CollectionProperty(type=ATP_ShapeKeyItem, name="形态键列表")
     shape_key_list_index: bpy.props.IntProperty(name="形态键列表索引", default=0)
+    sk_use_grouping: bpy.props.BoolProperty(
+        name="组合连续形态键",
+        default=True,
+        update=update_shape_key_grouping,
+        description="把「相同前缀 + 连续数字编号」的形态键合并成一行，用一个滑块按顺序整体拖动",
+    )
+    sk_list_rows: bpy.props.IntProperty(
+        name="列表行数",
+        default=8,
+        min=3,
+        max=30,
+        description="统一控制器列表的显示高度，超出部分滚动查看",
+    )
+    sk_live_sync: bpy.props.BoolProperty(
+        name="实时同步选中物体",
+        default=True,
+        description="拖动列表滑块时，把参考物体上的形态键值同步到其余选中物体\n关闭后列表只驱动参考物体自身",
+    )
+    sk_value_min: bpy.props.FloatProperty(
+        name="最小值",
+        default=0.0,
+        update=update_shape_key_value_range,
+        description="列表内所有形态键的最小值（默认 0）",
+    )
+    sk_value_max: bpy.props.FloatProperty(
+        name="最大值",
+        default=1.0,
+        update=update_shape_key_value_range,
+        description="列表内所有形态键的最大值（默认 1）",
+    )
     sk_add_new_name: bpy.props.StringProperty(name="形态键名称", default="NewKey", description="要批量添加或删除的形态键的名称")
     sk_set_active_name: bpy.props.StringProperty(name="活动形态键名称", default="", description="要设置为活动项的形态键名称")
     sk_rename_old_name: bpy.props.StringProperty(name="旧名称片段", default="", description="要在形态键名称中查找并替换的文本片段")
@@ -288,5 +371,6 @@ at_properties_list = (
     ATP_ShapeKeyItem,
     ATP_FrameShapeKeyPair,
     ATP_UL_FrameShapeKeyList,
+    ATP_UL_ShapeKeyList,
     ATP_Properties,
 )

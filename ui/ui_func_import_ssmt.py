@@ -580,7 +580,16 @@ def ImprotFromWorkSpaceFull(self, context):
     # 提取文件还在；来源日志更新时读侧自动淘汰、回退实时扫描（生成侧
     # efmi.py::_efmi_pass_layouts 先读此缓存）。按 IB 增量合并：本批导入只更新
     # 自己这些部件，旧批次部件不丢。任何失败都不阻断导入（生成侧有兜底）。
-    if GlobalConfig.logic_name == LogicName.EFMI:
+    # 受导出节点「多pass贴图槽位镜像」总开关控制
+    # （GlobalProterties.efmi_pass_mirror_enabled，默认关）：开启时本流程才走并写缓存；
+    # 默认关 ⇒ 不写缓存（生成侧开关同为关闭态，缓存存在与否无所谓）。
+    # 访问器兜底（与本文件既有 getattr 习惯一致）：轻量宿主（测试桩、旧版本 add-on
+    # 的 GlobalProterties）可能没有该访问器，此时按属性默认值「关」处理，与属性声明
+    # 一致；访问器存在时读它的真实返回值（开启即走本流程）。
+    _efmi_pass_mirror_enabled = getattr(
+        GlobalProterties, "efmi_pass_mirror_enabled", lambda: False
+    )
+    if GlobalConfig.logic_name == LogicName.EFMI and _efmi_pass_mirror_enabled():
         try:
             from ..common.efmi_skeleton import EFMISkeletonMergeHelper as _EFMIPassHelper
             from .universal.efmi_pass_mirror import (
@@ -622,15 +631,41 @@ def ImprotFromWorkSpaceFull(self, context):
         except Exception as _pm_exc:
             print(f"[EFMI多pass镜像] pass 布局写回异常（不阻断导入）: {_pm_exc}")
 
-    # ZZMI 骨骼合并数据预生成（与 EFMI 同构的分支选项）：
-    # 复选框（import_merged_vgmap，「使用融合统一顶点组」）关闭时完全不执行，保持旧逻辑；
-    # 开启时把 FrameAnalysis 反查的 VGMap/VGOffset/VGCount 写回工作空间 json，
-    # 导入流程经 create_mesh_from_json 的既有双条件路径自动走全局骨骼索引。
-    is_zzmi_merged = (
+    # ZZMI 骨骼合并数据预生成：**生成侧与消费侧分离**。
+    #
+    # 生成侧（本段）：无论「使用融合统一顶点组」以及两个实验开关（启用合并网格
+    # 自动重定向 / 跨组融合统一顶点组测试）是否开启，首次导入、或「清除骨骼合并
+    # VGMap 缓存」后的重新导入，都必须把提取文件里的骨骼合并数据完整反查并落盘到
+    # 工作空间——VGMap/VGOffset/VGCount + SkeletonGroup/DeformDrawIndex/
+    # OriginalVertexCount + ModImpRuntime 的 palette（BoneMatrix）与对象变换
+    # （ObjectCB1）副本。因此这些开关之后任何时候打开都不再需要提取文件；数据
+    # 持久保存，只有清缓存才触发下一次反查（有新提取文件用新的，没有则用工作空间
+    # 缓存重建，见 ZZMISkeletonMergeHelper.ensure_skeleton_data）。
+    # 自愈：判据不止「缺 VGMap 元数据」，还含快路径完整性（_zzmi_cache_intact）
+    # ——旧算法版本、缺导出侧守卫字段、palette 缓存损坏等一律在下次导入修复
+    # （v4→v5 可就地升级，不需要提取文件）；换用新的提取文件仍需重新选择提取源
+    # 并重新导入（不自动改用游戏目录里的其它帧）。
+    #
+    # 消费侧（本段之外，本文件不改判定）：复选框仍决定本次导入/导出是否使用这份
+    # 数据（common/ssmt_import_helper.py 的 merged_vgmap_enabled 与
+    # common/submesh_model.py 的合并骨架预处理），关闭时导入结果与旧版一致。
+    zzmi_merged_consumption = (
         GlobalConfig.logic_name == LogicName.ZZMI
         and GlobalProterties.import_merged_vgmap()
     )
-    if is_zzmi_merged:
+    zzmi_merged_metadata_missing = False
+    if GlobalConfig.logic_name == LogicName.ZZMI:
+        try:
+            from ..common.zzmi_skeleton import ZZMISkeletonMergeHelper as _ZZMIMergeHelper
+            zzmi_merged_metadata_missing = bool(
+                _ZZMIMergeHelper.missing_merged_metadata_exist(
+                    GlobalConfig.path_workspace_folder(),
+                    [target["import_key"] for target in import_targets],
+                )
+            )
+        except Exception:
+            zzmi_merged_metadata_missing = False
+    if zzmi_merged_consumption or zzmi_merged_metadata_missing:
         merged_vgmap_ready = False
         try:
             from ..common.zzmi_skeleton import ZZMISkeletonMergeHelper
@@ -642,28 +677,41 @@ def ImprotFromWorkSpaceFull(self, context):
             print(f"[ZZMI骨骼合并] {message}")
             merged_vgmap_ready = bool(ok)
             if ok:
-                self.report({'INFO'}, message)
+                if zzmi_merged_consumption:
+                    self.report({'INFO'}, message)
             else:
                 print(f"[ZZMI骨骼合并] 未生成骨骼数据：{message}")
-                # 部分/全部子网格未生成合并骨架数据时会走普通导入路线，
-                # 必须显式警告，避免用户误以为骨骼合并已完整生效。
-                self.report({'WARNING'}, f"骨骼合并未完整生成：{message}")
+                if zzmi_merged_consumption:
+                    # 部分/全部子网格未生成合并骨架数据时会走普通导入路线，
+                    # 必须显式警告，避免用户误以为骨骼合并已完整生效。复选框
+                    # 关闭时只记 stdout：本次导入本来就不消费合并数据。
+                    self.report({'WARNING'}, f"骨骼合并未完整生成：{message}")
         except Exception as e:
             import traceback
             print(f"[ZZMI骨骼合并] 预生成失败（不阻断导入）: {e}")
             traceback.print_exc()
-            self.report({'WARNING'}, f"ZZMI 骨骼合并预生成异常，已回退普通导入：{e}")
+            if zzmi_merged_consumption:
+                self.report({'WARNING'}, f"ZZMI 骨骼合并预生成异常，已回退普通导入：{e}")
 
-    if merged_vgmap_ready is False:
+    if merged_vgmap_ready is False and (
+        GlobalConfig.logic_name != LogicName.ZZMI or zzmi_merged_consumption
+    ):
         # 失败后若继续保留复选框，当前对象虽按普通组导入，后续导出器却仍会
         # 按合并骨架生成运行时段，形成导入/导出模式分裂。显式关闭选项，确保
         # 本次普通导入与随后导出保持同一契约；用户修好来源后可再次手动开启。
+        # ZZMI 在复选框本就关闭时（本次只是修复性预生成）不需要这条回退。
         GlobalProterties.set_import_merged_vgmap(False)
         self.report(
             {'WARNING'},
             "本次已整体回退普通顶点组，并关闭“使用融合统一顶点组”；"
             "修复骨骼来源后可重新开启并再次导入",
         )
+
+    # 消费侧覆盖值：ZZMI 复选框关闭时，即使数据已预生成到工作空间，也必须走
+    # 普通（局部）顶点组路线——传 None = 按全局选项决定，不改变旧版导入结果。
+    merged_vgmap_import_override = merged_vgmap_ready
+    if GlobalConfig.logic_name == LogicName.ZZMI and not zzmi_merged_consumption:
+        merged_vgmap_import_override = None
 
     foldername_gametypename_dict = {}
     imported_objects = []
@@ -693,7 +741,7 @@ def ImprotFromWorkSpaceFull(self, context):
                 imported_obj = SSMTImportHelper.create_mesh_from_json(
                     json_file_path=json_file_path,
                     import_collection=target["import_collection"],
-                    use_merged_vgmap=merged_vgmap_ready,
+                    use_merged_vgmap=merged_vgmap_import_override,
                 )
                 if imported_obj is None:
                     continue
@@ -715,7 +763,7 @@ def ImprotFromWorkSpaceFull(self, context):
 
                 imported_obj.name = display_name
                 imported_obj.data.name = imported_obj.name
-                if is_zzmi_merged and merged_vgmap_ready is True:
+                if zzmi_merged_consumption and merged_vgmap_ready is True:
                     # 分组版骨骼合并：导入对象按 json SkeletonGroup 归入对应骨架组合集，
                     # 让"同一对象空间的部件"在大纲视图里聚在一起（跨组不共享骨架）。
                     try:

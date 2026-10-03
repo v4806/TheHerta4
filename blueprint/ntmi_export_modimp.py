@@ -112,6 +112,7 @@ COMPATIBLE_POSTPROCESS_NODE_TYPES = {
     "SSMTNode_PostProcess_CommentCleanup",
     "SSMTNode_PostProcess_Material",
     "SSMTNode_PostProcess_CustomMaterialAssign",
+    "SSMTNode_PostProcess_RabbitFXPro",
     "SSMTNode_PostProcess_MultiFile",
     "SSMTNode_PostProcess_ResourceMerge",
     "SSMTNode_PostProcess_ShapeKey",

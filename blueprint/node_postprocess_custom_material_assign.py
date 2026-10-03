@@ -175,6 +175,12 @@ class SSMT_CustomMaterialAssignSwitchGroup(bpy.types.PropertyGroup):
         default="",
         options={"HIDDEN"},
     )
+    preview_state: bpy.props.IntProperty(
+        name="预览档位",
+        description="内部使用：该分组当前预览到第几套贴图（-1 = 未预览）",
+        default=-1,
+        options={"HIDDEN"},
+    )
 
 
 class SSMT_CustomMaterialAssignTargetItem(bpy.types.PropertyGroup):
@@ -826,6 +832,11 @@ class SSMT_OT_CustomMaterialScanSwitches(bpy.types.Operator):
         if not node:
             return {"CANCELLED"}
 
+        # 预览改的是网格面材质索引；重新扫描会重建分组，先还原预览，
+        # 否则"上一次预览停在第 N 套"的部件会被带进新分组。
+        _restore_all_preview(node)
+        _restore_preview_material_shading(node, context)
+
         prefix, next_number = _parse_switch_var_base(node)
         total_groups = 0
         total_parts = 0
@@ -1035,6 +1046,9 @@ class SSMT_OT_CustomMaterialClearSwitches(bpy.types.Operator):
         node = _find_node(context, self.node_name)
         if not node:
             return {"CANCELLED"}
+        # 分组马上要被清掉，预览的部件必须先还原（否则没人再能写回原材质）。
+        _restore_all_preview(node)
+        _restore_preview_material_shading(node, context)
         cleared = 0
         for item in node.target_items:
             cleared += len(item.switch_groups)
@@ -1042,6 +1056,519 @@ class SSMT_OT_CustomMaterialClearSwitches(bpy.types.Operator):
         cleared += len(node.global_switch_groups)
         node.global_switch_groups.clear()
         self.report({"INFO"}, f"已清除 {cleared} 个贴图切换控制组")
+        return {"FINISHED"}
+
+
+# ---------------------------------------------------------------------------
+# 贴图切换预览：点分组里的档位按钮，直接把对应部件的网格面切到那一套材质，
+# 在视口里实时看到效果；「恢复」把面材质索引写回预览前的备份。
+#
+# 档位口径必须与生成侧一致：``generate_material_lines`` 写出
+# ``if $swapkey == index`` 的 index 就是 ``find_matching_materials()`` 的序号，
+# 而后者按**材质槽顺序**收集同前缀材质（并按材质签名去重）。所以预览也按材质槽
+# 顺序取第 index 个材质，**不能按名称排序** —— 槽顺序是 [B, A] 时运行时的档位 0
+# 是 B 而不是 A（扫描写下的 bindings 是排序后的名字，只用于标识分组身份）。
+#
+# 预览只改 ``polygon.material_index``（视口显示），不动材质槽、不动贴图、不参与
+# 导出：材质转资源的 INI/资源生成读的是物体材质槽，与面材质索引无关。
+# ---------------------------------------------------------------------------
+PREVIEW_STATE_NONE = -1
+PREVIEW_STATE_CYCLE = -2
+PREVIEW_MAX_DIRECT_BUTTONS = 6
+_MATERIAL_SHADING_TYPES = {"MATERIAL", "RENDERED"}
+
+# 预览前的视口着色方式：{节点归属键: {视口键: 着色类型}}（会话级，不写进 .blend）
+_preview_shading_backup = {}
+
+
+def _group_preview_state(group):
+    """该切换组当前预览到第几档（``PREVIEW_STATE_NONE`` = 未预览）。"""
+    try:
+        return int(getattr(group, "preview_state", PREVIEW_STATE_NONE))
+    except Exception:
+        return PREVIEW_STATE_NONE
+
+
+def _set_group_preview_state(group, state):
+    try:
+        group.preview_state = int(state)
+    except Exception:
+        pass
+
+
+def _has_active_preview(node):
+    return any(
+        _group_preview_state(group) != PREVIEW_STATE_NONE
+        for group, _obj, _item in _iter_node_switch_groups(node)
+    )
+
+
+def _preview_prefix_set(group):
+    """切换组覆盖的材质前缀（来自扫描写下的 bindings）。"""
+    prefixes = set()
+    try:
+        bindings = json.loads(str(getattr(group, "bindings", "") or "") or "[]")
+    except Exception:
+        bindings = []
+    if not isinstance(bindings, list):
+        return prefixes
+    for names in bindings:
+        if not isinstance(names, (list, tuple)):
+            continue
+        for name in names:
+            prefix = str(name or "").split("_", 1)[0].strip().casefold()
+            if prefix:
+                prefixes.add(prefix)
+    return prefixes
+
+
+def _material_signature_provider(node):
+    """生成侧的去重口径 ``_build_material_signature``；取不到时退化为不去重。"""
+    provider = getattr(node, "_build_material_signature", None)
+    return provider if callable(provider) else None
+
+
+def _slot_order_prefix_materials(obj, prefix, signature_of=None):
+    """按材质槽顺序返回该前缀的全部材质名（同签名去重，与生成侧同序）。"""
+    names = []
+    seen = set()
+    for slot in getattr(obj, "material_slots", []) or []:
+        material = getattr(slot, "material", None)
+        name = str(getattr(material, "name", "") or "")
+        if not name or name.split("_", 1)[0].strip().casefold() != prefix:
+            continue
+        if signature_of is not None:
+            try:
+                signature = signature_of(material)
+            except Exception:
+                signature = ("__name__", name)
+            if signature in seen:
+                continue
+            seen.add(signature)
+        names.append(name)
+    return names
+
+
+def _read_material_indices(mesh):
+    indices = [0] * len(mesh.polygons)
+    mesh.polygons.foreach_get("material_index", indices)
+    return indices
+
+
+def _write_material_indices(mesh, indices):
+    mesh.polygons.foreach_set("material_index", indices)
+    mesh.update()
+
+
+def _material_runs(indices):
+    """材质索引 → 游程编码 ``[[档位, 连续面数], ...]``（备份要整串存进 RNA）。"""
+    runs = []
+    for value in indices:
+        value = int(value)
+        if runs and runs[-1][0] == value:
+            runs[-1][1] += 1
+        else:
+            runs.append([value, 1])
+    return runs
+
+
+def _runs_to_indices(runs, expected_count):
+    """游程解码；面数与备份不符（物体被改过）时返回 None，绝不写坏数据。"""
+    if not isinstance(runs, (list, tuple)):
+        return None
+    indices = []
+    for run in runs:
+        if not isinstance(run, (list, tuple)) or len(run) != 2:
+            return None
+        try:
+            slot = int(run[0])
+            count = int(run[1])
+        except Exception:
+            return None
+        if count <= 0:
+            return None
+        indices.extend([slot] * count)
+    if len(indices) != int(expected_count):
+        return None
+    return indices
+
+
+def _load_preview_backup(node):
+    try:
+        data = json.loads(str(getattr(node, "switch_preview_backup", "") or "") or "{}")
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _store_preview_backup(node, backup):
+    try:
+        node.switch_preview_backup = (
+            json.dumps(backup, ensure_ascii=False) if backup else ""
+        )
+    except Exception:
+        pass
+
+
+def _resolve_group_object(group, fallback_object=None):
+    """切换组的目标物体：优先按扫描时写下的物体名找（重命名后自动失效）。"""
+    name = str(getattr(group, "object_name", "") or "")
+    if name:
+        obj = bpy.data.objects.get(name)
+        if obj is not None:
+            return obj
+    return fallback_object
+
+
+def _iter_node_switch_groups(node):
+    """遍历节点内全部切换组：``(group, 目标物体, 所属 target_item)``。"""
+    for group in getattr(node, "global_switch_groups", []) or []:
+        yield group, _resolve_group_object(group), None
+    for item in getattr(node, "target_items", []) or []:
+        fallback = getattr(item, "target_object", None)
+        for group in getattr(item, "switch_groups", []) or []:
+            yield group, _resolve_group_object(group, fallback), item
+
+
+def _iter_variable_groups(node, variable):
+    """同一材质切换变量的全部部件组（运行时的 KeySwap 也是整变量一起切）。"""
+    normalized = str(variable or "").strip()
+    if not normalized:
+        return []
+    return [
+        entry
+        for entry in _iter_node_switch_groups(node)
+        if str(getattr(entry[0], "switch_variable", "") or "").strip() == normalized
+    ]
+
+
+def _preview_object_name(group, obj):
+    name = str(getattr(obj, "name", "") or "")
+    return name or str(getattr(group, "object_name", "") or "")
+
+
+def _object_hidden_in_viewport(obj):
+    for attr in ("hide_get", "hide_viewport"):
+        try:
+            value = getattr(obj, attr)
+            value = value() if callable(value) else value
+        except Exception:
+            continue
+        if bool(value):
+            return True
+    return False
+
+
+def _apply_preview_state(obj, prefixes, state, signature_of=None):
+    """把物体上属于这些前缀的面切到第 state 档材质；返回是否有改动。"""
+    mesh = getattr(obj, "data", None)
+    if mesh is None or not prefixes or not hasattr(mesh, "polygons"):
+        return False
+    prefix_materials = {}
+    for prefix in prefixes:
+        names = _slot_order_prefix_materials(obj, prefix, signature_of)
+        if names:
+            prefix_materials[prefix] = names
+    if not prefix_materials:
+        return False
+
+    slot_index_by_name = {}
+    slot_prefix = {}
+    for index, slot in enumerate(getattr(obj, "material_slots", []) or []):
+        material = getattr(slot, "material", None)
+        name = str(getattr(material, "name", "") or "")
+        if not name:
+            continue
+        slot_index_by_name.setdefault(name, index)
+        prefix = name.split("_", 1)[0].strip().casefold()
+        if prefix in prefix_materials:
+            slot_prefix[index] = prefix
+    if not slot_prefix:
+        return False
+
+    indices = _read_material_indices(mesh)
+    changed = False
+    for face, current in enumerate(indices):
+        prefix = slot_prefix.get(current)
+        if prefix is None:
+            continue
+        names = prefix_materials[prefix]
+        target = state if 0 <= state < len(names) else len(names) - 1
+        target_slot = slot_index_by_name.get(names[target])
+        if target_slot is None or target_slot == current:
+            continue
+        indices[face] = target_slot
+        changed = True
+    if changed:
+        _write_material_indices(mesh, indices)
+    return changed
+
+
+def _preview_switch_variable(node, variable, state, signature_of=None):
+    """把某个切换变量下的全部部件切到第 state 档。
+
+    首次预览某个物体前先记下它的原始面材质索引（游程编码存回节点），
+    所以「恢复」写回的一定是**预览前**的样子，而不是上一档。
+    返回 ``{"state", "changed", "missing", "hidden"}``；变量不存在时返回 None。
+    """
+    entries = _iter_variable_groups(node, variable)
+    if not entries:
+        return None
+    backup = _load_preview_backup(node)
+    backup_dirty = False
+    changed = []
+    missing = []
+    hidden = []
+    for group, obj, _item in entries:
+        name = _preview_object_name(group, obj)
+        if obj is None or getattr(obj, "type", "") != "MESH":
+            missing.append(name)
+            continue
+        prefixes = _preview_prefix_set(group)
+        if not prefixes:
+            missing.append(name)
+            continue
+        if name and name not in backup:
+            try:
+                backup[name] = _material_runs(_read_material_indices(obj.data))
+                backup_dirty = True
+            except Exception:
+                pass
+        if _apply_preview_state(obj, prefixes, state, signature_of):
+            changed.append(name)
+        if _object_hidden_in_viewport(obj):
+            hidden.append(name)
+        _set_group_preview_state(group, state)
+    if backup_dirty:
+        _store_preview_backup(node, backup)
+    return {
+        "state": state,
+        "changed": changed,
+        "missing": missing,
+        "hidden": hidden,
+    }
+
+
+def _restore_preview_objects(node, object_names):
+    """把备份里的原始面材质索引写回这些物体；返回真正恢复的部件数。"""
+    backup = _load_preview_backup(node)
+    if not backup:
+        return 0
+    restored = 0
+    for object_name in object_names:
+        if object_name not in backup:
+            continue
+        runs = backup.pop(object_name)
+        obj = bpy.data.objects.get(object_name)
+        mesh = getattr(obj, "data", None) if obj is not None else None
+        if mesh is None or not hasattr(mesh, "polygons"):
+            continue
+        indices = _runs_to_indices(runs, len(mesh.polygons))
+        if indices is None:
+            continue
+        _write_material_indices(mesh, indices)
+        restored += 1
+    _store_preview_backup(node, backup)
+    return restored
+
+
+def _reset_preview_states(node):
+    for group, _obj, _item in _iter_node_switch_groups(node):
+        _set_group_preview_state(group, PREVIEW_STATE_NONE)
+
+
+def _restore_preview_variable(node, variable):
+    """退出某个分组的预览：还原它的部件并清掉该变量的预览档位。"""
+    entries = _iter_variable_groups(node, variable)
+    names = []
+    for group, obj, _item in entries:
+        name = _preview_object_name(group, obj)
+        if name and name not in names:
+            names.append(name)
+        _set_group_preview_state(group, PREVIEW_STATE_NONE)
+    return _restore_preview_objects(node, names)
+
+
+def _restore_all_preview(node):
+    """还原节点里全部预览过的部件（扫描/清除前也走这里收尾）。"""
+    _reset_preview_states(node)
+    backup = _load_preview_backup(node)
+    return _restore_preview_objects(node, list(backup.keys()))
+
+
+def _preview_owner_key(node):
+    tree = getattr(node, "id_data", None)
+    tree_name = str(getattr(tree, "name", "") or "")
+    return f"{tree_name}::{str(getattr(node, 'name', '') or '')}"
+
+
+def _iter_view3d_shading_spaces(context):
+    """``((屏幕|区域|序号), 着色设置)``；无窗口/无 3D 视图时为空。"""
+    window_manager = getattr(context, "window_manager", None)
+    for window in getattr(window_manager, "windows", []) or []:
+        screen = getattr(window, "screen", None)
+        screen_name = str(getattr(screen, "name", "") or "")
+        for area in getattr(screen, "areas", []) or []:
+            if getattr(area, "type", "") != "VIEW_3D":
+                continue
+            area_name = str(getattr(area, "name", "") or "")
+            for index, space in enumerate(getattr(area, "spaces", []) or []):
+                shading = getattr(space, "shading", None)
+                if shading is None:
+                    continue
+                yield f"{screen_name}|{area_name}|{index}", shading
+
+
+def _ensure_preview_material_shading(node, context):
+    """没有视口处于材质/渲染着色时临时切到材质预览，否则预览看不见贴图变化。
+
+    已有材质预览视口就完全不动用户的着色设置；切换过的视口在退出预览时还原。
+    """
+    if not bool(getattr(node, "preview_material_shading", True)):
+        return
+    spaces = list(_iter_view3d_shading_spaces(context))
+    if not spaces:
+        return
+    if any(
+        str(getattr(shading, "type", "")) in _MATERIAL_SHADING_TYPES
+        for _key, shading in spaces
+    ):
+        return
+    backup = _preview_shading_backup.setdefault(_preview_owner_key(node), {})
+    for key, shading in spaces:
+        current = str(getattr(shading, "type", "") or "")
+        if current in _MATERIAL_SHADING_TYPES:
+            continue
+        backup.setdefault(key, current)
+        try:
+            shading.type = "MATERIAL"
+        except Exception:
+            pass
+
+
+def _restore_preview_material_shading(node, context):
+    backup = _preview_shading_backup.pop(_preview_owner_key(node), None)
+    if not backup:
+        return
+    spaces = dict(_iter_view3d_shading_spaces(context))
+    for key, shading_type in backup.items():
+        shading = spaces.get(key)
+        if shading is None:
+            continue
+        try:
+            shading.type = shading_type
+        except Exception:
+            pass
+
+
+def _tag_redraw(context):
+    area = getattr(context, "area", None)
+    if area is None:
+        return
+    try:
+        area.tag_redraw()
+    except Exception:
+        pass
+
+
+class SSMT_OT_CustomMaterialPreviewSwitch(bpy.types.Operator):
+    """把某个贴图切换分组的部件切到指定档位（视口实时预览）。"""
+
+    bl_idname = "ssmt.custom_material_preview_switch"
+    bl_label = "预览贴图切换"
+    bl_description = (
+        "把该分组对应部件的网格面切到指定档位的材质，直接在视口里看到贴图切换效果；"
+        "点 ↺ 还原原始材质。只影响视口显示，不影响导出的 INI 与资源"
+    )
+    bl_options = {"REGISTER", "UNDO", "INTERNAL"}
+
+    node_name: bpy.props.StringProperty(default="")
+    switch_variable: bpy.props.StringProperty(default="")
+    state: bpy.props.IntProperty(default=0)
+
+    def execute(self, context):
+        node = _find_node(context, self.node_name)
+        if node is None:
+            self.report({"WARNING"}, "未找到材质转资源pro 节点")
+            return {"CANCELLED"}
+        variable = str(self.switch_variable or "").strip()
+        if not variable:
+            self.report({"WARNING"}, "该切换组没有材质切换变量，请重新扫描")
+            return {"CANCELLED"}
+
+        if int(self.state) == PREVIEW_STATE_NONE:
+            restored = _restore_preview_variable(node, variable)
+            if not _has_active_preview(node):
+                _restore_preview_material_shading(node, context)
+            _tag_redraw(context)
+            self.report(
+                {"INFO"},
+                f"已恢复 {restored} 个部件的原始材质"
+                if restored
+                else "该分组当前没有预览中的部件",
+            )
+            return {"FINISHED"}
+
+        specs = _iter_variable_groups(node, variable)
+        if not specs:
+            self.report({"WARNING"}, "该贴图切换分组已失效，请重新扫描")
+            return {"CANCELLED"}
+        state_count = max(
+            2,
+            max(int(getattr(group, "state_count", 2) or 2) for group, _obj, _item in specs),
+        )
+        target = int(self.state)
+        if target == PREVIEW_STATE_CYCLE:
+            current = _group_preview_state(specs[0][0])
+            # 第一下先跳开默认档（档 0），让用户马上看到"换过"的差别；
+            # 之后循环 1 → 2 → … → 0 回到默认。
+            target = (current + 1) % state_count if current >= 0 else (1 % state_count)
+        target = max(0, min(target, state_count - 1))
+
+        result = _preview_switch_variable(
+            node, variable, target, _material_signature_provider(node)
+        )
+        if result is None:
+            self.report({"WARNING"}, "该贴图切换分组已失效，请重新扫描")
+            return {"CANCELLED"}
+        _ensure_preview_material_shading(node, context)
+        _tag_redraw(context)
+
+        message = (
+            f"贴图预览 {target + 1}/{state_count}：{len(result['changed'])} 个部件已切换"
+            if result["changed"]
+            else f"贴图预览 {target + 1}/{state_count}：材质已是该档"
+        )
+        if result["missing"]:
+            message += f"，{len(result['missing'])} 个部件未找到"
+        if result["hidden"]:
+            message += "（有部件在视口隐藏，看不到效果）"
+        self.report({"INFO"}, message)
+        return {"FINISHED"}
+
+
+class SSMT_OT_CustomMaterialPreviewRestoreAll(bpy.types.Operator):
+    """退出本节点全部贴图预览并还原原始材质。"""
+
+    bl_idname = "ssmt.custom_material_preview_restore_all"
+    bl_label = "退出贴图预览"
+    bl_description = "把本节点预览过的全部部件材质还原为预览前的样子"
+    bl_options = {"REGISTER", "UNDO", "INTERNAL"}
+
+    node_name: bpy.props.StringProperty(default="")
+
+    def execute(self, context):
+        node = _find_node(context, self.node_name)
+        if node is None:
+            self.report({"WARNING"}, "未找到材质转资源pro 节点")
+            return {"CANCELLED"}
+        restored = _restore_all_preview(node)
+        _restore_preview_material_shading(node, context)
+        _tag_redraw(context)
+        self.report(
+            {"INFO"},
+            f"已还原 {restored} 个部件的原始材质" if restored else "没有需要还原的预览",
+        )
         return {"FINISHED"}
 
 
@@ -1076,6 +1603,23 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
     )
     global_switch_groups: bpy.props.CollectionProperty(
         type=SSMT_CustomMaterialAssignSwitchGroup
+    )
+    switch_preview_backup: bpy.props.StringProperty(
+        name="预览备份",
+        description=(
+            "内部使用：预览贴图切换前的网格面材质索引备份（游程编码），"
+            "「恢复」按钮用它把部件材质写回原样"
+        ),
+        default="",
+        options={"HIDDEN"},
+    )
+    preview_material_shading: bpy.props.BoolProperty(
+        name="预览时切换到材质预览着色",
+        description=(
+            "点预览按钮时，若没有任何视口处于材质预览/渲染着色，自动切到材质预览"
+            "（否则视口里看不到贴图变化），退出预览时还原原着色方式"
+        ),
+        default=True,
     )
 
     def init(self, context):
@@ -1788,6 +2332,55 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
         elif self.detect_all_ok:
             box.label(text="全部正确", icon="CHECKMARK")
 
+    def _draw_switch_preview_row(self, layout, group):
+        """一行贴图预览档位按钮：点一下就把该分组的部件切到那一档。
+
+        档数少时每个档一个按钮（按下态 = 当前预览档），档数多时用一个循环按钮；
+        预览中额外给一个「恢复」按钮（LOOP_BACK），点它写回预览前的材质。
+        """
+        variable = str(getattr(group, "switch_variable", "") or "").strip()
+        if not variable:
+            return
+        state_count = max(2, int(getattr(group, "state_count", 2) or 2))
+        current = _group_preview_state(group)
+
+        row = layout.row(align=True)
+        row.label(text="贴图预览", icon="HIDE_OFF")
+        if state_count <= PREVIEW_MAX_DIRECT_BUTTONS:
+            for index in range(state_count):
+                button = row.operator(
+                    "ssmt.custom_material_preview_switch",
+                    text=str(index + 1),
+                    depress=current == index,
+                )
+                button.node_name = self.name
+                button.switch_variable = variable
+                button.state = index
+        else:
+            button = row.operator(
+                "ssmt.custom_material_preview_switch",
+                text=f"{current + 1 if current >= 0 else 1}/{state_count}",
+                depress=current >= 0,
+            )
+            button.node_name = self.name
+            button.switch_variable = variable
+            button.state = PREVIEW_STATE_CYCLE
+
+        if current >= 0:
+            restore = row.operator(
+                "ssmt.custom_material_preview_switch", text="", icon="LOOP_BACK"
+            )
+            restore.node_name = self.name
+            restore.switch_variable = variable
+            restore.state = PREVIEW_STATE_NONE
+            layout.label(
+                text=(
+                    f"预览中（第 {current + 1}/{state_count} 套贴图）"
+                    "——只改视口显示，导出不受影响"
+                ),
+                icon="INFO",
+            )
+
     def _draw_target_input_panel(self, context, layout):
         """非全局模式：显示目标部件输入框。"""
         title = layout.box()
@@ -1846,6 +2439,7 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
             parent.prop(group, "switch_variable", text="材质切换变量")
             parent.prop(group, "comment", text="备注")
             parent.prop(group, "key", text="切换按键")
+            self._draw_switch_preview_row(parent, group)
 
         for index, item in enumerate(self.target_items):
             if index not in primary_indices:
@@ -1911,6 +2505,7 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
             group_box.prop(first_group, "switch_variable", text="材质切换变量")
             group_box.prop(first_group, "comment", text="备注")
             group_box.prop(first_group, "key", text="切换按键")
+            self._draw_switch_preview_row(group_box, first_group)
 
     def draw_buttons(self, context, layout):
         layout.prop(self, "use_global_assign", text="使用全局指定")
@@ -1938,6 +2533,14 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
             icon="X",
         )
         clear.node_name = self.name
+        if _has_active_preview(self):
+            restore_all = scan_row.operator(
+                "ssmt.custom_material_preview_restore_all",
+                text="退出预览",
+                icon="LOOP_BACK",
+            )
+            restore_all.node_name = self.name
+        layout.prop(self, "preview_material_shading")
 
         if self.use_global_assign:
             self._draw_global_switch_panel(context, layout)
@@ -2059,6 +2662,8 @@ classes = (
     SSMT_OT_CustomMaterialAssignPickTargetModal,
     SSMT_OT_CustomMaterialScanSwitches,
     SSMT_OT_CustomMaterialClearSwitches,
+    SSMT_OT_CustomMaterialPreviewSwitch,
+    SSMT_OT_CustomMaterialPreviewRestoreAll,
     SSMTNode_PostProcess_CustomMaterialAssign,
 )
 

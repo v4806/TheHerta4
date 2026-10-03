@@ -568,7 +568,108 @@ class ObjBufferHelper:
         normalize_weights = "Blend" in d3d11_game_type.OrderedCategoryNameList
 
         # normalize_weights = False
-        if GlobalConfig.logic_name == LogicName.WWMI or GlobalConfig.logic_name == LogicName.NTEMI:
+        if (
+            LogicName.is_zzmi_family(GlobalConfig.logic_name)
+            and GlobalProterties.import_merged_vgmap()
+        ):
+            # ZZMI 合并对象可把 BI4/BI8/BI16 混在同一个 Blender Mesh 中。
+            # 目标 IB 的 BLENDINDICES 通道数就是最终 ABI。
+            # 2026-09-21 用户裁定（修正旧口径）：与其它所有游戏路径（v1 / v3 /
+            # v4_fast）一致——顶点骨骼影响数超过目标槽位数时**自动降宽**（保留权重
+            # 最强的 N 个 + 重新归一化，见
+            # `VertexGroupUtils.get_blendweights_blendindices_for_layout`），不再
+            # Fatal 中断导出：权重平滑会制造大量极小尾巴，逐个顶点人工检查不现实。
+            # 影响损失改为**汇总后大声报告**（超限顶点数 / 最大丢弃权重占比 / 样本
+            # 顶点索引），占比过大时提示回 Blender 修权重。
+            blend_index_element = next(
+                (
+                    element
+                    for element in getattr(d3d11_game_type, "D3D11ElementList", [])
+                    if str(getattr(element, "SemanticName", "") or "").upper()
+                    == "BLENDINDICES"
+                ),
+                None,
+            )
+            if blend_index_element is not None:
+                try:
+                    scalar_size = numpy.dtype(
+                        FormatUtils.get_nptype_from_format(blend_index_element.Format)
+                    ).itemsize
+                    blend_size = max(
+                        1,
+                        int(blend_index_element.ByteWidth) // max(scalar_size, 1),
+                    )
+                except (TypeError, ValueError, ZeroDivisionError):
+                    blend_size = 4
+            # 统计（在调用提取函数**之前**，与提取函数同一口径：weight > 0 且有限）：
+            # 全网格最大有效影响数 M、超限顶点数、最大丢弃权重占比、样本顶点索引。
+            max_effective_influences = 0
+            over_slot_vertices = 0
+            max_dropped_fraction = 0.0
+            sample_offenders: list[int] = []
+            for vertex in mesh_vertices:
+                weights: list[float] = []
+                for assignment in getattr(vertex, "groups", ()) or ():
+                    try:
+                        weight = float(getattr(assignment, "weight", 0.0) or 0.0)
+                    except (TypeError, ValueError):
+                        continue
+                    if weight > 0.0 and numpy.isfinite(weight):
+                        weights.append(weight)
+                effective_influences = len(weights)
+                if effective_influences > max_effective_influences:
+                    max_effective_influences = effective_influences
+                if effective_influences <= blend_size:
+                    continue
+                over_slot_vertices += 1
+                if len(sample_offenders) < 3:
+                    sample_offenders.append(int(getattr(vertex, "index", 0)))
+                total_weight = float(sum(weights))
+                if total_weight > 0.0:
+                    kept_weight = float(
+                        sum(sorted(weights, reverse=True)[:blend_size])
+                    )
+                    dropped_fraction = max(
+                        0.0, (total_weight - kept_weight) / total_weight
+                    )
+                    if dropped_fraction > max_dropped_fraction:
+                        max_dropped_fraction = dropped_fraction
+            if over_slot_vertices:
+                target_format = (
+                    str(getattr(blend_index_element, "Format", "") or "unknown")
+                    if blend_index_element is not None
+                    else "unknown"
+                )
+                try:
+                    target_byte_width = int(
+                        getattr(blend_index_element, "ByteWidth", 0) or 0
+                    ) if blend_index_element is not None else 0
+                except (TypeError, ValueError):
+                    target_byte_width = 0
+                print(
+                    "[ZZMI骨骼合并] !!! 顶点影响数超过目标 BLENDINDICES 槽位，"
+                    f"已自动降宽（保留最强 N={blend_size} 个 + 重新归一化）："
+                    f"对象 [{getattr(mesh, 'name', '') or '<unnamed mesh>'}]，"
+                    f"超限顶点 {over_slot_vertices}/{len(mesh_vertices)} 个，"
+                    f"最大丢弃权重占比 {max_dropped_fraction * 100:.2f}%，"
+                    f"样本顶点索引 {sample_offenders}（最大有效影响数 M="
+                    f"{max_effective_influences}；目标 Format={target_format} / "
+                    f"ByteWidth={target_byte_width}）"
+                )
+                if max_dropped_fraction >= 0.05:
+                    print(
+                        "[ZZMI骨骼合并] !!! 上述丢弃占比偏大（≥5%）：这些顶点重新"
+                        "归一化后蒙皮位置会偏移；请回 Blender 选中该物体执行 "
+                        "清理 Clean → 限制总影响数 Limit Total = "
+                        f"{blend_size} → 归一化 All 修好权重后再导出"
+                        "（合并骨骼下组名 = 全局骨骼 id，不要靠删组解决）。"
+                    )
+            blendweights_dict, blendindices_dict = VertexGroupUtils.get_blendweights_blendindices_for_layout(
+                mesh=mesh,
+                channel_count=blend_size,
+                normalize_weights=True,
+            )
+        elif GlobalConfig.logic_name == LogicName.WWMI or GlobalConfig.logic_name == LogicName.NTEMI:
             # print("鸣潮专属测试版权重处理：")
             blendweights_dict, blendindices_dict = VertexGroupUtils.get_blendweights_blendindices_v4_fast(mesh=mesh,normalize_weights = normalize_weights,blend_size=blend_size)
 

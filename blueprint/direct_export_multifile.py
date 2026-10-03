@@ -13,6 +13,7 @@ from ..common.mod_path_compat import ensure_resource_alias_section
 from ..common.mod_path_compat import find_base_position_resource_name
 from ..common.mod_path_compat import is_stale_texture_override_position_copy_desc_line
 from ..common.mod_path_compat import resolve_position_buffer_candidate
+from ..common.safe_write import write_text_if_changed
 from ..utils.export_utils import ExportUtils
 from ..utils.log_utils import LOG
 from .direct_export_runtime_utils import (
@@ -656,8 +657,13 @@ class DirectMultiFileGenerator:
         dest_res_dir = os.path.join(self.mod_export_path, "res")
         os.makedirs(dest_res_dir, exist_ok=True)
         shader_dest_path = os.path.join(dest_res_dir, "merge_anim_packed_delta.hlsl")
-        shutil.copy2(shader_source_path, shader_dest_path)
-        self.config_node._update_shader_file(shader_dest_path)
+        # 只播种缺失的模板；已存在则保持原样，由 _update_shader_file 以模板为源
+        # 重新注入。不能用 shutil.copy2：它每轮把目标 mtime 重置成模板的旧 mtime，
+        # 3DMigoto 的 .bin 缓存（按注入后写入时刻对齐）必然错配、每轮重编译。
+        if not os.path.exists(shader_dest_path):
+            with open(shader_source_path, 'r', encoding='utf-8') as f:
+                write_text_if_changed(shader_dest_path, f.read())
+        self.config_node._update_shader_file(shader_dest_path, source_path=shader_source_path)
 
         constants_section = "[Constants]"
         constants_lines = sections.get(constants_section, [])

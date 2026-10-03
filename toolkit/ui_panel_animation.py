@@ -30,17 +30,65 @@ class ATP_PT_ShapeKeyTools(bpy.types.Panel):
 
     def draw(self, context):
         from . import at_shape_key_control
-        
+        from . import at_shape_key_operations
+        from .at_properties import ATP_UL_SHAPEKEY_LIST_IDNAME
+
         layout = self.layout
         props = context.scene.atp_props
-        
+
         box = layout.box()
-        box.label(text="统一控制器:")
-        for item in props.shape_key_list:
-            row = box.row(align=True)
-            split = row.split(factor=0.4)
-            split.label(text=item.name)
-            split.prop(item, "value", text="", slider=True)
+
+        header = box.row(align=True)
+        header.label(text=f"统一控制器 ({len(props.shape_key_list)})", icon='SHAPEKEY_DATA')
+        header.operator(at_shape_key_control.ATP_OT_RefreshShapeKeys.bl_idname, text="", icon='FILE_REFRESH')
+        header.operator(at_shape_key_operations.ATP_OT_ResetAllShapeKeys.bl_idname, text="", icon='LOOP_BACK')
+
+        options = box.row(align=True)
+        options.prop(props, "sk_use_grouping", text="组合连续形态键", icon='GROUP')
+        options.prop(props, "sk_list_rows", text="行数")
+
+        sync_row = box.row(align=True)
+        sync_row.prop(props, "sk_live_sync", text="实时同步选中物体", icon='LINKED')
+
+        if len(props.shape_key_list) > 0:
+            box.template_list(
+                ATP_UL_SHAPEKEY_LIST_IDNAME, "",
+                props, "shape_key_list",
+                props, "shape_key_list_index",
+                rows=props.sk_list_rows,
+            )
+        else:
+            box.label(text="列表为空，请选中网格物体后点击刷新", icon='INFO')
+
+        index = props.shape_key_list_index
+        if 0 <= index < len(props.shape_key_list):
+            item = props.shape_key_list[index]
+            if item.is_group:
+                names = at_shape_key_control.split_key_names(item.key_names)
+                preview = "、".join(names[:6])
+                if len(names) > 6:
+                    preview += f" … (+{len(names) - 6})"
+                box.label(text=f"组成员: {preview}", icon='INFO')
+
+        # ---------- 值域设置（作用于列表内全部形态键） ----------
+        box.separator()
+        range_box = box.box()
+        range_box.label(text="值域设置 (全部形态键):", icon='DRIVER')
+        range_row = range_box.row(align=True)
+        range_row.prop(props, "sk_value_min", text="最小值")
+        range_row.prop(props, "sk_value_max", text="最大值")
+
+        if props.sk_value_max <= props.sk_value_min:
+            range_box.label(text="最大值必须大于最小值", icon='ERROR')
+        else:
+            range_box.label(
+                text=f"写入各形态键的滑块范围 {props.sk_value_min:g} ~ {props.sk_value_max:g}",
+                icon='INFO',
+            )
+
+        op_row = range_box.row(align=True)
+        op_row.operator(at_shape_key_control.ATP_OT_ApplyShapeKeyRange.bl_idname, text="应用值域", icon='CHECKMARK')
+        op_row.operator(at_shape_key_control.ATP_OT_ResetShapeKeyRange.bl_idname, text="恢复 0~1", icon='LOOP_BACK')
 
 
 class ATP_PT_ShapeKeyOperations(bpy.types.Panel):

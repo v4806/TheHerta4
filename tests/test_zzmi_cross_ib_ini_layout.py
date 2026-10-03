@@ -4,6 +4,8 @@ import types
 import unittest
 from pathlib import Path
 
+from tests import _real_modules
+
 
 def _install_module(name, **attrs):
     module = types.ModuleType(name)
@@ -23,6 +25,9 @@ for package_name in (
 ):
     package = _install_module(package_name)
     package.__path__ = []
+
+# 真实 common 子模块按 fake 包前缀注册（空 __path__ 假包解析不了相对导入）
+_real_modules.register_real_common_modules(f"{PKG}.common")
 
 
 class _FakeIniSection:

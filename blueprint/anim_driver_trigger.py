@@ -189,6 +189,7 @@ class SSMTNode_AnimDriver_Trigger(SSMTNode_AnimDriver_Base):
 
         runtime = self._find_runtime_node()
         playback_rate = runtime.playback_rate if runtime else 1
+        frame_var = self._frame_variable_of(runtime)
 
         paused_state = self._resolve_default_play_state(self.default_paused)
         paused_var = self.custom_paused_var.strip()
@@ -219,7 +220,7 @@ class SSMTNode_AnimDriver_Trigger(SSMTNode_AnimDriver_Base):
             "; 暂停状态",
             "[Present]",
             f"if {paused_var} == 1",
-            f"    if $swapvar % $speed_auto{idx} == 0",
+            f"    if {frame_var} % $speed_auto{idx} == 0",
         ]
 
         lines.extend(target_assignments)

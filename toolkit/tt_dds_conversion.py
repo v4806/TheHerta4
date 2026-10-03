@@ -133,26 +133,84 @@ def _format_is_srgb(dds_format: str) -> bool:
 def _texconv_colorspace_flags(dds_format: str) -> list[str]:
     """按输出 DXGI 格式决定 texconv 的色彩空间标志，保证「数值不变、颜色不变」。
 
-    - _srgb 输出（如 bc7_unorm_srgb）：texconv 会把输入默认当作线性并再 encode 到
-      sRGB，导致颜色整体变亮（实测参考图 0.845 -> 0.926）。必须用 --srgb-in 让
-      texconv 先把输入按 sRGB 解码、再 encode 回 sRGB，净效果为恒等，存进去的就是
-      输入本身的数值（0.845 仍旧是 0.845）。
-    - 非 sRGB / 线性 UNORM 输出（bc7_unorm、r8g8b8a8_unorm 等）：按原始数值直接读取
-      （--ignore-srgb），不做任何色彩空间变换，直接存入原值。
+    规则：**输出格式与输入格式的 sRGB 属性一致时才恒等**，不一致就会产生一次色彩变换。
+    - ``_srgb`` 输出（bc7_unorm_srgb 等）：输入通常是 PNG 这类**没有色彩空间信息**的
+      WIC 位图（texconv 默认当线性读），此时必须用 ``--srgb-in`` 让它按 sRGB 解码、
+      再由 sRGB 输出编码回去，净效果恒等。
+    - 非 sRGB 输出（bc7_unorm、r8g8b8a8_unorm 等）：用 ``--ignore-srgb`` 按原始数值读写。
 
-    因此不能用固定标志：--srgb-in 对线性输出会误做一次 sRGB->线性解码（变暗），
-    --ignore-srgb 对 sRGB 输出会漏掉解码导致二次 encode（变亮）。"""
+    **重要边界（2026-09-27 实测澄清）**：``--ignore-srgb`` 只作用于 WIC 输入/输出，
+    **管不了 DDS 自身的 ``_SRGB`` 格式语义**——texconv 读 ``BC7_UNORM_SRGB`` 一定解码、
+    写它一定编码。因此把「已经是 _SRGB 的 DDS」按非 sRGB 规则重编码，会净压暗一次
+    （反向则提亮一次）；用户工作空间里「颜色贴图整体变暗」正是这么来的
+    （规则表被改成全 ``bc7_unorm``，而磁盘上的贴图是 ``_SRGB``）。
+    要避免它：让规则与现网文件的 sRGB 属性保持一致，而不是指望开关去补偿。"""
     if _format_is_srgb(dds_format):
         return ["--srgb-in"]
     return ["--ignore-srgb"]
 
 
 def _apply_image_colorspace(image, dds_format: str):
-    """Blender 内的显示色彩空间跟随输出文件的实际编码。"""
+    """按输出格式设置 Blender 显示色彩空间。
+
+    **注意：这已经不是重连路径的常规动作**，只在快照取不到有效值时作为兜底调用
+    （见 :func:`_restore_image_display_state`）。b7b1992 曾把「Blender 显示色彩空间
+    按输出格式的 _srgb 后缀设置」当成重连后的常规动作，本次（用户 2026-09-27 要求）
+    推翻该行为：重连只换容器格式与文件路径，必须沿用原本的纹理节点配置，不得改写
+    用户已设好的色彩空间。
+    """
     try:
         image.colorspace_settings.name = "sRGB" if _format_is_srgb(dds_format) else "Non-Color"
     except Exception:
         pass
+
+
+def _snapshot_image_display_state(image) -> dict:
+    """重连前记录图片自身的显示配置（色彩空间 / Alpha 模式）。
+
+    为什么只快照这两个字段：`filepath` + `reload()` 只重建 ImBuf，实测（Blender 5.0.1，
+    见 .dbg/relink_probe/relink_probe_result.json）不会改动引用该图的
+    `ShaderNodeTexImage` 节点的 interpolation / extension / projection，也不动
+    `image_user`；本算子同样不写任何节点字段。因此会覆盖用户配置的只有「按格式硬设
+    色彩空间」这一条，快照这两个字段即可覆盖全部会被改写的入口。
+
+    取不到值的字段留空串，由恢复侧自行决定是否按格式兜底。
+    """
+    state = {"colorspace": "", "alpha_mode": ""}
+    try:
+        state["colorspace"] = str(image.colorspace_settings.name or "")
+    except Exception:
+        pass
+    try:
+        state["alpha_mode"] = str(image.alpha_mode or "")
+    except Exception:
+        pass
+    return state
+
+
+def _restore_image_display_state(image, snapshot, dds_format: str) -> None:
+    """重连后把快照原样写回：转换只换容器格式与文件路径，不改用户既有配置。
+
+    只有快照取不到有效值（读取异常 / 空串）或写回失败时，才退回「按输出格式设置
+    色彩空间」的兜底；所有异常都在内部吃掉，绝不中断整个转换循环。
+    """
+    colorspace = str((snapshot or {}).get("colorspace") or "")
+    if not colorspace:
+        _apply_image_colorspace(image, dds_format)
+    else:
+        try:
+            if image.colorspace_settings.name != colorspace:
+                image.colorspace_settings.name = colorspace
+        except Exception:
+            _apply_image_colorspace(image, dds_format)
+
+    alpha_mode = str((snapshot or {}).get("alpha_mode") or "")
+    if alpha_mode:
+        try:
+            if image.alpha_mode != alpha_mode:
+                image.alpha_mode = alpha_mode
+        except Exception:
+            pass
 
 
 def resolve_dds_target(filename: str, props) -> tuple[str, str, str]:
@@ -306,9 +364,14 @@ class TT_OT_convert_to_dds(bpy.types.Operator):
                 abs_filepath = os.path.normpath(bpy.path.abspath(image.filepath_raw))
                 if abs_filepath in conversion_map:
                     new_path, dds_format = conversion_map[abs_filepath]
-                    image.filepath = new_path
-                    image.reload()
-                    _apply_image_colorspace(image, dds_format)
+                    # 重连只换文件路径与容器格式：先快照用户既有的显示配置，重载后原样写回
+                    display_state = _snapshot_image_display_state(image)
+                    try:
+                        image.filepath = new_path
+                        image.reload()
+                    finally:
+                        # reload 失败也要写回：路径已经换过了，配置同样不该被改写
+                        _restore_image_display_state(image, display_state, dds_format)
                     updated_images_count += 1
             except Exception as exc:
                 self.report({"WARNING"}, f"更新图片 '{image.name}' 的路径时出错: {exc}")

@@ -9,11 +9,12 @@ import bpy
 
 from ..utils.log_utils import LOG
 from ..utils.shapekey_utils import ShapeKeyUtils
+from ..common.safe_write import write_text_if_changed
 from .direct_export_runtime_utils import normalize_runtime_name as _normalize_runtime_name
 from .direct_export_shapekey_output_mixin import DirectShapeKeyOutputMixin
 from .direct_export_shapekey_runtime_mixin import DirectShapeKeyRuntimeMixin
 from .direct_export_shapekey_sampling_mixin import DirectShapeKeySamplingMixin
-from .direct_export_shapekey_shared import ShapeKeyDirectExportError
+from .direct_export_shapekey_shared import ShapeKeyDirectExportError, resolve_use_delta
 from .export_helper import BlueprintExportHelper
 
 
@@ -193,6 +194,16 @@ class DirectShapeKeyGenerator(
 
         try:
             use_preprocess_records = bool(BlueprintExportHelper.get_direct_shapekey_position_records())
+            if use_preprocess_records and bool(getattr(self.node, "store_all_vertex_channels", False)):
+                # 前处理记录只存顶点坐标（preprocess.py 只 foreach_get("co")），
+                # 合成槽位时也只覆写 POSITION 元素字节 —— 法线/切线会保持基础网格值，
+                # 于是全通道增量的法线/切线部分是 0。这里必须显式说出来，
+                # 否则用户在游戏里只会看到"开关没反应"。
+                LOG.warning(
+                    "直出形态键: 已开启「存储全部顶点属性增量」，但本次走的是前处理记录路径——"
+                    "该路径只记录顶点坐标，法线/切线增量将为 0（描边/光照不会跟随形变）。"
+                    "需要法线/切线增量时请改用 exporter 缓冲路径（关闭前处理记录采集）。"
+                )
             if use_preprocess_records:
                 runtime_infos = self._build_runtime_infos(unique_hashes)
             else:
@@ -359,7 +370,7 @@ class DirectShapeKeyGenerator(
         os.makedirs(dest_res_dir, exist_ok=True)
 
         use_packed = self.node.use_packed_Meshess
-        use_delta = self.node.store_deltas
+        use_delta = resolve_use_delta(self.node)
         use_optimized = self.node.use_optimized_lookup
         merge_slot_files = self.node._should_merge_slot_files(use_packed)
         drag_drive_enabled = bool(getattr(self.node, "drag_drive_enabled", False))
@@ -378,7 +389,12 @@ class DirectShapeKeyGenerator(
             if logical_hash not in hash_slot_data_map or not hash_slot_data_map[logical_hash]:
                 continue
             shader_dest_path = os.path.join(dest_res_dir, f"shapekey_anim_{logical_hash}.hlsl")
-            shutil.copy2(shader_source_path, shader_dest_path)
+            # 只播种缺失的模板；已存在则保持原样，由 _update_shader_file 以模板为源
+            # 重新注入。不能用 shutil.copy2：它每轮把目标 mtime 重置成模板的旧
+            # mtime，而 3DMigoto 的 .bin 缓存按"注入后写入时刻"对齐 → 每轮必错配。
+            if not os.path.exists(shader_dest_path):
+                with open(shader_source_path, 'r', encoding='utf-8') as f:
+                    write_text_if_changed(shader_dest_path, f.read())
             hash_to_shader_paths[logical_hash] = shader_dest_path
 
         for logical_hash in processed_hashes:
@@ -432,6 +448,7 @@ class DirectShapeKeyGenerator(
                     drag_stage_count=self.node._drag_drive_stage_count(),
                     drag_dirs=self.node._drag_drive_dirs(hash_unique_names) if drag_drive_enabled else None,
                     hash_val=logical_hash,
+                    source_path=shader_source_path,
                 )
         LOG.info(f"直出形态键: shader/freq 写出完成 {perf_counter() - stage_start:.3f}s")
 

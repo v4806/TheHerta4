@@ -16,6 +16,8 @@ import types
 import unittest
 from pathlib import Path
 
+from tests import _real_modules
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PKG = "_zzmi_redirect_crossib_test_pkg"
@@ -32,6 +34,9 @@ def _install_module(name, **attrs):
 for package_name in (PKG, f"{PKG}.ui", f"{PKG}.ui.universal", f"{PKG}.common", f"{PKG}.utils"):
     package = _install_module(package_name)
     package.__path__ = []
+
+# 真实 common 子模块按 fake 包前缀注册（空 __path__ 假包解析不了相对导入）
+_real_modules.register_real_common_modules(f"{PKG}.common")
 
 
 class _FakeIniSection:

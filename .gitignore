@@ -42,3 +42,6 @@ review-reports/
 
 # ZZMI / FrameAnalysis 排查用的临时脚本与日志（本地诊断产物，全仓零引用）
 zzz_diag/
+# 根目录 _verify/：跨显卡排查期的一次性验证脚本（v1_slide.py 等，全仓零引用，
+# 不属于任何功能改动；需要留档时用 git add -f 单独强加）
+_verify/

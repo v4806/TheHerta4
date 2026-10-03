@@ -8,6 +8,7 @@ import shutil
 
 from ..common.global_config import GlobalConfig
 from ..common.logic_name import LogicName
+from . import fx_namespace
 from .node_postprocess_base import SSMTNode_PostProcess_Base
 
 _name_mapping_cache = {}
@@ -21,6 +22,46 @@ _TTL_MASK_INVERT_PREFIX = "${}TTL{}mask_invert".format(chr(92), chr(92)).casefol
 _TTL_DEFAULT_BRIGHTNESS = "1.5"
 # 拖拽物体显隐 flag 行（注入在绘制分支内；TTL 块重建必须原样保留，否则隐藏判定失效）
 _DRAG_OBJVIS_LINE_RE = re.compile(r'^\s*\$ssmtdrag_objvis_[\w]*\s*=\s*1\s*$')
+
+# 各 FX 命名空间的资源前缀（小写，用于识别 ini 里已有的发光/裁切绑定）。
+# 识别一律按「所有已知命名空间」做，而不是只看当前逻辑：作者可能在自己的配置表里
+# 手写另一套命名空间的绑定，材质转资源应该照样把它指向新复制出来的贴图资源。
+_FX_RESOURCE_PREFIXES = tuple(
+    profile.resource_prefix for profile in fx_namespace.ALL_PROFILES
+)
+_FX_PROFILE_BY_PREFIX = {
+    profile.resource_prefix.lower(): profile for profile in fx_namespace.ALL_PROFILES
+}
+# 绘制后复位块的引用行 / 亮度参数行（跨命名空间识别，避免透明度段重建时把复位行
+# 当成用户内容搬走）。
+_FX_RESET_REF_LINES = tuple(
+    f"{profile.glow_ref} = ref null" for profile in fx_namespace.ALL_PROFILES
+) + tuple(
+    f"{profile.fxmap_ref} = ref null" for profile in fx_namespace.ALL_PROFILES
+) + tuple(
+    # TTLMap 只有声明了它的命名空间才有（HI3FX）；空字符串要跳过，否则会多出一条
+    # 谁也匹配不上的 " = ref null"。
+    f"{profile.ttlmap_ref} = ref null"
+    for profile in fx_namespace.ALL_PROFILES
+    if profile.ttlmap_ref
+)
+_FX_RESET_PARAM_LINES = tuple(
+    f"{profile.param('brightness')} = 0" for profile in fx_namespace.ALL_PROFILES
+)
+_FX_RUN_LINES = tuple(profile.run_line for profile in fx_namespace.ALL_PROFILES)
+
+
+def _fx_profile_for_param(param_name):
+    """参数名属于哪个 FX 命名空间；不属于任何一套时返回 None。"""
+    lowered = str(param_name or "").lower()
+    for prefix, profile in _FX_PROFILE_BY_PREFIX.items():
+        if lowered.startswith(prefix):
+            return profile
+    return None
+
+
+def _starts_with_fx_resource_prefix(param_name):
+    return _fx_profile_for_param(param_name) is not None
 
 
 def _load_gimi_orfix_adapter():
@@ -1212,7 +1253,7 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
             is_supported_param = (
                 param_lower.startswith("ps-t")
                 or param_lower.startswith("resource\\zzmi\\")
-                or param_lower.startswith("resource\\rabbitfx\\")
+                or _starts_with_fx_resource_prefix(param_lower)
             )
             if not is_supported_param:
                 continue
@@ -1224,9 +1265,14 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
         if self._collect_ps_texture_slot_materials(obj):
             return True
 
+        # 贴图类型 → 材质前缀兜底。TTLMap 只在当前命名空间声明了它（HI3FX）时才算：
+        # 其它运行时没有这个通道，把 TTLMap_ 材质当候选会改变它们既有的物体匹配结果。
+        fallback_texture_types = ["Glowmap", "FXMap"]
+        if fx_namespace.current_profile().ttlmap_ref:
+            fallback_texture_types.append("TTLMap")
         return any(
             self.find_matching_materials(obj, texture_type)
-            for texture_type in ("Glowmap", "FXMap")
+            for texture_type in fallback_texture_types
         )
 
     @staticmethod
@@ -1360,7 +1406,10 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
                                 swap_key_prefix, next_swap_key_num, used_swap_keys,
                                 resource_name_provider=None):
         generated_lines = []
-        brightness_param_name = r"$\RabbitFX\brightness"
+        # 发光亮度写在当前逻辑对应的 FX 命名空间变量上：
+        # RabbitFX/NTEMIFX 是大写 $…\brightness 同名字段，HI3FX 同样叫 brightness
+        # （但它是 IniParams row230.w，语义一致）。
+        brightness_param_name = fx_namespace.current_profile().param("brightness")
 
         if len(matching_materials) == 1:
             material = matching_materials[0]
@@ -1474,8 +1523,10 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
             "Resource\\RabbitFx\\",
             "Resource\\ZZMI\\",
             "Resource\\NTEMIFX\\",
+            "Resource\\HI3FX\\",
             "ps-t",
             "$\\RabbitFX\\brightness",
+            "$\\HI3FX\\brightness",
         )
         generated_exact = {
             "run = CommandList\\RabbitFX\\SetTextures",
@@ -1483,6 +1534,8 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
             "run = CommandList\\ZZMI\\SetTextures",
             "run = CommandList\\RabbitFX\\Run",
             "run = CommandList\\NTEMIFX\\Run",
+            "run = CommandList\\HI3FX\\Run",
+            "run = CommandList\\HI3FX\\Reset",
         }
         return (
             stripped in generated_exact
@@ -1503,6 +1556,20 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
             return var_prefix == base_prefix and int(var_index) >= int(base_index)
 
         return line.strip().startswith(f"if {base_var} ")
+
+    @staticmethod
+    def _should_emit_fx_reset(fx_kinds, next_mesh_fx_kinds) -> bool:
+        """当前 mesh 是否需要发射 FX 复位行。
+
+        **恒为 True（2026-09 用户口径）**：每一次绘制都必须自带 FX 复位，因为作者会
+        自行调整绘制顺序；"下一个绘制必然重设同名 FX"这个前提在重排后不再成立，
+        一旦依赖它就会让上一个 mesh 的 FX 绑定泄漏到不该有的部件上。
+
+        历史上这里做过"下一个 mesh 会重设同名 FX 就跳过复位"的优化（省下每模组
+        ~1380 条/帧的 `CommandList\\…\\Run`），已按上述理由撤销；`next_mesh_fx_kinds`
+        参数保留以兼容调用点与既有测试。
+        """
+        return True
 
     def _find_mesh_block_reset_insert_index(self, lines, mesh_start_index: int) -> int:
         search_end_idx = len(lines)
@@ -2058,6 +2125,8 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
                                           used_swap_keys=None, transparency_sections_to_add=None):
         from ..utils.log_utils import LOG as _LOG
         debug_disable_fx_ttl = bool(getattr(self, "debug_disable_fx_ttl", False))
+        # 本次导出用哪一套 FX 命名空间：HIMI → HI3FX，NTEMI → NTEMIFX，其余 → RabbitFX。
+        fx_profile = fx_namespace.profile_for_logic(getattr(GlobalConfig, "logic_name", ""))
         if material_group_to_swapkey is None or material_group_to_swapkey is Ellipsis:
             material_group_to_swapkey = {}
         if used_swap_keys is None or used_swap_keys is Ellipsis:
@@ -2105,7 +2174,7 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
         object_to_diffuse_swapkey = {}
 
         mesh_lines_info_phase1 = [(i, self.extract_mesh_name(line)) for i, line in enumerate(lines) if self.extract_mesh_name(line)]
-        
+
         for insert_index, mesh_name in reversed(mesh_lines_info_phase1):
             obj = self.find_object_by_mesh_name(mesh_name, object_filter=material_candidate_filter)
             if not obj:
@@ -2117,7 +2186,8 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
             matched_types = []
             
             new_lines_for_this_mesh = []
-            generated_zzmi_style, generated_rabbitfx_style, generated_glowmap, generated_fxmap = False, False, False, False
+            generated_zzmi_style, generated_glowmap, generated_fxmap = False, False, False
+            generated_ttlmap = False
             generated_ps_slots = set()
 
             workspace_resource_by_slot = OrderedDict()
@@ -2162,13 +2232,17 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
 
             is_pst_style = any(k.lower().startswith("ps-t") for k in ini_mapping.keys())
             is_zzmi_style = any(k.lower().startswith("resource\\zzmi\\") for k in ini_mapping.keys())
-            is_rabbitfx_style = any(k.lower().startswith("resource\\rabbitfx\\") for k in ini_mapping.keys())
-            if is_pst_style or is_zzmi_style or is_rabbitfx_style:
+            is_fx_style = any(_starts_with_fx_resource_prefix(k) for k in ini_mapping.keys())
+            # 段里真正出现过哪几套 FX 命名空间（决定要不要补 SetTextures，
+            # 以及补哪一套的——各运行时的 SetTextures 不是同一个命令列表）。
+            fx_profiles_in_section = []
+            if is_pst_style or is_zzmi_style or is_fx_style:
                 for param_name, texture_type in ini_mapping.items():
                     is_zzmi_param = param_name.lower().startswith("resource\\zzmi\\")
-                    is_rabbitfx_param = param_name.lower().startswith("resource\\rabbitfx\\")
+                    fx_param_profile = _fx_profile_for_param(param_name)
+                    is_fx_param = fx_param_profile is not None
 
-                    if not is_zzmi_param and not is_rabbitfx_param and not param_name.lower().startswith("ps-t"):
+                    if not is_zzmi_param and not is_fx_param and not param_name.lower().startswith("ps-t"):
                         continue
                     if texture_type == "FXMap" and param_name.lower().startswith("ps-t"):
                         continue
@@ -2179,8 +2253,9 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
                         matched_types.append(texture_type)
                         if is_zzmi_param:
                             generated_zzmi_style = True
-                        elif is_rabbitfx_param:
-                            generated_rabbitfx_style = True
+                        elif is_fx_param:
+                            if fx_param_profile not in fx_profiles_in_section:
+                                fx_profiles_in_section.append(fx_param_profile)
                         resource_name_provider = None
                         if param_name.lower().startswith("ps-t"):
                             resource_name_provider = lambda material, index: self._ps_texture_material_resource_name(material)
@@ -2226,23 +2301,36 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
                     matched_types.append("DiffuseMap->ps-t2")
 
             fxmap_lines = []
-            fxmap_texture_types = ['Glowmap', 'FXMap']
-            for texture_type in fxmap_texture_types:
-                if debug_disable_fx_ttl and texture_type == 'FXMap':
+            # 贴图类型 → 资源别名。TTLMap 是「抖动半透明」专用的第二个遮罩通道，
+            # 只有当前命名空间的档案声明了它（目前只有 HI3FX）才会产出：其它运行时
+            # 没有这个概念，产出这条引用只会跑一个不存在的语义。
+            fxmap_texture_types = [
+                ('Glowmap', fx_profile.glow_ref),
+                ('FXMap', fx_profile.fxmap_ref),
+            ]
+            if fx_profile.ttlmap_ref:
+                fxmap_texture_types.append(('TTLMap', fx_profile.ttlmap_ref))
+            for texture_type, param_name in fxmap_texture_types:
+                if debug_disable_fx_ttl and texture_type in ('FXMap', 'TTLMap'):
                     continue
                 matching_materials = self.find_matching_materials(obj, texture_type)
                 if matching_materials:
                     matched_types.append(texture_type)
-                    fx_namespace = "NTEMIFX" if GlobalConfig.logic_name == LogicName.NTEMI else "RabbitFX"
-                    param_name = f"Resource\\{fx_namespace}\\{texture_type}"
+                    # 命名空间按当前执行逻辑取档案：RabbitFX / NTEMIFX / HI3FX。
+                    # HIMI（崩坏 3）走 HI3FX：资源别名是 Resource\HI3FX\GlowMap /
+                    # FXMap / TTLMap，变量名与 Run 命令列表都跟着换
+                    # （见 blueprint/fx_namespace.py）。
                     if texture_type == 'Glowmap': generated_glowmap = True
                     if texture_type == 'FXMap': generated_fxmap = True
+                    if texture_type == 'TTLMap': generated_ttlmap = True
                     generated_lines, next_swap_key_num = self.generate_material_lines(
                         matching_materials, param_name, texture_type, obj, texture_folder, all_sections,
                         object_to_diffuse_swapkey, material_group_to_swapkey,
                         swap_key_prefix, next_swap_key_num, used_swap_keys)
                     fxmap_lines.extend(generated_lines)
-                    fxmap_lines.append(f"run = CommandList\\{fx_namespace}\\Run")
+                    # Run 行对三种贴图类型是同一条命令列表：调用/使用方法不变，
+                    # 只是引用行多了一种贴图类型。
+                    fxmap_lines.append(fx_profile.run_line)
 
             ntemifx_lines = []
             ntemifx_texture_slots = {} if debug_disable_fx_ttl else self._collect_ntemifx_texture_slots(obj, workspace_resource_by_slot)
@@ -2264,28 +2352,37 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
                 _LOG.info(f"      找到 '{mesh_name}', 未匹配到材质")
             
             if generated_zzmi_style: new_lines_for_this_mesh.append("run = CommandList\\ZZMI\\SetTextures")
-            if generated_rabbitfx_style: new_lines_for_this_mesh.append("run = CommandList\\RabbitFX\\SetTextures")
+            # SetTextures 是「语义贴图重映射」，各运行时未必都提供（HI3FX 把它放在默认
+            # 不加载的 HI3FX.Remap.ini 里），所以只补段里实际出现过、且档案声明了它的
+            # 那一套命名空间。
+            for fx_param_profile in fx_profiles_in_section:
+                if fx_param_profile.set_textures_line:
+                    new_lines_for_this_mesh.append(fx_param_profile.set_textures_line)
             new_lines_for_this_mesh.extend(fxmap_lines)
             new_lines_for_this_mesh.extend(ntemifx_lines)
             lines[insert_index + 1:insert_index + 1] = new_lines_for_this_mesh
             reset_lines = []
-            if GlobalConfig.logic_name == LogicName.NTEMI:
-                if generated_glowmap:
-                    reset_lines.extend(["Resource\\NTEMIFX\\Glowmap = ref null", r"$\NTEMIFX\brightness = 0"])
-                if generated_fxmap:
-                    reset_lines.append("Resource\\NTEMIFX\\FXMap = ref null")
-            else:
-                if generated_glowmap:
-                    reset_lines.extend(["Resource\\RabbitFX\\Glowmap = ref null", r"$\RabbitFX\brightness = 0"])
-                if generated_fxmap:
-                    reset_lines.append("Resource\\RabbitFX\\FXMap = ref null")
+            if generated_glowmap:
+                reset_lines.append(f"{fx_profile.glow_ref} = ref null")
+                if fx_profile.reset_neutralises_variables:
+                    # RabbitFX/NTEMIFX 的 Run 结尾会把 $h/$s/$v/$brightness 复位，
+                    # 所以「写 0 + 再 Run 一次」就是复位。
+                    reset_lines.append(f"{fx_profile.param('brightness')} = 0")
+            if generated_fxmap:
+                reset_lines.append(f"{fx_profile.fxmap_ref} = ref null")
+            if generated_ttlmap:
+                reset_lines.append(f"{fx_profile.ttlmap_ref} = ref null")
             if reset_lines:
-                reset_lines.append("run = CommandList\\NTEMIFX\\Run" if GlobalConfig.logic_name == LogicName.NTEMI else "run = CommandList\\RabbitFX\\Run")
+                # HI3FX 的 Run 不复位变量，必须用 Reset（它自己会 null 别名 + Clean），
+                # 否则 $brightness 会一直停在 0，后续绘制全黑。
+                reset_lines.append(fx_profile.reset_line or fx_profile.run_line)
                 reset_insert_idx = self._find_mesh_block_reset_insert_index(lines, insert_index)
                 if reset_insert_idx != -1:
                     lines[reset_insert_idx:reset_insert_idx] = reset_lines
         # TTL 是 ZZMI 专属的绘制重建协议；EFMI 等其它逻辑仅执行普通材质转资源
         # 与 FX/Glowmap，不得因为某种 drawindexed 参数恰好能被正则解析就误入 TTL。
+        # 别和 HI3FX 的 TTLMap 混淆：那是**第二个遮罩通道**（抖动半透明），属于
+        # 普通材质转资源，由上面的 FX 段落产出，不涉及这里的绘制重建。
         ttl_supported = GlobalConfig.logic_name == LogicName.ZZMI
         if not debug_disable_fx_ttl and ttl_supported:
             next_swap_key_num = self._process_ttl_sections(
@@ -2346,14 +2443,19 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
                         break
                 if start_move_idx < end_move_idx:
                     block_to_move = lines[start_move_idx:end_move_idx]
+                    reset_keywords = _FX_RESET_REF_LINES + _FX_RESET_PARAM_LINES
                     filtered_block_to_move = [
                         line for line in block_to_move
-                        if not any(keyword in line for keyword in ["Resource\\RabbitFX\\Glowmap = ref null", r"$\RabbitFX\brightness = 0", "Resource\\RabbitFX\\FXMap = ref null", "Resource\\NTEMIFX\\Glowmap = ref null", r"$\NTEMIFX\brightness = 0", "Resource\\NTEMIFX\\FXMap = ref null"])
+                        if not any(keyword in line for keyword in reset_keywords)
                     ]
                     final_block = []
                     for line in filtered_block_to_move:
-                        if "run = CommandList\\RabbitFX\\Run" in line or "run = CommandList\\NTEMIFX\\Run" in line:
-                            has_resource_before = any(("Resource\\RabbitFX" in prev_line) or ("Resource\\NTEMIFX" in prev_line) for prev_line in final_block)
+                        if any(run_line in line for run_line in _FX_RUN_LINES):
+                            # Run 只有在前面已经出现过资源别名时才搬过去：整段没有
+                            # 别名绑定（只剩一条孤立的 Run）时它是空转，丢掉。
+                            has_resource_before = any(
+                                prefix in prev_line for prefix in _FX_RESOURCE_PREFIXES
+                            )
                             if has_resource_before:
                                 final_block.append(line)
                         else:

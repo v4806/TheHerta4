@@ -104,6 +104,17 @@ class SubMeshModel:
         self.vg_map_algorithm_version = int(
             getattr(submesh_metadata, "vg_map_algorithm_version", 0) or 0
         )
+        # t75 通道计划（唯一判定口径）：导入期算好并缓存，导出侧直接消费。
+        self.channel_plan_version = int(
+            getattr(submesh_metadata, "channel_plan_version", 0) or 0
+        )
+        self.channel_plan = dict(getattr(submesh_metadata, "channel_plan", {}) or {})
+        self.channel_plan_digest = str(
+            getattr(submesh_metadata, "channel_plan_digest", "") or ""
+        )
+        self.channel_plan_slot_weights = dict(
+            getattr(submesh_metadata, "channel_plan_slot_weights", {}) or {}
+        )
         self.merged_skeleton_metadata_valid = bool(
             getattr(submesh_metadata, "merged_skeleton_metadata_valid", True)
         )

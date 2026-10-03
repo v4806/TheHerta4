@@ -13,6 +13,7 @@ from .logic_name import LogicName
 from .global_key_count_helper import GlobalKeyCountHelper
 from .workspace_helper import WorkSpaceHelper
 from ..blueprint.export_helper import BlueprintExportHelper
+from ..utils.log_utils import LOG
 
 class M_IniHelper:
     """INI 辅助工具类
@@ -564,9 +565,73 @@ class M_IniHelper:
                     print("M_IniHelper: Slot 贴图目标已存在，跳过复制: " + target_path)
     
     @classmethod
+    def _report_standard_route_baked_shapekeys(cls, ini_builder:M_IniBuilder) -> list[str]:
+        """R-A 诊断：标准（非直出）路线把形态键烘焙掉时明确报警，不再静默 return。
+
+        背景（review-reports/t82-shapekey-drag-retest.md §3.3 R-A）：标准单轮导出的前处理
+        `blueprint/preprocess.py::_apply_shape_keys` 会先把副本上的非 Basis 键块烘焙进网格
+        （`bake_current_shape_key_mix_to_mesh` + `remove_non_basis_shape_keys`），于是经典
+        发射器拿到的 `shapekeyname_mkey_dict` 为空、载荷也为空 —— 旧实现在 :572-573 直接
+        `return`：产物里既没有形态键段，也没有任何告警。本方法把这条路径变成**可见**：
+        同时落 stdout/日志 sink（`LOG.warning`）与产物注释（ini `[Present]` 里的 `;` 行）。
+        """
+        try:
+            baked_object_names = BlueprintExportHelper.detect_standard_route_baked_shapekey_objects()
+        except Exception as exc:  # 诊断本身绝不能中断导出
+            LOG.warning(f"形态键丢弃检测失败（不影响导出结果）: {exc}")
+            return []
+
+        if not baked_object_names:
+            return []
+
+        shown_names = "、".join(baked_object_names[:5])
+        if len(baked_object_names) > 5:
+            shown_names += f" 等 {len(baked_object_names)} 个"
+
+        LOG.warning(
+            "[ShapeKeyExport] 标准（非直出）路线不导出形态键："
+            f"{len(baked_object_names)} 个物体的形态键已在标准前处理中被烘焙进网格"
+            f"（{shown_names}），本轮产物不会包含形态键段与形态键缓冲。"
+            "合并骨架下的形态键导出需要『直出模式』：请在形态键配置节点"
+            "（SSMTNode_PostProcess_ShapeKey）勾选 direct_export_mode（新节点默认已勾选）。"
+            "若确实不需要导出形态键，本告警可忽略；要消除它请删除物体上非 Basis 的形态键。"
+        )
+
+        notice_section = M_IniSection(M_SectionType.Present)
+        notice_section.SectionName = "Present"
+        notice_section.append("; --- SSMT 形态键导出诊断（标准/非直出路线）---")
+        notice_section.append(
+            "; 标准（非直出）路线不导出形态键："
+            + str(len(baked_object_names))
+            + " 个物体的形态键已在标准前处理中被烘焙进网格，本产物不含形态键段与形态键缓冲。"
+        )
+        notice_section.append(
+            "; 需要形态键导出请启用直出模式"
+            "（SSMTNode_PostProcess_ShapeKey.direct_export_mode，新节点默认已勾选）。"
+        )
+        notice_section.append("; --- SSMT 形态键导出诊断 END ---")
+        ini_builder.append_section(notice_section)
+        return baked_object_names
+
+    @classmethod
     def add_shapekey_ini_sections(cls, ini_builder:M_IniBuilder,drawib_drawibmodel_dict:dict[str,DrawIBModel]):
+        """发射经典（非直出）形态键 INI 段。
+
+        .. legacy::
+            本发射器是**老路线**（`[Constants] $shapekey*` + `CustomShaderComputeShapes`）的
+            唯一实现，在 ZZMI/ZZMIDX12 的实际路径上**从不产出**（见 t82：4 份产物
+            `CustomShaderComputeShapes` 恒为 0 —— 直出路线在此前主动
+            `set_suppress_shapekey_resource_export(True)` 压制它，标准路线的前处理则先把键块
+            烘焙掉）。它仍是 unity×2 / srmi / gimi / identityv / yysls / snowbreak / zzmidx12
+            的活性实现（全仓 9 处调用点，8 处在 ZZMI 之外），且是本轮 R-A 诊断的落点，故
+            **保留**；形态键导出请走
+            `blueprint/direct_export.py`（`direct_export_mode`，形态键节点新节点默认勾选）。
+        """
         if BlueprintExportHelper.should_suppress_shapekey_resource_export():
             return
+
+        # 放在空判定之前：无论「段没发出去」还是「段发出去了但载荷被烘焙没了」，都要能看见。
+        cls._report_standard_route_baked_shapekeys(ini_builder)
 
         shapekeyname_mkey_dict = BlueprintExportHelper.get_current_shapekeyname_mkey_dict()
         if len(shapekeyname_mkey_dict.keys()) == 0:

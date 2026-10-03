@@ -243,6 +243,37 @@ def _base_sections(hash_value="abc123", base_name="abc123-43191", vertex_count=1
     ])
 
 
+def _two_component_sections():
+    """双组件产物形态（叶瞬光01 实测布局的合成版）。
+
+    组件 1 ``abc123``：单 IB、单 part（base 0）。
+    组件 2 ``def456``：同一 DrawIB 两个 part——P0 承载真实几何（47448 索引，base 3，
+    Position.buf 的 13671 行落在运行时 VB0 的 3 行 stub 前缀之后）与 P1 头部的
+    3 行 stub 前缀（base 0）。VLR = 13674 = 3 + 13671。
+    """
+    sections = _base_sections()
+    extra = _base_sections(hash_value="def456", base_name="def456-43191", vertex_count=13674)
+    extra["[TextureOverride_def456_def456-43191A]"] = [
+        "hash = def456",
+        "match_first_index = 17946",
+        "ib = Resourcedef456-43191AIB",
+        "; [mesh:LOD0.def456-6462-17946_copy] [vertex_count:24180]",
+        "drawindexed = 47448, 0, 3",
+    ]
+    extra["[TextureOverride_def456_def456-43191B]"] = [
+        "hash = def456",
+        "match_first_index = 0",
+        "ib = Resourcedef456-43191BIB",
+        "; [mesh:LOD0.def456-17946-0] [vertex_count:3]",
+        "drawindexed = 3, 0, 0",
+    ]
+    for section, lines in extra.items():
+        if section in ("[Constants]", "[Present]"):
+            continue
+        sections[section] = lines
+    return sections
+
+
 def _cross_ib_sections():
     return OrderedDict([
         ("[Constants]", []),
@@ -888,6 +919,36 @@ class DragNodeEmitTests(unittest.TestCase):
 
         self.assertEqual(node._collect_click_export_drivers(), [(2, 3, "$Enabled")])
 
+    def test_click_export_value_list_drives_cycle_and_skips_seed(self):
+        """「开关值」模式跨节点契约：列表长度即循环档数（覆盖循环档数属性），
+        且不提供冷启动播种变量（列表值 → 点击计数不可逆，重启回列表首项）。"""
+        click_node = types.SimpleNamespace(
+            bl_idname="SSMTNode_AnimDriver_ClickExport",
+            mute=False,
+            click_zone_id=2,
+            cycle_length=7,
+            click_target_list=[types.SimpleNamespace(variable_name="$Swap")],
+            effective_cycle_length=lambda: 3,
+            click_value_sequence=lambda: ["0", "0", "1"],
+        )
+        anim_tree = types.SimpleNamespace(name="AnimTree", nodes=[click_node])
+        postprocess = types.SimpleNamespace(
+            bl_idname="SSMTNode_PostProcess_AnimDriver",
+            mute=False,
+            blueprint_name="AnimTree",
+        )
+        node = _make_node(self.mod, enable_shapekey_drive=True)
+        node.id_data = types.SimpleNamespace(nodes=[postprocess])
+
+        class _Groups(list):
+            def get(self, name, default=None):
+                return next((item for item in self if item.name == name), default)
+
+        self.mod.bpy.data.node_groups = _Groups([anim_tree])
+
+        self.assertEqual(node._collect_click_export_drivers(), [(2, 3, "")])
+        self.assertEqual(node._click_export_seed_entries(), [])
+
     def test_click_export_entries_ignore_muted_anim_driver_postprocess_node(self):
         click_node = types.SimpleNamespace(
             bl_idname="SSMTNode_AnimDriver_ClickExport",
@@ -1012,7 +1073,7 @@ class DragNodeEmitTests(unittest.TestCase):
         present = sections["[Present]"]
         boot_run = "if $ssmtdrag_booted_testns == 0"
         seed_run = "elif $ssmtdrag_seed_pending_testns == 1"
-        interaction_run = "elif $ssmtdrag_drag_enabled_testns >= 1"
+        interaction_run = "elif $ssmtdrag_drag_enabled_testns >= 1 && $ssmtdrag_drawn_testns == 1"
         self.assertIn(boot_run, present)
         self.assertIn(seed_run, present)
         self.assertLess(present.index(boot_run), present.index(seed_run))
@@ -1127,11 +1188,14 @@ class DragNodeEmitTests(unittest.TestCase):
         # 防陈旧绑定跨 mode-0 滞留、回模式 1 后无命中复活
         elif_idx = next(
             i for i, line in enumerate(present)
-            if line == "elif $ssmtdrag_drag_enabled_testns >= 1")
+            if line == "elif $ssmtdrag_drag_enabled_testns >= 1 && $ssmtdrag_drawn_testns == 1")
         tail = present[elif_idx:]
         else_idx = next(i for i, line in enumerate(tail) if line == "else")
-        self.assertEqual(tail[else_idx + 1], "\tclear = ResourceDragShapeKeyDragLatch_testns 0.0")
-        self.assertEqual(tail[else_idx + 2], "endif")
+        # 未绘制帧不再跑 PinDetected，其内部 else 够不到：终态 else 负责把检测
+        # 允许位与形态键绑定锁存一起清掉
+        self.assertEqual(tail[else_idx + 1], "\t$ObjectDetectAllowed_testns = 0")
+        self.assertEqual(tail[else_idx + 2], "\tclear = ResourceDragShapeKeyDragLatch_testns 0.0")
+        self.assertEqual(tail[else_idx + 3], "endif")
 
     def test_shapekey_drive_mouse_displacement_present_lines(self):
         zone = self._zone_item(0)
@@ -1373,10 +1437,22 @@ class DragNodeEmitTests(unittest.TestCase):
         rb = "\n".join(sections["[CommandListDragShapeKeyVarReadback_testns]"])
         # store 直接读源缓冲（无镜像/克隆）
         self.assertNotIn(" = copy ", rb)
+        # ---- 回读最小化：只在"值可能变了"时 store ----
+        # 区域激活不再逐绑定回读 ZoneActive（N 次 store），改为按住/松开沿回读
+        # 一次绑定锁存（单槽，驱动 CS 当帧写）再由 CPU 推导
+        self.assertNotIn("ResourceDragShapeKeyZoneActive_testns", rb)
+        self.assertIn(
+            "store = $ssmtdrag_sklatch_testns, ResourceDragShapeKeyDragLatch_testns, 0", rb)
+        self.assertIn("if $ssmtdrag_skheld_testns == 1 || $ssmtdrag_skheldprev_testns == 1", rb)
+        self.assertIn("$ssmtdrag_sklatch_testns = 0", rb)
+        self.assertIn("if $ssmtdrag_sklatch_testns == 1", rb)
+        self.assertIn("$ssmtdrag_skact_testns_0 = 1", rb)
+        # 驱动槽只在该绑定激活或等确认时回读
+        self.assertIn(
+            "if $ssmtdrag_skact_testns_0 >= 1 || $ssmtdrag_skpending_testns_0 == 1", rb)
+        self.assertIn("store = $ssmtdrag_skrb_testns_0, ResourceDragShapeKeyDrive_testns, 5", rb)
         # 变量优先握手：变化后 pending=1/mode=2，持续回推直到回读追平；
         # 只有追平后才允许拖拽/缓冲变化以 mode=1 拉回变量。
-        self.assertIn("store = $ssmtdrag_skact_testns_0, ResourceDragShapeKeyZoneActive_testns, 0", rb)
-        self.assertIn("store = $ssmtdrag_skrb_testns_0, ResourceDragShapeKeyDrive_testns, 5", rb)
         self.assertIn("if $Freq_A != $ssmtdrag_skprev_testns_0", rb)
         self.assertIn("$ssmtdrag_skprev_testns_0 = $Freq_A", rb)
         self.assertIn("$ssmtdrag_skpending_testns_0 = 1", rb)
@@ -1384,13 +1460,24 @@ class DragNodeEmitTests(unittest.TestCase):
         self.assertIn("elif $ssmtdrag_skpending_testns_0 == 1", rb)
         self.assertIn("if $ssmtdrag_skrb_testns_0 == $ssmtdrag_skprev_testns_0", rb)
         self.assertIn("elif $ssmtdrag_skact_testns_0 >= 1", rb)
+        # 拖拽拉动缓冲：值**变了才**回写变量（不再每帧无脑覆盖）
+        self.assertIn("if $ssmtdrag_skrb_testns_0 != $ssmtdrag_skprev_testns_0", rb)
         self.assertIn("$Freq_A = $ssmtdrag_skrb_testns_0", rb)
         self.assertIn("$ssmtdrag_skmode_testns_0 = 1", rb)
         self.assertIn("store = $ssmtdrag_skrb_testns_1, ResourceDragShapeKeyDrive_testns, 0", rb)
         self.assertIn("$Freq_B = $ssmtdrag_skrb_testns_1", rb)
+        # 只有绑定处于 mode!=0 才置 skany（Present 用它门控同步 CS 的 dispatch）
+        self.assertIn("if $ssmtdrag_skmode_testns_0 != 0", rb)
+        self.assertIn("$ssmtdrag_skany_testns = 1", rb)
+        self.assertIn("$ssmtdrag_skany_testns = 0", rb)
+        # 空闲帧不再空跑同步 CS
+        self.assertIn("if $ssmtdrag_drawn_testns == 1 && $ssmtdrag_skany_testns == 1", present)
 
         constants = "\n".join(sections["[Constants]"])
         self.assertIn("global $ssmtdrag_skheld_testns = 0", constants)
+        self.assertIn("global $ssmtdrag_skheldprev_testns = 0", constants)
+        self.assertIn("global $ssmtdrag_sklatch_testns = 0", constants)
+        self.assertIn("global $ssmtdrag_skany_testns = 0", constants)
         self.assertIn("global $ssmtdrag_skact_testns_0 = 0", constants)
         self.assertIn("global $ssmtdrag_skrb_testns_0 = 0", constants)
         self.assertIn("global $ssmtdrag_skprev_testns_0 = 0", constants)
@@ -1402,6 +1489,45 @@ class DragNodeEmitTests(unittest.TestCase):
         cs = "\n".join(sections["[CustomShaderDragShapeKeyVarSync_testns]"])
         self.assertIn("x90 = $ssmtdrag_skmode_testns_0", cs)
         self.assertIn("y90 = $ssmtdrag_skmode_testns_1", cs)
+
+    def test_readback_stores_do_not_scale_with_binding_count(self):
+        """回读最小化：store 次数必须与绑定数解耦（旧实现固定 2N 次/帧）。
+
+        新实现：锁存回读 1 次（且只在按住/松开沿）+ 每个绑定仅在该绑定
+        「拖拽激活」或「等 store 确认」时回读驱动槽 → 空闲帧 0 次 store。
+        """
+        zone = self._zone_item(0)
+        node = _make_node(
+            self.mod,
+            enable_shapekey_drive=True,
+            zone_objects=[zone],
+        )
+        node.id_data = types.SimpleNamespace(nodes=[
+            self._fake_sk_node([(f"SK{i}", 0, "0", 1) for i in range(6)]),
+        ])
+        sections = {}
+        node._emit_shapekey_var_readback_command_list(sections, "testns")
+        rb = sections["[CommandListDragShapeKeyVarReadback_testns]"]
+
+        stores = [line.strip() for line in rb if line.strip().startswith("store =")]
+        # 锁存 1 + 6 个绑定各 1（都在门控内）；旧实现是 6×2 = 12 次且无门控
+        self.assertEqual(len(stores), 7, stores)
+        self.assertEqual(
+            sum(1 for s in stores if "DragLatch" in s), 1,
+            "锁存只回读一次（区域激活由 CPU 推导）",
+        )
+        self.assertFalse(
+            any("ZoneActive" in line for line in rb),
+            "不再逐绑定回读 ZoneActive",
+        )
+        # 每个 store 都必须在条件里（不存在无条件回读）
+        for idx, line in enumerate(rb):
+            if not line.strip().startswith("store ="):
+                continue
+            self.assertTrue(
+                any(prev.strip().startswith("if ") for prev in rb[max(0, idx - 3):idx]),
+                f"store 未被门控: {line}",
+            )
 
     def test_shapekey_var_sync_nine_bindings_do_not_overlap_iniparams(self):
         zone = self._zone_item(0)
@@ -1746,6 +1872,9 @@ class DragNodeEmitTests(unittest.TestCase):
         # part A: index_count=52688 → step = 52688//8 = 6586；R5 段合并后单 sample 段
         #（8P → P），偏移经 [Constants] global 迭代变量推导
         s1 = sections["[CustomShaderDragBakeSample_abc123_43191P0_testns]"]
+        # [t148] 探针必须强制精确写入（透明 pass 的混合会污染校准）
+        assert "blend = ADD ONE ZERO" in s1
+        assert "alpha = ADD ONE ZERO" in s1
         self.assertIn("local $ssmtdrag_bake_off_abc123_43191P0_testns", s1)
         self.assertIn(
             "$ssmtdrag_bake_off_abc123_43191P0_testns = "
@@ -1942,7 +2071,36 @@ class DragNodeEmitTests(unittest.TestCase):
         present = "\n".join(sections["[Present]"])
         self.assertIn("global $ssmtdrag_objvis_testns_0 = 0", const)
         self.assertIn("pre run = CommandListDragVisPublish_testns", present)
-        self.assertIn("post $ssmtdrag_objvis_testns_0 = 0", present)
+        # 发布只在臂动模式（消费者置位的同一条条件）下执行
+        self.assertIn(
+            "if $ssmtdrag_drag_enabled_testns >= 1 && $inputMode == 0"
+            " && $ssmtdrag_mode_testns == 1 && $ssmtdrag_drawn_testns == 1\n"
+            "\tpre run = CommandListDragVisPublish_testns\n"
+            "endif",
+            present,
+        )
+        # 清零仍必须每绘制帧执行（objvis 是逐绘制置位的，与 mode 无关）
+        self.assertIn(
+            "if $ssmtdrag_drawn_testns == 1\n"
+            "\tpost $ssmtdrag_objvis_testns_0 = 0\n",
+            present,
+        )
+        self.assertIn(
+            "\tpost $ssmtdrag_objvis_testns_1 = 0\n"
+            "endif\n"
+            "if $ssmtdrag_drawn_testns == 1\n"
+            "\tpost run = CommandListDragUIReadback_testns\n",
+            present,
+        )
+        # 光标/视口更新只在臂动时执行（消费者全是 mode==1 链路，检测读的还是上一帧光标）
+        self.assertIn(
+            "elif $ssmtdrag_drag_enabled_testns >= 1 && $ssmtdrag_drawn_testns == 1\n"
+            "\tpre run = CommandListDragPinDetected_testns\n"
+            "\tif $ssmtdrag_mode_testns == 1\n"
+            "\t\trun = CommandListDragCursorUpdate_testns\n"
+            "\tendif\n",
+            present,
+        )
 
     def test_global_object_oids_union(self):
         node = _make_node(self.mod)
@@ -2759,10 +2917,13 @@ class DragNodeReexportLatchMigrationTests(unittest.TestCase):
                 pin[disarm_idx + 1],
                 "\tclear = ResourceDragShapeKeyDragLatch_testns 0.0",
             )
-            # Present 终态 else（G1：模式 1→0 直跳清锁存）
+            # Present 终态 else（G1：模式 1→0 直跳清锁存；未绘制帧也走这里）
             present = "\n".join(sections["[Present]"])
             self.assertIn(
-                "else\n\tclear = ResourceDragShapeKeyDragLatch_testns 0.0\nendif",
+                "else\n"
+                "\t$ObjectDetectAllowed_testns = 0\n"
+                "\tclear = ResourceDragShapeKeyDragLatch_testns 0.0\n"
+                "endif",
                 present,
             )
 
@@ -4927,6 +5088,388 @@ class DragCollisionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             self.assertFalse(node._write_collision_resources(td, {}, comp, "testns"))
             self.assertNotIn("collision_grid", comp)
+
+
+class DragMergedSkeletonDiagnosticLevelTests(unittest.TestCase):
+    """R-C：合并骨架上两条「必然且良性」的诊断降级为 INFO（非合并骨架仍是 WARNING）。
+
+    依据 review-reports/t82-shapekey-drag-retest.md §2.3/§3.3 R-C：
+    - `多个 base vertex`：合并骨架给被吸收件补了 3 行前缀 stub，同一 DrawIB 的多个 part
+      天然有不同 base vertex（实测 {0,3}）；
+    - `Position.buf 顶点数 != VLR`：VLR 是合并 SO 总行数，Position.buf 只有本件导出行数
+      （实测差 3 行）。
+    两条都**不许删**：`3b1b73fe` 的 `vertex_base=3` 分支与「以 buf 为准」兜底都靠它们。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_drag_module()
+
+    @staticmethod
+    def _sections_with_split_base_vertices():
+        sections = _base_sections()
+        # part A base=3（承载真实几何）/ part B base=0（ZZMI 头部 3 行 stub 前缀，
+        # 只画那 3 个顶点）⇒ 触发「多个 base vertex」分支（t82/叶瞬光01 实测 {0,3}）。
+        # B 必须保持 stub 形态：真实几何 part 的 base 一旦不同于掩码基准就会被
+        # _assert_component_base_alignment 判为掩码错位并 fail loudly。
+        sections["[TextureOverride_abc123_abc123-43191A]"][-1] = "drawindexed = 52688, 0, 3"
+        sections["[TextureOverride_abc123_abc123-43191B]"][-1] = "drawindexed = 3, 0, 0"
+        return sections
+
+    def _locate_stdout(self, sections):
+        import contextlib
+        import io
+
+        node = _make_node(self.mod)
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            comp = node._locate_components(sections, ["abc123"])[0]
+        return comp, buffer.getvalue()
+
+    def _read_position_buf_stdout(self, sections):
+        import contextlib
+        import io
+        import tempfile
+
+        node = _make_node(self.mod)
+        res_name = "Resource_abc123_Position"
+        self.assertIn(f"[{res_name}]", sections)
+        comp = {"base_resource": res_name}
+        buffer = io.StringIO()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            meshes_dir = os.path.join(temp_dir, "Meshes")
+            os.makedirs(meshes_dir, exist_ok=True)
+            # 20 行 × stride 40（= 800 字节）≠ VLR 14078 ⇒ 触发 buf/VLR 不一致分支
+            with open(os.path.join(meshes_dir, "abc123-43191-Position.buf"), "wb") as file:
+                file.write(b"\x00" * (20 * 40))
+            with contextlib.redirect_stdout(buffer):
+                values = node._read_position_buf(temp_dir, sections, comp, 14078)
+        return values, buffer.getvalue()
+
+    @staticmethod
+    def _add_merged_skeleton_marker(sections):
+        sections["[Constants]"].append("global $zz_ms_seen_10 = 0")
+
+    def test_detects_merged_skeleton_product_by_variable_marker(self):
+        sections = _base_sections()
+        detector = self.mod.SSMTNode_PostProcess_DragInteraction._is_merged_skeleton_product
+
+        self.assertFalse(detector(sections))
+        self._add_merged_skeleton_marker(sections)
+        self.assertTrue(detector(sections))
+
+    def test_detects_merged_skeleton_product_by_section_name(self):
+        sections = _base_sections()
+        detector = self.mod.SSMTNode_PostProcess_DragInteraction._is_merged_skeleton_product
+        sections["[CustomShaderZZMIMergedSkeletonAttach_C1_s0]"] = ["cs = ./res/x.hlsl"]
+        self.assertTrue(detector(sections))
+
+    def test_detects_merged_skeleton_product_by_resource_marker(self):
+        sections = _base_sections()
+        detector = self.mod.SSMTNode_PostProcess_DragInteraction._is_merged_skeleton_product
+        sections["[ResourceZZMergedSkeleton_G0_s0]"] = ["type = RWStructuredBuffer"]
+        self.assertTrue(detector(sections))
+
+    def test_plain_product_keeps_multiple_base_vertices_warning(self):
+        _, out = self._locate_stdout(self._sections_with_split_base_vertices())
+        self.assertIn("[DragInteraction][WARNING]", out)
+        self.assertIn("base vertex", out)
+
+    def test_merged_skeleton_downgrades_multiple_base_vertices_to_info(self):
+        sections = self._sections_with_split_base_vertices()
+        self._add_merged_skeleton_marker(sections)
+
+        _, out = self._locate_stdout(sections)
+
+        self.assertNotIn("[DragInteraction][WARNING] hash abc123 的绘制段使用多个", out)
+        self.assertIn("[DragInteraction][INFO] hash abc123 的绘制段使用多个", out)
+        self.assertIn("合并骨架场景下必然出现且良性", out)
+
+    def test_plain_product_keeps_buf_vertex_count_mismatch_warning(self):
+        values, out = self._read_position_buf_stdout(_base_sections())
+        self.assertIsNotNone(values)
+        self.assertEqual(len(values), 20)
+        self.assertIn("[DragInteraction][WARNING] Position.buf 顶点数 20 与 VLR 14078", out)
+
+    def test_merged_skeleton_downgrades_buf_mismatch_to_info(self):
+        sections = _base_sections()
+        self._add_merged_skeleton_marker(sections)
+
+        values, out = self._read_position_buf_stdout(sections)
+
+        self.assertIsNotNone(values)
+        self.assertNotIn("[DragInteraction][WARNING] Position.buf 顶点数", out)
+        self.assertIn("[DragInteraction][INFO] Position.buf 顶点数 20 与 VLR 14078", out)
+        self.assertIn("合并骨架场景下必然出现且良性", out)
+
+
+class DragTwoComponentIndependenceTests(unittest.TestCase):
+    """多 IB / 多组件必须各自成链（叶瞬光01 实测：body 3b1b73fe 可用、hair 999bff94 无命中）。
+
+    两条根因（review-reports/t106-merge-vs-drag-causal-audit.md §C4b）：
+    1. 组件本该独立的屏幕状态/路径进度缓冲与 UpdateScreenJiggle pass 被共享 ⇒ 两组件读
+       同一个命中赢家，要么同时移动要么后者饿死；
+    2. ``vertex_base`` 取各 part 的最小值 ⇒ {0,3} 时逐顶点掩码整体前移 3 行，真实几何读到
+       错位权重，且基座 Detect 段的 z26 与 P0 变体自相矛盾（0 vs 3）。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_drag_module()
+
+    def _emit_two(self, **props):
+        node = _make_node(self.mod, **props)
+        sections = _two_component_sections()
+        comps = node._locate_components(sections, ["abc123", "def456"])
+        node._emit_sections(sections, comps, "testns")
+        return node, sections, comps
+
+    @staticmethod
+    def _zone_item(zone_id, weight=1.0):
+        settings = types.SimpleNamespace(
+            enabled=True,
+            brush_strength=weight,
+            brush_falloff_k=4.6,
+            radius=0.0,
+            strength=0.0,
+            max_offset=0.0,
+            falloff=0.0,
+            damping=0.0,
+            grabbable=True,
+        )
+        empty = types.SimpleNamespace(
+            name=f"zone_{zone_id}",
+            ssmt_drag_zone=settings,
+            matrix_world=np.eye(4),
+        )
+        return types.SimpleNamespace(zone_id=zone_id, zone_object=empty)
+
+    # ---- (a) 逐组件屏幕状态/进度资源 + 逐组件 UpdateScreenJiggle ----
+
+    def test_two_component_fixture_yields_two_components(self):
+        _, _, comps = self._emit_two()
+        self.assertEqual([c["comp_name"] for c in comps], ["abc123_43191", "def456_43191"])
+        # 真实几何 part（base 3）与头部 stub 前缀 part（base 0）并存
+        self.assertEqual([p["vertex_base"] for p in comps[1]["parts"]], [3, 0])
+
+    def test_per_component_screen_state_resources_emitted(self):
+        _, sections, _ = self._emit_two()
+        for cn in ("abc123_43191", "def456_43191"):
+            self.assertEqual(
+                sections[f"[ResourceDragJiggleScreenState_{cn}_testns]"],
+                ["type = RWBuffer", "format = R32G32B32A32_FLOAT", "array = 15"],
+            )
+            self.assertEqual(
+                sections[f"[ResourceDragPathProgressState_{cn}_testns]"][:2],
+                ["type = RWBuffer", "format = R32_FLOAT"],
+            )
+        # 手部/光标/预览按设计消费的共享副本必须保留
+        self.assertIn("[ResourceDragJiggleScreenState_testns]", sections)
+        self.assertIn("[ResourceDragPathProgressState_testns]", sections)
+
+    def test_each_jiggle_binds_its_own_screen_state(self):
+        _, sections, _ = self._emit_two()
+        for cn, other in (("abc123_43191", "def456_43191"), ("def456_43191", "abc123_43191")):
+            jig = "\n".join(sections[f"[CustomShaderDragJiggle{cn}_testns]"])
+            self.assertIn(f"cs-t71 = ResourceDragJiggleScreenState_{cn}_testns", jig)
+            self.assertIn(f"cs-t74 = ResourceDragPathProgressState_{cn}_testns", jig)
+            # 不得再读共享副本，也不得读另一个组件的那一份
+            self.assertNotIn("cs-t71 = ResourceDragJiggleScreenState_testns", jig)
+            self.assertNotIn("cs-t74 = ResourceDragPathProgressState_testns", jig)
+            self.assertNotIn(f"ResourceDragJiggleScreenState_{other}_testns", jig)
+            self.assertNotIn(f"ResourceDragPathProgressState_{other}_testns", jig)
+
+    def test_per_component_update_screen_jiggle_sections(self):
+        _, sections, _ = self._emit_two()
+        for cn in ("abc123_43191", "def456_43191"):
+            usj = "\n".join(sections[f"[CustomShaderDragUpdateScreenJiggle_{cn}_testns]"])
+            # 喂入本组件自己的命中赢家，写出本组件自己的状态缓冲
+            self.assertIn(f"cs-t67 = ResourceDragPinnedComponentInfo_{cn}_testns", usj)
+            self.assertIn(f"cs-u0 = ResourceDragJiggleScreenState_{cn}_testns", usj)
+            self.assertIn(f"cs-u1 = ResourceDragPathProgressState_{cn}_testns", usj)
+            self.assertIn(f"cs-t75 = ResourceDragZoneParams_testns", usj)
+            self.assertIn("post cs-u0 = null", usj)
+            # 本组件段不得引用共享赢家/共享状态
+            self.assertNotIn("ResourceDragPinnedDetectInfo_testns", usj)
+        shared = "\n".join(sections["[CustomShaderDragUpdateScreenJiggle_testns]"])
+        self.assertIn("cs-t67 = ResourceDragPinnedDetectInfo_testns", shared)
+        self.assertIn("cs-u0 = ResourceDragJiggleScreenState_testns", shared)
+        self.assertIn("cs-u1 = ResourceDragPathProgressState_testns", shared)
+
+    def test_command_list_runs_shared_then_each_component_pass(self):
+        _, sections, _ = self._emit_two()
+        cmd = sections["[CommandListDragPinDetected_testns]"]
+        order = [
+            "\trun = CustomShaderDragUpdateScreenJiggle_testns",
+            "\trun = CustomShaderDragUpdateScreenJiggle_abc123_43191_testns",
+            "\trun = CustomShaderDragUpdateScreenJiggle_def456_43191_testns",
+        ]
+        for line in order:
+            self.assertIn(line, cmd)
+        self.assertEqual([cmd.index(line) for line in order], sorted(cmd.index(line) for line in order))
+        # 共享 pass 仍跟随 PinComponent 之后、逐组件 pass 之前
+        self.assertLess(
+            cmd.index("\trun = CustomShaderDragPinComponentdef456_43191_testns"),
+            cmd.index(order[0]),
+        )
+        # boot-clear 必须覆盖逐组件副本（不清则首帧残留垃圾会假命中）
+        for cn in ("abc123_43191", "def456_43191"):
+            self.assertIn(f"\tclear = ResourceDragJiggleScreenState_{cn}_testns 0.0", cmd)
+            self.assertIn(f"\tclear = ResourceDragPathProgressState_{cn}_testns 0.0", cmd)
+
+    def test_present_gate_clears_per_component_state(self):
+        node, sections, comps = self._emit_two()
+        node._emit_present_and_constants(sections, comps, "testns")
+        present = "\n".join(sections["[Present]"])
+        for cn in ("abc123_43191", "def456_43191"):
+            self.assertIn(f"clear = ResourceDragJiggleScreenState_{cn}_testns 0.0", present)
+            self.assertIn(f"clear = ResourceDragPathProgressState_{cn}_testns 0.0", present)
+
+    def test_dead_detect_timer_vars_not_emitted(self):
+        """t149 变量追溯审计：两个**只写不读**的计时变量已从产物移除。
+
+        静态使用表（对产物 ini 逐 `$var` 统计写/读）显示
+        `$ssmtdrag_detect_next_time` / `$ssmtdrag_detect_interval` 只被声明与赋值，
+        **从不被任何条件、表达式或 IniParams 槽消费**，也未被任何 hlsl 读取；
+        且 `0.25` / `time` 均无副作用 ⇒ 删除行为等价。
+        同块的 dt 钳制用的是 `$ssmtdrag_delta_time_*`，必须原样保留。
+        """
+        from pathlib import Path
+
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "blueprint"
+            / "node_postprocess_draginteraction.py"
+        ).read_text(encoding="utf-8")
+        # 发射点已删除（连注释里的原样记录都带上 `local ` 前缀，故只匹配发射形态）
+        self.assertNotIn('"local $ssmtdrag_detect_next_time"', source)
+        self.assertNotIn('"local $ssmtdrag_detect_interval = 0.25"', source)
+        self.assertNotIn('"\\t$ssmtdrag_detect_next_time = time"', source)
+        # 只删死变量：同块的 dt 钳制仍在源码里发射
+        self.assertIn('"\\t$ssmtdrag_delta_time_{ns} = 0.0166667"', source)
+        self.assertIn('f"$ssmtdrag_prev_time_{ns} = time"', source)
+
+        # 兜底：任何已发射的段里都不得再出现这两个名字
+        node, sections, comps = self._emit_two()
+        node._emit_present_and_constants(sections, comps, "testns")
+        blob = "\n".join("\n".join(v) for v in sections.values())
+        self.assertNotIn("ssmtdrag_detect_next_time", blob)
+        self.assertNotIn("ssmtdrag_detect_interval", blob)
+
+    # ---- (b) 逐组件 vertex_base 正确性 ----
+
+    def test_split_base_vertices_use_geometry_part_base(self):
+        node, sections, comps = self._emit_two()
+        comp = comps[1]
+        self.assertEqual(comp["vertex_base"], 3)
+        self.assertEqual(int(comp["parts"][0]["vertex_base"]), 3)
+        self.assertEqual(int(comp["parts"][1]["vertex_base"]), 0)
+
+        base = "\n".join(sections["[CustomShaderDragDetectdef456_43191_testns]"])
+        p0 = "\n".join(sections["[CustomShaderDragDetectdef456_43191P0_testns]"])
+        p1 = "\n".join(sections["[CustomShaderDragDetectdef456_43191P1_testns]"])
+        # 基座段曾取 min()=0，与 P0 变体的 3 自相矛盾；两者必须都等于掩码基准
+        self.assertIn("z26 = 3", base)
+        self.assertIn("z26 = 3", p0)
+        # stub 前缀 part 保留自身 base，继续读掩码的无效前缀区
+        self.assertIn("z26 = 0", p1)
+
+    def test_mask_buffer_places_geometry_rows_after_prefix(self):
+        """端到端：真实几何 base=3 ⇒ Position.buf 第 0 行必须落在掩码第 3 行。
+
+        取 min()=0 会把权重写在 0..13670，而真实几何按 index+3 读到 3..13673 ⇒ 整体
+        错位 3 行（叶瞬光01 hair 999bff94 完全无命中的直接原因）。
+        """
+        import tempfile
+
+        node = _make_node(self.mod, zone_objects=[self._zone_item(0)])
+        sections = _two_component_sections()
+        comp = node._locate_components(sections, ["abc123", "def456"])[1]
+        node._check_zone_radius_scale = lambda zones: False
+        node._read_position_buf = lambda *args: np.zeros((13671, 3), dtype=np.float32)
+        node._get_reference_matrix_inv = lambda comp: None
+        node._get_export_space_matrix = lambda: np.eye(4)
+        node._get_non_mirror_mirror = lambda: None
+        node._buffer_dir = lambda sections, comp: "Meshes"
+        node._evaluate_zone_field = lambda positions, *args, **kwargs: np.ones(
+            len(positions), dtype=np.float32
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            self.assertTrue(node._write_jiggle_masks(td, sections, comp, "testns"))
+            weights = np.fromfile(
+                Path(td) / "Meshes" / "def456-43191JiggleZoneWeights.buf", dtype=np.float32
+            ).reshape(-1, 4)
+            ids = np.fromfile(
+                Path(td) / "Meshes" / "def456-43191JiggleZoneIDs.buf", dtype=np.uint32
+            ).reshape(-1, 4)
+
+        self.assertEqual(weights.shape, (13674, 4))
+        self.assertTrue(bool(np.all(weights[:3] == 0.0)))
+        self.assertTrue(bool(np.all(ids[:3] == self.mod.INVALID_ZONE_ID)))
+        self.assertTrue(bool(np.all(weights[3:, 0] == 1.0)))
+
+    def test_real_geometry_part_with_foreign_base_fails_loudly(self):
+        node = _make_node(self.mod)
+        sections = _two_component_sections()
+        # part B 不再是 3 行 stub 而是真实几何（12000 索引）却仍声明 base 0：
+        # 同一条 Position.buf 无法同时对齐 0 与 3 ⇒ 必须 fail loudly 而不是静默错位
+        sections["[TextureOverride_def456_def456-43191B]"][-1] = "drawindexed = 12000, 0, 0"
+        with self.assertRaises(ValueError) as ctx:
+            node._locate_components(sections, ["abc123", "def456"])
+        self.assertIn("掩码基准", str(ctx.exception))
+
+    def test_prefix_only_part_boundary(self):
+        detector = self.mod.SSMTNode_PostProcess_DragInteraction._part_is_prefix_only
+        self.assertTrue(detector({"vertex_base": 0, "index_count": 9}, 3))
+        self.assertTrue(detector({"vertex_base": 0, "index_count": 3}, 3))
+        self.assertFalse(detector({"vertex_base": 0, "index_count": 12}, 3))
+        self.assertFalse(detector({"vertex_base": 3, "index_count": 47448}, 3))
+        self.assertFalse(detector({"vertex_base": 5, "index_count": 12}, 3))
+
+    # ---- (c) objvis array == Σ 每组件物体数 ----
+
+    def test_object_vis_array_equals_sum_of_component_counts(self):
+        _, sections, comps = self._emit_two()
+        counts = [len(c["object_id_map"]) for c in comps]
+        total = sum(counts)
+        self.assertEqual(
+            sections["[ResourceDragObjectVis_testns]"],
+            ["type = RWBuffer", "format = R32_FLOAT", f"array = {total}"],
+        )
+        self.assertEqual([c["object_count"] for c in comps], counts)
+        pub = "\n".join(sections["[CommandListDragVisPublish_testns]"])
+        for oid in range(total):
+            self.assertIn(f"$ssmtdrag_objvis_testns_{oid}", pub)
+
+    def test_stale_object_vis_array_is_rewritten_to_current_counts(self):
+        node = _make_node(self.mod)
+        sections = _two_component_sections()
+        # 旧导出残留（物体增删后）：array 与新 oid 空间错位会让发布 CS 漏写后段 flag
+        sections["[ResourceDragObjectVis_testns]"] = [
+            "type = RWBuffer", "format = R32_FLOAT", "array = 99",
+        ]
+        comps = node._locate_components(sections, ["abc123", "def456"])
+        node._emit_sections(sections, comps, "testns")
+        total = sum(len(c["object_id_map"]) for c in comps)
+        self.assertEqual(sections["[ResourceDragObjectVis_testns]"][-1], f"array = {total}")
+
+    def test_duplicate_object_ids_fail_loudly(self):
+        node = _make_node(self.mod)
+        comps = [
+            {"comp_name": "a", "object_count": 2, "object_id_map": {"A": 0, "B": 1}},
+            {"comp_name": "b", "object_count": 2, "object_id_map": {"C": 1, "D": 2}},
+        ]
+        with self.assertRaises(ValueError) as ctx:
+            node._emit_vis_publish_sections(OrderedDict(), comps, "testns")
+        self.assertIn("ResourceDragObjectVis", str(ctx.exception))
+
+    def test_object_count_must_be_derived_from_id_map(self):
+        node = _make_node(self.mod)
+        comps = [{"comp_name": "a", "object_count": 5, "object_id_map": {"A": 0}}]
+        with self.assertRaises(ValueError) as ctx:
+            node._emit_vis_publish_sections(OrderedDict(), comps, "testns")
+        self.assertIn("object_id_map", str(ctx.exception))
 
 
 if __name__ == "__main__":

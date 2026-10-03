@@ -22,6 +22,7 @@ from ..common.mod_path_compat import (
     iter_position_buffer_candidates,
 )
 from ..common.logic_name import LogicName
+from ..common.safe_write import write_text_if_changed, copy_file_if_changed
 from ..utils.export_space import position_export_matrix
 
 try:
@@ -42,6 +43,19 @@ INVALID_ZONE_ID = 0xFFFFFFFF
 ZONES_PER_PAGE = 1
 VAR_SYNC_VALUE_BASE = 81
 VAR_SYNC_MODE_BASE = 90
+
+# 合并骨架（ZZMI MergedSkeleton）在产物 ini 里的稳定标记：R-C 用它把「合并骨架上必然出现
+# 且良性」的两条诊断从 WARNING 降级为 INFO（`多个 base vertex` / `buf 与 VLR 不一致`）。
+# 依据 review-reports/t82-shapekey-drag-retest.md §2.3：合并骨架给被吸收件补了 3 行前缀
+# stub，于是同一 DrawIB 的多个 part 有不同 base vertex（实测 {0,3}），且
+# `override_vertex_count = 合并 SO 总行数` 而 `Position.buf = 本件导出行数`（实测差 3 行）。
+MERGED_SKELETON_PRODUCT_MARKERS = (
+    "ZZMIMergedSkeleton",
+    "ResourceZZMergedSkeleton",
+    "zz_ms_seen_",
+    "zz_ms_prev_",
+    "ResourceZZRedirectSO",
+)
 VAR_SYNC_FLOAT4_CAPACITY = 9
 VAR_SYNC_MAX_BINDINGS = VAR_SYNC_FLOAT4_CAPACITY * 4
 
@@ -1343,6 +1357,30 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         return sections, preserved_tail_content, preserved_driver_content
 
     @staticmethod
+    def _is_merged_skeleton_product(sections) -> bool:
+        """产物 ini 是否带 ZZMI 合并骨架（MergedSkeleton）痕迹。
+
+        判据只依赖产物内容（段名 + 行文本），因此在导出后处理阶段对任何来源的 ini 都成立。
+        合并骨架确实存在时，下面两条拖拽诊断在合并骨架上**必然出现且良性**，应当降级为
+        INFO（勿删：`3b1b73fe` 的 `vertex_base=3` 分支依赖这些兜底逻辑）。
+        """
+        if not sections:
+            return False
+        for section_name, lines in sections.items():
+            if any(marker in str(section_name) for marker in MERGED_SKELETON_PRODUCT_MARKERS):
+                return True
+            for line in lines or ():
+                if any(marker in str(line) for marker in MERGED_SKELETON_PRODUCT_MARKERS):
+                    return True
+        return False
+
+    def _diagnostic_level(self, sections, *, merged_skeleton_suffix: str = "") -> tuple:
+        """返回 (级别标签, 附加说明)：合并骨架上降级为 INFO，其余保持 WARNING。"""
+        if self._is_merged_skeleton_product(sections):
+            return "INFO", merged_skeleton_suffix
+        return "WARNING", ""
+
+    @staticmethod
     def _strip_legacy_help_mode_block(text):
         """Remove every old help-gated drag-mode override from UI tails."""
         lines = str(text or "").splitlines(keepends=True)
@@ -1685,11 +1723,24 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 for part in parts
             }
             if len(vertex_bases) > 1:
-                print(
-                    f"[DragInteraction][WARNING] hash {hash_value} 的绘制段使用多个 "
-                    f"base vertex {sorted(vertex_bases)}；逐顶点资源暂按最小值对齐"
+                # 合并骨架下同一 DrawIB 的多个 part 天然有不同 base vertex（实测 {0,3}：
+                # 头部 stub 前缀 part 的 base=0 + 承载真实几何的 part 的 base=3）⇒ 必然
+                # 出现且良性，降级 INFO；勿删，逐 part 的 vertex_base 兜底正是靠这条信息。
+                _level, _suffix = self._diagnostic_level(
+                    sections, merged_skeleton_suffix="（合并骨架场景下必然出现且良性）"
                 )
-            vertex_base = min(vertex_bases) if vertex_bases else 0
+                print(
+                    f"[DragInteraction][{_level}] hash {hash_value} 的绘制段使用多个 "
+                    f"base vertex {sorted(vertex_bases)}；最小值 {min(vertex_bases)} 仅供诊断，"
+                    f"逐顶点资源与 z26 一律按承载真实几何的 part 基准 {max(vertex_bases)} 对齐"
+                    f"{_suffix}"
+                )
+            # 掩码基准取**承载真实几何的 part** 的 base（= max）：ZZMI 合并重定向把 3 行
+            # stub 前缀放在 carrier 头部（那一 part 的 base=0），Position.buf 的第 0 行落
+            # 在运行时 VB0 的 base 行上。历史实现取 min()，于是 {0,3} 时逐顶点掩码整体前
+            # 移 3 行——真实几何按 index+3 读到错位权重（叶瞬光01 的 999bff94 完全无命中即
+            # 此因），且基座 Detect 段的 z26 与 P0 变体自相矛盾（0 vs 3）。
+            vertex_base = max(vertex_bases) if vertex_bases else 0
             # 物体显隐：按记录稳定分配全局物体编号（mesh 注释名 → id；跨组件连续），
             # 供 flag 变量注入与 TriangleObjectIDs 烘焙共用同一编号空间。
             name_to_id = {}
@@ -1699,7 +1750,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                     if key not in name_to_id:
                         name_to_id[key] = object_offset
                         object_offset += 1
-            components.append({
+            comp = {
                 "hash": hash_value,
                 "base_name": base_name,
                 "comp_name": self._comp_name(base_name),
@@ -1709,8 +1760,70 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 "parts": parts,
                 "object_id_map": name_to_id,
                 "object_count": len(name_to_id),
-            })
+            }
+            # 掩码基准与每个「绘制真实几何」的 part 的 base 必须一致；不一致就是上面那条
+            # 错位链的复发，宁可 fail loudly 也不能静默产出错位产物。
+            self._assert_component_base_alignment(comp)
+            components.append(comp)
         return components
+
+    @staticmethod
+    def _part_is_prefix_only(part, mask_base):
+        """该 part 是否只绘制运行时 VB0 的 stub 前缀（不含真实几何）。
+
+        ZZMI 合并重定向把 3 行 stub 前缀放在 carrier 头部，对应 part 的 base 恒为 0、
+        索引数也恰好只覆盖那几个前缀顶点；这类 part 的 z26 必须保留自身 base（0），
+        让检测读到掩码前缀区（本来就恒为无效值）。
+        """
+        base = int(part.get("vertex_base", 0) or 0)
+        mask_base = int(mask_base or 0)
+        if base >= mask_base:
+            # base == mask_base 即承载真实几何的基准；base > mask_base 绝不可能是前缀
+            # （前缀只占 [0, mask_base)）。
+            return False
+        index_count = int(part.get("index_count", 0) or 0)
+        # 必要上界：前缀区只有 mask_base 个顶点，每条三角形最多引用其中 3 个，索引数
+        # 超过 3×mask_base 时必然引用到前缀之外的顶点 ⇒ 该 part 含真实几何。
+        return index_count <= 3 * mask_base
+
+    @classmethod
+    def _part_vertex_base(cls, comp, part):
+        """part 的检测基准 z26：承载真实几何的 part 恒等于掩码基准，前缀 stub 用自身 base。"""
+        mask_base = int(comp.get("vertex_base", 0) or 0)
+        if cls._part_is_prefix_only(part, mask_base):
+            return int(part.get("vertex_base", 0) or 0)
+        return mask_base
+
+    @classmethod
+    def _assert_component_base_alignment(cls, comp):
+        """掩码基准必须与每个绘制真实几何的 part 的 base 一致（fail loudly）。
+
+        前缀 stub part 允许 base < mask_base（它只画前缀顶点）；只要有任何 part 在
+        前缀之外仍绘制几何、而其 base 不同于掩码基准，Position.buf 烘焙出的逐顶点
+        权重就会对它整体错位——此时必须中止而不是产出「产品自相矛盾」的 ini。
+        """
+        mask_base = int(comp.get("vertex_base", 0) or 0)
+        parts = comp.get("parts") or []
+        offenders = [
+            part for part in parts
+            if not cls._part_is_prefix_only(part, mask_base)
+            and int(part.get("vertex_base", 0) or 0) != mask_base
+        ]
+        if not offenders:
+            return
+        detail = ", ".join(
+            "part{} base={} index_count={}".format(
+                idx,
+                int(part.get("vertex_base", 0) or 0),
+                int(part.get("index_count", 0) or 0),
+            )
+            for idx, part in enumerate(parts)
+        )
+        raise ValueError(
+            f"[DragInteraction] {comp.get('comp_name')} 的绘制段 base vertex 与掩码基准 "
+            f"{mask_base} 不一致，逐顶点掩码/权重将整体错位（{detail}）；"
+            "同一条 Position.buf 只能按唯一基准烘焙，请检查该 IB 的 part 划分"
+        )
 
     @staticmethod
     def _record_object_key(record):
@@ -2035,13 +2148,25 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
     # =======================================================================
 
     def _copy_shaders(self, res_dir):
+        """把所需着色器准备到 ``res_dir``。
+
+        安全合并：内容与目标相同的文件**不重写**，从而不改动它的 mtime。
+        3DMigoto 的自定义着色器编译缓存按 ``.hlsl`` 的 mtime 与同名
+        ``<stage>_5_0.<flags>.bin`` 配对（``CompareFileTime`` 必须精确相等），
+        无条件重写会让整族缓存失效、下次进游戏/按 F10 全量重编译
+        （实测单次两分钟量级）。详见 ``common/safe_write.py``。
+        """
         toolset = self._get_toolset_dir()
         files = list(SHADER_FILES)
         if self._feature_skd():
             files += list(SHADER_DRIVE_FILES)
-        if self._feature_var():
+        if self._feature_var() and self._drag_drive_var_sync_bindings():
+            # 只有真会发射同步段时才拷贝：否则 res/ 里留下一个没有 ini 引用、
+            # 也没有编译产物的孤儿 hlsl（旧版曾在「F4 开但一个形态键都没绑区域」
+            # 的工程里留下 rzm_shapekey_var_sync.hlsl 孤儿）。
             files += list(SHADER_VARSYNC_FILES)
         vertex_struct = self._get_vertex_struct_definition()
+        rewritten = 0
         for fname in files:
             src = os.path.join(toolset, fname)
             if not os.path.exists(src):
@@ -2057,27 +2182,31 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 flags=re.DOTALL,
             )
             dest = os.path.join(res_dir, fname)
-            with open(dest, 'w', encoding='utf-8') as f:
-                f.write(content)
-        # PathVectors 按稳定区域 ID 容量在导出阶段生成，不再复制旧版 12 项模板。
-        # 手部着色器 + 网格/法线资产：全部字节级原样复制。手部着色器读自己
+            # 内容没变就不写：保持 .hlsl 的 mtime，3DMigoto 的编译缓存才继续命中
+            if write_text_if_changed(dest, content):
+                rewritten += 1
+        # 手部着色器 + 网格/法线资产：全部字节级原样合并。手部着色器读自己
         # 的 vb0（stride 28 固定布局），不含 struct VertexAttributes，无需也
         # 不许走文本替换路径（避免行尾转换）——与原作保持字节一致。
         if self.enable_hand_cursor:
             for fname in HAND_SHADER_FILES + HAND_ASSET_FILES:
                 src = os.path.join(toolset, fname)
                 if os.path.exists(src):
-                    shutil.copy2(src, os.path.join(res_dir, fname))
+                    if copy_file_if_changed(src, os.path.join(res_dir, fname)):
+                        rewritten += 1
                 else:
                     print(f"[DragInteraction][WARNING] 手部文件缺失: {src}")
-        # 视口探针着色器：字节级原样复制（不读角色网格，无 struct VertexAttributes）
+        # 视口探针着色器：字节级原样合并（不读角色网格，无 struct VertexAttributes）
         if self.enable_viewport_probe:
             for fname in VIEWPORT_SHADER_FILES:
                 src = os.path.join(toolset, fname)
                 if os.path.exists(src):
-                    shutil.copy2(src, os.path.join(res_dir, fname))
+                    if copy_file_if_changed(src, os.path.join(res_dir, fname)):
+                        rewritten += 1
                 else:
                     print(f"[DragInteraction][WARNING] 视口探针着色器缺失: {src}")
+        if rewritten:
+            print(f"[DragInteraction] 着色器已更新 {rewritten} 个")
 
     # =======================================================================
     # 资源烘焙（稀疏区域权重 / ObjectMap / ZoneParams / PathVectors）
@@ -2804,7 +2933,17 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 return None
             n = len(data) // stride
             if vertex_count and n != vertex_count:
-                print(f"[DragInteraction][WARNING] Position.buf 顶点数 {n} 与 VLR {vertex_count} 不一致，以 buf 为准")
+                # 合并骨架上 `override_vertex_count` 是合并 SO 总行数（含被吸收件的 3 行前缀），
+                # 而 Position.buf 只有本件的导出行数 ⇒ 差 3 行必然出现且良性，降级 INFO。
+                # 勿删：以 buf 为准的兜底与下面的补前缀逻辑都依赖这条判断。
+                _level, _suffix = self._diagnostic_level(
+                    sections,
+                    merged_skeleton_suffix="（合并骨架场景下必然出现且良性：VLR=合并 SO 总行数）",
+                )
+                print(
+                    f"[DragInteraction][{_level}] Position.buf 顶点数 {n} 与 VLR {vertex_count} "
+                    f"不一致，以 buf 为准{_suffix}"
+                )
             arr = data[:n * stride].reshape(n, stride)
             attribute_bytes = arr[:, position_offset:position_offset + attribute_size].copy()
             values = attribute_bytes.view(scalar_type).reshape(n, component_count)
@@ -3159,8 +3298,14 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                     zone = int(getattr(anim_node, "click_zone_id", -1))
                 except Exception:
                     zone = -1
+                # 有效循环档数（跨节点只读契约）：节点配置了「开关值」时列表长度即
+                # 该区域的循环，否则回退循环档数属性（旧节点/测试桩无此方法）
+                cycle_fn = getattr(anim_node, "effective_cycle_length", None)
                 try:
-                    cycle = int(getattr(anim_node, "cycle_length", 0) or 0)
+                    if callable(cycle_fn):
+                        cycle = int(cycle_fn())
+                    else:
+                        cycle = int(getattr(anim_node, "cycle_length", 0) or 0)
                 except Exception:
                     cycle = 0
                 if not (0 <= zone < MAX_ZONES):
@@ -3169,12 +3314,17 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                         f"0-{MAX_ZONES - 1}，已跳过"
                     )
                     continue
+                # 「开关值」模式下不提供冷启动播种变量：列表值 → 点击计数不可逆
+                #（列表允许重复项），重启后统一回到列表首项（见点击导出节点注释）
+                seq_fn = getattr(anim_node, "click_value_sequence", None)
+                uses_click_values = bool(seq_fn()) if callable(seq_fn) else False
                 first_var = ""
-                for target in getattr(anim_node, "click_target_list", None) or []:
-                    name = normalize_variable_name(getattr(target, "variable_name", "") or "")
-                    if name:
-                        first_var = f"${name}"
-                        break
+                if not uses_click_values:
+                    for target in getattr(anim_node, "click_target_list", None) or []:
+                        name = normalize_variable_name(getattr(target, "variable_name", "") or "")
+                        if name:
+                            first_var = f"${name}"
+                            break
                 entries.append((zone, min(64, max(0, cycle)), first_var))
         return entries
 
@@ -3205,6 +3355,50 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 "[DragInteraction][WARNING] 已启用变量联动但形态键联动关闭，"
                 "变量联动随之后台降级（其缓冲族依赖形态键联动）"
             )
+        # F4 开、但没有任何形态键绑定区域：整族同步段/回读命令表/同步映射表都不会
+        # 发射（设计上按绑定项非空门控）。这不是崩溃，但用户会看到「拖拽与形态键
+        # 变量毫无联动」却查不出原因，必须显式告警。
+        if self._feature_var() and not self._drag_drive_var_sync_bindings():
+            print(
+                "[DragInteraction][WARNING] 变量联动已开启，但没有任何形态键绑定拖拽区域 → "
+                "不会生成「变量↔驱动缓冲同步」段与回读命令表（拖拽/动画驱动与形态键变量之间"
+                "不会有联动，形态键只会跟随面板/驱动变量）。"
+                "如需联动，请在形态键配置节点的「区域」列填写拖拽节点区域编号后重新导出。"
+            )
+
+    def _click_export_seed_variable_declared(self):
+        """``$ssmtdrag_seed_pending_{ns}`` 是否会被声明（= 是否存在冷启动播种条目）。
+
+        与 ``_emit_present_and_constants`` 的声明谓词必须保持一致：不声明却被
+        点击计数导出段引用，会让该变量退化成 3DMigoto 的局部变量（跨段失效）。
+        「开关值」模式的点击导出节点不提供播种变量（列表值 → 计数不可逆），
+        此时导出段必须去掉门控里的 seed_pending 项。
+        """
+        try:
+            if not self._feature_var():
+                return False
+            if self._is_efmi_mode():
+                # EFMI 分支在 F1 下恒声明 $ssmtdrag_efmi_seed_pending_{ns}
+                #（驱动段无条件绑 x157），门控里的 seed_pending 项必须保留。
+                return True
+            return bool(self._click_export_seed_entries())
+        except Exception:
+            return False
+
+    def _click_export_trigger_vars(self, ns):
+        """点击计数导出的"按住"变量（LMB / X）。
+
+        点击计数只可能在按住期间推进（驱动 CS 只在按住时写 ClickCount），
+        所以回读只需在按住（含松开沿与首帧建基线）时进行——空闲帧零 store。
+        EFMI 分支的驱动门控语义不同（Candidate 跨实例赢家仲裁 + shader 内部
+        mode 门），未做等价论证前不做门控 → 返回空表示"保持每帧回读"。
+        """
+        if self._is_efmi_mode():
+            return []
+        return [
+            f"$ssmtdrag_lmb_down_{ns}",
+            f"$ssmtdrag_x_down_{ns}",
+        ]
 
     def _is_efmi_mode(self):
         """当前游戏类型是否为 EFMI（路由与消费方契约共用判定）。"""
@@ -3515,7 +3709,11 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
 
         # ---- 全局 Pin / UpdateScreenJiggle / CommandList 段 ----
         self._emit_pin_detected_section(sections, ns)
+        # 共享段恒发（手部/光标/预览消费共享屏幕状态），随后为每个组件各发一份独立段：
+        # 组件级触发链（Detect→PinComponent→UpdateScreenJiggle→Jiggle）各自闭环，互不串动。
         self._emit_update_screen_jiggle_section(sections, ns)
+        for comp in components:
+            self._emit_update_screen_jiggle_section(sections, ns, comp)
         if self._feature_skd():
             self._emit_shapekey_drive_section(sections, ns)
             if self._feature_var():
@@ -3562,6 +3760,18 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             "type = Buffer", "format = R32G32B32A32_FLOAT",
             f"filename = {res_dir}/{stem}JiggleZoneWeights.buf",
         ]
+        # 逐组件屏幕状态/路径进度：共享副本（ResourceDragJiggleScreenState_{ns}）按
+        # 全局命中赢家（ResourceDragPinnedDetectInfo_{ns}）写入，手部/光标/预览按设计读它；
+        # 多组件若共用这两条缓冲，各组件的 Jiggle 就会读同一个赢家的状态——要么互相带动，
+        # 要么第二个组件饿死（叶瞬光01 双组件实测）。故每个组件各发一份，由该组件自己的
+        # PinComponent 赢家（ResourceDragPinnedComponentInfo_{cn}）喂入，Jiggle 侧回绑。
+        comp_resources[f"[ResourceDragJiggleScreenState_{cn}_{ns}]"] = [
+            "type = RWBuffer", "format = R32G32B32A32_FLOAT", "array = 15",
+        ]
+        comp_resources[f"[ResourceDragPathProgressState_{cn}_{ns}]"] = [
+            "type = RWBuffer", "format = R32_FLOAT",
+            f"array = {self._zone_capacity(self._collect_enabled_zone_entries())}",
+        ]
         # 逐三角形物体编号（显隐过滤：检测着色器按命中三角形查 ObjectVis）
         for p_idx, _part in enumerate(comp["parts"]):
             comp_resources[f"[ResourceDragTriangleObjectIDs_{cn}P{p_idx}_{ns}]"] = [
@@ -3600,13 +3810,45 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         """物体显隐发布：CPU flag 变量 → ini params → 发布 CS → GPU 缓冲。
         复用与 rzm_shapekey_var_sync 相同的“变量→缓冲”链路；flag 槽位从
         IniParams[130] 起按 4/float4 打包（与 81/100/119 的既有用法错开）。"""
-        total = sum(int(comp.get("object_count") or 0) for comp in components)
+        # 编号契约（逐组件派生 + 断言，不得靠巧合）：每个组件的物体数恒等于其
+        # object_id_map 的条目数，oid 由 _locate_components 跨组件累计分配；
+        # ResourceDragObjectVis 的 array 必须 == Σ 每组件物体数。
+        per_component_counts = [len(comp.get("object_id_map") or {}) for comp in components]
+        declared_counts = [int(comp.get("object_count") or 0) for comp in components]
+        if declared_counts != per_component_counts:
+            raise ValueError(
+                "[DragInteraction] 物体数声明与 object_id_map 不一致："
+                f"object_count={declared_counts} vs len(object_id_map)={per_component_counts}"
+            )
+        total = sum(per_component_counts)
         if not total:
             return
-        sections.setdefault(
-            f"[ResourceDragObjectVis_{ns}]",
-            ["type = RWBuffer", "format = R32_FLOAT", f"array = {total}"],
-        )
+        vis_sec = f"[ResourceDragObjectVis_{ns}]"
+        vis_lines = ["type = RWBuffer", "format = R32_FLOAT", f"array = {total}"]
+        previous = sections.get(vis_sec)
+        if previous is not None and list(previous) != vis_lines:
+            # 配置变化（物体增删/组件跳过）后旧声明会残留：array 与新 oid 空间错位会
+            # 让发布 CS 漏写后段 flag，这里按当前配置重写而不是沿用旧值。
+            print(
+                f"[DragInteraction][INFO] {vis_sec} 容量 {previous} 与当前 Σ 每组件物体数 "
+                f"{per_component_counts} 不一致，已重写为 array = {total}"
+            )
+        sections[vis_sec] = vis_lines
+        oids = self._global_object_oids(components)
+        if len(oids) != total:
+            # 唯一性硬断言：oid 重复 = 两个组件抢同一条显隐 flag（会互相清/置位），
+            # 且 array 与 oid 数不符。编号空洞（被跳过组件的 oid 被整体剔除）不在此列，
+            # 只告警——不值得因此让整次导出失败。
+            raise ValueError(
+                "[DragInteraction] 物体编号与 ResourceDragObjectVis 容量不一致："
+                f"array = {total}（Σ 每组件物体数 {per_component_counts}），实际 oid = {oids}"
+            )
+        if oids != list(range(total)):
+            print(
+                f"[DragInteraction][WARNING] 物体编号存在空洞（oid={oids}，容量 {total}）："
+                "被跳过的组件仍占用了全局编号，其 flag 不会出现在 "
+                f"CommandListDragVisPublish_{ns} 中"
+            )
         sections.setdefault(f"[CustomShaderDragVisPublish_{ns}]", [
             f"cs = {RES_SHADER_DIR}/rzm_vis_publish.hlsl",
             f"cs-u0 = ResourceDragObjectVis_{ns}",
@@ -3653,7 +3895,10 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         cn = comp["comp_name"]
         vertex_base = int(comp.get("vertex_base", 0) or 0)
         if part_index is not None and part_index < len(comp.get("parts") or []):
-            vertex_base = int(comp["parts"][part_index].get("vertex_base", vertex_base) or 0)
+            # 承载真实几何的 part 一律用掩码基准（= comp["vertex_base"]，已被
+            # _assert_component_base_alignment 断言一致）；前缀 stub part 用自身 base，
+            # 使 z26 与掩码行空间严格对齐（基座段与 P0 变体不再自相矛盾）。
+            vertex_base = self._part_vertex_base(comp, comp["parts"][part_index])
         lines = [
             f"cs = {RES_SHADER_DIR}/rzm_object_detect.hlsl",
             "x28 = 0",
@@ -3754,6 +3999,9 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 f"ps = {RES_SHADER_DIR}/rzm_gs_probe.hlsl",
                 "topology = point_list",
                 f"o0 = set_viewport no_view_cache ResourceDragBakeRT_{ns}",
+                # [t148] 探针精确写入：透明 pass 的 alpha 混合会污染校准 RT
+                "blend = ADD ONE ZERO",
+                "alpha = ADD ONE ZERO",
                 f"local {off_var}",
                 f"{off_var} = {base_var} + {i_var} * {step_var}",
                 f"x26 = {i_var}",
@@ -3841,9 +4089,11 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             f"cs-t68 = ResourceDragJiggleParams_{cn}_{ns}",
             f"cs-t65 = ResourceDragJiggleZoneIDs_{cn}_{ns}",
             f"cs-t66 = ResourceDragJiggleZoneWeights_{cn}_{ns}",
-            f"cs-t71 = ResourceDragJiggleScreenState_{ns}",
+            # 逐组件屏幕状态/进度：本组件只读自己的（由本组件 UpdateScreenJiggle 段写），
+            # 不得读共享副本，否则拖动组件 A 的几何会跟着组件 B 的状态走（或多组件饿死）。
+            f"cs-t71 = ResourceDragJiggleScreenState_{cn}_{ns}",
             f"cs-t73 = ResourceDragPathVectors_{ns}",
-            f"cs-t74 = ResourceDragPathProgressState_{ns}",
+            f"cs-t74 = ResourceDragPathProgressState_{cn}_{ns}",
             f"cs-t75 = ResourceDragZoneParams_{ns}",
             f"cs-u6 = ResourceDragJiggleState_{cn}_{ns}",
         ])
@@ -3913,10 +4163,27 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
 
     # ---- UpdateScreenJiggle（y72=1.0 非 mult_radius，照原作不对称）----
 
-    def _emit_update_screen_jiggle_section(self, sections, ns):
-        sec = f"[CustomShaderDragUpdateScreenJiggle_{ns}]"
-        if sec in sections:
+    def _emit_update_screen_jiggle_section(self, sections, ns, comp=None):
+        """发射 UpdateScreenJiggle 段。
+
+        ``comp is None`` → 全局共享段：读共享赢家 ResourceDragPinnedDetectInfo_{ns}，
+        写共享 ResourceDragJiggleScreenState_{ns}/PathProgressState_{ns}（手部、光标
+        预览、PresentHand 按设计消费这两条共享缓冲，必须保留）。
+        ``comp`` 给定 → 该组件的独立段：读本组件赢家 ResourceDragPinnedComponentInfo_<C>，
+        写本组件独立的屏幕状态/进度缓冲，供本组件 Jiggle 的 cs-t71/cs-t74 读取。多个
+        组件各自成链，拖拽其一只动其一的几何。
+        """
+        cn = comp["comp_name"] if comp is not None else None
+        sec = (f"[CustomShaderDragUpdateScreenJiggle_{ns}]" if cn is None
+               else f"[CustomShaderDragUpdateScreenJiggle_{cn}_{ns}]")
+        if comp is None and sec in sections:
             return
+        pinned_info = (f"ResourceDragPinnedDetectInfo_{ns}" if cn is None
+                       else f"ResourceDragPinnedComponentInfo_{cn}_{ns}")
+        screen_state = (f"ResourceDragJiggleScreenState_{ns}" if cn is None
+                        else f"ResourceDragJiggleScreenState_{cn}_{ns}")
+        path_state = (f"ResourceDragPathProgressState_{ns}" if cn is None
+                      else f"ResourceDragPathProgressState_{cn}_{ns}")
         lines = [
             "local $LLScreenCursorXPast", "local $LLScreenCursorYPast", "local $LLScreenWasMouseDown",
             "",
@@ -3957,10 +4224,10 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             f"y119 = {self._zone_capacity(self._collect_enabled_zone_entries())}",
         ]
         lines.extend([
-            f"cs-t67 = ResourceDragPinnedDetectInfo_{ns}",
+            f"cs-t67 = {pinned_info}",
             f"cs-t75 = ResourceDragZoneParams_{ns}",
-            f"cs-u0 = ResourceDragJiggleScreenState_{ns}",
-            f"cs-u1 = ResourceDragPathProgressState_{ns}",
+            f"cs-u0 = {screen_state}",
+            f"cs-u1 = {path_state}",
             "dispatch = 1, 1, 1",
             "post cs-u0 = null", "post cs-u1 = null", "post cs-t67 = null",
         ])
@@ -3987,17 +4254,20 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             "y79 = $ssmtdrag_shapekey_dx_" + ns,
             "x80 = " + self._fmt(self.shapekey_drive_move_sensitivity),
         ]
-        if self._feature_var():
+        seed_entries = self._click_export_seed_entries() if self._feature_var() else []
+        if seed_entries:
             # 冷启动播种（F4/ClickExport 链）：x81=条目数，从 82 起每条
-            # (x=区域, y=导出变量当前值)；变量联动关闭时不发，避免残留 F4 引用
+            # (x=区域, y=导出变量当前值)。
             lines.append(f"y80 = $ssmtdrag_seed_pending_{ns}")
-            seed_entries = self._click_export_seed_entries()
-            if seed_entries:
-                # 冷启动播种参数：x81=条目数，从 82 起每条 (x=区域, y=导出变量当前值)
-                lines.append(f"x81 = {len(seed_entries)}")
-                for seed_idx, (seed_zone, seed_var) in enumerate(seed_entries):
-                    lines.append(f"x{82 + seed_idx} = {seed_zone}")
-                    lines.append(f"y{82 + seed_idx} = {seed_var}")
+            lines.append(f"x81 = {len(seed_entries)}")
+            for seed_idx, (seed_zone, seed_var) in enumerate(seed_entries):
+                lines.append(f"x{82 + seed_idx} = {seed_zone}")
+                lines.append(f"y{82 + seed_idx} = {seed_var}")
+        else:
+            # 不发射播种链时必须显式写 0：槽位 80/81 与变量同步段的取值区
+            # （81..89）重叠，残留值可能让驱动 CS 走进播种分支（读到脏条目）。
+            lines.append("y80 = 0")
+            lines.append("x81 = 0")
         lines.extend([
             f"cs-t67 = ResourceDragPinnedDetectInfo_{ns}",
             f"cs-t68 = ResourceDragShapeKeyZoneStageCounts_{ns}",
@@ -4088,7 +4358,28 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         # 变量优先 + 确认握手：变量变化后 pending=1/mode=2，GPU 每帧强制推送，
         # 直到 store 回读追平 prev 才结束；仅区域实际激活且无 pending 时允许缓冲
         # 回拉变量。这样 store 的延迟旧值不会覆盖刚写入的新变量。
-        lines = []
+        #
+        # ---- 回读最小化（只在"值可能变了"时回读）----
+        # store 是 GPU→CPU 同步，属整条链里最贵的操作。旧实现每帧对每个绑定
+        # 固定做 2 次 store（ZoneActive + Drive），即 2N 次/帧，绝大多数帧什么都没
+        # 变。现在：
+        #   * 区域激活不再逐绑定回读 ZoneActive（N 次），改为在"按住 / 松开沿"上
+        #     回读一次**绑定锁存**（单槽，驱动 CS 当帧写、本 CL 之前刚跑过，最新），
+        #     再由 CPU 推导每个绑定是否激活 → 0~1 次 store/帧；
+        #   * 驱动槽只在该绑定"拖拽激活"或"等待 store 确认"时回读 → 空闲帧 0 次；
+        #   * 变量只在**真的变了**时才回写（拖拽拉动缓冲 → 值变了才写变量）；
+        #   * 同步 CS 的 dispatch 由 skany 门控（只有绑定处于 mode!=0 才需要跑）。
+        lines = [
+            # 本帧是否需要 dispatch 变量→缓冲同步 CS（有绑定 mode!=0 时置 1）
+            f"$ssmtdrag_skany_{ns} = 0",
+            # 锁存只在按住/松开沿回读；跳过时必须显式清 0，否则陈旧绑定会让
+            # CPU 一直以为拖拽还在进行（每帧回拉一个已经不动的缓冲值）
+            f"$ssmtdrag_sklatch_{ns} = 0",
+            f"if $ssmtdrag_skheld_{ns} == 1 || $ssmtdrag_skheldprev_{ns} == 1",
+            f"\tstore = $ssmtdrag_sklatch_{ns}, ResourceDragShapeKeyDragLatch_{ns}, 0",
+            "endif",
+            f"$ssmtdrag_skheldprev_{ns} = $ssmtdrag_skheld_{ns}",
+        ]
         for i, (var_name, slot, zone, _nd_stage) in enumerate(bindings):
             active = f"$ssmtdrag_skact_{ns}_{i}"
             rb = f"$ssmtdrag_skrb_{ns}_{i}"
@@ -4096,8 +4387,16 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             pending = f"$ssmtdrag_skpending_{ns}_{i}"
             mode = f"$ssmtdrag_skmode_{ns}_{i}"
             lines.extend([
-                f"store = {active}, ResourceDragShapeKeyZoneActive_{ns}, {zone}",
-                f"store = {rb}, ResourceDragShapeKeyDrive_{ns}, {slot}",
+                # 由锁存推导本绑定的区域激活（纯 CPU，零回读）。锁存编码 = 区域id+1，
+                # 与 ZoneActive 同源，整数取值比较精确。
+                f"{active} = 0",
+                f"if $ssmtdrag_sklatch_{ns} == {zone + 1}",
+                f"\t{active} = 1",
+                "endif",
+                # 只有"拖拽激活"或"等 store 确认"时才回读驱动槽
+                f"if {active} >= 1 || {pending} == 1",
+                f"\tstore = {rb}, ResourceDragShapeKeyDrive_{ns}, {slot}",
+                "endif",
                 f"if {var_name} != {prev}",
                 f"\t{prev} = {var_name}",
                 f"\t{pending} = 1",
@@ -4110,11 +4409,19 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 f"\t\t{mode} = 2",
                 "\tendif",
                 f"elif {active} >= 1",
-                f"\t{var_name} = {rb}",
-                f"\t{prev} = {rb}",
+                # 拖拽激活：缓冲值**变了才**回写变量（不再每帧无脑覆盖）
                 f"\t{mode} = 1",
+                f"\tif {rb} != {prev}",
+                f"\t\t{var_name} = {rb}",
+                f"\t\t{prev} = {rb}",
+                "\tendif",
                 "else",
                 f"\t{mode} = 0",
+                "endif",
+                # mode=1 也需要 CS 跑一趟：让它把 VarSyncPrev 追平到已拉取值，
+                # 否则之后 CS 再次运行时会把这个值当"变量变化"回声写回缓冲
+                f"if {mode} != 0",
+                f"\t$ssmtdrag_skany_{ns} = 1",
                 "endif",
             ])
         sections[sec] = lines
@@ -4142,6 +4449,12 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 f"\tclear = ResourceDragPathProgressState_{ns} 0.0",
                 f"\tclear = ResourceDragViewportFrameAPI_{ns} 0.0",
             ]
+            # 逐组件屏幕状态/进度同样要清：不清则首帧残留垃圾会让某组件假命中/假位移
+            for comp in components:
+                lines.extend([
+                    f"\tclear = ResourceDragJiggleScreenState_{comp['comp_name']}_{ns} 0.0",
+                    f"\tclear = ResourceDragPathProgressState_{comp['comp_name']}_{ns} 0.0",
+                ])
             if any(int(comp.get("object_count") or 0) for comp in components):
                 lines.append(f"\tclear = ResourceDragObjectVis_{ns} 0.0")
             if self._feature_skd():
@@ -4189,8 +4502,17 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                     "",
                 ])
             lines.extend([
-                "local $ssmtdrag_detect_next_time",
-                "local $ssmtdrag_detect_interval = 0.25",
+                # t149 变量追溯审计：此处原发
+                #     local $ssmtdrag_detect_next_time
+                #     local $ssmtdrag_detect_interval = 0.25
+                # 以及
+                #     if $isMouseButtonDown == 1
+                #         $ssmtdrag_detect_next_time = time
+                #     endif
+                # 两者在产物 ini 里**只写不读**（无任何条件/表达式/IniParams 消费；
+                # 也未被任何 hlsl 读），且表达式 `0.25` / `time` 无副作用 ⇒ 删除是
+                # 行为等价的（不改变任何其它命令的求值）。dt 钳制用的是
+                # `$ssmtdrag_delta_time_{ns}`，与它们无关。
                 # dt 钳制 [0.001, 0.100]（time 单位分钟 → 秒）
                 f"if $ssmtdrag_prev_time_{ns} == 0",
                 f"\t$ssmtdrag_delta_time_{ns} = 0.0166667",
@@ -4203,10 +4525,6 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 "\tendif",
                 "endif",
                 f"$ssmtdrag_prev_time_{ns} = time",
-                "",
-                "if $isMouseButtonDown == 1",
-                "\t$ssmtdrag_detect_next_time = time",
-                "endif",
                 "",
                 f"if {drag_mode_var} >= 1 && $inputMode == 0 && $ssmtdrag_mode_{ns} == 1 && $ssmtdrag_drawn_{ns} == 1",
                 f"\t$ObjectDetectAllowed_{ns} = 1",
@@ -4224,6 +4542,11 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             for comp in components:
                 lines.append(f"\trun = CustomShaderDragPinComponent{comp['comp_name']}_{ns}")
             lines.append(f"\trun = CustomShaderDragUpdateScreenJiggle_{ns}")
+            # 逐组件独立段紧随共享段：各组件在自己的赢家缓冲上推进屏幕状态/路径进度，
+            # 后面的 Jiggle 各自读自己的那一份（共享段仍在，手部/光标继续消费）。
+            for comp in components:
+                lines.append(
+                    f"\trun = CustomShaderDragUpdateScreenJiggle_{comp['comp_name']}_{ns}")
             if self._feature_skd():
                 lines.append(f"\trun = CustomShaderDragShapeKeyDrive_{ns}")
             for _slot in ("69", "70", "72", "73", "97"):
@@ -4830,8 +5153,16 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             _sync_n = len(self._drag_drive_var_sync_bindings())
             if _sync_n:
                 globals_to_add.append(f"global $ssmtdrag_skheld_{ns} = 0")
-            # 冷启动播种标志：开启驱动即声明，保证引用处变量恒存在（默认 0）
-            globals_to_add.append(f"global $ssmtdrag_seed_pending_{ns} = 0")
+                # 回读最小化用：按住沿（决定何时回读绑定锁存）、锁存值（区域激活的
+                # CPU 侧推导源）、是否需要 dispatch 同步 CS
+                globals_to_add.append(f"global $ssmtdrag_skheldprev_{ns} = 0")
+                globals_to_add.append(f"global $ssmtdrag_sklatch_{ns} = 0")
+                globals_to_add.append(f"global $ssmtdrag_skany_{ns} = 0")
+            # 冷启动播种标志：只有真的会置 1（存在 ClickExport 播种条目）时才声明，
+            # 否则它是个「声明 + 被 CS 读 + 从不赋值」的死变量。未发射时驱动 CS 段
+            # 显式绑 y80 = 0 / x81 = 0，不依赖本变量存在。
+            if self._click_export_seed_entries():
+                globals_to_add.append(f"global $ssmtdrag_seed_pending_{ns} = 0")
             for i in range(_sync_n):
                 globals_to_add.extend([
                     f"global $ssmtdrag_skact_{ns}_{i} = 0",
@@ -4893,6 +5224,12 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             f"\tclear = ResourceDragJiggleScreenState_{ns} 0.0",
             f"\tclear = ResourceDragPathProgressState_{ns} 0.0",
         ]
+        # 逐组件副本同步清零（否则模式降档后旧屏幕状态继续喂本组件 Jiggle）
+        for comp in components:
+            interaction_gate_lines.extend([
+                f"\tclear = ResourceDragJiggleScreenState_{comp['comp_name']}_{ns} 0.0",
+                f"\tclear = ResourceDragPathProgressState_{comp['comp_name']}_{ns} 0.0",
+            ])
         for comp in components:
             interaction_gate_lines.append(
                 f"\tclear = ResourceDragJiggleState_{comp['comp_name']}_{ns} 0.0")
@@ -5050,7 +5387,8 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 "endif",
                 f"if {drag_mode_var} >= 1 && $ssmtdrag_viewport_probe_enabled_{ns} == 1 && time >= $ssmtdrag_viewport_probe_next_time_{ns}",
                 f"\tResourceDragViewportSource_{ns} = null",
-                f"\tclear = ResourceDragViewportFrameAPI_{ns} 0.0",
+                # [t138] 不再 clear：重新布防失败时保留上一份好布局（解码器失败是提前 return，不会写坏）
+                # f"\tclear = ResourceDragViewportFrameAPI_{ns} 0.0",
                 f"\t$ssmtdrag_viewport_probe_armed_{ns} = 1",
                 f"\t$ssmtdrag_viewport_probe_generation_{ns} = $ssmtdrag_viewport_probe_generation_{ns} + 1",
                 f"\t$ssmtdrag_viewport_probe_next_time_{ns} = time + $ssmtdrag_viewport_probe_interval_{ns}",
@@ -5070,28 +5408,38 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 f"\tpre run = CommandListDragPinDetected_{ns}",
             ])
         block.extend([
-            # 与实机可用配置一致：Pin 检测/光标更新只由模式开关门控，不要求 Alt。
-            f"elif {drag_mode_var} >= 1",
+            # 与实机可用配置一致：Pin 检测/光标更新只由模式开关门控，不要求 Alt；
+            # 但必须要求本帧人物真的被绘制过（drawn==1）——否则角色不在场时每帧
+            # 仍在空跑整条检测/光标链路（装几十上百个模组时纯属浪费）。
+            f"elif {drag_mode_var} >= 1 && $ssmtdrag_drawn_{ns} == 1",
             f"\tpre run = CommandListDragPinDetected_{ns}",
-            f"\trun = CommandListDragCursorUpdate_{ns}",
+            # 光标/视口更新只被**臂动链路**消费：检测 CS 与手型光标都在 mode==1 下才跑
+            # （检测 CS 的 dispatch 条件里就有 mode==1），而检测读的本来就是上一帧的光标
+            # （`pre run` 在帧首执行，晚于它的光标更新要下一帧才可见）。所以不臂动时
+            # 更新光标/视口是纯空跑（本模组 ~32 条语句/帧，且"在场未臂动"是最常见状态）。
+            f"\tif $ssmtdrag_mode_{ns} == 1",
+            f"\t\trun = CommandListDragCursorUpdate_{ns}",
+            "\tendif",
         ])
+        # 未绘制（或模式 0）时 PinDetected 不执行，其内部 else 够不到：这里补上
+        # 终态清理，保证「不在场」帧的检测允许位归零。
+        block.append("else")
+        block.append(f"\t$ObjectDetectAllowed_{ns} = 0")
         if self._feature_skd():
             # 模式 0（含 1→0 直跳，不经过模式 2 dispatch 帧）：PinDetected 整体不
             # dispatch，臂动门控内的失臂 else 够不到；在此终态 else 清锁存，
             # 防陈旧绑定跨 mode-0 滞留、回模式 1 后无命中复活（评审 G1）。
-            block.extend([
-                "else",
-                f"\tclear = ResourceDragShapeKeyDragLatch_{ns} 0.0",
-            ])
+            block.append(f"\tclear = ResourceDragShapeKeyDragLatch_{ns} 0.0")
         block.append("endif")
         sync_bindings = (
             self._drag_drive_var_sync_bindings()
             if self._feature_var() else []
         )
         if sync_bindings:
-            # 分时互斥：ZoneActive 标志由同步 CS 每帧镜像驱动 CS 的绑定锁存
+            # 分时互斥：区域激活由回读命令列表从驱动 CS 的绑定锁存（单槽）推导
             #（按住命中即绑定、移出区域不丢、松开解除）；
-            # 回读只在「对应区域拖拽激活」时进行，其余时间变量完全归驱动器/用户所有
+            # 回读只在「拖拽激活」或「等 store 确认」时进行，其余时间变量完全归
+            # 驱动器/用户所有——空闲帧零回读。
             block.extend([
                 f"$ssmtdrag_skheld_{ns} = 0",
                 f"if $ssmtdrag_mode_{ns} == 1 && ($ssmtdrag_lmb_down_{ns} == 1 || $ssmtdrag_x_down_{ns} == 1)",
@@ -5100,9 +5448,9 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 f"if $ssmtdrag_booted_{ns} == 1 && $ssmtdrag_drawn_{ns} == 1",
                 f"\tpre run = CommandListDragShapeKeyVarReadback_{ns}",
                 "endif",
-                # 变量→驱动缓冲同步：只在角色在屏（drawn，由网格覆写置位）时运行；
-                # 排在回读之后让采用结果当帧生效
-                f"if $ssmtdrag_drawn_{ns} == 1",
+                # 变量→驱动缓冲同步：只在「有绑定需要推送 / 刚从缓冲拉取」时 dispatch
+                #（skany 由回读命令列表当帧算出），空闲帧不再空跑一次 CS
+                f"if $ssmtdrag_drawn_{ns} == 1 && $ssmtdrag_skany_{ns} == 1",
                 f"\trun = CustomShaderDragShapeKeyVarSync_{ns}",
                 "endif",
             ])
@@ -5164,13 +5512,26 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         # GPU 缓冲（下一帧检测消费）；随后 post 清零供下一帧分支重算。
         total_objs = sum(int(comp.get("object_count") or 0) for comp in components)
         if total_objs:
-            block.append(f"if $ssmtdrag_drawn_{ns} == 1")
+            # 发布只在「臂动模式」下被消费：绑定该缓冲的检测 CS（cs-t8）只在
+            # $ObjectDetectAllowed 为 1 时 dispatch，而它由下面这条**完全相同**的条件
+            # 置位（见 CommandListDragPinDetected 的发射点）。条件不成立时整条发布
+            # 命令列表（本模组 216 条语句 + 1 次 dispatch）纯属空跑。
+            block.append(
+                f"if {drag_mode_var} >= 1 && $inputMode == 0 && $ssmtdrag_mode_{ns} == 1"
+                f" && $ssmtdrag_drawn_{ns} == 1"
+            )
             block.append(f"\tpre run = CommandListDragVisPublish_{ns}")
             block.append("endif")
+            # 清零必须**每绘制帧**执行：objvis 标志是逐绘制置位的（与 mode 无关，
+            # 301 处都在材质分支里），攒着不清会让下次 mode==1 的发布读到陈旧可见性。
+            block.append(f"if $ssmtdrag_drawn_{ns} == 1")
             # 同上：post 清零按全局 oid 并集发射，按组件 range 会产生重复且漏掉
             # 第二组件起的 oid（曾出现 0-14 重复、37-51 缺失）。
+            # 清零只在「本帧真的发布过」时才有意义：角色不在场时没有任何分支把
+            # objvis 置 1，逐个 post 纯属每帧开销（本模组 215 条 × 每个模组）。
             for oid in self._global_object_oids(components):
-                block.append(f"post $ssmtdrag_objvis_{ns}_{oid} = 0")
+                block.append(f"\tpost $ssmtdrag_objvis_{ns}_{oid} = 0")
+            block.append("endif")
         if self._feature_panel():
             block.append(f"if $ssmtdrag_drawn_{ns} == 1")
             block.append(f"\tpost run = CommandListDragUIReadback_{ns}")

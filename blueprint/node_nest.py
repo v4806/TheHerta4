@@ -35,8 +35,11 @@ class SSMTNode_Blueprint_Nest(SSMTNodeBase):
         'SSMTNode_PostProcess_BufferCleanup': '缓冲区清理',
         'SSMTNode_PostProcess_MultiFile': '多文件配置',
         'SSMTNode_PostProcess_CustomMaterialAssign': '材质转资源pro',
+        'SSMTNode_PostProcess_Glow': 'RabbitFX贴图后处理',
+        'SSMTNode_PostProcess_RabbitFXPro': 'RabbitFX贴图后处理pro',
         'SSMTNode_PostProcess_DiffuseSwitch': '贴图切换 V5.1',
         'SSMTNode_PostProcess_SwapPanel': '物体切换面板',
+        'SSMTNode_PostProcess_TextAppend': '文本追加',
     }
 
     def update_blueprint_name(self, context):

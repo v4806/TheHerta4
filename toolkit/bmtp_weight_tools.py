@@ -96,6 +96,61 @@ class BMTP_OT_TransferWeights(bpy.types.Operator):
             if i < len(original_positions):
                 vert.co = original_positions[i]
 
+    def ensure_object_mode(self, context, obj):
+        if getattr(obj, "mode", 'OBJECT') == 'OBJECT':
+            return
+
+        previous_active = context.view_layer.objects.active
+        try:
+            context.view_layer.objects.active = obj
+            bpy.ops.object.mode_set(mode='OBJECT')
+        except RuntimeError:
+            pass
+        finally:
+            if previous_active is not None:
+                context.view_layer.objects.active = previous_active
+
+    def take_unselected_vertex_groups(self, obj, selected_names):
+        """备份并移除 obj 上未选中的顶点组，返回 {组名: {顶点索引: 权重}}。"""
+        weights_by_group = {}
+        for vertex in obj.data.vertices:
+            for assignment in vertex.groups:
+                if assignment.weight <= 0:
+                    continue
+                weights_by_group.setdefault(assignment.group, {})[str(vertex.index)] = assignment.weight
+
+        backup = {}
+        for index, vg in enumerate(list(obj.vertex_groups)):
+            if vg.name in selected_names:
+                continue
+            backup[vg.name] = weights_by_group.get(index, {})
+
+        for vg_name in backup:
+            vg = obj.vertex_groups.get(vg_name)
+            if vg:
+                obj.vertex_groups.remove(vg)
+
+        return backup
+
+    def restore_vertex_groups(self, obj, backup):
+        """把 take_unselected_vertex_groups 备份的顶点组连同权重还原回 obj。"""
+        if not backup:
+            return
+
+        vertex_count = len(obj.data.vertices)
+        for vg_name, weights in backup.items():
+            vg = obj.vertex_groups.get(vg_name)
+            if vg is None:
+                vg = obj.vertex_groups.new(name=vg_name)
+            else:
+                vg.remove(list(range(vertex_count)))
+
+            for vertex_index, weight in weights.items():
+                try:
+                    vg.add([int(vertex_index)], weight, 'REPLACE')
+                except (RuntimeError, IndexError):
+                    pass
+
     def execute(self, context):
         props = context.scene.bmtp_props
         source_obj = props.wt_source_obj
@@ -142,6 +197,7 @@ class BMTP_OT_TransferWeights(bpy.types.Operator):
         
         if props.wt_use_selected_groups:
             selected_vg_names = [item.name for item in props.wt_vertex_groups if item.selected]
+            selected_vg_name_set = set(selected_vg_names)
             
             if not selected_vg_names:
                 self.report({'ERROR'}, "请至少选择一个顶点组进行传递")
@@ -149,74 +205,62 @@ class BMTP_OT_TransferWeights(bpy.types.Operator):
             
             self.report({'INFO'}, f"将传递以下顶点组: {', '.join(selected_vg_names)}")
             
+            source_removed_groups = {}
+            
             try:
                 bpy.ops.object.mode_set(mode='OBJECT')
                 
-                for target_obj in target_objects:
-                    target_vg_backup = {}
-                    if not props.wt_cleanup:
-                        for vg in target_obj.vertex_groups:
-                            target_vg_backup[vg.name] = {}
-                            for i, v in enumerate(target_obj.data.vertices):
-                                try:
-                                    weight = vg.weight(i)
-                                    if weight > 0:
-                                        target_vg_backup[vg.name][str(i)] = weight
-                                except:
-                                    pass
+                # 先移除源物体上未选中的顶点组：按名字全量传递时源侧只剩本次要传的组，
+                # 目标物体也就不会被带上其它组；源物体的组在下方 finally 中无条件还原。
+                self.ensure_object_mode(context, source_obj)
+                source_removed_groups = self.take_unselected_vertex_groups(source_obj, selected_vg_name_set)
+                # 顶点组的增删不会让 depsgraph 失效：不显式打标的话，传递算子会继续用旧的
+                # 求值副本，在目标物体上多建出源物体未选中的空组。
+                source_obj.update_tag()
+                
+                try:
+                    if not source_obj.vertex_groups:
+                        self.report({'ERROR'}, "源物体上没有可传递的顶点组，请刷新顶点组列表后重试")
+                        return {'CANCELLED'}
                     
-                    if props.wt_cleanup:
-                        target_obj.vertex_groups.clear()
-                    
-                    for vg in source_obj.vertex_groups:
-                        if vg.name not in target_obj.vertex_groups:
-                            target_obj.vertex_groups.new(name=vg.name)
-                    
-                    for obj in context.view_layer.objects:
-                        obj.select_set(False)
-                    
-                    source_obj.select_set(True)
-                    target_obj.select_set(True)
-                    context.view_layer.objects.active = target_obj
-                    
-                    context.view_layer.update()
-                    bpy.context.evaluated_depsgraph_get().update()
-                    
-                    bpy.ops.object.data_transfer(
-                        use_reverse_transfer=True,
-                        data_type='VGROUP_WEIGHTS',
-                        use_create=True,
-                        vert_mapping=WEIGHT_TRANSFER_VERTEX_MAPPING,
-                        layers_select_src='NAME',
-                        layers_select_dst='ALL'
-                    )
-                    
-                    vgs_to_remove_from_target = []
-                    for vg in target_obj.vertex_groups:
-                        if vg.name not in selected_vg_names:
-                            vgs_to_remove_from_target.append(vg.name)
-                    
-                    for vg_name in vgs_to_remove_from_target:
-                        vg = target_obj.vertex_groups.get(vg_name)
-                        if vg:
-                            target_obj.vertex_groups.remove(vg)
-                    
-                    if not props.wt_cleanup and target_vg_backup:
-                        for vg_name, weights in target_vg_backup.items():
-                            if vg_name not in selected_vg_names:
-                                if vg_name not in target_obj.vertex_groups:
-                                    target_obj.vertex_groups.new(name=vg_name)
-                                vg = target_obj.vertex_groups.get(vg_name)
-                                if vg:
-                                    vg.remove([i for i in range(len(target_obj.data.vertices))])
-                                    for vert_idx_str, weight in weights.items():
-                                        vert_idx = int(vert_idx_str)
-                                        try:
-                                            vg.add([vert_idx], weight, 'REPLACE')
-                                        except (RuntimeError, IndexError):
-                                            pass
-                    
-                    target_obj.select_set(False)
+                    for target_obj in target_objects:
+                        if props.wt_cleanup:
+                            target_obj.vertex_groups.clear()
+                            target_removed_groups = {}
+                        else:
+                            target_removed_groups = self.take_unselected_vertex_groups(
+                                target_obj, selected_vg_name_set
+                            )
+                        
+                        for vg in source_obj.vertex_groups:
+                            if vg.name not in target_obj.vertex_groups:
+                                target_obj.vertex_groups.new(name=vg.name)
+                        
+                        for obj in context.view_layer.objects:
+                            obj.select_set(False)
+                        
+                        source_obj.select_set(True)
+                        target_obj.select_set(True)
+                        context.view_layer.objects.active = target_obj
+                        
+                        context.view_layer.update()
+                        bpy.context.evaluated_depsgraph_get().update()
+                        
+                        try:
+                            bpy.ops.object.data_transfer(
+                                use_reverse_transfer=True,
+                                data_type='VGROUP_WEIGHTS',
+                                use_create=True,
+                                vert_mapping=WEIGHT_TRANSFER_VERTEX_MAPPING,
+                                layers_select_src='NAME',
+                                layers_select_dst='ALL'
+                            )
+                        finally:
+                            self.restore_vertex_groups(target_obj, target_removed_groups)
+                        
+                        target_obj.select_set(False)
+                finally:
+                    self.restore_vertex_groups(source_obj, source_removed_groups)
             finally:
                 if original_active and original_active.name in bpy.data.objects:
                     context.view_layer.objects.active = original_active
