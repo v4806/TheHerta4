@@ -1,5 +1,6 @@
 import bpy
 import os
+import re
 import json
 
 
@@ -232,10 +233,17 @@ class GlobalConfig:
         return tree
 
     @classmethod
-    def _default_generated_mod_folder(cls):
-        # 确保用的时候直接拿到的就是已经存在的目录
+    def _default_generated_mod_folder(cls, folder_name=""):
+        """默认输出目录 SSMTGeneratedMod/<文件夹名>。
+
+        folder_name 留空时用工作空间名；传蓝图名即蓝图勾选了「生成Mod到
+        [蓝图名] 文件夹中」。确保用的时候直接拿到的就是已经存在的目录。
+        """
         ssmt_generated_mod_folder_path = os.path.join(GlobalConfig.path_mods_folder(),"SSMTGeneratedMod\\")
-        generate_mod_folder_path = os.path.join(ssmt_generated_mod_folder_path, cls.get_workspace_name() + "\\")
+        name = str(folder_name or "").strip() or cls.get_workspace_name()
+        # 蓝图名可能含路径非法字符，替换掉，避免建出意外层级的目录
+        name = re.sub(r'[\\/:*?"<>|]+', "_", name).strip() or cls.get_workspace_name()
+        generate_mod_folder_path = os.path.join(ssmt_generated_mod_folder_path, name + "\\")
         if not os.path.exists(generate_mod_folder_path):
             os.makedirs(generate_mod_folder_path)
         return generate_mod_folder_path
@@ -248,7 +256,8 @@ class GlobalConfig:
         输出目录蓝图指针，见 set_output_blueprint_tree）：
 
         - 蓝图导出流程内：只认当前蓝图自己的 output_tree 设置。蓝图勾选了
-          「生成Mod到指定的文件夹中」且路径非空就用它，否则用默认目录
+          「生成Mod到指定的文件夹中」且路径非空就用它；勾了「生成Mod到
+          [蓝图名] 文件夹中」则用 SSMTGeneratedMod/<蓝图名>；否则用默认目录
           SSMTGeneratedMod/<工作空间>。**绝不回落到场景全局设置**，否则会沿用
           以前在别的蓝图里留下的路径（PR 描述里的「未设置则沿用原有全局逻辑」
           与实际实现不符，以本处实现为准）。
@@ -262,6 +271,9 @@ class GlobalConfig:
                 tree_path = str(getattr(output_tree, "generate_mod_folder_path", "") or "").strip()
                 if tree_path:
                     return tree_path
+            if getattr(output_tree, "use_blueprint_name_generate_mod_folder", False):
+                # 「生成Mod到 [蓝图名] 文件夹中」：默认目录改用蓝图名
+                return cls._default_generated_mod_folder(getattr(output_tree, "name", ""))
             return cls._default_generated_mod_folder()
 
         # 非蓝图导出流程：沿用场景全局设置。

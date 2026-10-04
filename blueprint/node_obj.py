@@ -459,6 +459,9 @@ class SSMTNode_Result_Output(SSMTNodeBase):
             box.label(text="当前生成Mod位置文件夹:")
             box.prop(output_tree, "generate_mod_folder_path", text="")
 
+        # 放在「指定文件夹」及其路径框之后，避免路径框跟到别的勾选项下面
+        layout.prop(output_tree, "use_blueprint_name_generate_mod_folder")
+
         row = layout.row()
         row.prop(self, "show_vertex_deduplication_panel", 
                  icon='TRIA_DOWN' if self.show_vertex_deduplication_panel else 'TRIA_RIGHT',

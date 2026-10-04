@@ -44,6 +44,18 @@ class SSMTSocketPostProcess(NodeSocket):
         layout.label(text=text)
 
 
+def _on_use_specific_folder_changed(self, context):
+    """「指定文件夹」与「蓝图名文件夹」互斥：勾一个就取消另一个。"""
+    if self.use_specific_generate_mod_folder_path and self.use_blueprint_name_generate_mod_folder:
+        self.use_blueprint_name_generate_mod_folder = False
+
+
+def _on_use_blueprint_name_changed(self, context):
+    """「蓝图名文件夹」与「指定文件夹」互斥：勾一个就取消另一个。"""
+    if self.use_blueprint_name_generate_mod_folder and self.use_specific_generate_mod_folder_path:
+        self.use_specific_generate_mod_folder_path = False
+
+
 class SSMTBlueprintTree(NodeTree):
     '''SSMT Mod Logic Blueprint'''
     bl_idname = 'SSMTBlueprintTreeType'
@@ -55,6 +67,7 @@ class SSMTBlueprintTree(NodeTree):
         name="生成Mod到指定的文件夹中",
         description="勾选后将生成Mod到你指定的文件夹中（仅对当前蓝图生效）",
         default=False,
+        update=_on_use_specific_folder_changed,
     ) # type: ignore
 
     generate_mod_folder_path: bpy.props.StringProperty(
@@ -62,6 +75,17 @@ class SSMTBlueprintTree(NodeTree):
         description="选择的生成Mod的文件夹路径（仅对当前蓝图生效）",
         default="",
         subtype='DIR_PATH',
+    ) # type: ignore
+
+    use_blueprint_name_generate_mod_folder: bpy.props.BoolProperty(
+        name="生成Mod到 [蓝图名] 文件夹中",
+        description=(
+            "勾选后默认输出目录用当前蓝图名代替工作空间名，即 "
+            "SSMTGeneratedMod/[蓝图名]（默认是 SSMTGeneratedMod/[工作空间名]）；"
+            "与「生成Mod到指定的文件夹中」互斥（仅对当前蓝图生效）"
+        ),
+        default=False,
+        update=_on_use_blueprint_name_changed,
     ) # type: ignore
 
 
