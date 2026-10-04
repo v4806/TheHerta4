@@ -560,6 +560,8 @@ def _collect_connected_object_names(start_node):
 
     从结果输出节点反向遍历输入链：物体信息节点取 ``object_name``，多文件导出
     节点取 ``object_list``；遇到嵌套蓝图则进入它的结果输出节点继续遍历。
+    被静音（``mute``）的节点在 Blender 里等同于停用、不参与导出，因此不收集
+    （与同文件的 ``_connected_blueprint_object_names`` 同口径）。
     返回按出现顺序去重的物体名列表。
     """
     visited_nodes = set()
@@ -582,20 +584,23 @@ def _collect_connected_object_names(start_node):
         visited_nodes.add(key)
 
         node_type = getattr(node, "bl_idname", "")
-        if node_type == "SSMTNode_Object_Info":
-            add_name(getattr(node, "object_name", ""))
-        elif node_type == "SSMTNode_MultiFile_Export":
-            for item in getattr(node, "object_list", []) or []:
-                add_name(getattr(item, "object_name", ""))
-        elif node_type == "SSMTNode_Blueprint_Nest":
-            tree_name = str(getattr(node, "blueprint_name", "") or "").strip()
-            if tree_name and tree_name != "NONE" and tree_name not in visited_trees:
-                visited_trees.add(tree_name)
-                nested_tree = bpy.data.node_groups.get(tree_name)
-                if nested_tree and getattr(nested_tree, "bl_idname", "") == "SSMTBlueprintTreeType":
-                    for nested_node in nested_tree.nodes:
-                        if getattr(nested_node, "bl_idname", "") in _RESULT_OUTPUT_IDNAMES:
-                            walk(nested_node)
+        # 静音节点不收集名字（静音 = 停用、不参与导出）；但仍继续向上遍历，
+        # 因为 Blender 里静音节点的连线依然存在，链路不会因此断开。
+        if not getattr(node, "mute", False):
+            if node_type == "SSMTNode_Object_Info":
+                add_name(getattr(node, "object_name", ""))
+            elif node_type == "SSMTNode_MultiFile_Export":
+                for item in getattr(node, "object_list", []) or []:
+                    add_name(getattr(item, "object_name", ""))
+            elif node_type == "SSMTNode_Blueprint_Nest":
+                tree_name = str(getattr(node, "blueprint_name", "") or "").strip()
+                if tree_name and tree_name != "NONE" and tree_name not in visited_trees:
+                    visited_trees.add(tree_name)
+                    nested_tree = bpy.data.node_groups.get(tree_name)
+                    if nested_tree and getattr(nested_tree, "bl_idname", "") == "SSMTBlueprintTreeType":
+                        for nested_node in nested_tree.nodes:
+                            if getattr(nested_node, "bl_idname", "") in _RESULT_OUTPUT_IDNAMES:
+                                walk(nested_node)
 
         for socket in getattr(node, "inputs", []) or []:
             if not socket.is_linked:
@@ -643,10 +648,14 @@ class SSMT_OT_CustomMaterialAssignScanObjects(bpy.types.Operator):
         existing = {item.target_object for item in node.target_items if item.target_object}
         added = 0
         missing = 0
+        not_mesh = 0
         for obj_name in object_names:
             obj = bpy.data.objects.get(obj_name)
-            if obj is None or getattr(obj, "type", "") != "MESH":
+            if obj is None:
                 missing += 1
+                continue
+            if getattr(obj, "type", "") != "MESH":
+                not_mesh += 1
                 continue
             if obj in existing:
                 continue
@@ -665,8 +674,13 @@ class SSMT_OT_CustomMaterialAssignScanObjects(bpy.types.Operator):
             node.active_target_index = len(node.target_items) - 1
 
         message = f"扫描到 {len(object_names)} 个物体，新增 {added} 个部件"
+        skipped = []
         if missing:
-            message += f"（{missing} 个物体已不在场景中，跳过）"
+            skipped.append(f"{missing} 个已不在场景中")
+        if not_mesh:
+            skipped.append(f"{not_mesh} 个不是网格")
+        if skipped:
+            message += "（" + "，".join(skipped) + "，跳过）"
         self.report({"INFO"} if added else {"WARNING"}, message)
         return {"FINISHED"}
 
