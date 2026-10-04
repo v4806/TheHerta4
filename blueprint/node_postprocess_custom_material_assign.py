@@ -507,6 +507,170 @@ class SSMT_OT_CustomMaterialDetectClear(bpy.types.Operator):
         return {'FINISHED'}
 
 
+#: 结果输出节点的全部 idname（各导出入口各一个），扫描时作为链路起点识别。
+_RESULT_OUTPUT_IDNAMES = {
+    "SSMTNode_Result_Output",
+    "SSMTNode_Result_Output_NTMIModImp",
+    "SSMTNode_VeloExportBridge",
+}
+
+
+def _node_visit_key(node):
+    tree_name = getattr(getattr(node, "id_data", None), "name", "")
+    return f"{tree_name}::{getattr(node, 'name', '')}"
+
+
+def _find_connected_result_output(start_node):
+    """从后处理节点沿输入链向上找结果输出节点；找不到返回 None。"""
+    visited = set()
+
+    def walk(node):
+        if node is None:
+            return None
+        key = _node_visit_key(node)
+        if key in visited:
+            return None
+        visited.add(key)
+
+        if getattr(node, "bl_idname", "") in _RESULT_OUTPUT_IDNAMES:
+            return node
+
+        for socket in getattr(node, "inputs", []) or []:
+            if getattr(socket, "bl_idname", "") != "SSMTSocketPostProcess" or not socket.is_linked:
+                continue
+            for link in socket.links:
+                found = walk(link.from_node)
+                if found is not None:
+                    return found
+        return None
+
+    return walk(start_node)
+
+
+def _find_tree_result_output(tree):
+    """在当前蓝图树里找结果输出节点（节点还没接进链路时用）。"""
+    for candidate in getattr(tree, "nodes", []) or []:
+        if getattr(candidate, "bl_idname", "") in _RESULT_OUTPUT_IDNAMES:
+            return candidate
+    return None
+
+
+def _collect_connected_object_names(start_node):
+    """沿已连接的节点链收集物体信息节点引用的物体名（含嵌套蓝图）。
+
+    从结果输出节点反向遍历输入链：物体信息节点取 ``object_name``，多文件导出
+    节点取 ``object_list``；遇到嵌套蓝图则进入它的结果输出节点继续遍历。
+    返回按出现顺序去重的物体名列表。
+    """
+    visited_nodes = set()
+    visited_trees = set()
+    names = []
+    seen_names = set()
+
+    def add_name(raw_name):
+        obj_name = str(raw_name or "").strip()
+        if obj_name and obj_name not in seen_names:
+            seen_names.add(obj_name)
+            names.append(obj_name)
+
+    def walk(node):
+        if node is None:
+            return
+        key = _node_visit_key(node)
+        if key in visited_nodes:
+            return
+        visited_nodes.add(key)
+
+        node_type = getattr(node, "bl_idname", "")
+        if node_type == "SSMTNode_Object_Info":
+            add_name(getattr(node, "object_name", ""))
+        elif node_type == "SSMTNode_MultiFile_Export":
+            for item in getattr(node, "object_list", []) or []:
+                add_name(getattr(item, "object_name", ""))
+        elif node_type == "SSMTNode_Blueprint_Nest":
+            tree_name = str(getattr(node, "blueprint_name", "") or "").strip()
+            if tree_name and tree_name != "NONE" and tree_name not in visited_trees:
+                visited_trees.add(tree_name)
+                nested_tree = bpy.data.node_groups.get(tree_name)
+                if nested_tree and getattr(nested_tree, "bl_idname", "") == "SSMTBlueprintTreeType":
+                    for nested_node in nested_tree.nodes:
+                        if getattr(nested_node, "bl_idname", "") in _RESULT_OUTPUT_IDNAMES:
+                            walk(nested_node)
+
+        for socket in getattr(node, "inputs", []) or []:
+            if not socket.is_linked:
+                continue
+            for link in socket.links:
+                walk(link.from_node)
+
+    walk(start_node)
+    return names
+
+
+class SSMT_OT_CustomMaterialAssignScanObjects(bpy.types.Operator):
+    bl_idname = "ssmt.custom_material_assign_scan_objects"
+    bl_label = "扫描蓝图物体"
+    bl_description = (
+        "扫描当前蓝图节点树上已连接的物体信息节点（含嵌套蓝图），"
+        "把它们引用的物体自动加入下方部件输入框；已在列表中的不会重复添加"
+    )
+    bl_options = {"REGISTER", "UNDO", "INTERNAL"}
+
+    node_name: bpy.props.StringProperty()
+
+    def execute(self, context):
+        node = _find_node(context, self.node_name)
+        if node is None:
+            self.report({"WARNING"}, "没有找到材质转资源pro 节点")
+            return {"CANCELLED"}
+        if bool(getattr(node, "use_global_assign", False)):
+            self.report({"WARNING"}, "全局指定模式下不需要部件输入框")
+            return {"CANCELLED"}
+
+        result_output = _find_connected_result_output(node)
+        if result_output is None:
+            # 节点还没接进链路时（刚拖进来），退化为在当前蓝图树里找结果输出节点
+            result_output = _find_tree_result_output(getattr(node, "id_data", None))
+        if result_output is None:
+            self.report({"WARNING"}, "当前蓝图里没有结果输出节点，无法扫描")
+            return {"CANCELLED"}
+
+        object_names = _collect_connected_object_names(result_output)
+        if not object_names:
+            self.report({"WARNING"}, "蓝图里没有已连接的物体信息节点")
+            return {"CANCELLED"}
+
+        existing = {item.target_object for item in node.target_items if item.target_object}
+        added = 0
+        missing = 0
+        for obj_name in object_names:
+            obj = bpy.data.objects.get(obj_name)
+            if obj is None or getattr(obj, "type", "") != "MESH":
+                missing += 1
+                continue
+            if obj in existing:
+                continue
+            item = next(
+                (candidate for candidate in node.target_items
+                 if getattr(candidate, "target_object", None) is None),
+                None,
+            )
+            if item is None:
+                item = node.target_items.add()
+            item.target_object = obj
+            existing.add(obj)
+            added += 1
+
+        if added:
+            node.active_target_index = len(node.target_items) - 1
+
+        message = f"扫描到 {len(object_names)} 个物体，新增 {added} 个部件"
+        if missing:
+            message += f"（{missing} 个物体已不在场景中，跳过）"
+        self.report({"INFO"} if added else {"WARNING"}, message)
+        return {"FINISHED"}
+
+
 class SSMT_OT_CustomMaterialAssignAddTarget(bpy.types.Operator):
     bl_idname = "ssmt.custom_material_assign_add_target"
     bl_label = "添加目标部件"
@@ -2474,6 +2638,10 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
         rows = layout.box()
         header = rows.row(align=True)
         header.label(text=f"部件输入框（{len(self.target_items)} 个）")
+        scan = header.operator(
+            "ssmt.custom_material_assign_scan_objects", text="扫描蓝图物体", icon="VIEWZOOM"
+        )
+        scan.node_name = self.name
         add = header.operator(
             "ssmt.custom_material_assign_add_target", text="添加", icon="ADD"
         )
@@ -2738,6 +2906,7 @@ classes = (
     SSMT_OT_CustomMaterialDetectClear,
     SSMT_OT_CustomMaterialAssignAddTarget,
     SSMT_OT_CustomMaterialAssignAddSelected,
+    SSMT_OT_CustomMaterialAssignScanObjects,
     SSMT_OT_CustomMaterialAssignRemoveTarget,
     SSMT_OT_CustomMaterialAssignPickTarget,
     SSMT_OT_CustomMaterialAssignPickTargetModal,
