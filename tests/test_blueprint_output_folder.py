@@ -7,7 +7,10 @@
    **不回落**到场景全局设置；
 3. 「输出目录蓝图」指针的作用域（问题 2 的回归）：导出结束——含异常路径与
    invoke 弹窗被取消的路径——必须把指针还原，否则「先蓝图导出、再非蓝图导出」
-   （快速局部导出 / NTMI ModImp）会命中上一个蓝图，输出目录串到旧蓝图。
+   （快速局部导出 / NTMI ModImp）会命中上一个蓝图，输出目录串到旧蓝图；
+4. 「生成Mod到 [蓝图名] 文件夹中」（PR #20）：默认目录用蓝图名而不是工作空间名，
+   蓝图名里的路径非法字符要替换掉，与「生成Mod到指定的文件夹中」互斥，
+   老蓝图（没有该属性）按未勾选处理。
 
 装载方式沿用 `tests/test_ntemi_standard_export_blocking.py` 的 fake-package 范式，
 但这里加载的是**真实的** `common/global_config.py` 与 `ui/ui_func_export.py`：
@@ -160,14 +163,16 @@ _ORIGINAL_GET_CURRENT_TREE = ui_func_export.BlueprintExportHelper.get_current_bl
 
 
 class _BlueprintTree:
-    """最小蓝图树桩：GlobalConfig 只按 name / bl_idname / 两个输出目录属性读它。"""
+    """最小蓝图树桩：GlobalConfig 只按 name / bl_idname / 三个输出目录属性读它。"""
 
     bl_idname = "SSMTBlueprintTreeType"
 
-    def __init__(self, name, use_specific=False, folder_path="", nodes=None):
+    def __init__(self, name, use_specific=False, folder_path="", nodes=None,
+                 blueprint_name_folder=False):
         self.name = name
         self.use_specific_generate_mod_folder_path = use_specific
         self.generate_mod_folder_path = folder_path
+        self.use_blueprint_name_generate_mod_folder = blueprint_name_folder
         self.nodes = list(nodes or [])
 
 
@@ -232,8 +237,9 @@ class BlueprintOutputFolderTests(unittest.TestCase):
         for directory in dirs:
             shutil.rmtree(directory, ignore_errors=True)
 
-    def _default_folder(self):
-        return os.path.join(GlobalConfig.path_mods_folder(), "SSMTGeneratedMod\\", GlobalConfig.get_workspace_name() + "\\")
+    def _default_folder(self, folder_name=""):
+        name = folder_name or GlobalConfig.get_workspace_name()
+        return os.path.join(GlobalConfig.path_mods_folder(), "SSMTGeneratedMod\\", name + "\\")
 
     def _register(self, tree):
         _NODE_GROUPS[tree.name] = tree
@@ -391,6 +397,210 @@ class BlueprintOutputFolderTests(unittest.TestCase):
         self.assertEqual(operator._export_path, self.blueprint_folder)
         self.assertEqual(GlobalConfig.get_output_blueprint_tree_name(), "", "invoke 返回后指针必须还原")
         self.assertEqual(GlobalConfig.path_generate_mod_folder(), self.global_folder)
+
+    # --- 用例 4：PR #20「生成Mod到 [蓝图名] 文件夹中」 -----------------------
+
+    def test_blueprint_name_option_uses_blueprint_name_folder(self):
+        tree = self._register(_BlueprintTree("蓝图B", blueprint_name_folder=True))
+
+        GlobalConfig.set_output_blueprint_tree(tree)
+
+        result = GlobalConfig.path_generate_mod_folder()
+        self.assertEqual(result, self._default_folder("蓝图B"))
+        self.assertNotEqual(result, self._default_folder(), "不应再用工作空间名")
+        self.assertNotEqual(result, self.global_folder)
+        self.assertTrue(os.path.isdir(result), "蓝图名目录应被创建")
+
+    def test_blueprint_name_option_replaces_illegal_path_characters(self):
+        illegal = '角/色:蓝*图?<A>|B"'
+        tree = self._register(_BlueprintTree(illegal, blueprint_name_folder=True))
+
+        GlobalConfig.set_output_blueprint_tree(tree)
+
+        # 连续的非法字符折叠成一个下划线（re.sub 的 `+`），且各段仍可辨认
+        self.assertEqual(
+            GlobalConfig.path_generate_mod_folder(),
+            self._default_folder("角_色_蓝_图_A_B_"),
+        )
+        self.assertNotIn("/", os.path.basename(os.path.dirname(GlobalConfig.path_generate_mod_folder())))
+
+    def test_blueprint_name_option_only_applies_inside_blueprint_flow(self):
+        """非蓝图导出流程不受蓝图名开关影响（沿用场景全局设置）。"""
+        self._register(_BlueprintTree("蓝图B", blueprint_name_folder=True))
+
+        self.assertEqual(GlobalConfig.path_generate_mod_folder(), self.global_folder)
+        self.assertFalse(os.path.isdir(self._default_folder("蓝图B")))
+
+    def test_blueprint_name_no_longer_applies_after_pointer_restore(self):
+        tree = self._register(_BlueprintTree("蓝图B", blueprint_name_folder=True))
+
+        previous = GlobalConfig.get_output_blueprint_tree_name()
+        GlobalConfig.set_output_blueprint_tree(tree)
+        self.assertEqual(GlobalConfig.path_generate_mod_folder(), self._default_folder("蓝图B"))
+
+        GlobalConfig.restore_output_blueprint_tree(previous)
+
+        self.assertEqual(GlobalConfig.path_generate_mod_folder(), self.global_folder)
+
+    def test_specific_folder_takes_priority_over_blueprint_name(self):
+        """两个开关同时为真（旧数据 / 脚本直接写属性）时，「指定文件夹」优先。"""
+        tree = self._register(
+            _BlueprintTree(
+                "蓝图C",
+                use_specific=True,
+                folder_path=self.blueprint_folder,
+                blueprint_name_folder=True,
+            )
+        )
+
+        GlobalConfig.set_output_blueprint_tree(tree)
+
+        self.assertEqual(GlobalConfig.path_generate_mod_folder(), self.blueprint_folder)
+
+    def test_specific_switch_with_empty_path_falls_through_to_blueprint_name(self):
+        """指定文件夹勾了但路径为空 -> 落到蓝图名目录，而不是工作空间目录。"""
+        tree = self._register(
+            _BlueprintTree("蓝图D", use_specific=True, folder_path="   ", blueprint_name_folder=True)
+        )
+
+        GlobalConfig.set_output_blueprint_tree(tree)
+
+        self.assertEqual(GlobalConfig.path_generate_mod_folder(), self._default_folder("蓝图D"))
+
+    def test_blueprint_name_option_absent_on_legacy_tree(self):
+        """老蓝图（没有该属性）按未勾选处理 —— getattr 兜底，不得报错。"""
+
+        class _LegacyTree:
+            bl_idname = "SSMTBlueprintTreeType"
+            name = "旧蓝图"
+            use_specific_generate_mod_folder_path = False
+            generate_mod_folder_path = ""
+            nodes = ()
+
+        tree = self._register(_LegacyTree())
+
+        GlobalConfig.set_output_blueprint_tree(tree)
+
+        self.assertEqual(GlobalConfig.path_generate_mod_folder(), self._default_folder())
+
+
+def _load_node_base_callbacks():
+    """从 blueprint/node_base.py 里取出两个互斥 update 回调。
+
+    只编译那两个模块级函数，不导入整个 node_base（它需要完整的 bpy）。
+    """
+    import ast
+
+    source = (Path(__file__).resolve().parents[1] / "blueprint" / "node_base.py").read_text(
+        encoding="utf-8"
+    )
+    wanted = {"_on_use_specific_folder_changed", "_on_use_blueprint_name_changed"}
+    picked = [
+        node for node in ast.parse(source).body
+        if isinstance(node, ast.FunctionDef) and node.name in wanted
+    ]
+    missing = wanted - {node.name for node in picked}
+    if missing:
+        raise AssertionError(f"blueprint/node_base.py 里缺少互斥回调：{sorted(missing)}")
+    namespace = {}
+    exec(compile(ast.Module(body=picked, type_ignores=[]), "node_base.py", "exec"), namespace)
+    return {name: namespace[name] for name in wanted}
+
+
+class _TreeWithCallbacks:
+    """复刻 Blender 的「赋值即触发 update 回调」语义，用于验证互斥不会来回弹跳。"""
+
+    def __init__(self, callbacks, specific=False, name_folder=False):
+        object.__setattr__(self, "_callbacks", dict(callbacks))
+        object.__setattr__(self, "assignments", [])
+        object.__setattr__(self, "_values", {
+            "use_specific_generate_mod_folder_path": specific,
+            "use_blueprint_name_generate_mod_folder": name_folder,
+        })
+
+    def __getattr__(self, item):
+        values = object.__getattribute__(self, "_values")
+        if item in values:
+            return values[item]
+        raise AttributeError(item)
+
+    def __setattr__(self, key, value):
+        values = object.__getattribute__(self, "_values")
+        if key not in values:
+            object.__setattr__(self, key, value)
+            return
+        if values[key] == value:
+            return
+        values[key] = value
+        self.assignments.append((key, value))
+        callback = object.__getattribute__(self, "_callbacks").get(key)
+        if callback is not None:
+            callback(self, None)
+
+
+class BlueprintFolderOptionExclusionTests(unittest.TestCase):
+    """PR #20：「生成Mod到指定的文件夹中」与「生成Mod到 [蓝图名] 文件夹中」互斥。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.callbacks = _load_node_base_callbacks()
+
+    def _tree(self, **kwargs):
+        return _TreeWithCallbacks(
+            {
+                "use_specific_generate_mod_folder_path": self.callbacks["_on_use_specific_folder_changed"],
+                "use_blueprint_name_generate_mod_folder": self.callbacks["_on_use_blueprint_name_changed"],
+            },
+            **kwargs,
+        )
+
+    def test_checking_specific_folder_clears_blueprint_name(self):
+        tree = self._tree(specific=False, name_folder=True)
+
+        tree.use_specific_generate_mod_folder_path = True
+
+        self.assertTrue(tree.use_specific_generate_mod_folder_path)
+        self.assertFalse(tree.use_blueprint_name_generate_mod_folder)
+        self.assertEqual(
+            tree.assignments,
+            [
+                ("use_specific_generate_mod_folder_path", True),
+                ("use_blueprint_name_generate_mod_folder", False),
+            ],
+            "只应发生两次赋值（勾 A、关 B），回调不得来回弹跳",
+        )
+
+    def test_checking_blueprint_name_clears_specific_folder(self):
+        tree = self._tree(specific=True, name_folder=False)
+
+        tree.use_blueprint_name_generate_mod_folder = True
+
+        self.assertTrue(tree.use_blueprint_name_generate_mod_folder)
+        self.assertFalse(tree.use_specific_generate_mod_folder_path)
+        self.assertEqual(
+            [key for key, _value in tree.assignments],
+            [
+                "use_blueprint_name_generate_mod_folder",
+                "use_specific_generate_mod_folder_path",
+            ],
+        )
+
+    def test_checking_when_other_is_already_off_is_a_no_op(self):
+        tree = self._tree(specific=False, name_folder=False)
+
+        tree.use_specific_generate_mod_folder_path = True
+
+        self.assertEqual(tree.assignments, [("use_specific_generate_mod_folder_path", True)])
+
+    def test_node_base_wires_the_callbacks_to_the_properties(self):
+        """源码护栏：属性上必须挂着 update=，否则互斥会静默失效。"""
+        source = (Path(__file__).resolve().parents[1] / "blueprint" / "node_base.py").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("update=_on_use_specific_folder_changed", source)
+        self.assertIn("update=_on_use_blueprint_name_changed", source)
+        self.assertIn("use_blueprint_name_generate_mod_folder: bpy.props.BoolProperty(", source)
 
 
 if __name__ == "__main__":
