@@ -12,6 +12,7 @@ from ..utils.shapekey_utils import ShapeKeyUtils
 from ..common.safe_write import write_text_if_changed
 from .direct_export_runtime_utils import normalize_runtime_name as _normalize_runtime_name
 from .direct_export_shapekey_output_mixin import DirectShapeKeyOutputMixin
+from .direct_export_shapekey_output_mixin import WEIGHT_SYNC_SHADER_NAME
 from .direct_export_shapekey_runtime_mixin import DirectShapeKeyRuntimeMixin
 from .direct_export_shapekey_sampling_mixin import DirectShapeKeySamplingMixin
 from .direct_export_shapekey_shared import ShapeKeyDirectExportError, resolve_use_delta
@@ -396,6 +397,18 @@ class DirectShapeKeyGenerator(
                 with open(shader_source_path, 'r', encoding='utf-8') as f:
                     write_text_if_changed(shader_dest_path, f.read())
             hash_to_shader_paths[logical_hash] = shader_dest_path
+
+        # 权重同步 CS：形态键强度经 IniParams 打包中转搬进 mod 专属权重缓冲，
+        # 由每个形态键 dispatch 段「run」它。内容固定（无 per-hash 注入），每份 mod
+        # 只需一份。**缺了它，ini 里的 `cs = ./res/shapekey_weight_sync.hlsl` 会加载
+        # 失败 → 权重恒为 0 → 形态键完全拖不动**（实机踩过：文件只被 node_postprocess
+        # 路径复制，而本直出路径才是实际执行的入口）。
+        weight_sync_source = os.path.join(os.path.dirname(shader_source_path), WEIGHT_SYNC_SHADER_NAME)
+        if os.path.exists(weight_sync_source):
+            with open(weight_sync_source, 'r', encoding='utf-8') as f:
+                write_text_if_changed(os.path.join(dest_res_dir, WEIGHT_SYNC_SHADER_NAME), f.read())
+        else:
+            LOG.warning(f"直出形态键: 未找到权重同步着色器模板 {weight_sync_source}")
 
         for logical_hash in processed_hashes:
             hash_slot_data = hash_slot_data_map.get(logical_hash, {})

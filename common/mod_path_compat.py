@@ -256,6 +256,20 @@ def derive_shapekey_freq_resource_name(base_resource_name: str) -> str:
     return clean_name + "_Position_FreqIndices"
 
 
+def derive_shapekey_weight_resource_name(base_resource_name: str) -> str:
+    """派生形态键权重缓冲资源名称（形态键强度经 IniParams 打包中转写入）。
+
+    该缓冲是 mod 专属资源（资源名即命名空间），权重最终住在这里，
+    不再长期驻留 3DMigoto 全局共享的 IniParams 表。
+    """
+    clean_name = section_to_resource_name(base_resource_name)
+    if clean_name.endswith("_Position"):
+        return clean_name + "_ShapeKeyWeight"
+    if clean_name.endswith("Position"):
+        return clean_name + "_ShapeKeyWeight"
+    return clean_name + "_Position_ShapeKeyWeight"
+
+
 def derive_shapekey_merged_data_resource_name(base_resource_name: str, use_delta: bool) -> str:
     clean_name = section_to_resource_name(base_resource_name)
     suffix = "_Merged_PackedPosDelta" if use_delta else "_Merged_Packed"

@@ -29,11 +29,15 @@ CONSTANTS_SECTION = "[Constants]"
 
 RANK_MULTIFILE = 10
 RANK_SHAPEKEY = 20
+# 形态键权重搬运必须先于形态键 CS：先把打包窗口搬进 mod 专属权重缓冲并清零窗口，
+# Anim CS 才能从缓冲读到本帧强度。rank 取 18（< RANK_SHAPEKEY=20）保证排序在前。
+RANK_SHAPEKEY_WEIGHT_SYNC = 18
 
 _INDENT = "    "
 
 # ``run = CustomShader_xxx_1Anim`` → (rank, 资源键)；``run = CustomShader_{hash}_Anim`` → rank 20
 _CHAIN_RUN_RE = re.compile(r"^\s*run\s*=\s*CustomShader_(.+)_1Anim\s*$")
+_CHAIN_RUN_SHAPEKEY_WEIGHT_SYNC_RE = re.compile(r"^\s*run\s*=\s*CustomShaderShapeKeyWeightSync_(.+)\s*$")
 _CHAIN_RUN_SHAPEKEY_RE = re.compile(r"^\s*run\s*=\s*CustomShader_(.+)_Anim\s*$")
 
 _MF_REF_RE = re.compile(r"^\s*(\S+)_mf\s*=\s*ref\s+cs-u5\s*$")
@@ -77,6 +81,9 @@ def classify_chain_run(line) -> Optional[Tuple[int, str]]:
     m = _CHAIN_RUN_RE.match(line)
     if m:
         return (RANK_MULTIFILE, m.group(1))
+    m = _CHAIN_RUN_SHAPEKEY_WEIGHT_SYNC_RE.match(line)
+    if m:
+        return (RANK_SHAPEKEY_WEIGHT_SYNC, m.group(1))
     m = _CHAIN_RUN_SHAPEKEY_RE.match(line)
     if m:
         return (RANK_SHAPEKEY, m.group(1))

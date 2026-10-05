@@ -38,6 +38,7 @@ _install_module(
             "derive_shapekey_merged_map_resource_name",
             "derive_shapekey_slot_map_resource_name",
             "derive_shapekey_slot_resource_name",
+            "derive_shapekey_weight_resource_name",
             "ensure_resource_alias_section",
         )
     },
@@ -75,6 +76,7 @@ class _NodeStub:
     VERTEX_RANGE_START_INDEX = 60
     DRAG_DRIVE_REGISTER = 100
     DRAG_CLICK_COUNT_REGISTER = 101
+    WEIGHT_BUFFER_REGISTER = 102
 
     def _extract_hash_prefix(self, logical_hash):
         return str(logical_hash).split("-")[0]

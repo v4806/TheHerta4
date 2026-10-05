@@ -11,6 +11,7 @@ from ..common.mod_path_compat import derive_shapekey_merged_data_resource_name
 from ..common.mod_path_compat import derive_shapekey_merged_map_resource_name
 from ..common.mod_path_compat import derive_shapekey_slot_map_resource_name
 from ..common.mod_path_compat import derive_shapekey_slot_resource_name
+from ..common.mod_path_compat import derive_shapekey_weight_resource_name
 from ..common.mod_path_compat import ensure_resource_alias_section
 from ..utils.log_utils import LOG
 from .direct_export_runtime_utils import apply_position_override_in_place
@@ -18,6 +19,13 @@ from .direct_export_runtime_utils import assemble_drawib_position_bytes
 from .direct_export_runtime_utils import extract_position_bytes_by_indices as _extract_position_bytes_by_indices
 from .direct_export_runtime_utils import iter_drawib_models as _iter_drawib_models
 from .direct_export_shapekey_shared import ShapeKeyDirectExportError, _buffer_to_bytes, resolve_use_delta
+
+
+# 形态键权重搬运的跨模块约定：必须与 node_postprocess_shapekey.py 的
+# WEIGHT_SYNC_SHADER_NAME / SSMTNode_PostProcess_ShapeKey.WEIGHT_BUFFER_REGISTER
+# 一致——两条生成路径写的是同一份 shader、同一张共享表、同一批槽位。
+WEIGHT_SYNC_SHADER_NAME = "shapekey_weight_sync.hlsl"
+WEIGHT_SYNC_SHADER_REL = "./res/" + WEIGHT_SYNC_SHADER_NAME
 
 
 class DirectShapeKeyOutputMixin:
@@ -115,6 +123,12 @@ class DirectShapeKeyOutputMixin:
             lines.extend(guard_open)
             lines.extend(f"{indent}{line}" for line in signature_lines)
             lines.append(f"{indent}if {condition}")
+            # 权重搬运必须先于形态键 CS：把打包窗口搬进 mod 专属权重缓冲并清零，
+            # Anim CS 才能从缓冲读到本帧强度（见 shapekey_weight_sync.hlsl）。
+            lines.extend(
+                f"{indent}    run = CustomShaderShapeKeyWeightSync_{logical_hash}"
+                for logical_hash in unique_hashes
+            )
             lines.extend(
                 f"{indent}    run = CustomShader_{logical_hash}_Anim"
                 for logical_hash in unique_hashes
@@ -125,6 +139,10 @@ class DirectShapeKeyOutputMixin:
                 lines.append("endif")
         else:
             lines.extend(guard_open)
+            lines.extend(
+                f"{indent}run = CustomShaderShapeKeyWeightSync_{logical_hash}"
+                for logical_hash in unique_hashes
+            )
             lines.extend(
                 f"{indent}run = CustomShader_{logical_hash}_Anim"
                 for logical_hash in unique_hashes
@@ -664,6 +682,9 @@ class DirectShapeKeyOutputMixin:
         generated_run_lines = {
             f"run = CustomShader_{logical_hash}_Anim"
             for logical_hash in unique_hashes
+        } | {
+            f"run = CustomShaderShapeKeyWeightSync_{logical_hash}"
+            for logical_hash in unique_hashes
         }
         line_index = 0
         while line_index < len(present_lines):
@@ -728,6 +749,8 @@ class DirectShapeKeyOutputMixin:
                     constants_lines.append(declaration)
 
         compute_blocks_to_add = OrderedDict()
+        # 每个 hash 的形态键数量：权重缓冲的 array 容量（供资源段使用）
+        hash_weight_counts = {}
         for logical_hash in unique_hashes:
             hash_objects = hash_to_objects.get(logical_hash, [])
             hash_slot_data = hash_slot_data_map.get(logical_hash, {})
@@ -748,11 +771,37 @@ class DirectShapeKeyOutputMixin:
             )
 
             block_name = f"[CustomShader_{logical_hash}_Anim]"
-            block_lines = ["\n    ; --- Shared Intensity Controls (per Shape Key Name) ---"]
+            # 形态键强度不再直读共享表：写进打包中转窗口 → 权重同步 CS 搬进
+            # mod 专属权重缓冲 → 窗口立即清零。与 node_postprocess 路径同格式。
+            _weight_h_prefix = self.node._extract_hash_prefix(logical_hash)
+            _weight_base_resources = hash_to_base_resources.get(_weight_h_prefix, [])
+            _weight_primary_base = (
+                _weight_base_resources[0]
+                if _weight_base_resources
+                else f"Resource_{self.node._hash_to_resource_prefix(logical_hash)}_Position"
+            )
+            weight_resource = derive_shapekey_weight_resource_name(_weight_primary_base)
+            sync_lines = ["\n    ; --- Shape Key Weight Transfer (packed 4 keys per float4) ---"]
             for index, name in enumerate(hash_unique_names):
                 freq_param = shapekey_freq_params.get(name)
                 if freq_param:
-                    block_lines.append(f"    x{self.node.INTENSITY_START_INDEX + index} = {freq_param} \n; {name}")
+                    sync_lines.append(
+                        f"    {'xyzw'[index % 4]}{self.node.INTENSITY_START_INDEX + index // 4} = {freq_param} \n; {name}"
+                    )
+            sync_lines.extend([
+                f"    cs = {WEIGHT_SYNC_SHADER_REL}",
+                f"    cs-u0 = {weight_resource}",
+                f"    Dispatch = {max(1, (len(hash_unique_names) + 63) // 64)}, 1, 1",
+                "    cs-u0 = null",
+            ])
+            # 搬运后立即清零：共享表里不留形态键值，别的 mod 即使也占用这些槽位，
+            # 渲染期读到的也永远是 0。
+            for index in range(len(hash_unique_names)):
+                sync_lines.append(
+                    f"    {'xyzw'[index % 4]}{self.node.INTENSITY_START_INDEX + index // 4} = 0"
+                )
+
+            block_lines = []
             if not use_optimized:
                 block_lines.append("\n    ; --- Per-Object Vertex Range Controls ---")
                 for index, obj_name in enumerate(hash_unique_objects):
@@ -814,6 +863,11 @@ class DirectShapeKeyOutputMixin:
                 t_registers_to_null.append(f"cs-t{self.node.DRAG_DRIVE_REGISTER}")
                 t_registers_to_null.append(f"cs-t{self.node.DRAG_CLICK_COUNT_REGISTER}")
 
+            # 权重缓冲：mod 专属资源，由 CustomShaderShapeKeyWeightSync 每帧搬运
+            block_lines.append("\n    ; --- Shape Key Weight Buffer ---")
+            block_lines.append(f"    cs-t{self.node.WEIGHT_BUFFER_REGISTER} = {weight_resource}")
+            t_registers_to_null.append(f"cs-t{self.node.WEIGHT_BUFFER_REGISTER}")
+
             block_lines.append(f"    cs = ./res/shapekey_anim_{logical_hash}.hlsl")
             res_to_bind = base_resources if base_resources else [f"Resource_{self.node._hash_to_resource_prefix(logical_hash)}_Position"]
             if len(res_to_bind) > 1:
@@ -842,6 +896,9 @@ class DirectShapeKeyOutputMixin:
             )
             block_lines.extend([f"    Dispatch = {dispatch_count}, 1, 1", "    cs-u5 = null", *[f"    {reg} = null" for reg in sorted(list(set(t_registers_to_null)))]] )
             compute_blocks_to_add[block_name] = block_lines
+            # 权重搬运段：每帧「写打包窗口 → 搬运 → 清零」，必须排在 Anim 之前
+            compute_blocks_to_add[f"[CustomShaderShapeKeyWeightSync_{logical_hash}]"] = sync_lines
+            hash_weight_counts[logical_hash] = len(hash_unique_names)
 
         new_resource_lines = []
         generated_section_names = set()
@@ -856,6 +913,20 @@ class DirectShapeKeyOutputMixin:
                 stride = hash_to_stride.get(hash_prefix, 40)
                 new_resource_lines.extend([section_name, "type = Buffer", f"stride = {stride}", f"filename = Meshes0000/{actual_file_hash}-Position.buf", ""])
                 generated_section_names.add(section_name)
+
+            # 形态键权重缓冲：mod 专属 RWBuffer（资源名即命名空间），由
+            # CustomShaderShapeKeyWeightSync 每帧写入。不给 filename 即零初始化。
+            weight_section_name = f"[{derive_shapekey_weight_resource_name(primary_base_resource)}]"
+            if weight_section_name not in sections and weight_section_name not in generated_section_names:
+                weight_capacity = max(1, int(hash_weight_counts.get(logical_hash, 1)))
+                new_resource_lines.extend([
+                    weight_section_name,
+                    "type = RWBuffer",
+                    "format = R32_FLOAT",
+                    f"array = {weight_capacity}",
+                    "",
+                ])
+                generated_section_names.add(weight_section_name)
 
         if merge_slot_files:
             for logical_hash in unique_hashes:

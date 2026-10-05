@@ -103,6 +103,7 @@ _install_module(
     derive_shapekey_merged_map_resource_name=lambda *args, **_kwargs: "",
     derive_shapekey_slot_map_resource_name=lambda *args, **_kwargs: "",
     derive_shapekey_slot_resource_name=lambda *args, **_kwargs: "",
+    derive_shapekey_weight_resource_name=lambda *args, **_kwargs: "ResourceWeightStub",
     ensure_resource_alias_section=lambda *_args, **_kwargs: None,
     resolve_hash_buffer_candidate=_resolve_hash_buffer_candidate,
 )
