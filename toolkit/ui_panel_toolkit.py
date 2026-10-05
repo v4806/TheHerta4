@@ -233,11 +233,26 @@ class BMTP_WeightOperationPanel(bpy.types.Panel):
 
 
         box = layout.box()
-        box.label(text="顶点组合并 (作用于当前活动物体)", icon='AUTOMERGE_ON')
+        box.label(text="顶点组合并 (按顶点组名称)", icon='AUTOMERGE_ON')
 
+        selected_meshes = [
+            obj for obj in context.selected_objects
+            if obj is not None and obj.type == 'MESH'
+        ]
         active_obj = context.active_object
-        if active_obj and active_obj.type == 'MESH':
-            box.label(text=f"当前物体: {active_obj.name}", icon='MESH_DATA')
+        has_target = bool(selected_meshes) or (active_obj is not None and active_obj.type == 'MESH')
+
+        if has_target:
+            if selected_meshes:
+                box.label(text=f"选中 {len(selected_meshes)} 个网格物体", icon='MESH_DATA')
+            else:
+                box.label(text=f"当前物体: {active_obj.name}", icon='MESH_DATA')
+
+            box.prop(props, "wt_merge_apply_to_selected")
+            if props.wt_merge_apply_to_selected:
+                box.label(text="按名称在各选中物体上分别合并同名顶点组", icon='INFO')
+            else:
+                box.label(text="仅作用于当前活动物体", icon='INFO')
 
             row = box.row(align=True)
             row.operator("toolkit.bmtp_refresh_merge_vertex_groups", icon='FILE_REFRESH')
@@ -254,10 +269,10 @@ class BMTP_WeightOperationPanel(bpy.types.Panel):
                 rows=5,
             )
             box.prop(props, "wt_merge_target_name")
-            box.label(text="留空则合并到第一个选中的顶点组", icon='INFO')
+            box.label(text="留空则每个物体合并到它自己的第一个匹配顶点组", icon='INFO')
             box.operator("toolkit.bmtp_merge_vertex_groups", icon='PLAY')
         else:
-            box.label(text="请先激活一个网格物体", icon='ERROR')
+            box.label(text="请先选择或激活一个网格物体", icon='ERROR')
 
 
 class BMTP_WeightManagePanel(bpy.types.Panel):

@@ -138,6 +138,108 @@ class VertexGroupUtils:
                 len(obj.vertex_groups) - 1,
             )
 
+    @staticmethod
+    def normalize_vertex_group_names(group_names):
+        """按出现顺序返回去空白、去重后的顶点组名称列表。"""
+        unique_names = []
+        seen_names = set()
+        for group_name in group_names or []:
+            normalized_name = str(group_name).strip()
+            if normalized_name and normalized_name not in seen_names:
+                seen_names.add(normalized_name)
+                unique_names.append(normalized_name)
+        return unique_names
+
+    @classmethod
+    def merge_named_vertex_groups_on_objects(cls, objects, source_group_names, target_group_name=None):
+        """按顶点组名称，在多个网格物体上分别合并各自的同名顶点组。
+
+        与 :meth:`merge_vertex_groups` 的差异：
+
+        - 一次作用于多个物体（保持传入顺序，按对象身份去重）；
+        - 参与合并的顶点组由 **名称** 决定：每个物体上只要存在这些名称中的
+          至少两个，就把该物体自己的这些同名组合并成一个目标组；
+        - 单个物体失败不会中断其余物体（该物体的回滚由
+          :meth:`merge_vertex_groups` 自己的快照负责）；
+        - ``target_group_name`` 留空时，每个物体各自退回到"它自己第一个匹配到的
+          顶点组名"，因此多物体下不要求各物体一开始就存在同名目标组。
+
+        返回 ``{"processed": [...], "skipped": [...], "failed": [...]}``：
+
+        - ``processed``：每项 ``{object, name, target_name, removed_groups, merged_vertices}``；
+        - ``skipped``：``{name, reason, message}``，reason ∈
+          ``not_a_mesh`` / ``not_object_mode`` / ``not_enough_groups``；
+        - ``failed``：``{name, error}``，合并抛错（如目标名已存在且未被选中）的物体。
+        """
+        unique_names = cls.normalize_vertex_group_names(source_group_names)
+        if len(unique_names) < 2:
+            raise Fatal("At least two vertex groups are required for merging")
+
+        requested_target = str(target_group_name or "").strip()
+
+        processed = []
+        skipped = []
+        failed = []
+        seen_objects = set()
+
+        for obj in objects or []:
+            if obj is None or id(obj) in seen_objects:
+                continue
+            seen_objects.add(id(obj))
+
+            object_name = str(getattr(obj, "name", "") or "<unnamed>")
+
+            if getattr(obj, "type", "") != "MESH":
+                skipped.append({
+                    "name": object_name,
+                    "reason": "not_a_mesh",
+                    "message": "不是网格物体",
+                })
+                continue
+            if getattr(obj, "mode", "OBJECT") != "OBJECT":
+                skipped.append({
+                    "name": object_name,
+                    "reason": "not_object_mode",
+                    "message": "不在物体模式",
+                })
+                continue
+
+            present_names = [
+                name for name in unique_names
+                if obj.vertex_groups.get(name) is not None
+            ]
+            if len(present_names) < 2:
+                skipped.append({
+                    "name": object_name,
+                    "reason": "not_enough_groups",
+                    "message": f"只匹配到 {len(present_names)} 个顶点组",
+                })
+                continue
+
+            try:
+                result = cls.merge_vertex_groups(
+                    obj=obj,
+                    source_group_names=present_names,
+                    target_group_name=requested_target or None,
+                )
+            except Exception as exc:
+                failed.append({"name": object_name, "error": str(exc)})
+                continue
+
+            processed.append({
+                "object": obj,
+                "name": object_name,
+                "target_name": result["target_name"],
+                "removed_groups": result["removed_groups"],
+                "merged_vertices": result["merged_vertices"],
+            })
+
+        return {
+            "processed": processed,
+            "skipped": skipped,
+            "failed": failed,
+        }
+
     @classmethod
     def merge_vertex_groups(cls, obj, source_group_names, target_group_name=None):
         """Merge multiple vertex groups on a mesh object into one target group."""
@@ -146,13 +248,8 @@ class VertexGroupUtils:
         if getattr(obj, "mode", "OBJECT") != "OBJECT":
             raise Fatal("Vertex groups can only be merged in Object Mode")
 
-        unique_names = []
-        seen_names = set()
-        for group_name in source_group_names or []:
-            normalized_name = str(group_name).strip()
-            if normalized_name and normalized_name not in seen_names:
-                seen_names.add(normalized_name)
-                unique_names.append(normalized_name)
+        unique_names = cls.normalize_vertex_group_names(source_group_names)
+        seen_names = set(unique_names)
 
         if len(unique_names) < 2:
             raise Fatal("At least two vertex groups are required for merging")

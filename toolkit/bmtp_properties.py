@@ -95,10 +95,15 @@ class BMTP_Properties(bpy.types.PropertyGroup):
         default="",
         options={'HIDDEN'},
     )
+    wt_merge_apply_to_selected: bpy.props.BoolProperty(
+        name="作用于所有选中物体",
+        default=True,
+        description="开启后按顶点组名称在所有选中的网格物体上分别合并同名顶点组；关闭后只作用于当前活动物体",
+    )
     wt_merge_target_name: bpy.props.StringProperty(
         name="合并后顶点组名",
         default="",
-        description="留空时使用列表中第一个选中的顶点组作为目标组"
+        description="留空时每个物体使用它自己第一个匹配到的顶点组作为目标组"
     )
 
     wt_smooth_factor: bpy.props.FloatProperty(

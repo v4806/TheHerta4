@@ -8,6 +8,103 @@ from ..utils.vertexgroup_utils import VertexGroupUtils
 from ..utils.format_utils import Fatal
 
 
+def _is_mergeable_mesh_object(obj):
+    """顶点组合并只处理「网格 + 物体模式」的物体。"""
+    return (
+        obj is not None
+        and getattr(obj, "type", "") == 'MESH'
+        and getattr(obj, "mode", "OBJECT") == 'OBJECT'
+    )
+
+
+def _iter_selected_mesh_objects(context):
+    objects = getattr(context, "selected_objects", None) or []
+    return [obj for obj in objects if obj is not None and getattr(obj, "type", "") == 'MESH']
+
+
+def _iter_candidate_mesh_objects(context):
+    """活动物体 + 选中物体里的网格物体（按对象身份去重）。"""
+    candidates = []
+    seen_ids = set()
+
+    active = getattr(context, "active_object", None)
+    if active is not None and getattr(active, "type", "") == 'MESH':
+        candidates.append(active)
+        seen_ids.add(id(active))
+
+    for obj in _iter_selected_mesh_objects(context):
+        if id(obj) in seen_ids:
+            continue
+        seen_ids.add(id(obj))
+        candidates.append(obj)
+
+    return candidates
+
+
+def _resolve_merge_targets(context, props):
+    """按「作用于所有选中物体」开关解析合并目标（只做网格过滤）。
+
+    开关开启时使用选中的所有网格物体，选择为空才退回活动物体；关闭时只返回
+    活动物体，保持改动前的单物体语义。
+    """
+    apply_to_selected = True
+    if props is not None:
+        apply_to_selected = bool(getattr(props, "wt_merge_apply_to_selected", True))
+
+    if apply_to_selected:
+        selected_meshes = _iter_selected_mesh_objects(context)
+        if selected_meshes:
+            return selected_meshes
+
+    active = getattr(context, "active_object", None)
+    if active is not None and getattr(active, "type", "") == 'MESH':
+        return [active]
+    return []
+
+
+def _collect_vertex_group_names(objects):
+    """按出现顺序收集多个物体的顶点组名称（去重），并记录首次出现的组索引。"""
+    names = []
+    indexes = {}
+    seen_names = set()
+
+    for obj in objects or []:
+        for index, group in enumerate(getattr(obj, "vertex_groups", None) or []):
+            name = str(getattr(group, "name", "") or "")
+            if not name or name in seen_names:
+                continue
+            seen_names.add(name)
+            names.append(name)
+            indexes[name] = index
+
+    return names, indexes
+
+
+def _rebuild_merge_list(props, names, indexes, selected_names=()):
+    selected_names = set(selected_names)
+
+    props.wt_merge_vertex_groups.clear()
+    for name in names:
+        item = props.wt_merge_vertex_groups.add()
+        item.name = name
+        item.index = indexes.get(name, 0)
+        item.selected = name in selected_names
+
+    props.wt_merge_vertex_groups_index = min(
+        int(getattr(props, "wt_merge_vertex_groups_index", 0) or 0),
+        max(0, len(names) - 1),
+    )
+
+
+def _describe_merge_issues(skipped, failed, limit=3):
+    parts = []
+    for item in list(skipped or [])[:limit]:
+        parts.append(f"{item['name']}（{item.get('message') or item.get('reason')}）")
+    for item in list(failed or [])[:limit]:
+        parts.append(f"{item['name']}（{item.get('error')}）")
+    return "，".join(parts)
+
+
 class BMTP_OT_TransferWeights(bpy.types.Operator):
     bl_idname = "toolkit.bmtp_transfer_weights"
     bl_label = "执行权重传递"
@@ -605,35 +702,40 @@ class BMTP_OT_SpreadWeights(bpy.types.Operator):
 class BMTP_OT_RefreshMergeVertexGroups(bpy.types.Operator):
     bl_idname = "toolkit.bmtp_refresh_merge_vertex_groups"
     bl_label = "刷新合并顶点组"
-    bl_description = "刷新当前活动网格物体的顶点组列表，用于顶点组合并"
+    bl_description = "刷新选中（或活动）网格物体的顶点组名称列表，用于按名称合并顶点组"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
     def poll(cls, context):
-        obj = context.active_object
-        return obj is not None and obj.type == 'MESH'
+        return any(
+            _is_mergeable_mesh_object(obj)
+            for obj in _iter_candidate_mesh_objects(context)
+        )
 
     def execute(self, context):
         props = context.scene.bmtp_props
-        obj = context.active_object
+        active = getattr(context, "active_object", None)
 
-        if getattr(props, "wt_merge_source_object", None) is not obj:
+        targets = [
+            obj for obj in _resolve_merge_targets(context, props)
+            if _is_mergeable_mesh_object(obj)
+        ]
+        if not targets:
+            self.report({'ERROR'}, "请先选择（或激活）至少一个物体模式的网格物体")
+            return {'CANCELLED'}
+
+        if getattr(props, "wt_merge_source_object", None) is not active:
             props.wt_merge_target_name = ""
-        props.wt_merge_source_object = obj
-        props.wt_merge_source_object_name = obj.name
-        props.wt_merge_vertex_groups.clear()
+        props.wt_merge_source_object = active
+        props.wt_merge_source_object_name = str(getattr(active, "name", "") or "")
 
-        for index, vg in enumerate(obj.vertex_groups):
-            item = props.wt_merge_vertex_groups.add()
-            item.name = vg.name
-            item.index = index
-            item.selected = False
+        names, indexes = _collect_vertex_group_names(targets)
+        _rebuild_merge_list(props, names, indexes)
 
-        props.wt_merge_vertex_groups_index = min(
-            props.wt_merge_vertex_groups_index,
-            max(0, len(props.wt_merge_vertex_groups) - 1)
+        self.report(
+            {'INFO'},
+            f"已从 {len(targets)} 个网格物体加载 {len(names)} 个顶点组名称用于合并",
         )
-        self.report({'INFO'}, f"已加载 {len(obj.vertex_groups)} 个顶点组用于合并")
         return {'FINISHED'}
 
 
@@ -656,35 +758,55 @@ class BMTP_OT_SelectMergeVertexGroups(bpy.types.Operator):
 class BMTP_OT_MergeVertexGroups(bpy.types.Operator):
     bl_idname = "toolkit.bmtp_merge_vertex_groups"
     bl_label = "合并顶点组"
-    bl_description = "将当前活动物体上选中的多个顶点组合并为一个"
+    bl_description = "按顶点组名称，把选中的多个顶点组在每个目标物体上分别合并为一个"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
     def poll(cls, context):
-        obj = context.active_object
-        return obj is not None and obj.type == 'MESH' and getattr(obj, "mode", "OBJECT") == 'OBJECT'
+        return any(
+            _is_mergeable_mesh_object(obj)
+            for obj in _iter_candidate_mesh_objects(context)
+        )
 
     def execute(self, context):
         props = context.scene.bmtp_props
-        obj = context.active_object
+        active = getattr(context, "active_object", None)
 
-        if (
-            getattr(props, "wt_merge_source_object", None) is not obj
-            or props.wt_merge_source_object_name != obj.name
-        ):
-            self.report({'ERROR'}, "活动物体已变化，请先刷新合并顶点组列表")
-            return {'CANCELLED'}
-
-        selected_group_names = [item.name for item in props.wt_merge_vertex_groups if item.selected]
+        selected_group_names = [
+            item.name for item in props.wt_merge_vertex_groups if item.selected
+        ]
         if len(selected_group_names) < 2:
             self.report({'ERROR'}, "请至少勾选两个顶点组进行合并")
             return {'CANCELLED'}
 
+        targets = [
+            obj for obj in _resolve_merge_targets(context, props)
+            if _is_mergeable_mesh_object(obj)
+        ]
+        if not targets:
+            self.report({'ERROR'}, "请先选择（或激活）至少一个物体模式的网格物体")
+            return {'CANCELLED'}
+
+        list_belongs_to_active = (
+            active is not None
+            and getattr(props, "wt_merge_source_object", None) is active
+            and getattr(props, "wt_merge_source_object_name", "")
+            == str(getattr(active, "name", "") or "")
+        )
+        if not list_belongs_to_active:
+            if len(targets) == 1:
+                self.report({'ERROR'}, "活动物体已变化，请先刷新合并顶点组列表")
+                return {'CANCELLED'}
+            self.report(
+                {'WARNING'},
+                "合并列表不是按当前选择刷新的，将按顶点组名称在各选中物体上重新匹配",
+            )
+
         try:
-            result = VertexGroupUtils.merge_vertex_groups(
-                obj=obj,
+            result = VertexGroupUtils.merge_named_vertex_groups_on_objects(
+                objects=targets,
                 source_group_names=selected_group_names,
-                target_group_name=props.wt_merge_target_name,
+                target_group_name=getattr(props, "wt_merge_target_name", ""),
             )
         except Fatal as exc:
             self.report({'ERROR'}, str(exc))
@@ -693,23 +815,45 @@ class BMTP_OT_MergeVertexGroups(bpy.types.Operator):
             self.report({'ERROR'}, f"合并顶点组失败: {exc}")
             return {'CANCELLED'}
 
-        props.wt_merge_target_name = result["target_name"]
-        props.wt_merge_vertex_groups.clear()
-        for index, vg in enumerate(obj.vertex_groups):
-            item = props.wt_merge_vertex_groups.add()
-            item.name = vg.name
-            item.index = index
-            item.selected = (vg.name == result["target_name"])
-        props.wt_merge_vertex_groups_index = min(
-            props.wt_merge_vertex_groups_index,
-            max(0, len(props.wt_merge_vertex_groups) - 1),
+        processed = result["processed"]
+        skipped = result["skipped"]
+        failed = result["failed"]
+
+        if not processed:
+            message = "没有任何物体完成顶点组合并"
+            detail = _describe_merge_issues(skipped, failed)
+            if detail:
+                message += f"：{detail}"
+            self.report({'ERROR'}, message)
+            return {'CANCELLED'}
+
+        if not str(getattr(props, "wt_merge_target_name", "") or "").strip() and len(processed) == 1:
+            # 单物体时保持原行为：把实际目标名回写到输入框
+            props.wt_merge_target_name = processed[0]["target_name"]
+
+        # 列表按本次全部目标物体的现状重建：被跳过/失败的物体也列在其现有组名，
+        # 用户能直接看到它们的顶点组还在（否则列表会凭空少掉一组）。
+        names, indexes = _collect_vertex_group_names(targets)
+        _rebuild_merge_list(
+            props,
+            names,
+            indexes,
+            selected_names={item["target_name"] for item in processed},
         )
 
-        self.report(
-            {'INFO'},
-            f"已将 {len(selected_group_names)} 个顶点组合并到 '{result['target_name']}'，"
-            f"删除 {result['removed_groups']} 个原顶点组"
+        target_names = sorted({item["target_name"] for item in processed})
+        total_removed = sum(item["removed_groups"] for item in processed)
+        summary = (
+            f"已对 {len(processed)} 个物体完成顶点组合并"
+            f"（{len(selected_group_names)} 个顶点组 → {'、'.join(target_names)}，"
+            f"删除 {total_removed} 个原顶点组）"
         )
+        if skipped:
+            summary += f"，跳过 {len(skipped)} 个物体"
+        if failed:
+            summary += f"，{len(failed)} 个物体失败"
+
+        self.report({'INFO'} if not (skipped or failed) else {'WARNING'}, summary)
         return {'FINISHED'}
 
 
