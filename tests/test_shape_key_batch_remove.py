@@ -24,7 +24,11 @@ _install_module(
     types=types.SimpleNamespace(Operator=object),
 )
 _install_module(f"{PKG}.utils.shapekey_rebase_utils", rebase_shape_key_coordinates=lambda **_kwargs: {})
-_install_module(f"{PKG}.toolkit.at_shape_key_control", refresh_shape_key_list=lambda *_args, **_kwargs: None)
+_install_module(
+    f"{PKG}.toolkit.at_shape_key_control",
+    refresh_shape_key_list=lambda *_args, **_kwargs: None,
+    driving_objects=lambda *_args, **_kwargs: [],
+)
 
 
 def _load_module(module_name, relative_path):

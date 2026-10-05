@@ -10,7 +10,7 @@ def update_group_shape_key_value(self, context):
 
 
 def update_single_shape_key_value(self, context):
-    """单键滑块变动：把所有物体的同名形态键统一写成同一个值"""
+    """单键滑块变动：把选中物体的同名形态键统一写成同一个值"""
     from . import at_shape_key_control
     at_shape_key_control.on_single_value_update(self, context)
 
@@ -41,7 +41,7 @@ class ATP_ShapeKeyItem(bpy.types.PropertyGroup):
         soft_min=0.0,
         soft_max=1.0,
         update=update_single_shape_key_value,
-        description="把该形态键写成这个值：场景里每一个有这个同名形态键的物体都会一起变",
+        description="把该形态键写成这个值：选中的每一个有这个同名形态键的物体都会一起变",
     )
     group_value: bpy.props.FloatProperty(
         name="GroupValue",

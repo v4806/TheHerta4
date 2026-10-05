@@ -202,10 +202,10 @@ class ApplyValueTests(unittest.TestCase):
         self.assertEqual(blocks.get("Key_1").slider_max, 2.0)
 
 class UnifiedSingleKeyTests(unittest.TestCase):
-    """单键行的语义：一行滑块 = 一个形态键名，拖动时场景里所有同名键一起变。
+    """单键行的语义：一行滑块 = 一个形态键名，拖动时选中的同名键一起变。
 
-    用户验收场景：10 个物体都有同名形态键，拖动时 10 个都必须变；
-    且不管当前选了什么、选了几个，甚至完全没选。
+    用户验收场景：选中 10 个都有同名形态键的物体，拖动时这 10 个都必须变；
+    没被选中的物体一个都不许动（写值范围与刷新出来的列表完全一致）。
     """
 
     def setUp(self):
@@ -229,7 +229,7 @@ class UnifiedSingleKeyTests(unittest.TestCase):
         skc.refresh_from_context(context)
         return context
 
-    def test_single_value_writes_all_ten_objects(self):
+    def test_single_value_writes_all_ten_selected_objects(self):
         props = _FakeProps()
         objects = self._ten_objects()
         context = self._refresh(props, objects, active=objects[0])
@@ -243,8 +243,8 @@ class UnifiedSingleKeyTests(unittest.TestCase):
             [0.5] * 10,
         )
 
-    def test_single_value_ignores_current_selection(self):
-        """只选中 1 个物体时，其余 9 个也必须跟着变（旧版只动活动物体）。"""
+    def test_single_value_only_touches_selected_objects(self):
+        """只选中 1 个物体时，其余 9 个必须原样不动（范围跟着选择走）。"""
         props = _FakeProps()
         objects = self._ten_objects()
         context = self._refresh(props, objects, selected=objects[:1], active=objects[0])
@@ -253,18 +253,21 @@ class UnifiedSingleKeyTests(unittest.TestCase):
         item.value = 0.25
         skc.on_single_value_update(item, context)
 
-        self.assertEqual([obj.key_block("Smile").value for obj in objects], [0.25] * 10)
+        self.assertEqual(objects[0].key_block("Smile").value, 0.25)
+        self.assertEqual([obj.key_block("Smile").value for obj in objects[1:]], [0.0] * 9)
 
-    def test_single_value_works_without_any_selection(self):
+    def test_single_value_falls_back_to_active_object_without_selection(self):
+        """一个都没选中时退回活动物体，其余物体不动。"""
         props = _FakeProps()
         objects = self._ten_objects()
-        context = self._refresh(props, objects, selected=[])
+        context = self._refresh(props, objects, selected=[], active=objects[0])
         item = next(item for item in props.shape_key_list if item.name == "Smile")
 
         item.value = 0.75
         skc.on_single_value_update(item, context)
 
-        self.assertEqual([obj.key_block("Smile").value for obj in objects], [0.75] * 10)
+        self.assertEqual(objects[0].key_block("Smile").value, 0.75)
+        self.assertEqual([obj.key_block("Smile").value for obj in objects[1:]], [0.0] * 9)
 
     def test_objects_without_the_key_are_left_alone(self):
         props = _FakeProps()
@@ -349,8 +352,8 @@ class NoHandlerLeftoversTests(unittest.TestCase):
         self.assertFalse(hasattr(skc, "_SELECTION_SIGNATURE"))
 
 
-class SceneWideDriveTests(unittest.TestCase):
-    """驱动集合 = 场景里所有带形态键的物体，活动物体只影响遍历顺序。"""
+class SelectionScopedDriveTests(unittest.TestCase):
+    """驱动集合 = 当前选中的带形态键的物体；刷新列表与写值范围同源。"""
 
     def setUp(self):
         skc._suppress_update = False
@@ -363,35 +366,56 @@ class SceneWideDriveTests(unittest.TestCase):
             _FakeObject({"Basis": 0.0, "Smile": 0.0}, name="C"),
         )
 
-    def test_driving_objects_covers_whole_scene_with_active_first(self):
+    @staticmethod
+    def _plain_object(name="P"):
+        return types.SimpleNamespace(
+            name=name,
+            type="MESH",
+            data=types.SimpleNamespace(shape_keys=None),
+        )
+
+    def test_driving_objects_uses_selection_with_active_first(self):
         props = _FakeProps()
         obj_a, obj_b, obj_c = self._three_objects()
-        context = _make_context(props, obj_b, scene_objects=[obj_a, obj_b, obj_c])
+        context = _make_context(props, obj_a, obj_b, obj_c, scene_objects=[obj_a, obj_b, obj_c])
+        context.active_object = obj_b
 
         driven = skc.driving_objects(context)
 
         self.assertEqual([obj.name for obj in driven], ["B", "A", "C"])
 
-    def test_driving_objects_falls_back_to_selection(self):
+    def test_driving_objects_ignores_unselected_scene_objects(self):
+        props = _FakeProps()
+        obj_a, obj_b, obj_c = self._three_objects()
+        context = _make_context(props, obj_a, scene_objects=[obj_a, obj_b, obj_c])
+
+        self.assertEqual([obj.name for obj in skc.driving_objects(context)], ["A"])
+
+    def test_driving_objects_falls_back_to_active_object(self):
         props = _FakeProps()
         obj_a, obj_b, _obj_c = self._three_objects()
-        context = _make_context(props, obj_a, obj_b, scene_objects=[])
+        context = _make_context(props, scene_objects=[obj_a, obj_b])
+        context.active_object = obj_b
 
-        self.assertEqual([obj.name for obj in skc.driving_objects(context)], ["A", "B"])
+        self.assertEqual([obj.name for obj in skc.driving_objects(context)], ["B"])
+
+    def test_driving_objects_keeps_active_object_outside_selection(self):
+        """活动物体通常已在选中集里；万一不在（脚本改选择），也不能漏掉它。"""
+        props = _FakeProps()
+        obj_a, obj_b, _obj_c = self._three_objects()
+        context = _make_context(props, obj_a, scene_objects=[obj_a, obj_b])
+        context.active_object = obj_b
+
+        self.assertEqual([obj.name for obj in skc.driving_objects(context)], ["B", "A"])
 
     def test_driving_objects_skips_objects_without_shape_keys(self):
         props = _FakeProps()
         obj_a, _obj_b, _obj_c = self._three_objects()
-        plain = types.SimpleNamespace(
-            name="P",
-            type="MESH",
-            data=types.SimpleNamespace(shape_keys=None),
-        )
-        context = _make_context(props, obj_a, scene_objects=[plain, obj_a])
+        context = _make_context(props, self._plain_object(), obj_a, scene_objects=[obj_a])
 
         self.assertEqual([obj.name for obj in skc.driving_objects(context)], ["A"])
 
-    def test_refresh_lists_keys_of_unselected_objects(self):
+    def test_refresh_only_lists_keys_of_selected_objects(self):
         props = _FakeProps()
         obj_a = _FakeObject({"Basis": 0.0, "Smile": 0.0}, name="A")
         obj_b = _FakeObject({"Basis": 0.0, "Wave_1": 0.0}, name="B")
@@ -399,7 +423,44 @@ class SceneWideDriveTests(unittest.TestCase):
 
         found = skc.refresh_from_context(context)
 
-        self.assertEqual(sorted(found), ["Smile", "Wave_1"])
+        self.assertEqual(sorted(found), ["Smile"])
+
+    def test_unselected_object_is_never_written(self):
+        """范围一致性：没选中的物体带着同名键也不许被偷偷改值。"""
+        props = _FakeProps()
+        obj_a = _FakeObject({"Basis": 0.0, "Smile": 0.0}, name="A")
+        obj_b = _FakeObject({"Basis": 0.0, "Smile": 0.0}, name="B")
+        context = _make_context(props, obj_a, scene_objects=[obj_a, obj_b])
+        skc.refresh_from_context(context)
+        item = next(item for item in props.shape_key_list if item.name == "Smile")
+
+        item.value = 0.6
+        skc.on_single_value_update(item, context)
+
+        self.assertAlmostEqual(obj_a.key_block("Smile").value, 0.6)
+        self.assertAlmostEqual(obj_b.key_block("Smile").value, 0.0)
+
+    def test_describe_scope_reports_selection_size(self):
+        props = _FakeProps()
+        obj_a, obj_b, _obj_c = self._three_objects()
+        context = _make_context(props, obj_a, obj_b, scene_objects=[obj_a, obj_b])
+
+        self.assertEqual(skc.describe_scope(context), "作用于选中的 2 个带形态键的物体")
+
+    def test_describe_scope_reports_active_fallback(self):
+        props = _FakeProps()
+        obj_a, obj_b, _obj_c = self._three_objects()
+        context = _make_context(props, scene_objects=[obj_a, obj_b])
+        context.active_object = obj_a
+
+        self.assertEqual(skc.describe_scope(context), "未选中物体：暂时只作用于活动物体 A")
+
+    def test_describe_scope_reports_nothing_to_control(self):
+        props = _FakeProps()
+        plain = self._plain_object()
+        context = _make_context(props, plain, scene_objects=[plain])
+
+        self.assertEqual(skc.describe_scope(context), "未选中可用物体：请选中带形态键的网格物体")
 
     def test_refresh_fills_item_value_from_first_holder(self):
         props = _FakeProps()
@@ -413,11 +474,11 @@ class SceneWideDriveTests(unittest.TestCase):
         item = next(item for item in props.shape_key_list if item.name == "Smile")
         self.assertAlmostEqual(item.value, 0.9)
 
-    def test_group_values_drive_every_object(self):
+    def test_group_values_drive_every_selected_object(self):
         props = _FakeProps()
         obj_a = _FakeObject({"Basis": 0.0, "Motion_Key_1": 0.0, "Motion_Key_2": 0.0}, name="A")
         obj_b = _FakeObject({"Basis": 0.0, "Motion_Key_1": 0.0, "Motion_Key_2": 0.0}, name="B")
-        context = _make_context(props, obj_a, scene_objects=[obj_a, obj_b])
+        context = _make_context(props, obj_a, obj_b, scene_objects=[obj_a, obj_b])
         skc.refresh_from_context(context)
         group_item = next(item for item in props.shape_key_list if item.is_group)
 

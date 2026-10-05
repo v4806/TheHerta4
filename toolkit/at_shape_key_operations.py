@@ -4,7 +4,7 @@ import bpy
 import numpy as np
 
 from ..utils.shapekey_rebase_utils import rebase_shape_key_coordinates
-from .at_shape_key_control import refresh_shape_key_list
+from .at_shape_key_control import driving_objects, refresh_shape_key_list
 
 
 def _snapshot_shape_key_coordinates(key_blocks):
@@ -25,10 +25,12 @@ def _restore_shape_key_coordinates(key_blocks, coordinates_by_name):
 
 
 def _refresh_shape_key_list_from_context(context):
-    refresh_targets = list(context.selected_objects) if context.selected_objects else []
-    if context.active_object and context.active_object not in refresh_targets:
-        refresh_targets.append(context.active_object)
-    refresh_shape_key_list(context.scene.atp_props, refresh_targets)
+    # 与写值范围同源：批量操作后重建的列表必须和「刷新列表」看到的一致
+    refresh_shape_key_list(
+        context.scene.atp_props,
+        driving_objects(context),
+        getattr(context, "active_object", None),
+    )
 
 
 def _allocate_shape_key_temp_name(existing_names, base_name):

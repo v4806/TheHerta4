@@ -47,6 +47,9 @@ class ATP_PT_ShapeKeyTools(bpy.types.Panel):
         options.prop(props, "sk_use_grouping", text="组合连续形态键", icon='GROUP')
         options.prop(props, "sk_list_rows", text="行数")
 
+        scope_row = box.row(align=True)
+        scope_row.label(text=at_shape_key_control.describe_scope(context), icon='RESTRICT_SELECT_OFF')
+
         if len(props.shape_key_list) > 0:
             box.template_list(
                 ATP_UL_SHAPEKEY_LIST_IDNAME, "",
@@ -55,7 +58,7 @@ class ATP_PT_ShapeKeyTools(bpy.types.Panel):
                 rows=props.sk_list_rows,
             )
         else:
-            box.label(text="列表为空：场景里没有可控制的形态键，点刷新重试", icon='INFO')
+            box.label(text="列表为空：选中的物体里没有可控制的形态键，点刷新重试", icon='INFO')
 
         index = props.shape_key_list_index
         if 0 <= index < len(props.shape_key_list):

@@ -134,18 +134,30 @@ def _iter_shape_key_objects(objects):
 
 
 def driving_objects(context):
-    """统一控制器的驱动集合 = 场景里所有带形态键的网格物体。
+    """统一控制器的驱动集合 = 当前选中的带形态键的网格物体。
 
-    这就是「统一控制所有同名形态键」的全部含义：拖动某一行时，凡是**有这个同名
-    形态键**的物体都会被写成同一个值 —— 不看选择、不看活动物体、不看可见性。
-    活动物体排在集合最前（仅影响遍历顺序）；取不到场景物体时退回所选物体，
-    保证任何上下文都不会退化成空集。
+    这就是「统一控制所有同名形态键」的全部含义：拖动某一行时，凡是**被选中且
+    有这个同名形态键**的物体都会被写成同一个值。刷新列表与写值共用这一个集合，
+    两者的范围永远一致 —— 列表里看不到的物体不会被偷偷改值。
+    活动物体排在集合最前（仅影响遍历顺序）；一个都没选中时退回活动物体，
+    避免刚打开面板、选择还没建立时退化成空集。
     """
     active_object = getattr(context, "active_object", None)
-    ordered = _ordered_objects(getattr(getattr(context, "scene", None), "objects", None), active_object)
-    if not ordered:
-        ordered = _ordered_objects(getattr(context, "selected_objects", None), active_object)
-    return ordered
+    selected = list(getattr(context, "selected_objects", None) or [])
+    if active_object is not None and active_object not in selected:
+        selected.append(active_object)
+    return _ordered_objects(selected, active_object)
+
+
+def describe_scope(context):
+    """面板上的一行范围提示：刷新与写值当前到底作用于哪些物体。"""
+    selected = getattr(context, "selected_objects", None) or []
+    driving = driving_objects(context)
+    if not driving:
+        return "未选中可用物体：请选中带形态键的网格物体"
+    if not selected:
+        return f"未选中物体：暂时只作用于活动物体 {driving[0].name}"
+    return f"作用于选中的 {len(driving)} 个带形态键的物体"
 
 
 def _ordered_objects(objects, active_object=None):
@@ -370,7 +382,7 @@ def apply_single_values(context, key_names, value, value_range=None):
     """把驱动范围内所有同名形态键统一写成同一个值，返回实际写到的键数量。
 
     这是统一控制器的核心语义：一行滑块对应一个形态键名，拖动/输入多少，
-    场景里**每一个**有这个同名键的物体就都变成多少。
+    选中的**每一个**有这个同名键的物体就都变成多少（没选中的物体一律不动）。
     """
     props = getattr(getattr(context, "scene", None), "atp_props", None)
     if value_range is None:
@@ -449,7 +461,11 @@ def refresh_shape_key_list(scene_props, objects, active_object=None):
 
 
 def refresh_from_context(context):
-    """按当前场景刷新统一控制器列表（连续形态键自动合并为一行）。"""
+    """按当前选择刷新统一控制器列表（连续形态键自动合并为一行）。
+
+    列表内容与写值范围同源（都走 :func:`driving_objects`）：选了几个物体，
+    列表就只列这几个物体身上的形态键。
+    """
     targets = driving_objects(context)
     return refresh_shape_key_list(
         context.scene.atp_props,
@@ -465,7 +481,7 @@ def refresh_from_context(context):
 class ATP_OT_RefreshShapeKeys(bpy.types.Operator):
     bl_idname = "atp.refresh_shape_keys"
     bl_label = "刷新形态键列表"
-    bl_description = "扫描场景里所有物体的形态键，重建统一形态键控制列表（连续形态键自动合并为一行）"
+    bl_description = "扫描选中物体（未选中时为活动物体）的形态键，重建统一形态键控制列表（连续形态键自动合并为一行）"
     bl_options = {'REGISTER', 'UNDO'}
 
     @classmethod
