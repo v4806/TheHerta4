@@ -26,7 +26,7 @@ _install_module(f"{PKG}.common.d3d11_gametype", D3D11GameType=object)
 _install_module(f"{PKG}.common.draw_call_model", DrawCallModel=object)
 _install_module(
     f"{PKG}.common.logic_name",
-    LogicName=types.SimpleNamespace(WWMI="WWMI", NTEMI="NTEMI", EFMI="EFMI", YYSLS="YYSLS", SnowBreak="SnowBreak"),
+    LogicName=types.SimpleNamespace(WWMI="WWMI", NTEMI="NTEMI", EFMI="EFMI", YYSLS="YYSLS", SnowBreak="SnowBreak", HIMI="HIMI"),
 )
 _install_module(f"{PKG}.common.global_config", GlobalConfig=types.SimpleNamespace(logic_name="GIMI"))
 _install_module(
@@ -259,6 +259,9 @@ class ObjBufferHelperAverageNormalColorTests(unittest.TestCase):
     def setUp(self):
         self._original_recalculate_color = obj_buffer_helper_module.GlobalProterties.recalculate_color
         obj_buffer_helper_module.GlobalProterties.recalculate_color = lambda: True
+        # 全局开关只在 HI3 2.0（HIMI）下真正改写 COLOR：这些用例验证的是 HIMI 口径。
+        self._original_logic_name = obj_buffer_helper_module.GlobalConfig.logic_name
+        obj_buffer_helper_module.GlobalConfig.logic_name = "HIMI"
         self._had_width_accessor = hasattr(obj_buffer_helper_module.GlobalProterties, "recalculate_color_width")
         self._original_width = getattr(obj_buffer_helper_module.GlobalProterties, "recalculate_color_width", None)
         obj_buffer_helper_module.GlobalProterties.recalculate_color_width = lambda: 0.5
@@ -268,6 +271,7 @@ class ObjBufferHelperAverageNormalColorTests(unittest.TestCase):
 
     def tearDown(self):
         obj_buffer_helper_module.GlobalProterties.recalculate_color = self._original_recalculate_color
+        obj_buffer_helper_module.GlobalConfig.logic_name = self._original_logic_name
         if self._had_width_accessor:
             obj_buffer_helper_module.GlobalProterties.recalculate_color_width = self._original_width
         elif hasattr(obj_buffer_helper_module.GlobalProterties, "recalculate_color_width"):
@@ -292,6 +296,38 @@ class ObjBufferHelperAverageNormalColorTests(unittest.TestCase):
     def _decoded(result):
         colors = np.asarray(result["COLOR"], dtype=np.float64)
         return colors[:, :3] / 255.0 * 2.0 - 1.0
+
+    def test_non_himi_global_switch_does_not_overwrite_game_color(self):
+        """非 HIMI（UI 不显示该栏）时，全局开关不得改写游戏原生顶点色。
+
+        回归：默认值 AVERAGE 曾让 ZZZ 的 COLOR（游戏原生光照/材质遮罩）被这套
+        "法线编码 + 描边宽度"覆盖，表现为角色属性界面光影质感错乱。
+        """
+        obj_buffer_helper_module.GlobalConfig.logic_name = "ZZMI"
+        vertices = [
+            self._vertex((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), alpha=17),
+            self._vertex((0.0, 0.0, 0.0), (0.0, 1.0, 0.0), alpha=17),
+        ]
+        result = self._recalculate(vertices)
+
+        colors = np.frombuffer(b"".join(result), dtype=self.DTYPE)["COLOR"]
+        np.testing.assert_array_equal(
+            colors, np.array([[10, 20, 30, 17], [10, 20, 30, 17]], dtype=np.uint8)
+        )
+
+    def test_non_himi_object_marker_still_applies(self):
+        """非 HIMI 时物体级 3DMigoto:RecalculateCOLOR 仍然生效（手动开启路径保留）。"""
+        obj_buffer_helper_module.GlobalConfig.logic_name = "ZZMI"
+        result = ObjBufferHelper.average_normal_color(
+            obj={"3DMigoto:RecalculateCOLOR": True},
+            indexed_vertices=[self._vertex((1.0, 0.0, 0.0), (0.0, 0.0, 1.0), alpha=17)],
+            d3d11GameType=self.game_type,
+            dtype=self.DTYPE,
+        )
+
+        vectors = self._decoded(result)
+        np.testing.assert_allclose(vectors[0], (0.0, 0.0, 1.0), atol=0.01)
+        self.assertEqual(int(result["COLOR"][0, 3]), 128)
 
     def test_hard_edge_average_is_stored_as_unit_vector(self):
         result = self._recalculate(
@@ -475,7 +511,7 @@ class ObjBufferHelperAverageNormalColorTests(unittest.TestCase):
           · 游戏自身 COLOR vs 同顶点 NORMAL：13.9°（大件）/41.5°（头发）—— 差值只来自"平滑 vs 逐面"
         流水线顺序也支持这一点：common/submesh_model.py:428 先把导出空间变换烘焙进临时物体，
         utils/export_utils.py:577 才轮到 average_normal_color ⇒ 此刻 loop 法线已在导出空间。
-        非 HIMI 游戏同样不受影响（本来就没有映射）。
+        非 HIMI 游戏不再进入这条路径（全局开关只对 HIMI 生效），因此这里同时验证它们原样返回。
         """
         logic = obj_buffer_helper_module.GlobalConfig.logic_name
         had_flag = hasattr(obj_buffer_helper_module.GlobalConfig, "enable_non_mirror_workflow")
@@ -485,7 +521,12 @@ class ObjBufferHelperAverageNormalColorTests(unittest.TestCase):
                 for mirrored in (True, False):
                     obj_buffer_helper_module.GlobalConfig.logic_name = logic_name
                     obj_buffer_helper_module.GlobalConfig.enable_non_mirror_workflow = mirrored
-                    written = self._decoded(self._recalculate([self._vertex((0.0, 0.0, 0.0), (0.0, 1.0, 0.0))]))
+                    result = self._recalculate([self._vertex((0.0, 0.0, 0.0), (0.0, 1.0, 0.0))])
+                    if logic_name != "HIMI":
+                        # 非 HIMI：全局开关不改写游戏原生 COLOR，原样返回输入
+                        self.assertIsInstance(result, list)
+                        continue
+                    written = self._decoded(result)
                     np.testing.assert_allclose(written[0], (0.0, 1.0, 0.0), atol=0.02,
                                                err_msg="%s(非镜像=%s) 不应该改动法线方向" % (logic_name, mirrored))
         finally:
