@@ -12,6 +12,7 @@ from ..utils.shapekey_utils import ShapeKeyUtils
 from ..common.safe_write import write_text_if_changed
 from .direct_export_runtime_utils import normalize_runtime_name as _normalize_runtime_name
 from .direct_export_shapekey_output_mixin import DirectShapeKeyOutputMixin
+from .direct_export_shapekey_output_mixin import WEIGHT_SYNC_SHADER_NAME
 from .direct_export_shapekey_runtime_mixin import DirectShapeKeyRuntimeMixin
 from .direct_export_shapekey_sampling_mixin import DirectShapeKeySamplingMixin
 from .direct_export_shapekey_shared import ShapeKeyDirectExportError, resolve_use_delta
@@ -384,6 +385,80 @@ class DirectShapeKeyGenerator(
                 )
                 drag_drive_enabled = False
 
+        # 帧表模式准备（仅在勾选「帧表插值」时启用；不勾选时以下分支整体不执行，
+        # 完全沿用原有槽位模型）。分组配置从「形态键扩展」节点直接读取——该节点运行
+        # 在本节点**之后**，导出时 ini 里的 sync 块尚未写入，不能依赖解析 ini；
+        # ini 解析仅作为旧版插件的兜底。
+        frame_table_mode = bool(getattr(self.node, "use_frame_table", False))
+        sequence_groups = {}
+        group_totals = {}
+        freq_params = {}
+        frame_table_meta_map = {}
+        frame_table_blocked = []
+        if frame_table_mode:
+            # 前置条件校验：帧表依赖「紧凑 + 合并槽位文件 + 优化查找」三件套产出的
+            # 中间数据，且当前模板只处理位置通道。任一不满足都明确点名并回退，
+            # 而不是让用户只看到一句笼统的「帧表构建失败」。
+            if bool(getattr(self.node, "store_all_vertex_channels", False)):
+                frame_table_blocked.append(
+                    "「存储全部顶点属性增量」：帧表当前只建位置通道，法线/切线增量会被丢弃"
+                    "（描边与光照不会跟随形变）"
+                )
+            if not use_packed:
+                frame_table_blocked.append("「紧凑模式」：帧表需要合并后的逐槽位数据")
+            if not merge_slot_files:
+                frame_table_blocked.append("「合并槽位文件」：帧表需要 merged 数据产物")
+            if not use_optimized:
+                frame_table_blocked.append("「优化查找性能」：帧表需要 freq_indices 产物")
+            if drag_drive_enabled:
+                frame_table_blocked.append("「拖拽驱动形态键」：帧表模板尚未实现拖拽分支")
+            if frame_table_blocked:
+                # 勾选了帧表就应当明确成功或明确失败，不静默回退——否则用户无从
+                # 分辨本次导出究竟用了哪套模型。
+                raise ShapeKeyDirectExportError(
+                    "帧表插值无法启用。请修正以下设置，或取消勾选「帧表插值（序列组加速）」后重试：\n"
+                    + "\n".join("  - " + reason for reason in frame_table_blocked)
+                )
+
+        # 顶点命中索引（稀疏查找）准备：把「每顶点遍历全部槽位」换成「只遍历该顶点
+        # 命中的槽位」。与帧表同样是「勾选了就明确成功或明确失败」，不静默回退。
+        sparse_requested = bool(getattr(self.node, "use_sparse_vertex_index", False))
+        use_sparse_vertex_index = self.node.effective_use_sparse_index(
+            use_packed, use_delta, use_optimized, merge_slot_files
+        )
+        if sparse_requested:
+            # 只要勾了就走这里：① 四项前置缺一不可；② 与帧表互斥——帧表即便前置
+            # 齐全也必须拦下，否则稀疏资源段与 cs-t96/97/98 会被绑到帧表着色器上
+            # （它没有这些寄存器），加载即出错。两种情况都明确失败，不静默回退。
+            sparse_blockers = list(
+                self.node._sparse_index_blockers(
+                    use_packed, use_delta, use_optimized, merge_slot_files
+                )
+            )
+            if frame_table_mode:
+                sparse_blockers.append(
+                    "「帧表插值（序列组加速）」：与顶点命中索引是互斥的两套渲染模型"
+                )
+            if sparse_blockers:
+                raise ShapeKeyDirectExportError(
+                    "「顶点命中索引（稀疏查找）」无法启用。请修正以下设置，或取消勾选后重试：\n"
+                    + "\n".join("  - " + reason for reason in sparse_blockers)
+                )
+        if frame_table_mode:
+            freq_params = {
+                name: self.node.get_shape_key_export_variable_name(name) for name in all_unique_names
+            }
+            sequence_groups, group_totals = self._read_sequence_groups_from_ext_node(freq_params)
+            if not sequence_groups:
+                sequence_groups = self._parse_sequence_groups_from_ini(sections, ini_path=target_ini_file)
+                group_totals = {}
+            if not sequence_groups:
+                raise ShapeKeyDirectExportError(
+                    "帧表插值已启用，但未找到可用的序列分组。\n"
+                    "请确认「形态键扩展」节点已启用、至少有一个「序列」模式的分组且该分组已分配到形态键；\n"
+                    "或取消勾选「帧表插值（序列组加速）」后重试。"
+                )
+
         hash_to_shader_paths = {}
         for logical_hash in processed_hashes:
             if logical_hash not in hash_slot_data_map or not hash_slot_data_map[logical_hash]:
@@ -396,6 +471,18 @@ class DirectShapeKeyGenerator(
                 with open(shader_source_path, 'r', encoding='utf-8') as f:
                     write_text_if_changed(shader_dest_path, f.read())
             hash_to_shader_paths[logical_hash] = shader_dest_path
+
+        # 权重同步 CS：形态键强度经 IniParams 打包中转搬进 mod 专属权重缓冲，
+        # 由每个形态键 dispatch 段「run」它。内容固定（无 per-hash 注入），每份 mod
+        # 只需一份。**缺了它，ini 里的 `cs = ./res/shapekey_weight_sync.hlsl` 会加载
+        # 失败 → 权重恒为 0 → 形态键完全拖不动**（实机踩过：文件只被 node_postprocess
+        # 路径复制，而本直出路径才是实际执行的入口）。
+        weight_sync_source = os.path.join(os.path.dirname(shader_source_path), WEIGHT_SYNC_SHADER_NAME)
+        if os.path.exists(weight_sync_source):
+            with open(weight_sync_source, 'r', encoding='utf-8') as f:
+                write_text_if_changed(os.path.join(dest_res_dir, WEIGHT_SYNC_SHADER_NAME), f.read())
+        else:
+            LOG.warning(f"直出形态键: 未找到权重同步着色器模板 {weight_sync_source}")
 
         for logical_hash in processed_hashes:
             hash_slot_data = hash_slot_data_map.get(logical_hash, {})
@@ -420,19 +507,102 @@ class DirectShapeKeyGenerator(
                 LOG.info(
                     f"Direct ShapeKey: write freq indices hash={logical_hash}, names={hash_unique_names}, objects={hash_unique_objects}, vertex_count={vertex_count}"
                 )
-                self._write_freq_indices(
-                    logical_hash=logical_hash,
-                    actual_hash=hash_to_actual_file_hash.get(logical_hash, logical_hash),
-                    hash_slot_data=hash_slot_data,
-                    unique_names=hash_unique_names,
-                    vertex_count=vertex_count,
-                    calculated_ranges=calculated_ranges,
-                    merged_index_map=hash_to_merged_index_map.get(logical_hash),
-                    slot_index_maps=hash_to_slot_maps.get(logical_hash, {}),
-                )
+                if use_sparse_vertex_index:
+                    # 稀疏模式只写三份顶点命中索引，不写稠密 FREQ 表。
+                    self._write_sparse_vertex_index(
+                        logical_hash=logical_hash,
+                        actual_hash=hash_to_actual_file_hash.get(logical_hash, logical_hash),
+                        hash_slot_data=hash_slot_data,
+                        unique_names=hash_unique_names,
+                        vertex_count=vertex_count,
+                        calculated_ranges=calculated_ranges,
+                        merged_index_map=hash_to_merged_index_map.get(logical_hash),
+                        slot_index_maps=hash_to_slot_maps.get(logical_hash, {}),
+                    )
+                else:
+                    self._write_freq_indices(
+                        logical_hash=logical_hash,
+                        actual_hash=hash_to_actual_file_hash.get(logical_hash, logical_hash),
+                        hash_slot_data=hash_slot_data,
+                        unique_names=hash_unique_names,
+                        vertex_count=vertex_count,
+                        calculated_ranges=calculated_ranges,
+                        merged_index_map=hash_to_merged_index_map.get(logical_hash),
+                        slot_index_maps=hash_to_slot_maps.get(logical_hash, {}),
+                    )
+
+            frame_table_meta = None
+            frame_vertex_count = hash_to_vertex_count.get(
+                self.node._extract_hash_prefix(logical_hash), 0
+            )
+            if frame_table_mode:
+                # 帧表模式下任何一步失败都**直接终止导出**：勾选了就该明确成功或明确
+                # 失败，静默回退会让用户无法分辨本次究竟用了哪套模型。
+                # 陈旧产物防护：merged 数据必须由**本次**导出写出。否则磁盘上残留的
+                # 是上次的文件，直接拿来建表会得到静默错误的结果。
+                _merged_ok = hash_to_merged_index_map.get(logical_hash) is not None
+                if not _merged_ok:
+                    raise ShapeKeyDirectExportError(
+                        f"{logical_hash}: 本次导出未生成 merged 数据，帧表无法构建。"
+                        "请确认已勾选「紧凑模式」与「合并槽位文件」。"
+                    )
+                try:
+                    plan = self._build_frame_table_plan(
+                        hash_unique_names, freq_params, sequence_groups, group_totals
+                    )
+                except Exception as exc:
+                    raise ShapeKeyDirectExportError(
+                        f"{logical_hash}: 帧表分组计划构建失败: {exc!r}"
+                    ) from exc
+                if not plan:
+                    raise ShapeKeyDirectExportError(
+                        f"{logical_hash}: 无法生成帧表分组计划。\n"
+                        "常见原因：某分组只有部分形态键属于本网格（时间轴会错位）、"
+                        "组内形态键缺少对应的强度变量、或分组数超过上限。"
+                    )
+                actual_file_hash = hash_to_actual_file_hash.get(logical_hash, logical_hash)
+                inputs = self._read_frame_table_inputs(actual_file_hash)
+                if inputs is None:
+                    raise ShapeKeyDirectExportError(
+                        f"{logical_hash}: 读取帧表输入数据失败"
+                        "（merged / freq_indices 缺失，或与当前顶点数不匹配）。"
+                    )
+                try:
+                    frame_table_meta = self._write_frame_table_files(
+                        actual_hash=actual_file_hash,
+                        vertex_count=frame_vertex_count,
+                        plan=plan,
+                        inputs=inputs,
+                    )
+                except Exception as exc:
+                    raise ShapeKeyDirectExportError(
+                        f"{logical_hash}: 帧表数据写入失败: {exc!r}"
+                    ) from exc
+                if not frame_table_meta:
+                    raise ShapeKeyDirectExportError(
+                        f"{logical_hash}: 帧表数据为空（所有分组的顶点并集均为空）。"
+                    )
 
             shader_path = hash_to_shader_paths.get(logical_hash)
-            if shader_path:
+            if shader_path and frame_table_meta:
+                frame_table_template = self.node._get_frame_table_template_path()
+                if not frame_table_template:
+                    raise ShapeKeyDirectExportError(
+                        "未找到帧表着色器模板 Toolset/shapekey_anim_frame_table.hlsl。"
+                    )
+                if not self._update_frame_table_shader(
+                    shader_path,
+                    frame_table_template,
+                    key_count=len(hash_unique_names),
+                    frame_meta=frame_table_meta["groups"],
+                    hash_val=logical_hash,
+                    vertex_count=frame_vertex_count,
+                ):
+                    raise ShapeKeyDirectExportError(
+                        f"{logical_hash}: 帧表着色器注入失败。"
+                    )
+                frame_table_meta_map[logical_hash] = frame_table_meta
+            elif shader_path:
                 self.node._update_shader_file(
                     shader_path,
                     hash_slot_data,
@@ -449,6 +619,7 @@ class DirectShapeKeyGenerator(
                     drag_dirs=self.node._drag_drive_dirs(hash_unique_names) if drag_drive_enabled else None,
                     hash_val=logical_hash,
                     source_path=shader_source_path,
+                    use_sparse_vertex_index=use_sparse_vertex_index,
                 )
         LOG.info(f"直出形态键: shader/freq 写出完成 {perf_counter() - stage_start:.3f}s")
 
@@ -473,5 +644,33 @@ class DirectShapeKeyGenerator(
             use_optimized=use_optimized,
             merge_slot_files=merge_slot_files,
             drag_drive_resource=drag_drive_resource,
+            frame_table_meta_map=frame_table_meta_map,
+            use_sparse_index=use_sparse_vertex_index,
         )
         LOG.info(f"直出形态键: ini 更新完成 {perf_counter() - stage_start:.3f}s")
+
+        # 帧表模式收尾：删除本次已不再被 ini 引用的中间数据文件（约 190 MB）。
+        # 必须放在 ini 写回**之后**——若中途失败，ini 仍引用旧文件、文件也还在，
+        # mod 不会陷入「有声明无文件」的坏状态。
+        if frame_table_meta_map:
+            removed = 0
+            for logical_hash in processed_hashes:
+                if frame_table_meta_map.get(logical_hash) is None:
+                    continue
+                actual_file_hash = hash_to_actual_file_hash.get(logical_hash, logical_hash)
+                for suffix in (
+                    self.node._get_merged_data_file_suffix(use_delta),
+                    "_merged_map",
+                    "_freq_indices",
+                ):
+                    stale_path = os.path.join(
+                        self.meshes_dir, f"{actual_file_hash}-Position{suffix}.buf"
+                    )
+                    if os.path.exists(stale_path):
+                        try:
+                            os.remove(stale_path)
+                            removed += 1
+                        except OSError as exc:
+                            LOG.warning(f"直出形态键: 删除冗余数据文件失败 {stale_path}: {exc!r}")
+            if removed:
+                LOG.info(f"直出形态键: 帧表模式已清理 {removed} 个冗余数据文件")

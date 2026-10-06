@@ -1110,10 +1110,16 @@ class ObjBufferHelper:
         '''
         if "COLOR" not in d3d11GameType.OrderedFullElementList:
             return indexed_vertices
+        # 「COLOR 写入方式」是 HI3 2.0 专用：UI 只在 HIMI 模式绘制该栏
+        # （blueprint/node_obj.py 的轮廓线修复栏）。此前这里不判游戏类型，而默认值是
+        # AVERAGE，于是 ZZZ 等游戏的顶点色（游戏原生的光照/材质遮罩，实测身体部件只有
+        # 6 种值）被这套"法线编码 + 描边宽度"覆盖（实测产物 7739 种值、alpha 恒 128），
+        # 表现为角色属性界面等吃 COLOR 的 pass 光影质感错乱。
+        # 非 HIMI 游戏如需该功能，仍可用物体属性 3DMigoto:RecalculateCOLOR 单独开启。
         allow_calc = False
-        if GlobalProterties.recalculate_color():
+        if obj.get("3DMigoto:RecalculateCOLOR", False):
             allow_calc = True
-        elif obj.get("3DMigoto:RecalculateCOLOR",False): 
+        elif GlobalProterties.recalculate_color() and GlobalConfig.logic_name == LogicName.HIMI:
             allow_calc = True
         if not allow_calc:
             return indexed_vertices

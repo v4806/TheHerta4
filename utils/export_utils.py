@@ -538,9 +538,15 @@ class ExportUtils:
         # fields, vertices can merge earlier and both COLOR/TANGENT averages
         # change. Keep the remote-compatible behavior while either recalc path
         # is enabled.
+        # 全局开关的判断必须与 actual 写入方保持一致：average_normal_color 只在 HIMI
+        # （HI3 2.0，UI 才显示该栏）下真正改写 COLOR。否则非 HIMI 游戏会仅仅因为默认值
+        # AVERAGE 就被禁掉局部去重，导出顶点数与"关掉该开关"时不一致。
         recalculate_average_normal_enabled = (
             GlobalProterties.recalculate_tangent()
-            or GlobalProterties.recalculate_color()
+            or (
+                GlobalProterties.recalculate_color()
+                and GlobalConfig.logic_name == LogicName.HIMI
+            )
             or obj.get("3DMigoto:RecalculateTANGENT", False)
             or obj.get("3DMigoto:RecalculateCOLOR", False)
         )

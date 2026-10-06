@@ -84,6 +84,10 @@ try:
         derive_shapekey_merged_map_resource_name=lambda *_a, **_k: "",
         derive_shapekey_slot_map_resource_name=lambda *_a, **_k: "",
         derive_shapekey_slot_resource_name=lambda *_a, **_k: "",
+        derive_shapekey_vertex_entry_start_resource_name=lambda *_a, **_k: "",
+        derive_shapekey_vertex_entry_packed_resource_name=lambda *_a, **_k: "",
+        derive_shapekey_vertex_entry_freq_resource_name=lambda *_a, **_k: "",
+        derive_shapekey_weight_resource_name=lambda *_a, **_k: "ResourceWeightStub",
         ensure_resource_alias_section=lambda *_a, **_k: None,
         resolve_hash_buffer_candidate=lambda *_a, **_k: "",
     )
