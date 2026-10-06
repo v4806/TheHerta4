@@ -30,12 +30,18 @@ _install_module(
             "derive_shapekey_merged_map_resource_name",
             "derive_shapekey_slot_map_resource_name",
             "derive_shapekey_slot_resource_name",
+            "derive_shapekey_frame_table_resource_name",
+            "derive_shapekey_group_map_resource_name",
             "derive_shapekey_weight_resource_name",
             "ensure_resource_alias_section",
         )
     },
 )
 _install_module(f"{PKG}.utils.log_utils", LOG=types.SimpleNamespace())
+_install_module(
+    f"{PKG}.common.safe_write",
+    write_text_if_changed=lambda *_args, **_kwargs: None,
+)
 _install_module(
     f"{PKG}.blueprint.direct_export_runtime_utils",
     apply_position_override_in_place=lambda *_args, **_kwargs: None,

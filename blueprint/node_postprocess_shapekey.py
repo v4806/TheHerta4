@@ -227,6 +227,17 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
         description="使用顶点FREQ索引缓冲区替代大量条件分支，显著提升GPU性能。需要 'numpy' 库。",
         default=True
     )
+    use_frame_table: bpy.props.BoolProperty(
+        name="帧表插值（序列组加速）",
+        description=(
+            "把「序列模式」的形态键分组编译成逐帧位移表：每个顶点只读「当前帧 / 下一帧」"
+            "两次做插值，取代逐顶点遍历全部槽位（旧模型每顶点固定遍历 num_slots 次）。"
+            "显著降低 GPU 计算量、着色器体积与 Present 行数（重载后编译更快）。"
+            "序列组来自「形态键扩展」节点的分组配置；未启用扩展或分组信息缺失时自动回退旧模型。"
+            "需要 'numpy' 库。"
+        ),
+        default=False
+    )
     merge_slot_files: bpy.props.BoolProperty(
         name="合并槽位文件",
         description="将各槽位生成的紧凑缓冲区与索引缓冲区合并为单文件，减少着色器 T 资源位占用。当前主要在紧凑模式下生效。",
@@ -789,6 +800,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
         compute_box.prop(self, "use_packed_Meshess")
         compute_box.prop(self, "use_optimized_lookup")
         compute_box.prop(self, "merge_slot_files")
+        compute_box.prop(self, "use_frame_table")
 
         storage_box = layout.box()
         storage_box.label(text="空间优化", icon='PACKAGE')
@@ -2048,6 +2060,11 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
         return None
 
     def _get_shader_template_name(self):
+        # 注意：这里**不能**因为 use_frame_table 就切到帧表模板。本方法决定的是
+        # 「播种 + _update_shader_file 注入」所用的骨架；一旦帧表因分组信息缺失而
+        # 回退旧模型，帧表骨架里没有 merged_shapekey_* / vertex_freq_indices 声明，
+        # 注入出来的 shader 会编译失败（实机表现为整块网格顶点塌到原点）。
+        # 帧表模板由 _get_frame_table_template_path() 单独提供。
         use_packed = self.use_packed_Meshess
         use_delta = self.effective_use_delta()
         use_optimized = self.use_optimized_lookup
@@ -2078,6 +2095,16 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
             return shader_source_path
         except Exception as e:
             print(f"获取着色器模板路径时出错: {e}")
+            return None
+
+    def _get_frame_table_template_path(self):
+        """帧表模式专用模板路径（与旧的播种/注入骨架路径解耦）。"""
+        try:
+            addon_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            path = os.path.join(addon_dir, "Toolset", "shapekey_anim_frame_table.hlsl")
+            return path if os.path.exists(path) else None
+        except Exception as e:
+            print(f"获取帧表着色器模板路径时出错: {e}")
             return None
 
     def _get_workspace_vertex_struct_definition(self, hash_val):
