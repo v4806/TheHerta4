@@ -36,10 +36,16 @@ from ..common.mod_path_compat import derive_shapekey_merged_data_resource_name
 from ..common.mod_path_compat import derive_shapekey_merged_map_resource_name
 from ..common.mod_path_compat import derive_shapekey_slot_map_resource_name
 from ..common.mod_path_compat import derive_shapekey_slot_resource_name
+from ..common.mod_path_compat import derive_shapekey_weight_resource_name
 from ..common.mod_path_compat import ensure_resource_alias_section
 from ..common.mod_path_compat import resolve_hash_buffer_candidate
 from ..common.object_prefix_helper import ObjectPrefixHelper
 from ..common.safe_write import write_text_if_changed
+
+# 形态键权重同步 CS：文件与 anim CS 同在 res/ 下，内容固定（无 per-hash 注入），
+# 每份 mod 只复制一次。
+WEIGHT_SYNC_SHADER_NAME = "shapekey_weight_sync.hlsl"
+WEIGHT_SYNC_SHADER_REL = "./res/" + WEIGHT_SYNC_SHADER_NAME
 
 
 class ShapeKeyVariableItem(bpy.types.PropertyGroup):
@@ -164,6 +170,15 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
     bl_label = '形态键配置'
     bl_description = '读取分类文本，生成支持多形态叠加混合的INI配置'
 
+    # 形态键强度**中转窗口**基址。窗口按 float4 打包（1 个槽位装 4 个形态键），
+    # 权重由 shapekey_weight_sync.hlsl 搬进 mod 专属权重缓冲后**立即清零**。
+    # 这样共享的 IniParams 表里既不长期驻留形态键数据、占用量也只有原来的 1/4。
+    #
+    # 历史事故（本改动的直接动因）：权重原先直读 IniParams[100+i].x 并长期驻留，
+    # 151 个形态键占满 x100~x250；某 ShaderFix 恰好把 IniParams[190].x 当作
+    # 「关闭角色描边」的开关，于是播放到第 91 个形态键（触手_037）时角色描边
+    # 整片消失。IniParams 是所有 mod 共享的唯一标量通道，没有命名空间，
+    # 靠错开固定槽位不可能根治，因此改为「专属缓冲 + 打包中转 + 用后清零」。
     INTENSITY_START_INDEX = 100
     VERTEX_RANGE_START_INDEX = 200
     # 形态键着色器中 ShapeKeyDrive 缓冲的 SRV 寄存器（同一 dispatch 内避开
@@ -171,6 +186,8 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
     DRAG_DRIVE_REGISTER = 100
     # 点击计数缓冲的 SRV 寄存器（由 INI 的 cs-t101 绑定）
     DRAG_CLICK_COUNT_REGISTER = 101
+    # 权重缓冲在 shapekey anim CS 中的 SRV 寄存器（避开 t100/t101 拖拽寄存器）
+    WEIGHT_BUFFER_REGISTER = 102
 
     shapekey_variable_items: bpy.props.CollectionProperty(type=ShapeKeyVariableItem) # type: ignore
     shapekey_variable_index: bpy.props.IntProperty(default=0) # type: ignore
@@ -209,6 +226,17 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
         name="优化查找性能",
         description="使用顶点FREQ索引缓冲区替代大量条件分支，显著提升GPU性能。需要 'numpy' 库。",
         default=True
+    )
+    use_frame_table: bpy.props.BoolProperty(
+        name="帧表插值（序列组加速）",
+        description=(
+            "把「序列模式」的形态键分组编译成逐帧位移表：每个顶点只读「当前帧 / 下一帧」"
+            "两次做插值，取代逐顶点遍历全部槽位（旧模型每顶点固定遍历 num_slots 次）。"
+            "显著降低 GPU 计算量、着色器体积与 Present 行数（重载后编译更快）。"
+            "序列组来自「形态键扩展」节点的分组配置；未启用扩展或分组信息缺失时自动回退旧模型。"
+            "需要 'numpy' 库。"
+        ),
+        default=False
     )
     merge_slot_files: bpy.props.BoolProperty(
         name="合并槽位文件",
@@ -772,6 +800,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
         compute_box.prop(self, "use_packed_Meshess")
         compute_box.prop(self, "use_optimized_lookup")
         compute_box.prop(self, "merge_slot_files")
+        compute_box.prop(self, "use_frame_table")
 
         storage_box = layout.box()
         storage_box.label(text="空间优化", icon='PACKAGE')
@@ -2031,6 +2060,11 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
         return None
 
     def _get_shader_template_name(self):
+        # 注意：这里**不能**因为 use_frame_table 就切到帧表模板。本方法决定的是
+        # 「播种 + _update_shader_file 注入」所用的骨架；一旦帧表因分组信息缺失而
+        # 回退旧模型，帧表骨架里没有 merged_shapekey_* / vertex_freq_indices 声明，
+        # 注入出来的 shader 会编译失败（实机表现为整块网格顶点塌到原点）。
+        # 帧表模板由 _get_frame_table_template_path() 单独提供。
         use_packed = self.use_packed_Meshess
         use_delta = self.effective_use_delta()
         use_optimized = self.use_optimized_lookup
@@ -2061,6 +2095,16 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
             return shader_source_path
         except Exception as e:
             print(f"获取着色器模板路径时出错: {e}")
+            return None
+
+    def _get_frame_table_template_path(self):
+        """帧表模式专用模板路径（与旧的播种/注入骨架路径解耦）。"""
+        try:
+            addon_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            path = os.path.join(addon_dir, "Toolset", "shapekey_anim_frame_table.hlsl")
+            return path if os.path.exists(path) else None
+        except Exception as e:
+            print(f"获取帧表着色器模板路径时出错: {e}")
             return None
 
     def _get_workspace_vertex_struct_definition(self, hash_val):
@@ -2446,6 +2490,9 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
             _total_slots, _zone_bases, _zone_stage_counts = self._drag_drive_buffer_layout()
             zone_bases = list(_zone_bases)
             define_lines = [f"// --- Shared Animation Intensity (per Shape Key Name) ---\n// From index {self.INTENSITY_START_INDEX} onwards"]
+            # 权重缓冲两种模式都要：它是「变量路径」的初值来源（拖拽命中时再由
+            # ShapeKeyDrive 覆盖）。权重不再直读共享表，见 shapekey_weight_sync.hlsl。
+            define_lines.append(f"Buffer<float> ShapeKeyWeight : register(t{self.WEIGHT_BUFFER_REGISTER});")
             if drag_drive_enabled:
                 define_lines.append(f"Buffer<float> ShapeKeyDrive : register(t{self.DRAG_DRIVE_REGISTER});")
                 define_lines.append(f"Buffer<uint> ShapeKeyClickCount : register(t{self.DRAG_CLICK_COUNT_REGISTER});")
@@ -2496,7 +2543,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                         f" ? ShapeKeyDrive[SHAPEKEY_SLOT_IDS[{i}]] : 0.0) // {name} (zone {zone}, slot {slot_id})"
                     )
                 else:
-                    define_lines.append(f"#define FREQ{i+1} IniParams[{self.INTENSITY_START_INDEX + i}].x // {name}")
+                    define_lines.append(f"#define FREQ{i+1} ShapeKeyWeight[{i}] // {name}")
 
             if not use_optimized:
                 define_lines.extend([f"\n// --- Per-Object Vertex Ranges ---\n// From index {self.VERTEX_RANGE_START_INDEX} onwards"])
@@ -2521,7 +2568,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                         logic_lines.append(f"    if (freq_idx_slot{slot_index} != 255)")
                         logic_lines.append("    {")
                         if drag_drive_enabled:
-                            logic_lines.append(f"        float anim_weight_slot{slot_index} = IniParams[{self.INTENSITY_START_INDEX} + freq_idx_slot{slot_index}].x;")
+                            logic_lines.append(f"        float anim_weight_slot{slot_index} = ShapeKeyWeight[freq_idx_slot{slot_index}];")
                             logic_lines.append(f"        uint sk_zone_slot{slot_index} = SHAPEKEY_ZONE_IDS[freq_idx_slot{slot_index}];")
                             logic_lines.append(f"        uint sk_nd_stage_slot{slot_index} = SHAPEKEY_ND_STAGE_IDS[freq_idx_slot{slot_index}];")
                             logic_lines.append(f"        uint sk_slot_slot{slot_index} = SHAPEKEY_SLOT_IDS[freq_idx_slot{slot_index}];")
@@ -2531,7 +2578,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                             logic_lines.append("        }")
                         else:
                             logic_lines.append(
-                                f"        float anim_weight_slot{slot_index} = IniParams[{self.INTENSITY_START_INDEX} + freq_idx_slot{slot_index}].x;"
+                                f"        float anim_weight_slot{slot_index} = ShapeKeyWeight[freq_idx_slot{slot_index}];"
                             )
                     else:
                         is_first_if = True
@@ -2582,7 +2629,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                     logic_lines.append(f"    if (freq_idx_slot{slot_index} != 255)")
                     logic_lines.append("    {")
                     if drag_drive_enabled:
-                        logic_lines.append(f"        float anim_weight_slot{slot_index} = IniParams[{self.INTENSITY_START_INDEX} + freq_idx_slot{slot_index}].x;")
+                        logic_lines.append(f"        float anim_weight_slot{slot_index} = ShapeKeyWeight[freq_idx_slot{slot_index}];")
                         logic_lines.append(f"        uint sk_zone_slot{slot_index} = SHAPEKEY_ZONE_IDS[freq_idx_slot{slot_index}];")
                         logic_lines.append(f"        uint sk_nd_stage_slot{slot_index} = SHAPEKEY_ND_STAGE_IDS[freq_idx_slot{slot_index}];")
                         logic_lines.append(f"        uint sk_slot_slot{slot_index} = SHAPEKEY_SLOT_IDS[freq_idx_slot{slot_index}];")
@@ -2591,7 +2638,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                         logic_lines.append(f"            anim_weight_slot{slot_index} = ShapeKeyDrive[sk_slot_slot{slot_index}];")
                         logic_lines.append("        }")
                     else:
-                        logic_lines.append(f"        float anim_weight_slot{slot_index} = IniParams[{self.INTENSITY_START_INDEX} + freq_idx_slot{slot_index}].x;")
+                        logic_lines.append(f"        float anim_weight_slot{slot_index} = ShapeKeyWeight[freq_idx_slot{slot_index}];")
 
                     if use_packed:
                         logic_lines.extend([f"        int packed_index = shapekey_maps[{slot_index}][i];", "        if (packed_index != -1)", "        {"])
@@ -3079,6 +3126,14 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                 hash_to_shader_paths[hash_val] = shader_dest_path
                 print(f"已创建独立着色器文件: shapekey_anim_{hash_val}.hlsl")
 
+            # 权重同步 CS：内容固定（无 per-hash 注入），每份 mod 复制一次。
+            weight_sync_source = os.path.join(os.path.dirname(shader_source_path), WEIGHT_SYNC_SHADER_NAME)
+            if os.path.exists(weight_sync_source):
+                with open(weight_sync_source, 'r', encoding='utf-8') as f:
+                    write_text_if_changed(os.path.join(dest_res_dir, WEIGHT_SYNC_SHADER_NAME), f.read())
+            else:
+                print(f"[形态键] 未找到权重同步着色器模板: {weight_sync_source}")
+
             for hash_val in unique_hashes:
                 hash_objects = hash_to_objects.get(hash_val, [])
                 hash_slot_data = {}
@@ -3179,11 +3234,25 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                 sections['[Present]'] = []
             present_lines = sections['[Present]']
             for h in unique_hashes:
+                # 权重同步必须排在形态键 CS 之前：先把打包窗口搬进权重缓冲
+                # 并清零窗口，形态键 CS 才能从缓冲读到本帧的强度。
+                #
+                # 幂等重排（不能只做「不存在才 append」）：上一次导出或其它节点
+                # 可能已经在 Present 留下 4 空格缩进的 Anim run，只补一行同步 run
+                # 会让它排到 Anim 之后 —— 那时窗口已被清零，权重恒为 0，形态键
+                # 整个失效。这里统一摘除这两行再按「同步 → 动画」顺序追加。
+                # （8 空格缩进的同名 run 属于签入门控块，整行不匹配，保持原样。）
+                sync_run_line = f"    run = CustomShaderShapeKeyWeightSync_{h}"
                 run_line = f"    run = CustomShader_{h}_Anim"
-                if run_line not in present_lines:
-                    present_lines.append(run_line)
+                present_lines[:] = [
+                    line for line in present_lines if line not in (sync_run_line, run_line)
+                ]
+                present_lines.append(sync_run_line)
+                present_lines.append(run_line)
 
             compute_blocks_to_add = OrderedDict()
+            # 每个 hash 的形态键数量：权重缓冲的 array 容量（供资源段使用）
+            hash_weight_counts = {}
             for h in unique_hashes:
                 block_name = f"[CustomShader_{h}_Anim]"
 
@@ -3201,10 +3270,37 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                     hash_unique_names = list(OrderedDict.fromkeys(name for slot_data in hash_slot_data.values() for name in slot_data.keys()))
                     hash_unique_objects = list(OrderedDict.fromkeys(obj for slot_data in hash_slot_data.values() for name_data in slot_data.values() for obj in name_data))
 
-                    block_lines = ["\n    ; --- Shared Intensity Controls (per Shape Key Name) ---"]
+                    # 形态键强度不再直读共享表：写进打包中转窗口 → 权重同步 CS
+                    # 搬进 mod 专属缓冲 → 窗口立即清零（见 shapekey_weight_sync.hlsl）
+                    _weight_h_prefix = self._extract_hash_prefix(h)
+                    _weight_base_resources = hash_to_base_resources.get(_weight_h_prefix, [])
+                    _weight_primary_base = (
+                        _weight_base_resources[0]
+                        if _weight_base_resources
+                        else f"Resource_{self._hash_to_resource_prefix(h)}_Position"
+                    )
+                    weight_resource = derive_shapekey_weight_resource_name(_weight_primary_base)
+                    sync_lines = ["\n    ; --- Shape Key Weight Transfer (packed 4 keys per float4) ---"]
                     for i, name in enumerate(hash_unique_names):
-                        if shapekey_freq_params.get(name):
-                            block_lines.append(f"    x{self.INTENSITY_START_INDEX + i} = {shapekey_freq_params.get(name)} \n; {name}")
+                        freq_param = shapekey_freq_params.get(name)
+                        if freq_param:
+                            sync_lines.append(
+                                f"    {'xyzw'[i % 4]}{self.INTENSITY_START_INDEX + i // 4} = {freq_param} \n; {name}"
+                            )
+                    sync_lines.extend([
+                        f"    cs = {WEIGHT_SYNC_SHADER_REL}",
+                        f"    cs-u0 = {weight_resource}",
+                        f"    Dispatch = {max(1, (len(hash_unique_names) + 63) // 64)}, 1, 1",
+                        "    cs-u0 = null",
+                    ])
+                    # 搬运后立即清零：共享表里不留形态键值，别的 mod 即使也占用这些
+                    # 槽位，渲染期读到的也永远是 0。
+                    for _i in range(len(hash_unique_names)):
+                        sync_lines.append(
+                            f"    {'xyzw'[_i % 4]}{self.INTENSITY_START_INDEX + _i // 4} = 0"
+                        )
+
+                    block_lines = []
                     if not use_optimized:
                         block_lines.append("\n    ; --- Per-Object Vertex Range Controls ---")
                         for i, obj_name in enumerate(hash_unique_objects):
@@ -3265,6 +3361,10 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                             block_lines.append(f"    cs-t{self.DRAG_CLICK_COUNT_REGISTER} = {click_resource}")
                         t_registers_to_null.append(f"cs-t{self.DRAG_DRIVE_REGISTER}")
                         t_registers_to_null.append(f"cs-t{self.DRAG_CLICK_COUNT_REGISTER}")
+                    # 权重缓冲：mod 专属资源，由 CustomShaderShapeKeyWeightSync 每帧搬运
+                    block_lines.append("\n    ; --- Shape Key Weight Buffer ---")
+                    block_lines.append(f"    cs-t{self.WEIGHT_BUFFER_REGISTER} = {weight_resource}")
+                    t_registers_to_null.append(f"cs-t{self.WEIGHT_BUFFER_REGISTER}")
 
                     block_lines.append(f"    cs = ./res/shapekey_anim_{h}.hlsl")
 
@@ -3293,6 +3393,9 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                     dispatch_count = self._compute_dispatch_group_count(vertex_counts.get(h_prefix, 0), threads_per_group=16)
                     block_lines.extend([f"    Dispatch = {dispatch_count}, 1, 1", "    cs-u5 = null", *[f"    {reg} = null" for reg in sorted(list(set(t_registers_to_null)))]])
                     compute_blocks_to_add[block_name] = block_lines
+                    # 权重搬运段：每帧「写打包窗口 → 搬运 → 清零」，必须排在 Anim 之前
+                    compute_blocks_to_add[f"[CustomShaderShapeKeyWeightSync_{h}]"] = sync_lines
+                    hash_weight_counts[h] = len(hash_unique_names)
 
             new_resource_lines = []
             generated_section_names = set()
@@ -3307,6 +3410,21 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                     stride = hash_to_stride.get(h_prefix, 40)
                     new_resource_lines.extend([section_name, "type = Buffer", f"stride = {stride}", f"filename = Meshes0000/{actual_file_hash}-Position.buf", ""])
                     generated_section_names.add(section_name)
+
+                # 形态键权重缓冲：mod 专属 RWBuffer（资源名即命名空间），
+                # 由 CustomShaderShapeKeyWeightSync 每帧写入。无 filename，
+                # 3DMigoto 分配即零初始化。
+                weight_section_name = f"[{derive_shapekey_weight_resource_name(primary_base_resource)}]"
+                if weight_section_name not in sections and weight_section_name not in generated_section_names:
+                    weight_capacity = max(1, int(hash_weight_counts.get(h, 1)))
+                    new_resource_lines.extend([
+                        weight_section_name,
+                        "type = RWBuffer",
+                        "format = R32_FLOAT",
+                        f"array = {weight_capacity}",
+                        "",
+                    ])
+                    generated_section_names.add(weight_section_name)
 
             if merge_slot_files:
                 for h in unique_hashes:

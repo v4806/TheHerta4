@@ -6,18 +6,29 @@ import numpy as np
 
 from ..common.mod_path_compat import collect_base_position_resource_map
 from ..common.mod_path_compat import derive_shapekey_base_resource_name
+from ..common.mod_path_compat import derive_shapekey_frame_table_resource_name
 from ..common.mod_path_compat import derive_shapekey_freq_resource_name
+from ..common.mod_path_compat import derive_shapekey_group_map_resource_name
 from ..common.mod_path_compat import derive_shapekey_merged_data_resource_name
 from ..common.mod_path_compat import derive_shapekey_merged_map_resource_name
 from ..common.mod_path_compat import derive_shapekey_slot_map_resource_name
 from ..common.mod_path_compat import derive_shapekey_slot_resource_name
+from ..common.mod_path_compat import derive_shapekey_weight_resource_name
 from ..common.mod_path_compat import ensure_resource_alias_section
+from ..common.safe_write import write_text_if_changed
 from ..utils.log_utils import LOG
 from .direct_export_runtime_utils import apply_position_override_in_place
 from .direct_export_runtime_utils import assemble_drawib_position_bytes
 from .direct_export_runtime_utils import extract_position_bytes_by_indices as _extract_position_bytes_by_indices
 from .direct_export_runtime_utils import iter_drawib_models as _iter_drawib_models
 from .direct_export_shapekey_shared import ShapeKeyDirectExportError, _buffer_to_bytes, resolve_use_delta
+
+
+# 形态键权重搬运的跨模块约定：必须与 node_postprocess_shapekey.py 的
+# WEIGHT_SYNC_SHADER_NAME / SSMTNode_PostProcess_ShapeKey.WEIGHT_BUFFER_REGISTER
+# 一致——两条生成路径写的是同一份 shader、同一张共享表、同一批槽位。
+WEIGHT_SYNC_SHADER_NAME = "shapekey_weight_sync.hlsl"
+WEIGHT_SYNC_SHADER_REL = "./res/" + WEIGHT_SYNC_SHADER_NAME
 
 
 class DirectShapeKeyOutputMixin:
@@ -115,6 +126,12 @@ class DirectShapeKeyOutputMixin:
             lines.extend(guard_open)
             lines.extend(f"{indent}{line}" for line in signature_lines)
             lines.append(f"{indent}if {condition}")
+            # 权重搬运必须先于形态键 CS：把打包窗口搬进 mod 专属权重缓冲并清零，
+            # Anim CS 才能从缓冲读到本帧强度（见 shapekey_weight_sync.hlsl）。
+            lines.extend(
+                f"{indent}    run = CustomShaderShapeKeyWeightSync_{logical_hash}"
+                for logical_hash in unique_hashes
+            )
             lines.extend(
                 f"{indent}    run = CustomShader_{logical_hash}_Anim"
                 for logical_hash in unique_hashes
@@ -125,6 +142,10 @@ class DirectShapeKeyOutputMixin:
                 lines.append("endif")
         else:
             lines.extend(guard_open)
+            lines.extend(
+                f"{indent}run = CustomShaderShapeKeyWeightSync_{logical_hash}"
+                for logical_hash in unique_hashes
+            )
             lines.extend(
                 f"{indent}run = CustomShader_{logical_hash}_Anim"
                 for logical_hash in unique_hashes
@@ -359,6 +380,447 @@ class DirectShapeKeyOutputMixin:
         with open(output_path, "wb") as file_obj:
             file_obj.write(freq_indices.reshape(-1).tobytes())
 
+    # ------------------------------------------------------------------
+    # 帧表（序列组加速）：把「每顶点遍历全部槽位」编译成「逐帧位移表插值」
+    # ------------------------------------------------------------------
+
+    # 帧表模式下组映射表占用的 cs-t 寄存器起点（t51 留给帧表本身）。
+    FRAME_TABLE_GROUP_MAP_REGISTER_BASE = 52
+    # 组数上限：52 + 组数 - 1 必须小于 t100（拖拽驱动起点）。
+    FRAME_TABLE_MAX_GROUPS = 45
+
+    def _read_sequence_groups_from_ext_node(self, freq_params):
+        """直接从「形态键扩展」节点读取序列分组配置。
+
+        为什么不能依赖 ini 里的 ``@@ShapeKeyExt:SYNC@@`` 块：扩展节点运行在形态键
+        节点**之后**，导出时 ini 里尚无该块（实机验证：导出前备份的 ini 中
+        ``[Present]`` 段为空，只有段头）。节点上的配置才是权威来源。
+        """
+        try:
+            import bpy
+        except Exception:
+            return {}, {}
+
+        name_to_var = {}
+        for name, param in (freq_params or {}).items():
+            if param:
+                name_to_var[name] = str(param).lstrip("$")
+
+        # 搜索顺序：先本节点所属的节点树（多蓝图共存时最准确），找不到再退回全局
+        # 扫描。必须保留全局兜底——形态键节点与扩展节点可能不在同一棵蓝图树里
+        # （direct_export 存在跨蓝图取源的情况），只认本树会导致永远读不到分组。
+        node_tree = getattr(self.node, "id_data", None)
+        search_passes = []
+        if node_tree is not None:
+            search_passes.append([node_tree])
+        search_passes.append(list(bpy.data.node_groups))
+
+        for candidate_trees in search_passes:
+            groups, group_totals = self._collect_sequence_groups(candidate_trees, name_to_var)
+            if groups:
+                return groups, group_totals
+        return {}, {}
+
+    @staticmethod
+    def _collect_sequence_groups(candidate_trees, name_to_var):
+        """在给定节点树集合里收集「序列模式」分组：``({组号: [变量]}, {组号: 完整成员数})``。"""
+        groups = {}
+        group_totals = {}
+        for node_group in candidate_trees:
+            for node in getattr(node_group, "nodes", []) or []:
+                if getattr(node, "bl_idname", "") != "SSMTNode_PostProcess_ShapeKeyExt":
+                    continue
+                mode_of = {}
+                for setting in getattr(node, "play_group_settings", []) or []:
+                    mode_of[int(getattr(setting, "group_index", 0) or 0)] = str(
+                        getattr(setting, "group_mode", "") or ""
+                    )
+                if "SEQUENCE" not in mode_of.values():
+                    continue
+
+                members = {}
+                totals = {}
+                for entry in getattr(node, "play_group_entries", []) or []:
+                    group_index = int(getattr(entry, "group_index", 0) or 0)
+                    key_name = str(getattr(entry, "shape_key_name", "") or "")
+                    if group_index <= 0 or not key_name:
+                        continue
+                    if mode_of.get(group_index) != "SEQUENCE":
+                        continue
+                    var = name_to_var.get(key_name)
+                    # 只统计**能映射到本次导出形态键变量**的成员：扩展节点里可能残留
+                    # 历史条目（改名/删除/未导出的键），它们不在 ini 的时间轴 N 里。
+                    # ini 的 N 正是「该组在本次导出变量里的成员数」。
+                    if not var:
+                        continue
+                    members.setdefault(group_index, []).append(var)
+                    totals[group_index] = totals.get(group_index, 0) + 1
+
+                sort_key = getattr(node, "_natural_sort_key", None)
+                for group_index, vars_in_group in members.items():
+                    if not vars_in_group:
+                        continue
+                    if callable(sort_key):
+                        vars_in_group.sort(key=sort_key)
+                    else:
+                        vars_in_group.sort()
+                    groups[group_index] = vars_in_group
+                group_totals.update(totals)
+        return groups, group_totals
+
+    def _parse_sequence_groups_from_ini(self, sections, ini_path=None):
+        """从 ini 里解析「形态键扩展」的序列分组。
+
+        返回 ``{组号: [(组内序号, $Freq_变量名), ...]}``（按序列顺序排序）。
+        只收「序列模式」的成员——同步模式的赋值是 `$x = $Freq_GroupN`，不带
+        `* N - idx`，自然不会被收进来。块不存在时返回空 dict（→ 回退旧模型）。
+
+        ``ini_path`` 给定时直接扫全文，比依赖 ``sections['[Present]']`` 的结构更稳
+        （后者受各 postprocess 节点的 tail/driver 切分逻辑影响）。
+        """
+        lines = None
+        if ini_path:
+            try:
+                with open(ini_path, "r", encoding="utf-8", errors="ignore") as file_obj:
+                    lines = file_obj.read().splitlines()
+            except Exception:
+                lines = None
+        if lines is None:
+            lines = sections.get('[Present]') or []
+
+        collected = {}
+        current = None
+        in_sync = False
+        for raw in lines:
+            text = raw.strip()
+            if not in_sync:
+                if '形态键扩展配置：组内变量同步' in text:
+                    in_sync = True
+                continue
+            if '结束组内变量同步' in text:
+                break
+            header = re.match(r';\s*分组(\d+)', text)
+            if header:
+                current = int(header.group(1))
+                collected.setdefault(current, [])
+                continue
+            member = re.match(r'\$(\w+)\s*=\s*\$Freq_Group\d+\s*\*\s*\d+\s*-\s*(\d+)', text)
+            if member and current is not None:
+                collected[current].append((int(member.group(2)), member.group(1)))
+
+        groups = {}
+        for group_index, items in collected.items():
+            if not items:
+                continue
+            items.sort(key=lambda pair: pair[0])
+            groups[group_index] = [var for _order, var in items]
+        return groups
+
+    def _build_frame_table_plan(self, unique_names, freq_params, sequence_groups, group_totals=None):
+        """把形态键索引编排成帧表分组计划。
+
+        每个分组 = 一条独立的帧序列；未分组的键各自成为「单帧组」（进度就是该键
+        自己的强度变量，等价于 N=1 的序列）。返回 None 表示信息不全，应回退旧模型。
+        """
+        # ini 的 sync 块里成员名不带 '$' 前缀（正则捕的是 \$ 之后的部分），
+        # 而 freq_params 的值带 '$'。两边必须规范化后再比对，否则分组会全部落空、
+        # 帧表退化成「每个键各自成组」，帧表路径等于整条失效。
+        var_to_freq = {}
+        for freq_index, name in enumerate(unique_names):
+            param = freq_params.get(name)
+            if param:
+                var_to_freq[str(param).lstrip("$")] = freq_index
+
+        groups = []
+        assigned = set()
+
+        for group_index in sorted(sequence_groups):
+            members = []
+            for var in sequence_groups[group_index]:
+                freq_index = var_to_freq.get(var)
+                if freq_index is None:
+                    continue
+                members.append(freq_index)
+                assigned.add(freq_index)
+            # 该组完全不属于本网格（例：尿道组只在上半身网格里）——跳过，不是错误。
+            # 必须先判空再校验，否则 expected 非零而 members 为空会被误判成「跨网格」，
+            # 导致整个帧表被放弃。
+            if not members:
+                continue
+            # 时间轴一致性：ini 侧进度是 `$Freq_GroupN * N - idx`（N = 该组在本次导出
+            # 变量里的完整成员数）。若本网格只命中其中一部分（分组跨网格、或组内有被
+            # 屏蔽/未导出的键），`t * M` 便不再等价于 `t * N`，序列姿态会整体错位且无
+            # 报错。这里直接放弃帧表、回退旧模型。
+            expected = int((group_totals or {}).get(group_index, 0) or 0)
+            if expected and len(members) != expected:
+                return None
+            groups.append({
+                "group": group_index,
+                "progress": f"$Freq_Group{group_index}",
+                "members": members,
+            })
+
+        for freq_index, name in enumerate(unique_names):
+            if freq_index in assigned:
+                continue
+            param = freq_params.get(name)
+            if not param:
+                return None
+            groups.append({"group": None, "progress": param, "members": [freq_index]})
+
+        if not groups:
+            return None
+        # t 寄存器上限：组映射表从 t52 起连续占用，而 t100/t101（拖拽驱动）与
+        # t102（权重缓冲）是固定用途，组数过多会互相覆盖。
+        if len(groups) > self.FRAME_TABLE_MAX_GROUPS:
+            return None
+        return {"groups": groups}
+
+    def _read_frame_table_inputs(self, actual_hash):
+        """读回刚写出的稀疏产物（帧表构建零侵入，不改动旧路径的产出）。"""
+        data_path = os.path.join(self.meshes_dir, f"{actual_hash}-Position_merged_packed_pos_delta.buf")
+        map_path = os.path.join(self.meshes_dir, f"{actual_hash}-Position_merged_map.buf")
+        freq_path = os.path.join(self.meshes_dir, f"{actual_hash}-Position_freq_indices.buf")
+        for path in (data_path, map_path, freq_path):
+            if not os.path.exists(path):
+                return None
+        raw = np.fromfile(data_path, dtype=np.float32)
+        merged_map = np.fromfile(map_path, dtype=np.int32)
+        freq_indices = np.fromfile(freq_path, dtype=np.uint32)
+        if merged_map.size == 0 or merged_map.size != freq_indices.size:
+            return None
+        active = int(merged_map.max()) + 1
+        if active <= 0 or raw.size % active != 0:
+            return None
+        per_record = raw.size // active
+        if per_record < 3:
+            return None
+        # 只取每条记录的前 3 个 float：形态键着色器只写回 position。
+        return raw.reshape(active, per_record)[:, :3], merged_map, freq_indices
+
+    def _pack_half_float3(self, values):
+        """把 (N,3) float32 逐条半精度打包：2 条记录占 3 个 uint32。
+
+        与 Toolset/shapekey_anim_frame_table.hlsl 的 ``frame_table_load`` 严格对齐：
+        偶数记录落在 [w0.lo, w0.hi, w1.lo]，奇数记录落在 [w1.hi, w2.lo, w2.hi]。
+        """
+        records = np.ascontiguousarray(values, dtype=np.float32)
+        count = records.shape[0]
+        if count == 0:
+            return np.zeros(0, dtype=np.uint32)
+        half_bits = records.astype(np.float16).view(np.uint16).reshape(-1).astype(np.uint32)
+        words = np.zeros(((count + 1) // 2) * 3, dtype=np.uint32)
+
+        even = np.arange(0, count, 2)
+        words[(even // 2) * 3] = half_bits[even * 3] | (half_bits[even * 3 + 1] << 16)
+        words[(even // 2) * 3 + 1] = half_bits[even * 3 + 2]
+
+        odd = np.arange(1, count, 2)
+        if odd.size:
+            words[(odd // 2) * 3 + 1] |= half_bits[odd * 3] << 16
+            words[(odd // 2) * 3 + 2] = half_bits[odd * 3 + 1] | (half_bits[odd * 3 + 2] << 16)
+        return words
+
+    def _write_frame_table_files(self, actual_hash, vertex_count, plan, inputs):
+        """构建并写出帧表 + 每组顶点局部索引表。
+
+        帧表第 m 条 = 组内前 m 个形态键的累积位移（relative to base，不含 base），
+        第 0 条恒为 0——于是「第 K 帧姿态 − base」与累积位移逐位等价。
+        """
+        delta_data, merged_map, freq_indices = inputs
+        slot_count = merged_map.size // vertex_count if vertex_count else 0
+        # 必须整除：freq_indices/merged_map 都是 (顶点数 × 槽位数) 展平而来，
+        # 不能整除说明读到的产物与当前顶点数不匹配（例如残留的旧文件）。
+        if vertex_count <= 0 or merged_map.size % vertex_count != 0 or slot_count <= 0:
+            return None
+        merged_map = merged_map.reshape(vertex_count, slot_count)
+        freq_indices = freq_indices.reshape(vertex_count, slot_count)
+
+        # key_records[freq_idx] = [(顶点数组, 位移载荷), ...]
+        # 同一形态键可跨多个槽位出现（各槽位覆盖的顶点集合通常不相交，
+        # 相交时位移应叠加，故统一按 np.add.at 累加而不是覆盖）。
+        key_records = {}
+        for slot_index in range(slot_count):
+            key_column = freq_indices[:, slot_index]
+            index_column = merged_map[:, slot_index]
+            valid = (key_column != 255) & (index_column >= 0)
+            if not valid.any():
+                continue
+            rows = np.flatnonzero(valid)
+            keys = key_column[rows]
+            for freq_index in np.unique(keys):
+                picked = rows[keys == freq_index]
+                key_records.setdefault(int(freq_index), []).append(
+                    (picked, delta_data[index_column[picked]])
+                )
+
+        table_parts = []
+        group_meta = []
+        offset = 0
+        for ordinal, group in enumerate(plan["groups"]):
+            members = group["members"]
+            key_mask = np.zeros(vertex_count, dtype=bool)
+            for freq_index in members:
+                for vertices, _payload in key_records.get(int(freq_index), ()):
+                    key_mask[vertices] = True
+            union_rows = np.flatnonzero(key_mask)
+            union_size = int(union_rows.size)
+            if union_size == 0:
+                continue
+
+            local_index = np.full(vertex_count, -1, dtype=np.int32)
+            local_index[union_rows] = np.arange(union_size, dtype=np.int32)
+
+            frames = np.zeros((len(members) + 1, union_size, 3), dtype=np.float32)
+            accumulator = np.zeros((union_size, 3), dtype=np.float32)
+            for step, freq_index in enumerate(members, start=1):
+                for vertices, payload in key_records.get(int(freq_index), ()):
+                    positions = np.searchsorted(union_rows, vertices)
+                    np.add.at(accumulator, positions, payload)
+                frames[step] = accumulator
+
+            # 注意：这里只收集原始记录，**不能**逐段打包。半精度打包把 2 条记录装进
+            # 3 个 uint32（每条 1.5 word），逐段打包时奇数条记录会产生半条 padding；
+            # 而 shader 是按「全局记录索引」推算 word 位置的（rec * 1.5），于是其后
+            # 所有组整体错位 3 个 word —— 实机表现为大范围顶点乱飞。
+            table_parts.append(frames.reshape(-1, 3))
+            # 序号必须连续：并集为空的组会被跳过，沿用 plan 的原始序号会让
+            # shader 里的 frame_group_map_N 与 map_register 错位。
+            slot_ordinal = len(group_meta)
+            group_meta.append({
+                "group": group["group"],
+                "progress": group["progress"],
+                "ordinal": slot_ordinal,
+                "key_count": len(members),
+                "union_size": union_size,
+                "offset": offset,
+                "map_register": self.FRAME_TABLE_GROUP_MAP_REGISTER_BASE + slot_ordinal,
+                "local_index": local_index,
+            })
+            offset += frames.shape[0] * union_size
+
+        if not group_meta:
+            return None
+
+        # 全部组的记录拼成一个连续数组后**一次性**打包，保证
+        # 「记录索引 → word 索引」的全局 1.5 倍关系处处成立。
+        all_records = (
+            np.concatenate(table_parts, axis=0)
+            if table_parts
+            else np.zeros((0, 3), dtype=np.float32)
+        )
+        table_path = os.path.join(self.meshes_dir, f"{actual_hash}-Position_frame_table.buf")
+        with open(table_path, "wb") as file_obj:
+            file_obj.write(self._pack_half_float3(all_records).tobytes())
+
+        for meta in group_meta:
+            map_path = os.path.join(self.meshes_dir, f"{actual_hash}-Position_group_map_{meta['ordinal']}.buf")
+            with open(map_path, "wb") as file_obj:
+                file_obj.write(meta["local_index"].tobytes())
+            meta["map_path"] = map_path
+
+        return {"groups": group_meta, "slot_count": slot_count}
+
+    # 帧表模板三个注入块的定位（与旧模板共用同一套标记）
+    FRAME_SHADER_BLOCK_RE = re.compile(
+        r"// --- \[PYTHON-MANAGED BLOCK START\] ---.*?// --- \[PYTHON-MANAGED BLOCK END\] ---",
+        re.DOTALL,
+    )
+    FRAME_SHADER_LOGIC_RE = re.compile(
+        r"// --- \[PYTHON-MANAGED LOGIC START\] ---.*?// --- \[PYTHON-MANAGED LOGIC END\] ---",
+        re.DOTALL,
+    )
+
+    def _build_frame_table_defines(self, key_count, frame_meta, vertex_count=0):
+        """帧表模式下的资源声明与分组常量。"""
+        lines = [
+            "// --- Shared Animation Intensity (per Shape Key Name) ---",
+            f"Buffer<float> ShapeKeyWeight : register(t{self.node.WEIGHT_BUFFER_REGISTER});",
+            f"#define SHAPEKEY_KEY_COUNT {key_count}u",
+            f"#define FRAME_GROUP_COUNT {len(frame_meta)}u",
+        ]
+        if vertex_count > 0:
+            # 用生成期已知的顶点数做边界，避免依赖 StructuredBuffer.Length
+            # （本路径未在实机验证过 .Length 的可用性，常量更确定）。
+            lines.append(f"#define FRAME_VERTEX_COUNT {int(vertex_count)}u")
+        else:
+            return []
+        for ordinal, meta in enumerate(frame_meta):
+            lines.append(
+                f"StructuredBuffer<int> frame_group_map_{ordinal} : register(t{meta['map_register']});"
+            )
+        for ordinal, meta in enumerate(frame_meta):
+            lines.append(f"#define GROUP{ordinal}_OFFSET {meta['offset']}u")
+            lines.append(f"#define GROUP{ordinal}_UNION {meta['union_size']}u")
+            lines.append(f"#define GROUP{ordinal}_KEYS {meta['key_count']}u")
+            lines.append(
+                f"#define GROUP{ordinal}_PROGRESS ShapeKeyWeight[{key_count + ordinal}] // {meta['progress']}"
+            )
+        return lines
+
+    def _build_frame_table_logic(self, frame_meta):
+        """每组的插值调用；组进度住在权重缓冲尾部，由权重同步 CS 每帧搬运。"""
+        lines = ["    // 帧表插值：每组只读「当前帧 / 下一帧」两条顺序记录。"]
+        for ordinal, meta in enumerate(frame_meta):
+            lines.extend([
+                "    {",
+                f"        int frame_local_{ordinal} = "
+                f"(i < FRAME_VERTEX_COUNT) ? frame_group_map_{ordinal}[i] : -1;",
+                # 上界同样要判：映射表若越界（文件过期/组间错配），SRV 读回 0 会被
+                # 当成合法的局部索引 0，从而静默串到该组第 0 条记录上。
+                f"        if (frame_local_{ordinal} >= 0 && frame_local_{ordinal} < (int)GROUP{ordinal}_UNION)",
+                "        {",
+                f"            total_diff_position += frame_table_sample("
+                f"GROUP{ordinal}_OFFSET, GROUP{ordinal}_UNION, GROUP{ordinal}_KEYS, "
+                f"(uint)frame_local_{ordinal}, GROUP{ordinal}_PROGRESS);",
+                "        }",
+                "    }",
+            ])
+        return lines
+
+    def _update_frame_table_shader(self, shader_path, template_path, key_count, frame_meta,
+                                   hash_val=None, vertex_count=0):
+        """把帧表配置注入模板并写到 shader_path。"""
+        # vertex_count 为 0 时 FRAME_VERTEX_COUNT 不会被定义，而注入的逻辑会引用它
+        # → shader 编译失败。这里直接拒绝，交由调用方回退旧模型。
+        if int(vertex_count or 0) <= 0 or not template_path:
+            return False
+        with open(template_path, "r", encoding="utf-8") as file_obj:
+            content = file_obj.read()
+
+        vertex_struct = self.node._get_vertex_struct_definition(hash_val=hash_val)
+        if vertex_struct:
+            content = re.sub(
+                r"struct VertexAttributes\s*\{[^}]*\};",
+                vertex_struct,
+                content,
+                flags=re.DOTALL,
+            )
+
+        define_lines = self._build_frame_table_defines(key_count, frame_meta, vertex_count)
+        logic_lines = self._build_frame_table_logic(frame_meta)
+
+        content = self.FRAME_SHADER_BLOCK_RE.sub(
+            lambda _match: (
+                "// --- [PYTHON-MANAGED BLOCK START] ---\n"
+                + "\n".join(define_lines)
+                + "\n// --- [PYTHON-MANAGED BLOCK END] ---"
+            ),
+            content,
+            count=1,
+        )
+        content = self.FRAME_SHADER_LOGIC_RE.sub(
+            lambda _match: (
+                "    // --- [PYTHON-MANAGED LOGIC START] ---\n"
+                + "\n".join(logic_lines)
+                + "\n    // --- [PYTHON-MANAGED LOGIC END] ---"
+            ),
+            content,
+            count=1,
+        )
+        write_text_if_changed(shader_path, content)
+        return True
+
     def _compose_slot_bytes(self, logical_hash, runtime_info, slot_index, names_data, slot_position_overrides):
         base_bytes = runtime_info["base_bytes"]
         position_stride = runtime_info["position_stride"]
@@ -585,6 +1047,7 @@ class DirectShapeKeyOutputMixin:
         merge_slot_files,
         preserved_driver_content="",
         drag_drive_resource=None,
+        frame_table_meta_map=None,
     ):
         if '[Constants]' not in sections:
             sections['[Constants]'] = []
@@ -664,6 +1127,9 @@ class DirectShapeKeyOutputMixin:
         generated_run_lines = {
             f"run = CustomShader_{logical_hash}_Anim"
             for logical_hash in unique_hashes
+        } | {
+            f"run = CustomShaderShapeKeyWeightSync_{logical_hash}"
+            for logical_hash in unique_hashes
         }
         line_index = 0
         while line_index < len(present_lines):
@@ -728,6 +1194,8 @@ class DirectShapeKeyOutputMixin:
                     constants_lines.append(declaration)
 
         compute_blocks_to_add = OrderedDict()
+        # 每个 hash 的形态键数量：权重缓冲的 array 容量（供资源段使用）
+        hash_weight_counts = {}
         for logical_hash in unique_hashes:
             hash_objects = hash_to_objects.get(logical_hash, [])
             hash_slot_data = hash_slot_data_map.get(logical_hash, {})
@@ -748,11 +1216,48 @@ class DirectShapeKeyOutputMixin:
             )
 
             block_name = f"[CustomShader_{logical_hash}_Anim]"
-            block_lines = ["\n    ; --- Shared Intensity Controls (per Shape Key Name) ---"]
+            # 形态键强度不再直读共享表：写进打包中转窗口 → 权重同步 CS 搬进
+            # mod 专属权重缓冲 → 窗口立即清零。与 node_postprocess 路径同格式。
+            _weight_h_prefix = self.node._extract_hash_prefix(logical_hash)
+            _weight_base_resources = hash_to_base_resources.get(_weight_h_prefix, [])
+            _weight_primary_base = (
+                _weight_base_resources[0]
+                if _weight_base_resources
+                else f"Resource_{self.node._hash_to_resource_prefix(logical_hash)}_Position"
+            )
+            weight_resource = derive_shapekey_weight_resource_name(_weight_primary_base)
+            # 帧表模式：组进度复用同一条打包窗口，紧跟在形态键强度之后，
+            # 于是权重同步 CS 会连进度一起搬进专属缓冲（无需新开通道）。
+            frame_meta = (frame_table_meta_map or {}).get(logical_hash)
+            frame_groups = frame_meta["groups"] if frame_meta else []
+            weight_slots = len(hash_unique_names) + len(frame_groups)
+            sync_lines = ["\n    ; --- Shape Key Weight Transfer (packed 4 keys per float4) ---"]
             for index, name in enumerate(hash_unique_names):
                 freq_param = shapekey_freq_params.get(name)
                 if freq_param:
-                    block_lines.append(f"    x{self.node.INTENSITY_START_INDEX + index} = {freq_param} \n; {name}")
+                    sync_lines.append(
+                        f"    {'xyzw'[index % 4]}{self.node.INTENSITY_START_INDEX + index // 4} = {freq_param} \n; {name}"
+                    )
+            for ordinal, group in enumerate(frame_groups):
+                slot = len(hash_unique_names) + ordinal
+                sync_lines.append(
+                    f"    {'xyzw'[slot % 4]}{self.node.INTENSITY_START_INDEX + slot // 4} = {group['progress']}"
+                    f" \n; frame group ordinal {ordinal} (group {group['group']})"
+                )
+            sync_lines.extend([
+                f"    cs = {WEIGHT_SYNC_SHADER_REL}",
+                f"    cs-u0 = {weight_resource}",
+                f"    Dispatch = {max(1, (weight_slots + 63) // 64)}, 1, 1",
+                "    cs-u0 = null",
+            ])
+            # 搬运后立即清零：共享表里不留形态键值，别的 mod 即使也占用这些槽位，
+            # 渲染期读到的也永远是 0。
+            for index in range(weight_slots):
+                sync_lines.append(
+                    f"    {'xyzw'[index % 4]}{self.node.INTENSITY_START_INDEX + index // 4} = 0"
+                )
+
+            block_lines = []
             if not use_optimized:
                 block_lines.append("\n    ; --- Per-Object Vertex Range Controls ---")
                 for index, obj_name in enumerate(hash_unique_objects):
@@ -778,7 +1283,22 @@ class DirectShapeKeyOutputMixin:
                 f"文件合并:{'是' if merge_slot_files else '否'}"
             )
             block_lines.append(f"\n    ; --- Binding Shape Key Meshess (Mode: {mode_str}) ---")
-            if merge_slot_files:
+            if frame_meta:
+                # 帧表模式：t51 给帧表，t52+ 给各组顶点局部索引表；
+                # 不再需要 merged delta / map / freq_indices（逐槽位遍历已被取代）。
+                block_lines.append("\n    ; --- Frame Table (per-group frame interpolation) ---")
+                block_lines.append(
+                    f"    cs-t51 = copy {derive_shapekey_frame_table_resource_name(primary_base_resource)}"
+                )
+                t_registers_to_null.append("cs-t51")
+                for ordinal, group in enumerate(frame_groups):
+                    register = group["map_register"]
+                    block_lines.append(
+                        f"    cs-t{register} = copy "
+                        f"{derive_shapekey_group_map_resource_name(primary_base_resource, ordinal)}"
+                    )
+                    t_registers_to_null.append(f"cs-t{register}")
+            elif merge_slot_files:
                 block_lines.append(f"    cs-t51 = copy {derive_shapekey_merged_data_resource_name(primary_base_resource, use_delta)}")
                 block_lines.append(f"    cs-t52 = copy {derive_shapekey_merged_map_resource_name(primary_base_resource)}")
                 t_registers_to_null.extend(["cs-t51", "cs-t52"])
@@ -814,6 +1334,11 @@ class DirectShapeKeyOutputMixin:
                 t_registers_to_null.append(f"cs-t{self.node.DRAG_DRIVE_REGISTER}")
                 t_registers_to_null.append(f"cs-t{self.node.DRAG_CLICK_COUNT_REGISTER}")
 
+            # 权重缓冲：mod 专属资源，由 CustomShaderShapeKeyWeightSync 每帧搬运
+            block_lines.append("\n    ; --- Shape Key Weight Buffer ---")
+            block_lines.append(f"    cs-t{self.node.WEIGHT_BUFFER_REGISTER} = {weight_resource}")
+            t_registers_to_null.append(f"cs-t{self.node.WEIGHT_BUFFER_REGISTER}")
+
             block_lines.append(f"    cs = ./res/shapekey_anim_{logical_hash}.hlsl")
             res_to_bind = base_resources if base_resources else [f"Resource_{self.node._hash_to_resource_prefix(logical_hash)}_Position"]
             if len(res_to_bind) > 1:
@@ -842,6 +1367,9 @@ class DirectShapeKeyOutputMixin:
             )
             block_lines.extend([f"    Dispatch = {dispatch_count}, 1, 1", "    cs-u5 = null", *[f"    {reg} = null" for reg in sorted(list(set(t_registers_to_null)))]] )
             compute_blocks_to_add[block_name] = block_lines
+            # 权重搬运段：每帧「写打包窗口 → 搬运 → 清零」，必须排在 Anim 之前
+            compute_blocks_to_add[f"[CustomShaderShapeKeyWeightSync_{logical_hash}]"] = sync_lines
+            hash_weight_counts[logical_hash] = weight_slots
 
         new_resource_lines = []
         generated_section_names = set()
@@ -857,6 +1385,46 @@ class DirectShapeKeyOutputMixin:
                 new_resource_lines.extend([section_name, "type = Buffer", f"stride = {stride}", f"filename = Meshes0000/{actual_file_hash}-Position.buf", ""])
                 generated_section_names.add(section_name)
 
+            # 形态键权重缓冲：mod 专属 RWBuffer（资源名即命名空间），由
+            # CustomShaderShapeKeyWeightSync 每帧写入。不给 filename 即零初始化。
+            # 容量 = 形态键数 + 组进度数（帧表模式下组进度住在尾部）。
+            weight_section_name = f"[{derive_shapekey_weight_resource_name(primary_base_resource)}]"
+            if weight_section_name not in sections and weight_section_name not in generated_section_names:
+                weight_capacity = max(1, int(hash_weight_counts.get(logical_hash, 1)))
+                new_resource_lines.extend([
+                    weight_section_name,
+                    "type = RWBuffer",
+                    "format = R32_FLOAT",
+                    f"array = {weight_capacity}",
+                    "",
+                ])
+                generated_section_names.add(weight_section_name)
+
+            # 帧表 + 各组顶点局部索引表（帧表模式专用）
+            frame_meta = (frame_table_meta_map or {}).get(logical_hash)
+            if frame_meta:
+                table_section = f"[{derive_shapekey_frame_table_resource_name(primary_base_resource)}]"
+                if table_section not in sections and table_section not in generated_section_names:
+                    new_resource_lines.extend([
+                        table_section,
+                        "type = Buffer",
+                        "stride = 4",
+                        f"filename = Meshes0000/{actual_file_hash}-Position_frame_table.buf",
+                        "",
+                    ])
+                    generated_section_names.add(table_section)
+                for ordinal, _group in enumerate(frame_meta["groups"]):
+                    map_section = f"[{derive_shapekey_group_map_resource_name(primary_base_resource, ordinal)}]"
+                    if map_section not in sections and map_section not in generated_section_names:
+                        new_resource_lines.extend([
+                            map_section,
+                            "type = Buffer",
+                            "stride = 4",
+                            f"filename = Meshes0000/{actual_file_hash}-Position_group_map_{ordinal}.buf",
+                            "",
+                        ])
+                        generated_section_names.add(map_section)
+
         if merge_slot_files:
             for logical_hash in unique_hashes:
                 hash_prefix = self.node._extract_hash_prefix(logical_hash)
@@ -868,17 +1436,21 @@ class DirectShapeKeyOutputMixin:
                 data_stride = self._delta_stride_for(logical_hash, base_stride) if use_delta else base_stride
                 base_resources = hash_to_base_resources.get(hash_prefix, [])
                 primary_base_resource = base_resources[0] if base_resources else f"Resource_{self.node._hash_to_resource_prefix(logical_hash)}_Position"
-                data_section = f"[{derive_shapekey_merged_data_resource_name(primary_base_resource, use_delta)}]"
-                data_filename = f"Meshes0000/{actual_file_hash}-Position{self.node._get_merged_data_file_suffix(use_delta)}.buf"
-                if data_section not in sections and data_section not in generated_section_names:
-                    new_resource_lines.extend([data_section, "type = Buffer", f"stride = {data_stride}", f"filename = {data_filename}", ""])
-                    generated_section_names.add(data_section)
+                # 帧表模式：shader 只读帧表与组映射，不再读 merged delta/map。
+                # 即使不绑定，光声明 [Resource] + filename 也会让 3DMigoto 把它加载进来，
+                # 白白吃掉上百 MB 的磁盘与显存（实机：帧表模式下这两项约 190 MB 纯冗余）。
+                if (frame_table_meta_map or {}).get(logical_hash) is None:
+                    data_section = f"[{derive_shapekey_merged_data_resource_name(primary_base_resource, use_delta)}]"
+                    data_filename = f"Meshes0000/{actual_file_hash}-Position{self.node._get_merged_data_file_suffix(use_delta)}.buf"
+                    if data_section not in sections and data_section not in generated_section_names:
+                        new_resource_lines.extend([data_section, "type = Buffer", f"stride = {data_stride}", f"filename = {data_filename}", ""])
+                        generated_section_names.add(data_section)
 
-                map_section = f"[{derive_shapekey_merged_map_resource_name(primary_base_resource)}]"
-                map_filename = f"Meshes0000/{actual_file_hash}-Position_merged_map.buf"
-                if map_section not in sections and map_section not in generated_section_names:
-                    new_resource_lines.extend([map_section, "type = Buffer", "stride = 4", f"filename = {map_filename}", ""])
-                    generated_section_names.add(map_section)
+                    map_section = f"[{derive_shapekey_merged_map_resource_name(primary_base_resource)}]"
+                    map_filename = f"Meshes0000/{actual_file_hash}-Position_merged_map.buf"
+                    if map_section not in sections and map_section not in generated_section_names:
+                        new_resource_lines.extend([map_section, "type = Buffer", "stride = 4", f"filename = {map_filename}", ""])
+                        generated_section_names.add(map_section)
         else:
             for slot_num, name_data in slot_to_name_to_objects.items():
                 for obj_name in [obj for _, objects in name_data.items() for obj in objects]:
@@ -915,6 +1487,9 @@ class DirectShapeKeyOutputMixin:
 
         if use_optimized:
             for logical_hash in unique_hashes:
+                # 帧表模式不声明 freq_indices（同上：只声明也会被加载）。
+                if (frame_table_meta_map or {}).get(logical_hash) is not None:
+                    continue
                 actual_file_hash = hash_to_actual_file_hash.get(logical_hash, logical_hash)
                 hash_prefix = self.node._extract_hash_prefix(logical_hash)
                 base_resources = hash_to_base_resources.get(hash_prefix, [])
@@ -923,6 +1498,27 @@ class DirectShapeKeyOutputMixin:
                 if freq_idx_section not in sections and freq_idx_section not in generated_section_names:
                     new_resource_lines.extend([freq_idx_section, "type = Buffer", "stride = 4", f"filename = Meshes0000/{actual_file_hash}-Position_freq_indices.buf", ""])
                     generated_section_names.add(freq_idx_section)
+
+        # 帧表模式：显式移除旧 ini 里残留的 merged / freq_indices 资源段。
+        # 只「不新增」不够 —— sections 是从旧 ini 读来的，旧段落会被原样写回，而
+        # 3DMigoto 只要看到 [Resource] + filename 就会加载（实机约 190 MB 纯冗余）。
+        if frame_table_meta_map:
+            for logical_hash in unique_hashes:
+                if frame_table_meta_map.get(logical_hash) is None:
+                    continue
+                hash_prefix = self.node._extract_hash_prefix(logical_hash)
+                base_resources = hash_to_base_resources.get(hash_prefix, [])
+                primary_base_resource = (
+                    base_resources[0]
+                    if base_resources
+                    else f"Resource_{self.node._hash_to_resource_prefix(logical_hash)}_Position"
+                )
+                for stale_section in (
+                    f"[{derive_shapekey_merged_data_resource_name(primary_base_resource, use_delta)}]",
+                    f"[{derive_shapekey_merged_map_resource_name(primary_base_resource)}]",
+                    f"[{derive_shapekey_freq_resource_name(primary_base_resource)}]",
+                ):
+                    sections.pop(stale_section, None)
 
         if new_resource_lines:
             sections[";; --- Generated Shape Key Meshess ---"] = new_resource_lines

@@ -88,6 +88,7 @@ _install_module(
     derive_shapekey_merged_map_resource_name=lambda *a: "",
     derive_shapekey_slot_map_resource_name=lambda *a: "",
     derive_shapekey_slot_resource_name=lambda *a: "",
+    derive_shapekey_weight_resource_name=lambda *a: "ResourceWeightStub",
     ensure_resource_alias_section=lambda *a, **_kw: "",
     resolve_hash_buffer_candidate=lambda *a, **_kw: None,
 )
@@ -318,7 +319,7 @@ class ShapeKeyDragDriveTests(unittest.TestCase):
         self.assertIn("anim_weight_slot0 = ShapeKeyDrive[sk_slot_slot0];", content)
         self.assertIn("#define FREQ1 (SHAPEKEY_ND_STAGE_IDS[0] == 0xFFFFFFFFu || ShapeKeyClickCount[SHAPEKEY_ZONE_IDS[0]] == SHAPEKEY_ND_STAGE_IDS[0]", content)
         # 未绑定形态键保持变量回退
-        self.assertIn("#define FREQ3 IniParams[102].x", content)
+        self.assertIn("#define FREQ3 ShapeKeyWeight[2]", content)
         # 未绑定守卫：不会访问 ShapeKeyDrive[-1]
         self.assertIn("0xFFFFFFFFu", content)
 
@@ -336,7 +337,7 @@ class ShapeKeyDragDriveTests(unittest.TestCase):
             self.assertIn("uint sk_slot_slot0 = SHAPEKEY_SLOT_IDS[freq_idx_slot0];", content, template_name)
             self.assertIn("ShapeKeyDrive[sk_slot_slot0]", content, template_name)
 
-    def test_disabled_keeps_original_ini_params_weight(self):
+    def test_disabled_reads_weight_from_dedicated_buffer(self):
         src = os.path.abspath(os.path.join("Toolset", "shapekey_anim_packed_delta_v5_merged.hlsl"))
         if not os.path.exists(src):
             self.skipTest("template missing")
@@ -356,7 +357,8 @@ class ShapeKeyDragDriveTests(unittest.TestCase):
         with open(dest, encoding="utf-8") as f:
             content = f.read()
         self.assertNotIn("ShapeKeyDrive", content)
-        self.assertIn("IniParams[100 + freq_idx_slot0].x", content)
+        self.assertIn("Buffer<float> ShapeKeyWeight : register(t102);", content)
+        self.assertIn("ShapeKeyWeight[freq_idx_slot0]", content)
 
     def test_no_zone_bound_still_emits_full_length_lookup_arrays(self):
         """开了拖拽驱动但一个区域都没绑：三张查找表必须满长度，不得发 [1] 占位。
@@ -399,8 +401,8 @@ class ShapeKeyDragDriveTests(unittest.TestCase):
         self.assertNotIn("SHAPEKEY_ZONE_IDS[1]", content)
         self.assertNotIn("SHAPEKEY_SLOT_IDS[1]", content)
         # 未绑定 → FREQ 走变量回退（面板变量直控形态键）
-        self.assertIn("#define FREQ1 IniParams[100].x", content)
-        self.assertIn("#define FREQ3 IniParams[102].x", content)
+        self.assertIn("#define FREQ1 ShapeKeyWeight[0]", content)
+        self.assertIn("#define FREQ3 ShapeKeyWeight[2]", content)
 
     def test_drag_drive_fields_hidden_when_toggle_off(self):
         node = _make_node({"A": 2})
