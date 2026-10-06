@@ -314,6 +314,33 @@ def derive_shapekey_group_map_resource_name(base_resource_name: str, group_index
     return clean_name + "_Position" + suffix
 
 
+def _append_shapekey_position_suffix(clean_name: str, suffix: str) -> str:
+    if clean_name.endswith("_Position"):
+        return clean_name + suffix
+    if clean_name.endswith("Position"):
+        return clean_name + suffix
+    return clean_name + "_Position" + suffix
+
+
+def derive_shapekey_vertex_entry_start_resource_name(base_resource_name: str) -> str:
+    """派生「顶点命中索引」的行偏移资源名称（顶点数 + 1 个 uint32）。
+
+    稀疏查找把 (顶点数 × 槽位数) 的稠密 FREQ 表转置成 CSR：第 i 个顶点的条目
+    区间是 [start[i], start[i + 1])，着色器只遍历自己命中的键。
+    """
+    return _append_shapekey_position_suffix(section_to_resource_name(base_resource_name), "_VertexEntryStart")
+
+
+def derive_shapekey_vertex_entry_packed_resource_name(base_resource_name: str) -> str:
+    """派生「顶点命中索引」的位移记录下标资源名称（int32，-1 = 无位移数据）。"""
+    return _append_shapekey_position_suffix(section_to_resource_name(base_resource_name), "_VertexEntryPacked")
+
+
+def derive_shapekey_vertex_entry_freq_resource_name(base_resource_name: str) -> str:
+    """派生「顶点命中索引」的强度槽位资源名称（uint32，索引 ShapeKeyWeight）。"""
+    return _append_shapekey_position_suffix(section_to_resource_name(base_resource_name), "_VertexEntryFreq")
+
+
 def _normalize_hash_prefix(value: str) -> str:
     normalized_value = str(value or "").strip()
     if normalized_value.upper().startswith("LOD") and "." in normalized_value:

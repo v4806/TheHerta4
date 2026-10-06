@@ -419,6 +419,31 @@ class DirectShapeKeyGenerator(
                     "帧表插值无法启用。请修正以下设置，或取消勾选「帧表插值（序列组加速）」后重试：\n"
                     + "\n".join("  - " + reason for reason in frame_table_blocked)
                 )
+
+        # 顶点命中索引（稀疏查找）准备：把「每顶点遍历全部槽位」换成「只遍历该顶点
+        # 命中的槽位」。与帧表同样是「勾选了就明确成功或明确失败」，不静默回退。
+        sparse_requested = bool(getattr(self.node, "use_sparse_vertex_index", False))
+        use_sparse_vertex_index = self.node.effective_use_sparse_index(
+            use_packed, use_delta, use_optimized, merge_slot_files
+        )
+        if sparse_requested:
+            # 只要勾了就走这里：① 四项前置缺一不可；② 与帧表互斥——帧表即便前置
+            # 齐全也必须拦下，否则稀疏资源段与 cs-t96/97/98 会被绑到帧表着色器上
+            # （它没有这些寄存器），加载即出错。两种情况都明确失败，不静默回退。
+            sparse_blockers = list(
+                self.node._sparse_index_blockers(
+                    use_packed, use_delta, use_optimized, merge_slot_files
+                )
+            )
+            if frame_table_mode:
+                sparse_blockers.append(
+                    "「帧表插值（序列组加速）」：与顶点命中索引是互斥的两套渲染模型"
+                )
+            if sparse_blockers:
+                raise ShapeKeyDirectExportError(
+                    "「顶点命中索引（稀疏查找）」无法启用。请修正以下设置，或取消勾选后重试：\n"
+                    + "\n".join("  - " + reason for reason in sparse_blockers)
+                )
         if frame_table_mode:
             freq_params = {
                 name: self.node.get_shape_key_export_variable_name(name) for name in all_unique_names
@@ -482,16 +507,29 @@ class DirectShapeKeyGenerator(
                 LOG.info(
                     f"Direct ShapeKey: write freq indices hash={logical_hash}, names={hash_unique_names}, objects={hash_unique_objects}, vertex_count={vertex_count}"
                 )
-                self._write_freq_indices(
-                    logical_hash=logical_hash,
-                    actual_hash=hash_to_actual_file_hash.get(logical_hash, logical_hash),
-                    hash_slot_data=hash_slot_data,
-                    unique_names=hash_unique_names,
-                    vertex_count=vertex_count,
-                    calculated_ranges=calculated_ranges,
-                    merged_index_map=hash_to_merged_index_map.get(logical_hash),
-                    slot_index_maps=hash_to_slot_maps.get(logical_hash, {}),
-                )
+                if use_sparse_vertex_index:
+                    # 稀疏模式只写三份顶点命中索引，不写稠密 FREQ 表。
+                    self._write_sparse_vertex_index(
+                        logical_hash=logical_hash,
+                        actual_hash=hash_to_actual_file_hash.get(logical_hash, logical_hash),
+                        hash_slot_data=hash_slot_data,
+                        unique_names=hash_unique_names,
+                        vertex_count=vertex_count,
+                        calculated_ranges=calculated_ranges,
+                        merged_index_map=hash_to_merged_index_map.get(logical_hash),
+                        slot_index_maps=hash_to_slot_maps.get(logical_hash, {}),
+                    )
+                else:
+                    self._write_freq_indices(
+                        logical_hash=logical_hash,
+                        actual_hash=hash_to_actual_file_hash.get(logical_hash, logical_hash),
+                        hash_slot_data=hash_slot_data,
+                        unique_names=hash_unique_names,
+                        vertex_count=vertex_count,
+                        calculated_ranges=calculated_ranges,
+                        merged_index_map=hash_to_merged_index_map.get(logical_hash),
+                        slot_index_maps=hash_to_slot_maps.get(logical_hash, {}),
+                    )
 
             frame_table_meta = None
             frame_vertex_count = hash_to_vertex_count.get(
@@ -581,6 +619,7 @@ class DirectShapeKeyGenerator(
                     drag_dirs=self.node._drag_drive_dirs(hash_unique_names) if drag_drive_enabled else None,
                     hash_val=logical_hash,
                     source_path=shader_source_path,
+                    use_sparse_vertex_index=use_sparse_vertex_index,
                 )
         LOG.info(f"直出形态键: shader/freq 写出完成 {perf_counter() - stage_start:.3f}s")
 
@@ -606,6 +645,7 @@ class DirectShapeKeyGenerator(
             merge_slot_files=merge_slot_files,
             drag_drive_resource=drag_drive_resource,
             frame_table_meta_map=frame_table_meta_map,
+            use_sparse_index=use_sparse_vertex_index,
         )
         LOG.info(f"直出形态键: ini 更新完成 {perf_counter() - stage_start:.3f}s")
 

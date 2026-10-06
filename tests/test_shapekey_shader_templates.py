@@ -20,6 +20,8 @@ class ShapeKeyShaderTemplateTests(unittest.TestCase):
             "shapekey_anim_standard_delta_v3.hlsl",
             "shapekey_anim_packed_delta_v5_merged.hlsl",
             "shapekey_anim_packed_v5_merged.hlsl",
+            "shapekey_anim_packed_delta_v6_sparse.hlsl",
+            "shapekey_anim_frame_table.hlsl",
         ):
             with self.subTest(shader=shader_filename):
                 self._assert_vertex_bounds_guard(shader_filename)
