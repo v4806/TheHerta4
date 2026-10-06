@@ -713,6 +713,40 @@ class SparseNodeWiringTests(unittest.TestCase):
             self.assertNotIn("sparse_entry", shader_source)
 
 
+class SparseFrameTableExclusionTests(unittest.TestCase):
+    """「顶点命中索引」与「帧表插值」在面板层就是硬互斥：勾一个自动取消另一个。
+
+    与「存储顶点增量 / 储存全部顶点属性增量」同一套做法（``update=`` 回调），
+    而不是只在面板上写一行提醒——两套渲染模型各有自己的骨架与资源段，
+    同时勾选会把稀疏的三条缓冲绑到没有这些寄存器声明的帧表骨架上。
+    """
+
+    def test_checking_sparse_index_clears_the_frame_table(self):
+        node = _make_shape_key_node(use_sparse_vertex_index=True, use_frame_table=True)
+        node_module.sync_shapekey_sparse_index_mode(node, None)
+        self.assertTrue(node.use_sparse_vertex_index)
+        self.assertFalse(node.use_frame_table)
+
+    def test_checking_the_frame_table_clears_sparse_index(self):
+        node = _make_shape_key_node(use_sparse_vertex_index=True, use_frame_table=True)
+        node_module.sync_shapekey_frame_table_mode(node, None)
+        self.assertTrue(node.use_frame_table)
+        self.assertFalse(node.use_sparse_vertex_index)
+
+    def test_unchecking_leaves_the_other_switch_alone(self):
+        node = _make_shape_key_node(use_sparse_vertex_index=False, use_frame_table=False)
+        node_module.sync_shapekey_sparse_index_mode(node, None)
+        node_module.sync_shapekey_frame_table_mode(node, None)
+        self.assertFalse(node.use_sparse_vertex_index)
+        self.assertFalse(node.use_frame_table)
+
+    def test_both_switches_carry_the_exclusion_callback(self):
+        source = (REPO_ROOT / "blueprint" / "node_postprocess_shapekey.py").read_text(encoding="utf-8")
+        self.assertIn("update=sync_shapekey_sparse_index_mode", source)
+        self.assertIn("update=sync_shapekey_frame_table_mode", source)
+        self.assertIn("def _enforce_exclusive_sparse_frame_table(node, keep: str):", source)
+
+
 # ============================================================================
 # 6. 直出侧：ini 资源段与 Present 绑定
 # ============================================================================

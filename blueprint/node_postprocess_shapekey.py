@@ -189,6 +189,28 @@ def sync_shapekey_all_channels_mode(node, _context):
     _enforce_exclusive_delta_mode(node, "store_all_vertex_channels")
 
 
+def _enforce_exclusive_sparse_frame_table(node, keep: str):
+    """「顶点命中索引（稀疏查找）」与「帧表插值（序列组加速）」互斥：勾选一个即取消另一个。
+
+    两者是**互相取代**的两套渲染模型：稀疏索引把稠密 FREQ 表转置成逐顶点条目
+    （骨架声明 t96/t97/t98），帧表则把序列组编译成逐帧位移表（另一套骨架与资源段）。
+    同时生效会把稀疏的三条缓冲绑到没有这些寄存器声明的帧表骨架上，加载即出错，
+    所以在面板层就做成和「存储顶点增量 / 储存全部顶点属性增量」一样的硬互斥，
+    而不是等导出时再报错。
+    """
+    other = "use_frame_table" if keep == "use_sparse_vertex_index" else "use_sparse_vertex_index"
+    if bool(getattr(node, keep, False)) and bool(getattr(node, other, False)):
+        setattr(node, other, False)
+
+
+def sync_shapekey_sparse_index_mode(node, _context):
+    _enforce_exclusive_sparse_frame_table(node, "use_sparse_vertex_index")
+
+
+def sync_shapekey_frame_table_mode(node, _context):
+    _enforce_exclusive_sparse_frame_table(node, "use_frame_table")
+
+
 class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
     INI_PREAMBLE_KEY = "__SSMT_INI_PREAMBLE__"
     bl_idname = 'SSMTNode_PostProcess_ShapeKey'
@@ -259,9 +281,11 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
             "两次做插值，取代逐顶点遍历全部槽位（旧模型每顶点固定遍历 num_slots 次）。"
             "显著降低 GPU 计算量、着色器体积与 Present 行数（重载后编译更快）。"
             "序列组来自「形态键扩展」节点的分组配置；未启用扩展或分组信息缺失时自动回退旧模型。"
+            "与「顶点命中索引（稀疏查找）」互斥：勾选本项会自动取消那一项。"
             "需要 'numpy' 库。"
         ),
-        default=False
+        default=False,
+        update=sync_shapekey_frame_table_mode,
     )
     merge_slot_files: bpy.props.BoolProperty(
         name="合并槽位文件",
@@ -276,9 +300,11 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
             "索引体积从「顶点数 × 槽位数 × 4B」降到「顶点数 × 4B + 命中数 × 8B」，"
             "逻辑块行数与键数脱钩。绝对形态键（互不相关的独立键）同样受益。"
             "需要同时开启「使用紧凑缓冲区 / 存储顶点增量 / 优化查找性能 / 合并槽位文件」，"
-            "且与「帧表插值」「拖拽驱动形态键」互斥。需要 'numpy' 库。"
+            "且与「帧表插值（序列组加速）」互斥：勾选本项会自动取消那一项。"
+            "与「拖拽驱动形态键」可以同时使用。需要 'numpy' 库。"
         ),
-        default=False
+        default=False,
+        update=sync_shapekey_sparse_index_mode,
     )
     # 直出开关和同蓝图中的其他 ShapeKey 后处理节点同步，避免槽位资源生成策略不一致。
     # 默认勾选（True）：形态键导出只走直出路线；经典（非直出）路线会把键块在标准前处理里
