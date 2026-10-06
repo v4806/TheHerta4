@@ -12,14 +12,37 @@ class ZZMIContractTests(unittest.TestCase):
         )
         self.assertEqual(result["level"], "notice")
 
-    def test_disabled_checkbox_with_global_data_is_error(self):
+    def test_disabled_checkbox_with_cached_data_is_plain_export(self):
+        """关闭复选框 = 普通导出（几何按部件局部编号），残留缓存不构成错误。
+
+        缓存由导入侧无条件落盘（生成侧/消费侧分离），与用户是否开过该开关
+        无关；旧实现把「关闭 + 有缓存」当成致命错误，会误伤普通导出，且它
+        给出的「关闭开关后重新导入」出路也不成立（重导入不清理既有缓存）。
+        """
         result = evaluate_merged_skeleton_contract(
             checkbox_enabled=False,
             parts_with_data=2,
             component_count=0,
         )
+        self.assertEqual(result["level"], "notice")
+        self.assertIn("普通导出", result["message"])
+        self.assertEqual(result["hint"], "")
+
+    def test_disabled_checkbox_with_global_geometry_is_error(self):
+        """几何**确实**使用全局骨骼编号 ⇒ 仍然中止：这是「导入时开着开关、
+
+        导出前把开关关掉」的真危险场景（导出的几何没有运行时合并骨架）。
+        判据由调用方从顶点组编号空间读出，缓存有无不再参与判定。
+        """
+        result = evaluate_merged_skeleton_contract(
+            checkbox_enabled=False,
+            parts_with_data=2,
+            parts_with_global_ids=1,
+            component_count=0,
+        )
         self.assertEqual(result["level"], "error")
-        self.assertIn("重新导入", result["hint"])
+        self.assertIn("确实", result["message"])
+        self.assertIn("重新一键导入", result["hint"])
 
     def test_rejected_all_components_is_error_and_lists_reason(self):
         result = evaluate_merged_skeleton_contract(

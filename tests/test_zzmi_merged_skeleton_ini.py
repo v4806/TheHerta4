@@ -354,6 +354,17 @@ class _FakeSubmesh:
         self.drawcall_model_list = []
 
 
+class _FakeDrawCall:
+    """最小 DrawCall 桩：契约的几何判据要按对象名解析 Blender 对象。"""
+
+    def __init__(self, obj_name):
+        self.obj_name = obj_name
+        self.source_obj_name = ""
+
+    def get_blender_obj_name(self):
+        return self.source_obj_name or self.obj_name
+
+
 class _FakeDrawIBModel:
     def __init__(self, draw_ib, submesh_model_list, part_map=None):
         self.draw_ib = draw_ib
@@ -4744,37 +4755,76 @@ class ZZMIMergedContractWiringTests(unittest.TestCase):
             {
                 "checkbox_enabled": True,
                 "parts_with_data": 1,
+                "parts_with_global_ids": 0,
                 "component_count": 1,
                 "skip_reasons": {},
             },
         )
         # 契约在先、落盘点在后：本用例 level=ok 因此确实走到了落盘点；
-        # 「判定发生在写盘之前」由下面两个 error 用例做强断言（落盘点从未到达）。
+        # 「判定发生在写盘之前」由下面的 error 用例做强断言（落盘点从未到达）。
         self.assertTrue(write_reached)
         self.assertIsInstance(raised, _StopExportSentinel)
 
-    # ---- 2) error 场景 A：开关关闭 + 有数据 ⇒ 写盘前中止 ------------------
-    def test_error_disabled_checkbox_with_data_aborts_before_writing(self):
+    # ---- 2) 开关关闭 + 有数据 ⇒ 普通导出，不中止 ---------------------------
+    def _model_with_object(self, group_names):
+        """给 `_data_model()` 的代表对象挂上给定数字顶点组名（几何判据输入）。"""
+        model = self._data_model()  # vg_count=51, vg_offset=154
+        submesh = model.submesh_model_list[0]
+        obj = _fake_bpy_data.objects.new(submesh.unique_str)
+        for group_name in group_names:
+            obj.vertex_groups.new(name=group_name)
+        submesh.drawcall_model_list = [_FakeDrawCall(submesh.unique_str)]
+        return model
+
+    def test_disabled_checkbox_with_data_exports_plainly(self):
+        """关闭复选框时几何是部件局部编号（合并预处理被该开关门控），
+
+        因此工作区残留的 VGMap 缓存（导入侧无条件生成）不参与本次导出，
+        契约按普通导出放行：必须走到落盘点，且**不得**抛 Fatal。
+        """
         exporter = self._exporter([self._data_model()], merged_vgmap=False)
-        decisions, write_reached, raised, _stdout = self._run_export_impl(exporter)
+        decisions, write_reached, raised, stdout = self._run_export_impl(exporter)
 
         self.assertEqual(
             decisions,
             [{
                 "checkbox_enabled": False,
                 "parts_with_data": 1,
+                "parts_with_global_ids": 0,
                 "component_count": 0,
                 "skip_reasons": {},
             }],
         )
-        self.assertFalse(write_reached, "契约 error 时不得到达任何落盘点")
-        self.assertEqual(os.listdir(self._tmp_dir), [], "不得写出任何输出文件")
-        self.assertIsNotNone(raised)
+        self.assertTrue(write_reached, "普通导出必须继续（要走到落盘点）")
+        self.assertIsInstance(raised, _StopExportSentinel)
+        self.assertIn("普通导出", stdout)
+
+    def test_disabled_checkbox_with_local_vertex_groups_exports_plainly(self):
+        """几何顶点组是部件局部编号 ``0..vg_count-1`` ⇒ 判为普通导出。"""
+        model = self._model_with_object(str(i) for i in range(51))
+        exporter = self._exporter([model], merged_vgmap=False)
+        decisions, write_reached, raised, _stdout = self._run_export_impl(exporter)
+
+        self.assertEqual(decisions[0]["parts_with_global_ids"], 0)
+        self.assertTrue(write_reached, "局部编号必须继续导出")
+        self.assertIsInstance(raised, _StopExportSentinel)
+
+    def test_disabled_checkbox_with_global_vertex_groups_still_aborts(self):
+        """几何顶点组**确实**落在全局骨骼编号空间 ⇒ 仍中止（保护未被削弱）。
+
+        「导入时开着开关、导出前把开关关掉」才有的真危险场景。本部件
+        vg_offset=154 / vg_count=51，局部空间只可能是 `0..50`，组名从 154 起
+        只能解释为全局骨骼 id。
+        """
+        model = self._model_with_object(str(154 + i) for i in range(51))
+        exporter = self._exporter([model], merged_vgmap=False)
+        decisions, write_reached, raised, _stdout = self._run_export_impl(exporter)
+
+        self.assertEqual(decisions[0]["parts_with_global_ids"], 1)
+        self.assertFalse(write_reached, "确证几何是全局编号时不得写出任何输出文件")
+        self.assertEqual(os.listdir(self._tmp_dir), [])
         self.assertEqual(type(raised).__name__, "Fatal")
-        text = str(raised)
-        self.assertIn("骨骼合并中止", text)
-        self.assertIn("使用融合统一顶点组", text)      # message（用户可见）
-        self.assertIn("打开", text)                    # hint（用户可见）
+        self.assertIn("确实", str(raised))
 
     # ---- 3) error 场景 B：有数据但全部被拒 ⇒ 写盘前中止 + 列出原因 --------
     def test_error_all_parts_rejected_lists_reasons_and_aborts(self):
@@ -4811,6 +4861,7 @@ class ZZMIMergedContractWiringTests(unittest.TestCase):
             [{
                 "checkbox_enabled": False,
                 "parts_with_data": 0,
+                "parts_with_global_ids": 0,
                 "component_count": 0,
                 "skip_reasons": {},
             }],
