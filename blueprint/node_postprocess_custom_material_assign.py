@@ -75,6 +75,10 @@ _MATERIAL_PROBE_TYPES = (
 #:   源为 null 时不会覆盖槽位），并且**保证它们的绘制点排在段内所有 MOD
 #:   覆盖之前** —— 定义之前游戏原版贴图自然就在槽位上。
 #: * 同 hash 段里的绘制顺序才是关键：非目标部件在前、目标部件在后。
+#: * 由此得出**按参数类型分流**的回退规则（实现见 ``_is_slot_style_param``）：
+#:   ``Resource\<ns>\Xxx`` 这类别名可以写 ``= null``（SlotFix 会放行）；
+#:   而 ``ps-tN`` / ``this`` 直接指向槽位，只能**整行删除** —— 不写赋值就等于
+#:   保留游戏原生贴图，写 ``= null`` 反而是显式解绑。
 
 #: 资源定义段里的 ``filename = ...`` 行。
 _FILENAME_LINE_RE = re.compile(
@@ -95,6 +99,17 @@ _ACTIVATION_FLAG_DECL_RE = re.compile(
     re.IGNORECASE,
 )
 _ACTIVATION_FLAG_SET_RE = re.compile(r"^[ \t]*(\$[A-Za-z_]\w*)[ \t]*=[ \t]*1[ \t]*$")
+
+
+def _is_slot_style_param(param) -> bool:
+    r"""绑定行的参数是不是「直接指向游戏槽位」的形态（``ps-tN`` / ``this``）。
+
+    这类参数回退时**只能整行删除**：写 ``ps-tN = null`` / ``this = null`` 等于
+    显式解绑，会让该部件直接变纯黑（见上方回退原理备忘）。``Resource\<ns>\Xxx``
+    这类别名则写 ``= null``，是否覆盖槽位交给 ZZMI 的 SlotFix（``unless_null``）。
+    """
+    text = str(param or "").strip().lower()
+    return text == "this" or text.startswith("ps-t")
 
 
 def _iter_ini_lines(sections):
@@ -3033,8 +3048,11 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
         它便停留在游戏原生贴图上。
 
         **绝不写 ``ps-tN = null``**：那是显式解绑，会让该部件直接变纯黑
-        （2026-10-06 实测）。排在 MOD 覆盖之后的非目标网格不做处理并计数上报，
-        因为那时槽位已被前面的块占住，置 null 同样拿不到原生贴图。
+        （2026-10-06 实测）。按参数类型分流（``_is_slot_style_param``）：
+        ``Resource\\<ns>\\Xxx`` 这类别名置 ``= null``；``ps-tN`` / ``this``
+        这类直接指向槽位的绑定**整行删除**（不写赋值 = 游戏原生贴图还在槽位里）。
+        排在 MOD 覆盖之后的非目标网格不做处理并计数上报，因为那时槽位已被前面
+        的块占住，回退同样拿不到原生贴图。
 
         随后回收因此失去全部引用的 ``[Resource-...]`` / ``[Resource_...]``
         定义段，最后删除这些定义段指向的、不再被任何 INI 引用的贴图文件。
@@ -3054,6 +3072,7 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
             return 0
 
         removed_bindings = 0
+        removed_slot_lines = 0
         removed_sections = 0
         skipped_sections = 0
         skipped_meshes = 0
@@ -3151,6 +3170,13 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
                         if match:
                             freed_resources.add(match.group("resource"))
                             removed_bindings += 1
+                            if _is_slot_style_param(match.group("param")):
+                                # ps-tN / this 直接指向游戏槽位：写 ``= null`` 是
+                                # 显式解绑（部件纯黑），只能整行删除——不写赋值，
+                                # 游戏自己绑定的那张纹理就还在槽位里。
+                                removed_slot_lines += 1
+                                section_changed = True
+                                continue
                             new_lines.append(f"{foreign_bindings[index]} = null")
                             section_changed = True
                             continue
@@ -3212,7 +3238,9 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
 
         if removed_bindings or removed_sections or removed_files:
             print(
-                f"[材质转资源pro] 已清除未指定部件贴图：置空绑定行 {removed_bindings}、"
+                f"[材质转资源pro] 已清除未指定部件贴图：回退绑定行 {removed_bindings}"
+                f"（删除槽位绑定 {removed_slot_lines} 行、别名置空 "
+                f"{removed_bindings - removed_slot_lines} 行）、"
                 f"资源定义段 {removed_sections}、贴图文件 {removed_files}"
             )
         if skipped_sections:

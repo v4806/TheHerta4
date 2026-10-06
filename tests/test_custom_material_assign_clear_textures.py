@@ -659,5 +659,164 @@ class NonTargetCleanupTests(_Base):
         self.assertTrue(os.path.exists(path))
 
 
+class SlotStyleBindingTests(_Base):
+    """回退绑定必须按参数类型分流（PR #23 的原始实现漏了这一步）。
+
+    ``Resource\\<ns>\\Xxx`` 这类别名写 ``= null``；而 ``ps-tN`` / ``this`` 直接
+    指向游戏槽位，写 ``= null`` 是**显式解绑**，会让该部件变纯黑（实测结论见
+    ``blueprint/node_postprocess_custom_material_assign.py`` 顶部备忘），只能整行
+    删除——不写赋值，游戏自己绑定的那张纹理就还在槽位里。
+    """
+
+    def _write_slot_ini(self, binding_line):
+        self._write_ini(
+            "\n".join(
+                [
+                    "[TextureOverride_LOD0.aaa_1_0]",
+                    "hash = aaa",
+                    binding_line,
+                    "; [mesh:LOD0.aaa-1-0.杂项_copy] [vertex_count:8]",
+                    "drawindexed = 6,0,0",
+                    "",
+                    "[Resource-aaa-1-0-DiffuseMap]",
+                    "filename = Textures/aaa-1-0-DiffuseMap.dds",
+                    "",
+                ]
+            )
+        )
+        self._write_texture("Textures/aaa-1-0-DiffuseMap.dds")
+
+    def test_ps_t_binding_is_deleted_instead_of_nulled(self):
+        self._register_objects("LOD0.aaa-1-0.杂项", "LOD0.bbb-2-0.主体")
+        self._write_slot_ini("ps-t0 = Resource-aaa-1-0-DiffuseMap")
+
+        self._run(["LOD0.bbb-2-0.主体"])
+
+        content = self._read()
+        self.assertNotIn("ps-t0", content)
+        self.assertNotIn("ps-t0 = null", content)
+        self.assertNotIn("[Resource-aaa-1-0-DiffuseMap]", content)
+        self.assertFalse(
+            os.path.exists(os.path.join(self.mod_root, "Textures", "aaa-1-0-DiffuseMap.dds"))
+        )
+        # 段头与绘制行必须保留，段本身不能消失
+        self.assertIn("[TextureOverride_LOD0.aaa_1_0]", content)
+        self.assertIn("drawindexed = 6,0,0", content)
+
+    def test_this_binding_is_deleted_instead_of_nulled(self):
+        self._register_objects("LOD0.aaa-1-0.杂项", "LOD0.bbb-2-0.主体")
+        self._write_slot_ini("this = Resource-aaa-1-0-DiffuseMap")
+
+        self._run(["LOD0.bbb-2-0.主体"])
+
+        content = self._read()
+        self.assertNotIn("this", content)
+        self.assertNotIn("this = null", content)
+        self.assertNotIn("[Resource-aaa-1-0-DiffuseMap]", content)
+        self.assertIn("drawindexed = 6,0,0", content)
+
+    def test_alias_and_slot_bindings_split_by_param_type(self):
+        """同一段里两种形态并存：别名置 null、槽位整行删除。"""
+        self._register_objects("LOD0.aaa-1-0.杂项", "LOD0.bbb-2-0.主体")
+        self._write_ini(
+            "\n".join(
+                [
+                    "[TextureOverride_LOD0.aaa_1_0]",
+                    "hash = aaa",
+                    r"Resource\ZZMI\Diffuse = ref Resource-aaa-1-0-DiffuseMap",
+                    "ps-t0 = Resource-bbb-2-0-DiffuseMap",
+                    "; [mesh:LOD0.aaa-1-0.杂项_copy] [vertex_count:8]",
+                    "drawindexed = 6,0,0",
+                    "",
+                    "[Resource-aaa-1-0-DiffuseMap]",
+                    "filename = Textures/aaa-1-0-DiffuseMap.dds",
+                    "",
+                    "[Resource-bbb-2-0-DiffuseMap]",
+                    "filename = Textures/bbb-2-0-DiffuseMap.dds",
+                    "",
+                ]
+            )
+        )
+        self._write_texture("Textures/aaa-1-0-DiffuseMap.dds")
+        self._write_texture("Textures/bbb-2-0-DiffuseMap.dds")
+
+        self._run(["LOD0.bbb-2-0.主体"])
+
+        content = self._read()
+        self.assertIn("Resource\\ZZMI\\Diffuse = null", content)
+        self.assertNotIn("ps-t0", content)
+        self.assertNotIn("[Resource-aaa-1-0-DiffuseMap]", content)
+        self.assertNotIn("[Resource-bbb-2-0-DiffuseMap]", content)
+        self.assertFalse(
+            os.path.exists(os.path.join(self.mod_root, "Textures", "aaa-1-0-DiffuseMap.dds"))
+        )
+        self.assertFalse(
+            os.path.exists(os.path.join(self.mod_root, "Textures", "bbb-2-0-DiffuseMap.dds"))
+        )
+
+    def test_slot_style_binding_of_target_part_is_kept(self):
+        self._register_objects("LOD0.aaa-1-0.杂项", "LOD0.bbb-2-0.主体")
+        self._write_slot_ini("ps-t0 = Resource-aaa-1-0-DiffuseMap")
+
+        self._run(["LOD0.aaa-1-0.杂项"])
+
+        content = self._read()
+        self.assertIn("ps-t0 = Resource-aaa-1-0-DiffuseMap", content)
+        self.assertIn("[Resource-aaa-1-0-DiffuseMap]", content)
+        self.assertTrue(
+            os.path.exists(os.path.join(self.mod_root, "Textures", "aaa-1-0-DiffuseMap.dds"))
+        )
+
+    def test_slot_style_binding_after_mod_coverage_is_left_untouched(self):
+        """排在 MOD 覆盖之后的槽位绑定动不了，必须原样留着（与别名分支同规则）。"""
+        self._register_objects("LOD0.aaa-1-0.杂项", "LOD0.bbb-2-0.主体")
+        self._write_ini(
+            "\n".join(
+                [
+                    "[TextureOverride_LOD0.aaa_1_0]",
+                    "hash = aaa",
+                    "ps-t0 = Resource-aaa-1-0-DiffuseMap",
+                    "; [mesh:LOD0.bbb-2-0.主体_copy] [vertex_count:8]",
+                    "drawindexed = 6,0,0",
+                    "ps-t0 = Resource-ccc-3-0-DiffuseMap",
+                    "; [mesh:LOD0.aaa-1-0.杂项_copy] [vertex_count:8]",
+                    "drawindexed = 6,0,0",
+                    "",
+                    "[Resource-aaa-1-0-DiffuseMap]",
+                    "filename = Textures/aaa-1-0-DiffuseMap.dds",
+                    "",
+                    "[Resource-ccc-3-0-DiffuseMap]",
+                    "filename = Textures/ccc-3-0-DiffuseMap.dds",
+                    "",
+                ]
+            )
+        )
+        self._write_texture("Textures/aaa-1-0-DiffuseMap.dds")
+        self._write_texture("Textures/ccc-3-0-DiffuseMap.dds")
+        before = self._read()
+
+        self._run(["LOD0.bbb-2-0.主体"])
+
+        self.assertEqual(before, self._read())
+
+
+class SlotStyleParamHelperTests(unittest.TestCase):
+    """``_is_slot_style_param`` 只认直接指向槽位的形态。"""
+
+    def test_slot_style_params_are_recognised(self):
+        for name in ("ps-t0", "ps-t9", "ps-t12", "PS-T3", " this ", "this", "THIS"):
+            self.assertTrue(module._is_slot_style_param(name), name)
+
+    def test_alias_and_other_params_are_not_slot_style(self):
+        for name in (
+            r"Resource\ZZMI\Diffuse",
+            "Resource-aaa-1-0-DiffuseMap",
+            "fxmap_ref",
+            "",
+            None,
+        ):
+            self.assertFalse(module._is_slot_style_param(name), name)
+
+
 if __name__ == "__main__":
     unittest.main()
