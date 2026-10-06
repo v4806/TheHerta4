@@ -5,7 +5,9 @@
 未在列表中指定的 TextureOverride 段（即其它部件）不会被触碰，保持默认配置。
 """
 import bpy
+import glob
 import json
+import os
 import re
 import time
 from collections import OrderedDict
@@ -34,6 +36,51 @@ _switch_sync_guard = False
 #: ``$ntmi_active0``）、``node_swap_ini`` 与 ``m_ini_helper.add_branch_key_sections``
 #: 的 ``$active0`` 一致。
 ACTIVATION_FLAG_CANDIDATES = ("$active0", "$ntmi_active0")
+
+#: 贴图槽位绑定行（``ps-tN = Resource_xxx`` / ``Resource\ZZMI\Xxx = ref Resource-yyy``）。
+#: 与 ``node_postprocess_object_texture`` 的口径一致：只认这三种参数名。
+_TEXTURE_BINDING_RE = re.compile(
+    r"^\s*(?P<param>Resource\\[A-Za-z0-9_]+\\[A-Za-z0-9_]+|this|ps-t\d+)\s*=\s*"
+    r"(?:ref\s+)?(?P<resource>[A-Za-z0-9_\-.]+)\s*(?:;.*)?$",
+    re.IGNORECASE,
+)
+
+#: ``[Resource-...]``（基础导出 slot 风格）与 ``[Resource_...]``（材质转资源）定义段。
+_RESOURCE_SECTION_RE = re.compile(r"^\[Resource[-_]", re.IGNORECASE)
+
+#: ini 中的部件锚点注释 ``; [mesh:物体名]``（可带 ``[vertex_count:N]``）。
+_MESH_COMMENT_RE = re.compile(r"\[mesh:([^\]]+)\]", re.IGNORECASE)
+
+#: 探测「该部件读不读得到材质」时依次尝试的贴图类型。
+#: 与材质转资源的前缀体系一致；只要有一种命中就认为材质可用。
+_MATERIAL_PROBE_TYPES = (
+    "DiffuseMap",
+    "NormalMap",
+    "LightMap",
+    "MaterialMap",
+    "Glowmap",
+    "GlowMap",
+    "FXMap",
+    "TTLMap",
+    "WengineFx",
+)
+
+#: 回退原理备忘（2026-10-06 实测结论，勿再引入 ``ps-tN = null``）：
+#:
+#: * 3DMigoto 的 TextureOverride 只在游戏 draw 之前**插入**指令。mod 不写
+#:   ``ps-tN`` 赋值时，游戏自己绑定的那张纹理仍在槽位里 —— 这就是原生贴图。
+#:   一旦 mod 写了 ``ps-tN = null`` 反而**显式解绑**，该部件会直接变成纯黑。
+#: * 因此让“其他部件”用原生贴图的正确做法是：把它们的贴图引用置
+#:   ``Resource\<ns>\Xxx = null``（ZZMI 的 SlotFix 用 ``unless_null`` 绑定，
+#:   源为 null 时不会覆盖槽位），并且**保证它们的绘制点排在段内所有 MOD
+#:   覆盖之前** —— 定义之前游戏原版贴图自然就在槽位上。
+#: * 同 hash 段里的绘制顺序才是关键：非目标部件在前、目标部件在后。
+
+#: 资源定义段里的 ``filename = ...`` 行。
+_FILENAME_LINE_RE = re.compile(
+    r"^[ \t]*filename[ \t]*=[ \t]*(?P<value>.+?)[ \t]*$",
+    re.IGNORECASE,
+)
 
 #: 只认这两种形态（行首 ``;`` 的注释行不算）：
 #:   ``global $active0`` / ``global persist $active0 = 0`` —— 门控标志的声明；
@@ -1842,6 +1889,19 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
         ),
         default=True,
     )
+    clear_non_target_textures: bpy.props.BoolProperty(
+        name="清除未指定部件的游戏贴图",
+        description=(
+            "导出时让目标部件列表之外的其他部件回退游戏原生贴图："
+            "把它们的 Resource 别名置空（不写 ps-t 解绑，否则会变纯黑），"
+            "并回收不再被引用的 Resource 定义段与 Textures 下对应贴图文件。"
+            "依赖同 hash 段内的绘制顺序——非目标部件必须排在目标部件之前，"
+            "排在之后的会被保持原样并计数上报。"
+            "目标部件里读不到材质的（未设材质/材质节点不正确）同样按非目标处理"
+            "并逐个提示。仅对能按 ; [mesh:...] 注释判定归属的段生效"
+        ),
+        default=False,
+    )
     use_global_assign: bpy.props.BoolProperty(
         name="使用全局指定",
         description=(
@@ -2814,6 +2874,8 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
         options.label(text="材质转资源选项", icon="MATERIAL")
         options.prop(self, "material_to_resource_override")
         options.prop(self, "restore_default_textures_after_draw")
+        if not self.use_global_assign:
+            options.prop(self, "clear_non_target_textures")
         options.prop(self, "debug_disable_fx_ttl")
 
         layout.label(
@@ -2836,11 +2898,354 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
             )
         self.draw_material_detection_panel(context, layout)
 
+    # ------------------------------------------------------------------ #
+    # 清除未指定部件的游戏贴图（勾选 clear_non_target_textures 时启用）
+    # ------------------------------------------------------------------ #
+
+    def _mesh_name_verdict(self, mesh_name, mesh_verdict_cache):
+        """``[mesh:...]`` 名 -> ``target`` / ``non_target`` / ``unknown``。"""
+        verdict = mesh_verdict_cache.get(mesh_name)
+        if verdict is None:
+            obj = self.find_object_by_mesh_name(mesh_name, object_filter=None)
+            if obj is None:
+                verdict = "unknown"
+            elif self._is_custom_target(obj):
+                verdict = "target"
+            else:
+                verdict = "non_target"
+            mesh_verdict_cache[mesh_name] = verdict
+        return verdict
+
+    def _target_has_readable_material(self, obj, probe_cache):
+        """目标部件是否读得到材质（没材质/材质节点不对都算读不到）。
+
+        判据与材质转资源生成绑定用的是同一套 ``find_matching_materials``：
+        它读不到材质时就不会给该部件写资源引用，该部件随后会继承同段里别的
+        绑定——所以这里必须把这类部件按非目标处理，否则贴图是错的。
+        """
+        key = str(getattr(obj, "name", "") or "")
+        cached = probe_cache.get(key)
+        if cached is not None:
+            return cached
+        readable = False
+        for texture_type in _MATERIAL_PROBE_TYPES:
+            try:
+                if self.find_matching_materials(obj, texture_type):
+                    readable = True
+                    break
+            except Exception:  # noqa: BLE001 - 材质异常一律按“读不到”处理
+                continue
+        probe_cache[key] = readable
+        return readable
+
+    @staticmethod
+    def _collect_mesh_binding_lines(lines):
+        """按「绘制点」把贴图绑定行归给网格。
+
+        返回 ``[(网格名, {参数: 行号}, 绘制行号)]``。3DMigoto 里槽位赋值对
+        之后的绘制持续生效，所以一个网格实际用到的绑定 = 它这条
+        ``drawindexed`` 之前最后一次设置的那批值。基础导出把绑定写在
+        ``; [mesh:...]`` 之前，材质转资源重建后写在注释之后，按绘制点取可以让
+        两种排布都归到正确的网格。
+        """
+        positions = []
+        for index, line in enumerate(lines):
+            mesh_name = _MESH_COMMENT_RE.search(str(line))
+            if mesh_name:
+                positions.append((index, mesh_name.group(1)))
+        if not positions:
+            return []
+
+        collected = []
+        latest = {}
+        cursor = 0
+        for order, (pos, name) in enumerate(positions):
+            next_pos = (
+                positions[order + 1][0] if order + 1 < len(positions) else len(lines)
+            )
+            draw_pos = next_pos
+            for index in range(pos, next_pos):
+                stripped = str(lines[index]).strip().lower()
+                if stripped.startswith("drawindexed") or stripped.startswith("draw "):
+                    draw_pos = index
+                    break
+            for index in range(cursor, draw_pos):
+                match = _TEXTURE_BINDING_RE.match(str(lines[index]))
+                if match:
+                    latest[match.group("param")] = index
+            collected.append((name, dict(latest), draw_pos))
+            cursor = draw_pos
+        return collected
+
+    @staticmethod
+    def _collect_filename_references(ini_files):
+        """收集所有 INI 中 ``filename = ...`` 指向的相对路径（小写正斜杠）。"""
+        referenced = set()
+        for ini_file in ini_files:
+            try:
+                with open(ini_file, "r", encoding="utf-8") as handle:
+                    content = handle.read()
+            except OSError:
+                continue
+            for line in content.splitlines():
+                match = _FILENAME_LINE_RE.match(line)
+                if not match:
+                    continue
+                value = match.group("value").strip().replace("\\", "/")
+                if value:
+                    referenced.add(value.lower())
+        return referenced
+
+    @staticmethod
+    def _resolve_mod_relative_path(mod_export_path, relative):
+        """把 mod 根目录下的相对路径解析为绝对路径；越界返回 ``None``。"""
+        root_abs = os.path.realpath(os.path.abspath(mod_export_path))
+        candidate = os.path.realpath(
+            os.path.abspath(os.path.join(root_abs, str(relative).replace("\\", os.sep).replace("/", os.sep)))
+        )
+        try:
+            if os.path.commonpath((os.path.normcase(root_abs), os.path.normcase(candidate))) != os.path.normcase(root_abs):
+                return None
+        except ValueError:
+            return None
+        return candidate
+
+    @staticmethod
+    def _resource_still_referenced(sections, resource_name):
+        """段集合中是否还有对 ``resource_name`` 的引用（段头行不算引用）。"""
+        pattern = re.compile(
+            r"(?<![\w\-.])" + re.escape(resource_name) + r"(?![\w\-])"
+        )
+        for lines in sections.values():
+            for line in lines:
+                if pattern.search(str(line)):
+                    return True
+        return False
+
+    def _clear_non_target_textures(self, mod_export_path):
+        """让目标部件列表之外的其他部件回退游戏原生贴图。
+
+        做法是**利用同 hash 段内的绘制顺序**：依次把绑定行按 ``; [mesh:...]``
+        注释与绘制点归到具体部件；只要某个网格排在段内所有 MOD 覆盖（也就是
+        目标部件/归属不明部件的绘制点）**之前**，它绘制时槽位里还是游戏自己
+        绑定的纹理，此时把它的 ``Resource\\ZZMI\\Xxx = ref ...`` 置成 ``= null``
+        （ZZMI 的 SlotFix 用 ``unless_null``，源为 null 就不会覆盖槽位），
+        它便停留在游戏原生贴图上。
+
+        **绝不写 ``ps-tN = null``**：那是显式解绑，会让该部件直接变纯黑
+        （2026-10-06 实测）。排在 MOD 覆盖之后的非目标网格不做处理并计数上报，
+        因为那时槽位已被前面的块占住，置 null 同样拿不到原生贴图。
+
+        随后回收因此失去全部引用的 ``[Resource-...]`` / ``[Resource_...]``
+        定义段，最后删除这些定义段指向的、不再被任何 INI 引用的贴图文件。
+        段内没有 ``; [mesh:...]`` 注释时无从判定归属，整段保持原样。
+
+        另外，**目标部件列表里读不到材质的部件一律视作非目标**：没设材质或材质
+        节点配置不正确时，材质转资源不会给它写资源引用，它只会继承同段别的
+        绑定而显示错误贴图。这类部件同样会被置空回退原生，并在结束时逐个点名
+        提示，方便回去补材质。
+        """
+        target_names = self._target_object_set()
+        if not target_names:
+            return 0
+
+        ini_files = sorted(glob.glob(os.path.join(mod_export_path, "*.ini")))
+        if not ini_files:
+            return 0
+
+        removed_bindings = 0
+        removed_sections = 0
+        skipped_sections = 0
+        skipped_meshes = 0
+        no_material_meshes = []
+        freed_filenames = set()
+        mesh_verdict_cache = {}
+        material_probe_cache = {}
+
+        for ini_file in ini_files:
+            try:
+                with open(ini_file, "r", encoding="utf-8") as handle:
+                    content = handle.read()
+            except OSError as exc:
+                print(f"[材质转资源pro] 清除未指定部件贴图失败 {ini_file}: {exc}")
+                continue
+
+            # 与材质转资源保持同一口径：驱动块与自动追加尾段整体剥出后原样拼回。
+            preserved_driver_content, content = self.split_anim_driver_block_content(content)
+            content, preserved_tail_content = self.split_auto_appended_tail_content(content)
+
+            preamble_lines, sections = self._parse_ini_content(content)
+            if not sections:
+                continue
+
+            freed_resources = set()
+            changed = False
+            for section_name in list(sections.keys()):
+                if not str(section_name).startswith("[TextureOverride_"):
+                    continue
+                lines = sections[section_name]
+                mesh_bindings = self._collect_mesh_binding_lines(lines)
+                if not mesh_bindings:
+                    if any(_TEXTURE_BINDING_RE.match(str(line)) for line in lines):
+                        skipped_sections += 1
+                    continue
+
+                protected_lines = set()
+                mesh_verdicts = []
+                boundary = None
+                for mesh_name, bindings, draw_pos in mesh_bindings:
+                    verdict = self._mesh_name_verdict(mesh_name, mesh_verdict_cache)
+                    if verdict == "target":
+                        target_obj = self.find_object_by_mesh_name(mesh_name, object_filter=None)
+                        if target_obj is not None and not self._target_has_readable_material(
+                            target_obj, material_probe_cache
+                        ):
+                            # 目标部件但读不到材质：材质转资源根本不会给它写引用，
+                            # 它只会继承同段里别的绑定（贴图是错的）。按非目标处理。
+                            verdict = "missing_material"
+                            if mesh_name not in no_material_meshes:
+                                no_material_meshes.append(mesh_name)
+                    mesh_verdicts.append((verdict, bindings, draw_pos))
+                    if verdict not in ("non_target", "missing_material"):
+                        # target：目标部件正在使用；unknown：名字对不上任何导出
+                        # 物体，归属不明。两者都必须原样保留，并构成 MOD 覆盖的
+                        # 边界——只有排在它们之前的绘制才拿得到游戏原生贴图。
+                        protected_lines.update(bindings.values())
+                        if boundary is None or draw_pos < boundary:
+                            boundary = draw_pos
+
+                foreign_bindings = {}
+                for verdict, bindings, draw_pos in mesh_verdicts:
+                    if verdict not in ("non_target", "missing_material"):
+                        continue
+                    if boundary is not None and draw_pos > boundary:
+                        # 排在 MOD 覆盖之后，槽位已被前面的块占住，置 null 也
+                        # 只是「不覆盖」，拿不到原生贴图。保持原样并上报。
+                        skipped_meshes += 1
+                        continue
+                    for param, index in bindings.items():
+                        foreign_bindings.setdefault(index, param)
+
+                # 孤儿绑定行：被后续赋值覆盖、任何绘制点都用不到（典型是基础
+                # 导出给第一个子网格写、而该段每个网格又都有自己的绑定时的那
+                # 一份段级默认值）。置空它们不影响任何绘制，却能解除对
+                # Resource 定义段的引用，让贴图真正可回收。
+                used_indexes = {
+                    index for _, bindings, _ in mesh_verdicts for index in bindings.values()
+                }
+                for index, line in enumerate(lines):
+                    if index in used_indexes:
+                        continue
+                    match = _TEXTURE_BINDING_RE.match(str(line))
+                    if match:
+                        foreign_bindings.setdefault(index, match.group("param"))
+
+                if not foreign_bindings:
+                    continue
+
+                section_changed = False
+                new_lines = []
+                for index, line in enumerate(lines):
+                    if index in foreign_bindings and index not in protected_lines:
+                        match = _TEXTURE_BINDING_RE.match(str(line))
+                        if match:
+                            freed_resources.add(match.group("resource"))
+                            removed_bindings += 1
+                            new_lines.append(f"{foreign_bindings[index]} = null")
+                            section_changed = True
+                            continue
+                    new_lines.append(line)
+                if section_changed:
+                    sections[section_name] = new_lines
+                    changed = True
+
+            if not changed:
+                continue
+
+            remaining_tokens = set()
+            for lines in sections.values():
+                for line in lines:
+                    match = _TEXTURE_BINDING_RE.match(str(line))
+                    if match:
+                        remaining_tokens.add(match.group("resource"))
+
+            for section_name in list(sections.keys()):
+                if not _RESOURCE_SECTION_RE.match(str(section_name)):
+                    continue
+                resource_name = str(section_name).strip().strip("[]").strip()
+                if resource_name not in freed_resources:
+                    continue
+                if resource_name in remaining_tokens:
+                    continue
+                if self._resource_still_referenced(sections, resource_name):
+                    continue
+                for line in sections[section_name]:
+                    file_match = _FILENAME_LINE_RE.match(str(line))
+                    if file_match:
+                        freed_filenames.add(file_match.group("value").strip().replace("\\", "/"))
+                del sections[section_name]
+                removed_sections += 1
+
+            new_content = self._serialize_ini_content(
+                preamble_lines,
+                sections,
+                preserved_tail_content=preserved_tail_content,
+                preserved_driver_content=preserved_driver_content,
+            )
+            with open(ini_file, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(new_content)
+
+        removed_files = 0
+        if freed_filenames:
+            still_referenced = self._collect_filename_references(ini_files)
+            for relative in sorted(freed_filenames):
+                if relative.lower() in still_referenced:
+                    continue
+                target_path = self._resolve_mod_relative_path(mod_export_path, relative)
+                if target_path is None or not os.path.isfile(target_path):
+                    continue
+                try:
+                    os.remove(target_path)
+                    removed_files += 1
+                except OSError as exc:
+                    print(f"[材质转资源pro] 删除贴图失败 {target_path}: {exc}")
+
+        if removed_bindings or removed_sections or removed_files:
+            print(
+                f"[材质转资源pro] 已清除未指定部件贴图：置空绑定行 {removed_bindings}、"
+                f"资源定义段 {removed_sections}、贴图文件 {removed_files}"
+            )
+        if skipped_sections:
+            print(
+                f"[材质转资源pro] 有 {skipped_sections} 个段含无法归属的网格，已保持原样"
+            )
+        if skipped_meshes:
+            print(
+                f"[材质转资源pro] 有 {skipped_meshes} 个非目标网格排在 MOD 覆盖之后"
+                f"（同 hash 段内），置 null 拿不到原生贴图，已保持原样"
+            )
+        if no_material_meshes:
+            # 提示语只用 ASCII 标点：Windows 上 stdout 可能是 GBK，emoji/特殊符号
+            # 会直接抛 UnicodeEncodeError 把导出打断。
+            print(
+                f"[材质转资源pro] 警告：以下 {len(no_material_meshes)} 个目标部件读不到材质"
+                "（未设置材质或材质节点配置不正确），已按非目标部件处理"
+                "并回退游戏原生贴图："
+            )
+            for mesh_name in no_material_meshes:
+                print(f"    - {mesh_name}")
+        return removed_bindings + removed_sections + removed_files
+
     def execute_postprocess(self, mod_export_path, exporter=None):
         if not bool(getattr(self, "use_global_assign", False)) and not self._target_object_set():
             print("[材质转资源pro] 未指定任何目标部件，跳过")
             return
-        return super().execute_postprocess(mod_export_path, exporter=exporter)
+        result = super().execute_postprocess(mod_export_path, exporter=exporter)
+        if bool(getattr(self, "clear_non_target_textures", False)) and not bool(
+            getattr(self, "use_global_assign", False)
+        ):
+            self._clear_non_target_textures(mod_export_path)
+        return result
 
 
 LEGACY_MATERIAL_NODE_ID = 'SSMTNode_PostProcess_Material'
