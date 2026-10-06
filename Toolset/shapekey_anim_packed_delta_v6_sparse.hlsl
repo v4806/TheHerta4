@@ -6,7 +6,7 @@
 // Description:
 //   - 顶点命中索引（稀疏查找）：每个顶点只遍历**自己真正命中**的形态键
 //     （典型 2~5 个），取代「逐顶点遍历全部槽位」（旧模型每顶点固定跑
-//     num_slots 次，且 `!= 255` 的早退会被 warp divergence 吃掉）。
+//     num_slots 次，且 `!= NO_FREQ_INDEX` 的早退会被 warp divergence 吃掉）。
 //   - 合并数据/索引缓冲与 V5 合并模式一致（t51 位移 / t52 合并映射）；
 //     稠密的 vertex_freq_indices（顶点数 × 槽位数）被三份稀疏索引取代。
 //   - 条目内容 = 「该顶点的某个命中键 ↔ 它的位移记录下标与强度槽位」。
@@ -16,7 +16,7 @@
 //   t97 vertex_entry_packed   条目对应的合并位移记录下标（-1 = 无位移）
 //   t98 vertex_entry_freq     条目对应的形态键强度下标（ShapeKeyWeight 槽位）
 
-#define NO_FREQ_INDEX 255
+#define NO_FREQ_INDEX 0xFFFFFFFFu
 
 struct VertexAttributes {
     float3 position;

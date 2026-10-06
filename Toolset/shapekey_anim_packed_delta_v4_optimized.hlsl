@@ -12,7 +12,7 @@
 //   - Expected speedup: 10-50x depending on GPU architecture
 //
 // DATA STRUCTURES:
-//   - vertex_freq_indices[vertex * MAX_SLOTS + slot] = freq_index (0-11) or 255 (no animation)
+//   - vertex_freq_indices[vertex * MAX_SLOTS + slot] = freq_index (0-11) or NO_FREQ_INDEX (no animation)
 //   - FREQ values are still read from IniParams[100-111]
 //
 // MEMORY OVERHEAD:
@@ -21,7 +21,7 @@
 
 #define MAX_SLOTS 24
 #define MAX_FREQS 12
-#define NO_FREQ_INDEX 255
+#define NO_FREQ_INDEX 0xFFFFFFFFu
 
 struct VertexAttributes {
     float3 position;
@@ -34,7 +34,7 @@ StructuredBuffer<float3> shapekey_pos_deltas[MAX_SLOTS] : register(t51);
 StructuredBuffer<int> shapekey_maps[MAX_SLOTS] : register(t75);
 
 // Per-vertex FREQ index buffer (packed: vertex * MAX_SLOTS + slot)
-// Each element is a uint32 (0-11 for FREQ index, 255 for no animation)
+// Each element is a uint32 (0-11 for FREQ index, NO_FREQ_INDEX for no animation)
 StructuredBuffer<uint> vertex_freq_indices : register(t99);
 
 Texture1D<float4> IniParams : register(t120);
