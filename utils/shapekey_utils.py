@@ -146,7 +146,28 @@ class ShapeKeyUtils:
             yield obj
 
     @classmethod
+    def unlock_shape_keys(cls, obj) -> int:
+        """解锁传入对象上被锁定的形态键，返回解锁数量（只影响传入对象自身）"""
+        key_blocks = getattr(getattr(getattr(obj, "data", None), "shape_keys", None), "key_blocks", None)
+        if not key_blocks:
+            return 0
+
+        unlocked = 0
+        for key_block in key_blocks:
+            if getattr(key_block, "lock_shape", False):
+                key_block.lock_shape = False
+                unlocked += 1
+
+        if unlocked:
+            print(f"[ShapeKeyUtils] {getattr(obj, 'name', '')}: 自动解锁 {unlocked} 个锁定的形态键")
+
+        return unlocked
+
+    @classmethod
     def remove_shape_keys(cls, obj, all=True, apply_mix=None, active_shape_key_index=None):
+        # Blender 的 shape_key_remove 遇到锁定形态键会直接报错，这里在移除前自动解锁。
+        cls.unlock_shape_keys(obj)
+
         kwargs = {"all": all}
         if apply_mix is not None:
             kwargs["apply_mix"] = apply_mix
