@@ -127,6 +127,35 @@ class NTMIShapeKeyNodeAdapter:
     def _should_merge_slot_files(self, use_packed=None):
         return self.original_node._should_merge_slot_files(use_packed)
 
+    def effective_use_sparse_index(
+        self,
+        use_packed=None,
+        use_delta=None,
+        use_optimized=None,
+        merge_slot_files=None,
+    ):
+        """崩铁 NTMI 路径不实现「顶点命中索引（稀疏查找）」模型（与帧表一致）。
+
+        `DirectShapeKeyGenerator.generate()` 在崩铁路径上的 `self.node` 就是本适配器，
+        且会无条件询问本方法，所以适配器必须给出答案：这里恒为未生效，导出继续走
+        稠密 FREQ 表。本适配器同样不定义 `use_sparse_vertex_index`，因此驱动里的
+        `getattr(self.node, "use_sparse_vertex_index", False)` 也得到 False，不会因为
+        节点上勾了该项而对 NTMI 导出报「无法启用」。
+        """
+        del use_packed, use_delta, use_optimized, merge_slot_files
+        return False
+
+    def _sparse_index_blockers(
+        self,
+        use_packed=None,
+        use_delta=None,
+        use_optimized=None,
+        merge_slot_files=None,
+    ):
+        """同上：NTMI 不实现稀疏模型，因此没有「缺前置项」需要报给用户。"""
+        del use_packed, use_delta, use_optimized, merge_slot_files
+        return []
+
     def _get_vertex_struct_definition(self, hash_val=None):
         del hash_val
         return "struct VertexAttributes {\n    float3 position;\n};"
@@ -225,6 +254,7 @@ class NTMIShapeKeyNodeAdapter:
         drag_dirs=None,
         hash_val=None,
         source_path=None,
+        use_sparse_vertex_index=False,
     ):
         # 调用方（``DirectShapeKeyGenerator.generate``）走的是「读模板、写目标」的
         # 通用契约，因此会传 ``source_path``；本适配器**不读模板**——着色器源码在
@@ -233,7 +263,10 @@ class NTMIShapeKeyNodeAdapter:
         # NTEMI 直出形态键导出会在调用点抛 TypeError，而本适配器又无法像
         # ``SSMTNode_PostProcess_ShapeKey`` 那样用 ``source_path or shader_path``
         # 去读盘），并不参与读盘，故与其它未使用形参一起显式丢弃。
+        # ``use_sparse_vertex_index`` 同理只接住不使用：崩铁 NTMI 路径沿用稠密
+        # FREQ 模型（与帧表一致，本适配器不实现新模型）。
         del unique_objects, use_packed, use_delta, use_optimized, merge_slot_files, hash_val, source_path
+        del use_sparse_vertex_index
         num_slots = max(hash_slot_data.keys()) if hash_slot_data else 0
         zone_ids = list(drag_zone_ids or []) if drag_drive_enabled else []
         click_stages = list(drag_click_stages or []) if drag_drive_enabled else []

@@ -13,6 +13,9 @@ from ..common.mod_path_compat import derive_shapekey_merged_data_resource_name
 from ..common.mod_path_compat import derive_shapekey_merged_map_resource_name
 from ..common.mod_path_compat import derive_shapekey_slot_map_resource_name
 from ..common.mod_path_compat import derive_shapekey_slot_resource_name
+from ..common.mod_path_compat import derive_shapekey_vertex_entry_freq_resource_name
+from ..common.mod_path_compat import derive_shapekey_vertex_entry_packed_resource_name
+from ..common.mod_path_compat import derive_shapekey_vertex_entry_start_resource_name
 from ..common.mod_path_compat import derive_shapekey_weight_resource_name
 from ..common.mod_path_compat import ensure_resource_alias_section
 from ..common.safe_write import write_text_if_changed
@@ -22,6 +25,26 @@ from .direct_export_runtime_utils import assemble_drawib_position_bytes
 from .direct_export_runtime_utils import extract_position_bytes_by_indices as _extract_position_bytes_by_indices
 from .direct_export_runtime_utils import iter_drawib_models as _iter_drawib_models
 from .direct_export_shapekey_shared import ShapeKeyDirectExportError, _buffer_to_bytes, resolve_use_delta
+try:
+    from .shapekey_sparse_index import (
+        SPARSE_FREQ_REGISTER,
+        SPARSE_FREQ_SUFFIX,
+        SPARSE_PACKED_REGISTER,
+        SPARSE_PACKED_SUFFIX,
+        SPARSE_START_REGISTER,
+        SPARSE_START_SUFFIX,
+        write_sparse_vertex_index,
+    )
+except ImportError:  # 测试 stub 包无 __path__ 时退化为绝对导入
+    from blueprint.shapekey_sparse_index import (
+        SPARSE_FREQ_REGISTER,
+        SPARSE_FREQ_SUFFIX,
+        SPARSE_PACKED_REGISTER,
+        SPARSE_PACKED_SUFFIX,
+        SPARSE_START_REGISTER,
+        SPARSE_START_SUFFIX,
+        write_sparse_vertex_index,
+    )
 
 
 # 形态键权重搬运的跨模块约定：必须与 node_postprocess_shapekey.py 的
@@ -331,9 +354,8 @@ class DirectShapeKeyOutputMixin:
 
         return merged_index_map
 
-    def _write_freq_indices(
+    def _build_freq_index_table(
         self,
-        logical_hash,
         actual_hash,
         hash_slot_data,
         unique_names,
@@ -342,9 +364,14 @@ class DirectShapeKeyOutputMixin:
         merged_index_map=None,
         slot_index_maps=None,
     ):
+        """构建稠密 FREQ 表（顶点数 × 槽位数，未命中为 255）。
+
+        稠密写出与「顶点命中索引（稀疏查找）」共用这一份结果：稀疏索引只是把
+        同一张表的非 255 条目按顶点压紧，不改变判定逻辑，避免两条路径走偏。
+        """
         num_slots = max(hash_slot_data.keys()) if hash_slot_data else 0
         if num_slots <= 0 or vertex_count <= 0:
-            return
+            return None, 0
 
         name_to_freq_index = {name: index for index, name in enumerate(unique_names)}
         freq_indices = np.full((vertex_count, num_slots), 255, dtype=np.uint32)
@@ -376,9 +403,70 @@ class DirectShapeKeyOutputMixin:
                     else:
                         freq_indices[start_v:end_v + 1, slot_index] = freq_idx
 
+        return freq_indices, num_slots
+
+    def _write_freq_indices(
+        self,
+        logical_hash,
+        actual_hash,
+        hash_slot_data,
+        unique_names,
+        vertex_count,
+        calculated_ranges,
+        merged_index_map=None,
+        slot_index_maps=None,
+    ):
+        freq_indices, _num_slots = self._build_freq_index_table(
+            actual_hash,
+            hash_slot_data,
+            unique_names,
+            vertex_count,
+            calculated_ranges,
+            merged_index_map=merged_index_map,
+            slot_index_maps=slot_index_maps,
+        )
+        if freq_indices is None:
+            return
+
         output_path = os.path.join(self.meshes_dir, f"{actual_hash}-Position_freq_indices.buf")
         with open(output_path, "wb") as file_obj:
             file_obj.write(freq_indices.reshape(-1).tobytes())
+
+    def _write_sparse_vertex_index(
+        self,
+        logical_hash,
+        actual_hash,
+        hash_slot_data,
+        unique_names,
+        vertex_count,
+        calculated_ranges,
+        merged_index_map=None,
+        slot_index_maps=None,
+    ):
+        """顶点命中索引（稀疏查找）：写出三份「每顶点只列命中槽位」的缓冲。
+
+        取代稠密 FREQ 表（顶点数 × 槽位数 × 4B）；着色器据此只遍历自己命中的
+        形态键，而不是把全部槽位过一遍。
+        """
+        freq_indices, _num_slots = self._build_freq_index_table(
+            actual_hash,
+            hash_slot_data,
+            unique_names,
+            vertex_count,
+            calculated_ranges,
+            merged_index_map=merged_index_map,
+            slot_index_maps=slot_index_maps,
+        )
+        if freq_indices is None:
+            return None
+
+        if merged_index_map is None:
+            LOG.warning(
+                f"直出形态键 {logical_hash}: 未读到合并映射文件，"
+                "顶点命中索引的位移记录下标将全部写 -1（位移不会生效）"
+            )
+
+        return write_sparse_vertex_index(self.meshes_dir, actual_hash, freq_indices, merged_index_map)
 
     # ------------------------------------------------------------------
     # 帧表（序列组加速）：把「每顶点遍历全部槽位」编译成「逐帧位移表插值」
@@ -1048,6 +1136,7 @@ class DirectShapeKeyOutputMixin:
         preserved_driver_content="",
         drag_drive_resource=None,
         frame_table_meta_map=None,
+        use_sparse_index=False,
     ):
         if '[Constants]' not in sections:
             sections['[Constants]'] = []
@@ -1280,7 +1369,8 @@ class DirectShapeKeyOutputMixin:
                 f"紧凑:{'是' if use_packed else '否'}, "
                 f"增量:{self.node._describe_delta_scope(use_delta)}, "
                 f"优化查找:{'是' if use_optimized else '否'}, "
-                f"文件合并:{'是' if merge_slot_files else '否'}"
+                f"文件合并:{'是' if merge_slot_files else '否'}, "
+                f"顶点命中索引:{'是' if use_sparse_index else '否'}"
             )
             block_lines.append(f"\n    ; --- Binding Shape Key Meshess (Mode: {mode_str}) ---")
             if frame_meta:
@@ -1303,7 +1393,16 @@ class DirectShapeKeyOutputMixin:
                 block_lines.append(f"    cs-t52 = copy {derive_shapekey_merged_map_resource_name(primary_base_resource)}")
                 t_registers_to_null.extend(["cs-t51", "cs-t52"])
 
-                if use_optimized:
+                if use_sparse_index:
+                    # 稀疏模式：三份顶点命中索引取代稠密 FREQ 表（t53 不再绑定）。
+                    for register, resource_name in (
+                        (SPARSE_START_REGISTER, derive_shapekey_vertex_entry_start_resource_name(primary_base_resource)),
+                        (SPARSE_PACKED_REGISTER, derive_shapekey_vertex_entry_packed_resource_name(primary_base_resource)),
+                        (SPARSE_FREQ_REGISTER, derive_shapekey_vertex_entry_freq_resource_name(primary_base_resource)),
+                    ):
+                        block_lines.append(f"    cs-t{register} = copy {resource_name}")
+                        t_registers_to_null.append(f"cs-t{register}")
+                elif use_optimized:
                     block_lines.append(f"    cs-t53 = copy {derive_shapekey_freq_resource_name(primary_base_resource)}")
                     t_registers_to_null.append("cs-t53")
             else:
@@ -1494,10 +1593,45 @@ class DirectShapeKeyOutputMixin:
                 hash_prefix = self.node._extract_hash_prefix(logical_hash)
                 base_resources = hash_to_base_resources.get(hash_prefix, [])
                 primary_base_resource = base_resources[0] if base_resources else f"Resource_{self.node._hash_to_resource_prefix(logical_hash)}_Position"
+                if use_sparse_index:
+                    # 稀疏模式：三份顶点命中索引取代稠密 FREQ 表。旧 ini 里的稠密段
+                    # 必须显式移除（与帧表同理：sections 是从旧 ini 读来的，只「不新增」
+                    # 会被原样写回，而 3DMigoto 见到 [Resource] + filename 就会加载）。
+                    for resource_name, suffix in (
+                        (derive_shapekey_vertex_entry_start_resource_name(primary_base_resource), SPARSE_START_SUFFIX),
+                        (derive_shapekey_vertex_entry_packed_resource_name(primary_base_resource), SPARSE_PACKED_SUFFIX),
+                        (derive_shapekey_vertex_entry_freq_resource_name(primary_base_resource), SPARSE_FREQ_SUFFIX),
+                    ):
+                        section_name = f"[{resource_name}]"
+                        if section_name not in sections and section_name not in generated_section_names:
+                            new_resource_lines.extend(
+                                [section_name, "type = Buffer", "stride = 4", f"filename = Meshes0000/{actual_file_hash}-Position{suffix}.buf", ""]
+                            )
+                            generated_section_names.add(section_name)
+                    sections.pop(f"[{derive_shapekey_freq_resource_name(primary_base_resource)}]", None)
+                    continue
+
                 freq_idx_section = f"[{derive_shapekey_freq_resource_name(primary_base_resource)}]"
                 if freq_idx_section not in sections and freq_idx_section not in generated_section_names:
                     new_resource_lines.extend([freq_idx_section, "type = Buffer", "stride = 4", f"filename = Meshes0000/{actual_file_hash}-Position_freq_indices.buf", ""])
                     generated_section_names.add(freq_idx_section)
+
+        # 未开启稀疏查找时：移除旧 ini 里残留的顶点命中索引段（同上，避免被加载）。
+        if use_optimized and not use_sparse_index:
+            for logical_hash in unique_hashes:
+                hash_prefix = self.node._extract_hash_prefix(logical_hash)
+                base_resources = hash_to_base_resources.get(hash_prefix, [])
+                primary_base_resource = (
+                    base_resources[0]
+                    if base_resources
+                    else f"Resource_{self.node._hash_to_resource_prefix(logical_hash)}_Position"
+                )
+                for stale_section in (
+                    f"[{derive_shapekey_vertex_entry_start_resource_name(primary_base_resource)}]",
+                    f"[{derive_shapekey_vertex_entry_packed_resource_name(primary_base_resource)}]",
+                    f"[{derive_shapekey_vertex_entry_freq_resource_name(primary_base_resource)}]",
+                ):
+                    sections.pop(stale_section, None)
 
         # 帧表模式：显式移除旧 ini 里残留的 merged / freq_indices 资源段。
         # 只「不新增」不够 —— sections 是从旧 ini 读来的，旧段落会被原样写回，而

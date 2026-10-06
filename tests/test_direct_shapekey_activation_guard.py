@@ -32,6 +32,9 @@ _install_module(
             "derive_shapekey_slot_resource_name",
             "derive_shapekey_frame_table_resource_name",
             "derive_shapekey_group_map_resource_name",
+            "derive_shapekey_vertex_entry_start_resource_name",
+            "derive_shapekey_vertex_entry_packed_resource_name",
+            "derive_shapekey_vertex_entry_freq_resource_name",
             "derive_shapekey_weight_resource_name",
             "ensure_resource_alias_section",
         )

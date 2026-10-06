@@ -32,6 +32,9 @@ _REAL_MODULES = (
 	("common", "safe_write"),
 	# t75：共享骨图 / 通道骨判定的唯一实现（zzmi_skeleton 与 zzmi.py 都依赖它）。
 	("common", "zzmi_channel"),
+	# 形态键「顶点命中索引」：纯 numpy/标准库的叶子模块，blueprint 侧的
+	# node_postprocess_shapekey.py 与 direct_export_shapekey_output_mixin.py 都依赖它。
+	("blueprint", "shapekey_sparse_index"),
 )
 
 

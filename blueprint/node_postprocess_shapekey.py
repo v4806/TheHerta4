@@ -19,6 +19,28 @@ try:
 except ImportError:  # 测试 stub 包无 __path__ 时退化为绝对导入
     from blueprint import deform_chain
 from .node_postprocess_base import SSMTNode_PostProcess_Base
+try:
+    from .shapekey_sparse_index import (
+        SPARSE_FREQ_REGISTER,
+        SPARSE_FREQ_SUFFIX,
+        SPARSE_PACKED_REGISTER,
+        SPARSE_PACKED_SUFFIX,
+        SPARSE_START_REGISTER,
+        SPARSE_START_SUFFIX,
+        build_sparse_logic_lines,
+        write_sparse_vertex_index,
+    )
+except ImportError:  # 测试 stub 包无 __path__ 时退化为绝对导入
+    from blueprint.shapekey_sparse_index import (
+        SPARSE_FREQ_REGISTER,
+        SPARSE_FREQ_SUFFIX,
+        SPARSE_PACKED_REGISTER,
+        SPARSE_PACKED_SUFFIX,
+        SPARSE_START_REGISTER,
+        SPARSE_START_SUFFIX,
+        build_sparse_logic_lines,
+        write_sparse_vertex_index,
+    )
 from .variable_registry import (
     allocate_shape_key_variable_name,
     mark_variable_name_used,
@@ -36,6 +58,9 @@ from ..common.mod_path_compat import derive_shapekey_merged_data_resource_name
 from ..common.mod_path_compat import derive_shapekey_merged_map_resource_name
 from ..common.mod_path_compat import derive_shapekey_slot_map_resource_name
 from ..common.mod_path_compat import derive_shapekey_slot_resource_name
+from ..common.mod_path_compat import derive_shapekey_vertex_entry_freq_resource_name
+from ..common.mod_path_compat import derive_shapekey_vertex_entry_packed_resource_name
+from ..common.mod_path_compat import derive_shapekey_vertex_entry_start_resource_name
 from ..common.mod_path_compat import derive_shapekey_weight_resource_name
 from ..common.mod_path_compat import ensure_resource_alias_section
 from ..common.mod_path_compat import resolve_hash_buffer_candidate
@@ -241,6 +266,18 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
     merge_slot_files: bpy.props.BoolProperty(
         name="合并槽位文件",
         description="将各槽位生成的紧凑缓冲区与索引缓冲区合并为单文件，减少着色器 T 资源位占用。当前主要在紧凑模式下生效。",
+        default=False
+    )
+    use_sparse_vertex_index: bpy.props.BoolProperty(
+        name="顶点命中索引（稀疏查找）",
+        description=(
+            "把稠密的 FREQ 表转置成「每顶点只登记自己命中的形态键」的稀疏索引："
+            "着色器改为一段有界循环（典型 2~5 次），取代逐顶点遍历全部槽位。"
+            "索引体积从「顶点数 × 槽位数 × 4B」降到「顶点数 × 4B + 命中数 × 8B」，"
+            "逻辑块行数与键数脱钩。绝对形态键（互不相关的独立键）同样受益。"
+            "需要同时开启「使用紧凑缓冲区 / 存储顶点增量 / 优化查找性能 / 合并槽位文件」，"
+            "且与「帧表插值」「拖拽驱动形态键」互斥。需要 'numpy' 库。"
+        ),
         default=False
     )
     # 直出开关和同蓝图中的其他 ShapeKey 后处理节点同步，避免槽位资源生成策略不一致。
@@ -2059,6 +2096,51 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
 
         return None
 
+    def _sparse_index_blockers(self, use_packed=None, use_delta=None, use_optimized=None, merge_slot_files=None):
+        """「顶点命中索引」的前置项检查：返回未满足项的中文名列表（空 = 可以启用）。
+
+        稀疏索引是把合并模式的稠密 FREQ 表**转置**，所以四项缺一不可：
+
+        * 合并槽位文件：条目里的位移记录下标来自合并索引表（t52）；
+        * 紧凑缓冲区：只有紧凑模式才有「位移记录下标」这一层；
+        * 存储顶点增量：V6 稀疏模板读的是 ``merged_shapekey_pos_deltas``；
+        * 优化查找性能：条目里的强度下标就是 FREQ 表的槽位序号，没有 FREQ 表
+          就只能退回「按物体区间判断」，而稀疏条目里没有物体信息。
+
+        本判定必须与 :meth:`_get_shader_template_name` / :meth:`_update_shader_file`
+        里的分支**完全一致**：骨架（模板声明了哪些 t 资源）与逻辑块必须同进同退，
+        否则注入出来的 shader 会编译失败（实机表现为整块网格顶点塌到原点），
+        与 ``_get_shader_template_name`` 里帧表那处注释警告的坑同源。
+        """
+        if not getattr(self, "use_sparse_vertex_index", False):
+            return []
+
+        if use_packed is None:
+            use_packed = self.use_packed_Meshess
+        if use_delta is None:
+            use_delta = self.effective_use_delta()
+        if use_optimized is None:
+            use_optimized = self.use_optimized_lookup
+        if merge_slot_files is None:
+            merge_slot_files = self._should_merge_slot_files(use_packed)
+
+        blockers = []
+        if not merge_slot_files:
+            blockers.append("合并槽位文件")
+        if not use_packed:
+            blockers.append("使用紧凑缓冲区")
+        if not use_delta:
+            blockers.append("存储顶点增量")
+        if not use_optimized:
+            blockers.append("优化查找性能")
+        return blockers
+
+    def effective_use_sparse_index(self, use_packed=None, use_delta=None, use_optimized=None, merge_slot_files=None):
+        """「顶点命中索引」是否真正生效（勾选 + 四项前置全满足）。"""
+        if not getattr(self, "use_sparse_vertex_index", False):
+            return False
+        return not self._sparse_index_blockers(use_packed, use_delta, use_optimized, merge_slot_files)
+
     def _get_shader_template_name(self):
         # 注意：这里**不能**因为 use_frame_table 就切到帧表模板。本方法决定的是
         # 「播种 + _update_shader_file 注入」所用的骨架；一旦帧表因分组信息缺失而
@@ -2069,6 +2151,11 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
         use_delta = self.effective_use_delta()
         use_optimized = self.use_optimized_lookup
         merge_slot_files = self._should_merge_slot_files(use_packed)
+
+        # 稀疏索引有自己的骨架（t96/t97/t98，没有 t53），必须在合并骨架之前判定；
+        # 判定与 _update_shader_file 共用 effective_use_sparse_index，保证同进同退。
+        if self.effective_use_sparse_index(use_packed, use_delta, use_optimized, merge_slot_files):
+            return "shapekey_anim_packed_delta_v6_sparse.hlsl"
 
         if merge_slot_files:
             if use_delta:
@@ -2431,7 +2518,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
 
         return self._DELTA_BUFFER_DECL_RE.sub(_replace, content, count=1)
 
-    def _update_shader_file(self, shader_path, hash_slot_data, use_packed, use_delta, unique_names, unique_objects, use_optimized=False, merge_slot_files=False, drag_drive_enabled=False, drag_zone_ids=None, drag_click_stages=None, drag_stage_count=1, drag_dirs=None, hash_val=None, source_path=None):
+    def _update_shader_file(self, shader_path, hash_slot_data, use_packed, use_delta, unique_names, unique_objects, use_optimized=False, merge_slot_files=False, drag_drive_enabled=False, drag_zone_ids=None, drag_click_stages=None, drag_stage_count=1, drag_dirs=None, hash_val=None, source_path=None, use_sparse_vertex_index=False):
         """把配置注入着色器模板并写到 ``shader_path``。
 
         ``source_path`` 指定读取的模板；缺省（None）时读 ``shader_path`` 自身，
@@ -2554,7 +2641,22 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
 
             logic_lines = []
 
-            if merge_slot_files:
+            # 稀疏模式：条目集合由导出期算好，这里只发一段有界循环；仍要求 prop
+            # 打开（与 _get_shader_template_name 的骨架判定同源，避免骨架/逻辑错配）。
+            sparse_index_active = bool(use_sparse_vertex_index) and self.effective_use_sparse_index(
+                use_packed, use_delta, use_optimized, merge_slot_files
+            )
+
+            if sparse_index_active:
+                logic_lines.append("    // Sparse vertex index: iterate only the shape keys this vertex actually hits")
+                logic_lines.extend(
+                    build_sparse_logic_lines(
+                        channel_names,
+                        self._build_delta_accumulation_lines,
+                        drag_drive_enabled=drag_drive_enabled,
+                    )
+                )
+            elif merge_slot_files:
                 logic_lines.append("    // V5 merged mode: all slot buffers are packed into a single data buffer and a single index buffer")
                 logic_lines.append(f"    uint num_slots = {max(hash_slot_data.keys()) if hash_slot_data else 0};")
 
@@ -2738,11 +2840,18 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
             traceback.print_exc()
             return False
 
-    def _generate_vertex_freq_index_Meshess(self, mod_export_path, hash_val, hash_slot_data, unique_names, vertex_count, calculated_ranges):
-        if not NUMPY_AVAILABLE:
-            print("Numpy库未找到，无法生成FREQ索引缓冲区")
-            return False
+    def _build_vertex_freq_index_table(self, mod_export_path, hash_val, hash_slot_data, unique_names, vertex_count, calculated_ranges):
+        """算出稠密 FREQ 表（顶点数 × 槽位数）。
 
+        :return: ``(freq_indices, num_slots, merged_index_map)``；``freq_indices`` 为
+            ``None`` 表示没有可用槽位/顶点（调用方直接跳过）。``merged_index_map``
+            为 ``None`` 表示没读到合并映射文件（此时按物体范围整段写入，与历史行为
+            一致）。
+
+        稠密写出（:meth:`_generate_vertex_freq_index_Meshess`）与稀疏转置
+        （:meth:`_generate_sparse_vertex_index_Meshess`）共用本函数，保证两种模式看到
+        的命中集合逐位相同——否则「开开关前后画面不一样」会变成难以定位的渲染问题。
+        """
         name_to_freq_index = {name: i for i, name in enumerate(unique_names)}
         print(f"    [DEBUG] 形态键到FREQ索引映射: {name_to_freq_index}")
         print(f"    [DEBUG] calculated_ranges 键: {list(calculated_ranges.keys())}")
@@ -2751,7 +2860,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
 
         if num_slots <= 0 or vertex_count <= 0:
             print("    [DEBUG] 没有可用槽位或顶点数为 0，跳过 FREQ 索引生成")
-            return 0
+            return None, 0, None
 
         freq_indices = np.full((vertex_count, num_slots), 255, dtype=np.uint32)
         merge_slot_files = self._should_merge_slot_files()
@@ -2841,6 +2950,20 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                         freq_indices[start_v:end_v + 1, slot_index] = freq_idx
                         print(f"        [DEBUG] 物体 '{obj_name}' 没有映射文件，直接设置所有顶点")
 
+        return freq_indices, num_slots, merged_index_map
+
+    def _generate_vertex_freq_index_Meshess(self, mod_export_path, hash_val, hash_slot_data, unique_names, vertex_count, calculated_ranges):
+        """写出稠密 FREQ 表（``{hash}-Position_freq_indices.buf``）。"""
+        if not NUMPY_AVAILABLE:
+            print("Numpy库未找到，无法生成FREQ索引缓冲区")
+            return False
+
+        freq_indices, num_slots, _merged_index_map = self._build_vertex_freq_index_table(
+            mod_export_path, hash_val, hash_slot_data, unique_names, vertex_count, calculated_ranges
+        )
+        if freq_indices is None or num_slots <= 0:
+            return 0
+
         output_dir = os.path.join(mod_export_path, "Meshes0000")
         os.makedirs(output_dir, exist_ok=True)
         output_path = os.path.join(output_dir, f"{hash_val}-Position_freq_indices.buf")
@@ -2851,6 +2974,36 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
         print(f"    生成FREQ索引缓冲区: {os.path.basename(output_path)} (顶点数: {vertex_count}, 槽位数: {num_slots})")
         print(f"    [DEBUG] FREQ索引值分布: {dict(zip(*np.unique(freq_indices, return_counts=True)))}")
 
+        return num_slots
+
+    def _generate_sparse_vertex_index_Meshess(self, mod_export_path, hash_val, hash_slot_data, unique_names, vertex_count, calculated_ranges):
+        """写出「顶点命中索引」三份缓冲（稀疏模式，替代稠密 FREQ 表）。
+
+        条目集合与稠密表逐位等价：稠密表里非 255 的 (顶点, 槽位) 恰好就是这里的条目；
+        位移记录下标直接取自合并映射（-1 表示该 (顶点, 槽位) 没有位移数据）。
+        """
+        if not NUMPY_AVAILABLE:
+            print("Numpy库未找到，无法生成顶点命中索引缓冲区")
+            return False
+
+        freq_indices, num_slots, merged_index_map = self._build_vertex_freq_index_table(
+            mod_export_path, hash_val, hash_slot_data, unique_names, vertex_count, calculated_ranges
+        )
+        if freq_indices is None or num_slots <= 0:
+            return 0
+
+        if merged_index_map is None:
+            print(
+                "    [WARNING] 「顶点命中索引」未读到合并映射文件，位移记录下标将全部写 -1"
+                "（该网格不会有形态键位移）；请检查「合并槽位文件」的生成步骤。"
+            )
+
+        meshes_dir = os.path.join(mod_export_path, "Meshes0000")
+        stats = write_sparse_vertex_index(meshes_dir, hash_val, freq_indices, merged_index_map)
+        print(
+            f"    生成顶点命中索引: {os.path.basename(meshes_dir)}/{hash_val}-Position_vertex_entry_*.buf "
+            f"(顶点数: {stats['vertex_count']}, 槽位数: {stats['slot_count']}, 条目数: {stats['entry_count']})"
+        )
         return num_slots
 
     def execute_postprocess(self, mod_export_path):
@@ -2871,6 +3024,14 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
         use_delta = self.effective_use_delta()
         use_optimized = self.use_optimized_lookup
         merge_slot_files = self._should_merge_slot_files(use_packed)
+        sparse_blockers = self._sparse_index_blockers(use_packed, use_delta, use_optimized, merge_slot_files)
+        use_sparse_vertex_index = self.effective_use_sparse_index(use_packed, use_delta, use_optimized, merge_slot_files)
+        if sparse_blockers:
+            print(
+                "[形态键] 「顶点命中索引（稀疏查找）」未生效：还需要开启 "
+                + " / ".join(sparse_blockers)
+                + "。本次按未勾选处理。"
+            )
 
         if (use_packed or use_delta or use_optimized) and not NUMPY_AVAILABLE:
             print("Numpy库未找到，无法使用优化功能")
@@ -3152,7 +3313,18 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                         hash_prefix = self._extract_hash_prefix(hash_val)
                         vertex_count = vertex_counts.get(hash_prefix, 10000)
                         actual_file_hash = hash_to_actual_file_hash.get(hash_val, hash_val)
-                        self._generate_vertex_freq_index_Meshess(mod_export_path, actual_file_hash, hash_slot_data, hash_unique_names, vertex_count, calculated_ranges)
+                        if use_sparse_vertex_index:
+                            # 稀疏模式只写三份顶点命中索引，不写稠密 FREQ 表
+                            # （要省掉的正是「顶点数 × 槽位数 × 4B」这份）。
+                            self._generate_sparse_vertex_index_Meshess(
+                                mod_export_path, actual_file_hash, hash_slot_data,
+                                hash_unique_names, vertex_count, calculated_ranges
+                            )
+                        else:
+                            self._generate_vertex_freq_index_Meshess(
+                                mod_export_path, actual_file_hash, hash_slot_data,
+                                hash_unique_names, vertex_count, calculated_ranges
+                            )
 
                     if not self._update_shader_file(
                         hash_to_shader_paths[hash_val],
@@ -3170,6 +3342,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                         drag_dirs=self._drag_drive_dirs(hash_unique_names) if drag_drive_enabled else None,
                         hash_val=hash_val,
                         source_path=shader_source_path,
+                        use_sparse_vertex_index=use_sparse_vertex_index,
                     ):
                         print(f"更新哈希 {hash_val} 的着色器文件失败")
 
@@ -3326,7 +3499,8 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                         f"紧凑:{'是' if use_packed else '否'}, "
                         f"增量:{self._describe_delta_scope(use_delta)}, "
                         f"优化查找:{'是' if use_optimized else '否'}, "
-                        f"文件合并:{'是' if merge_slot_files else '否'}"
+                        f"文件合并:{'是' if merge_slot_files else '否'}, "
+                        f"顶点命中索引:{'是' if use_sparse_vertex_index else '否'}"
                     )
                     block_lines.append(f"\n    ; --- Binding Shape Key Meshess (Mode: {mode_str}) ---")
                     if merge_slot_files:
@@ -3334,7 +3508,16 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                         block_lines.append(f"    cs-t52 = copy {derive_shapekey_merged_map_resource_name(primary_base_resource)}")
                         t_registers_to_null.extend(["cs-t51", "cs-t52"])
 
-                        if use_optimized:
+                        if use_sparse_vertex_index:
+                            # 稀疏模式：三份顶点命中索引取代稠密 FREQ 表（t53 不再绑定）。
+                            for register, resource_name in (
+                                (SPARSE_START_REGISTER, derive_shapekey_vertex_entry_start_resource_name(primary_base_resource)),
+                                (SPARSE_PACKED_REGISTER, derive_shapekey_vertex_entry_packed_resource_name(primary_base_resource)),
+                                (SPARSE_FREQ_REGISTER, derive_shapekey_vertex_entry_freq_resource_name(primary_base_resource)),
+                            ):
+                                block_lines.append(f"    cs-t{register} = copy {resource_name}")
+                                t_registers_to_null.append(f"cs-t{register}")
+                        elif use_optimized:
                             block_lines.append(f"    cs-t53 = copy {derive_shapekey_freq_resource_name(primary_base_resource)}")
                             t_registers_to_null.append("cs-t53")
                     else:
@@ -3490,10 +3673,43 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                     h_prefix = self._extract_hash_prefix(h)
                     base_resources = hash_to_base_resources.get(h_prefix, [])
                     primary_base_resource = base_resources[0] if base_resources else f"Resource_{self._hash_to_resource_prefix(h)}_Position"
+                    if use_sparse_vertex_index:
+                        # 稀疏模式：三份顶点命中索引，稠密 FREQ 段（若有残留）一并清掉，
+                        # 避免上一轮导出留下的段被继续绑定。
+                        for resource_name, suffix in (
+                            (derive_shapekey_vertex_entry_start_resource_name(primary_base_resource), SPARSE_START_SUFFIX),
+                            (derive_shapekey_vertex_entry_packed_resource_name(primary_base_resource), SPARSE_PACKED_SUFFIX),
+                            (derive_shapekey_vertex_entry_freq_resource_name(primary_base_resource), SPARSE_FREQ_SUFFIX),
+                        ):
+                            section_name = f"[{resource_name}]"
+                            if section_name in sections or section_name in generated_section_names:
+                                continue
+                            new_resource_lines.extend(
+                                [section_name, "type = Buffer", "stride = 4", f"filename = Meshes0000/{actual_file_hash}-Position{suffix}.buf", ""]
+                            )
+                            generated_section_names.add(section_name)
+                        sections.pop(f"[{derive_shapekey_freq_resource_name(primary_base_resource)}]", None)
+                        continue
+
                     freq_idx_section = f"[{derive_shapekey_freq_resource_name(primary_base_resource)}]"
                     if freq_idx_section not in sections and freq_idx_section not in generated_section_names:
                         new_resource_lines.extend([freq_idx_section, "type = Buffer", "stride = 4", f"filename = Meshes0000/{actual_file_hash}-Position_freq_indices.buf", ""])
                         generated_section_names.add(freq_idx_section)
+
+            # 未开启稀疏查找时：移除旧 ini 里残留的顶点命中索引段。
+            # 只「不新增」不够 —— sections 是从旧 ini 读来的，旧段落会被原样写回，而
+            # 3DMigoto 只要看到 [Resource] + filename 就会加载（与帧表同理）。
+            if use_optimized and not use_sparse_vertex_index:
+                for h in unique_hashes:
+                    h_prefix = self._extract_hash_prefix(h)
+                    base_resources = hash_to_base_resources.get(h_prefix, [])
+                    primary_base_resource = base_resources[0] if base_resources else f"Resource_{self._hash_to_resource_prefix(h)}_Position"
+                    for stale_section in (
+                        f"[{derive_shapekey_vertex_entry_start_resource_name(primary_base_resource)}]",
+                        f"[{derive_shapekey_vertex_entry_packed_resource_name(primary_base_resource)}]",
+                        f"[{derive_shapekey_vertex_entry_freq_resource_name(primary_base_resource)}]",
+                    ):
+                        sections.pop(stale_section, None)
 
             if new_resource_lines:
                 sections[";; --- Generated Shape Key Meshess ---"] = new_resource_lines

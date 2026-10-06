@@ -152,5 +152,82 @@ class NTMIUpdateShaderFileSignatureTests(unittest.TestCase):
                 )
 
 
+def _production_node_attribute_names():
+    """取出 `blueprint/direct_export_shapekey.py` 里所有 `self.node.<attr>` 访问名。
+
+    崩铁路径上 `DirectShapeKeyGenerator.generate()` 的 `self.node` 就是
+    `NTMIShapeKeyNodeAdapter`：驱动多访问一个属性、适配器没跟上，整个崩铁直出形态键
+    导出就抛 `AttributeError`（勾没勾新选项都一样）。这里直接解析生产源码，而不是
+    在测试里硬编码一份会过期的清单——任何一侧单独变动都会失败。
+    """
+    source_path = REPO_ROOT / "blueprint" / "direct_export_shapekey.py"
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    names = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Attribute):
+            continue
+        inner = node.value
+        if (
+            isinstance(inner, ast.Attribute)
+            and inner.attr == "node"
+            and isinstance(inner.value, ast.Name)
+            and inner.value.id == "self"
+        ):
+            names.add(node.attr)
+    return names
+
+
+# 帧表专属：崩铁路径上 `getattr(self.node, "use_frame_table", False)` 恒为 False，
+# 帧表分支不可达（帧表与 NTMI 是两套渲染模型），因此不要求适配器实现。
+_FRAME_TABLE_ONLY_NODE_ATTRIBUTES = {"_get_frame_table_template_path"}
+
+
+class NTMINodeSurfaceTests(unittest.TestCase):
+    """回归：驱动访问的每个 `self.node.*` 都必须在 NTMI 适配器上真实存在。"""
+
+    def _make_adapter(self):
+        return ntmi_shapekey.NTMIShapeKeyNodeAdapter(
+            original_node=types.SimpleNamespace(),
+            sections={},
+            mod_export_path=".",
+            ini_path="./mod.ini",
+        )
+
+    def test_adapter_exposes_every_attribute_the_driver_reads_on_self_node(self):
+        adapter = self._make_adapter()
+        accessed = _production_node_attribute_names()
+        self.assertTrue(
+            accessed,
+            "未在 blueprint/direct_export_shapekey.py 里找到 self.node.* 访问"
+            "（生产契约变了，本回归测试需要同步更新）",
+        )
+
+        missing = sorted(
+            name
+            for name in accessed - _FRAME_TABLE_ONLY_NODE_ATTRIBUTES
+            if not hasattr(adapter, name)
+        )
+        self.assertEqual(
+            missing,
+            [],
+            "崩铁直出形态键导出访问这些属性时会抛 AttributeError："
+            f"{missing}；需给 NTMIShapeKeyNodeAdapter 补上同名成员（或让驱动不再访问）。",
+        )
+
+    def test_adapter_declines_the_sparse_vertex_index_model(self):
+        """NTMI 不实现「顶点命中索引」：驱动必须拿到明确的 False 与空 blocker 列表。"""
+        adapter = self._make_adapter()
+
+        self.assertFalse(
+            adapter.effective_use_sparse_index(True, True, True, True),
+            "崩铁 NTMI 路径沿用稠密 FREQ 模型（与帧表一致），不应宣称稀疏索引已生效",
+        )
+        self.assertEqual(
+            adapter._sparse_index_blockers(True, True, True, True),
+            [],
+            "NTMI 不实现稀疏模型，不应因为四项前置项齐全就报「缺前置项」",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
