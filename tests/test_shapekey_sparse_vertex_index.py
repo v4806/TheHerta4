@@ -932,13 +932,15 @@ class SparseDriverWiringTests(unittest.TestCase):
                     names.add(sub_node.func.attr)
         return names
 
-    def test_blocked_option_raises_instead_of_silently_falling_back(self):
-        guard = None
+    def _sparse_guard(self):
+        """找到「勾选了稀疏索引就做前置校验」的那个分支。"""
         for node in ast.walk(self.tree):
             if isinstance(node, ast.If) and "sparse_requested" in ast.unparse(node.test):
-                if "not use_sparse_vertex_index" in ast.unparse(node.test):
-                    guard = node
-                    break
+                return node
+        return None
+
+    def test_blocked_option_raises_instead_of_silently_falling_back(self):
+        guard = self._sparse_guard()
 
         self.assertIsNotNone(guard, "必须存在「勾选但未生效」的前置校验分支")
         raises = [node for node in ast.walk(guard) if isinstance(node, ast.Raise)]
@@ -949,6 +951,20 @@ class SparseDriverWiringTests(unittest.TestCase):
 
     def test_frame_table_conflict_is_explained_to_the_user(self):
         self.assertIn("与顶点命中索引是互斥的两套渲染模型", self.source)
+
+    def test_frame_table_conflict_is_judged_inside_the_same_guard(self):
+        """帧表与稀疏同时勾选时必须报错，哪怕四项前置齐全。
+
+        所以「帧表冲突」要在同一个前置校验分支里追加，而不能只挂在「未生效」的
+        附属判断下——否则两条路都成立时，稀疏资源段与 cs-t96/97/98 会被绑到帧表
+        着色器上（它没有这些寄存器），加载即出错。
+        """
+        guard = self._sparse_guard()
+        self.assertIsNotNone(guard)
+        guard_source = ast.unparse(guard)
+        self.assertIn("frame_table_mode", guard_source)
+        self.assertIn("与顶点命中索引是互斥的两套渲染模型", guard_source)
+        self.assertIn("sparse_blockers", guard_source)
 
     def test_flag_reaches_the_shader_and_ini_stages(self):
         keywords = {}

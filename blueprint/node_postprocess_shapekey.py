@@ -837,7 +837,21 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
         compute_box.prop(self, "use_packed_Meshess")
         compute_box.prop(self, "use_optimized_lookup")
         compute_box.prop(self, "merge_slot_files")
+        compute_box.prop(self, "use_sparse_vertex_index")
         compute_box.prop(self, "use_frame_table")
+        if getattr(self, "use_sparse_vertex_index", False):
+            # 勾了就当场说明生效与否：与导出期同策略，不给用户「以为开了」的机会。
+            if getattr(self, "use_frame_table", False):
+                compute_box.label(text="与「帧表插值」互斥，请二选一", icon='ERROR')
+            else:
+                _sparse_blockers = self._sparse_index_blockers()
+                if _sparse_blockers:
+                    compute_box.label(
+                        text="未生效：还需开启 " + " / ".join(_sparse_blockers),
+                        icon='INFO',
+                    )
+                else:
+                    compute_box.label(text="已生效：只遍历该顶点命中的形态键", icon='CHECKMARK')
 
         storage_box = layout.box()
         storage_box.label(text="空间优化", icon='PACKAGE')

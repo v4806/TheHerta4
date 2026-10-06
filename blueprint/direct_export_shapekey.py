@@ -426,18 +426,24 @@ class DirectShapeKeyGenerator(
         use_sparse_vertex_index = self.node.effective_use_sparse_index(
             use_packed, use_delta, use_optimized, merge_slot_files
         )
-        if sparse_requested and not use_sparse_vertex_index:
-            sparse_blockers = self.node._sparse_index_blockers(
-                use_packed, use_delta, use_optimized, merge_slot_files
+        if sparse_requested:
+            # 只要勾了就走这里：① 四项前置缺一不可；② 与帧表互斥——帧表即便前置
+            # 齐全也必须拦下，否则稀疏资源段与 cs-t96/97/98 会被绑到帧表着色器上
+            # （它没有这些寄存器），加载即出错。两种情况都明确失败，不静默回退。
+            sparse_blockers = list(
+                self.node._sparse_index_blockers(
+                    use_packed, use_delta, use_optimized, merge_slot_files
+                )
             )
             if frame_table_mode:
                 sparse_blockers.append(
                     "「帧表插值（序列组加速）」：与顶点命中索引是互斥的两套渲染模型"
                 )
-            raise ShapeKeyDirectExportError(
-                "「顶点命中索引（稀疏查找）」无法启用。请修正以下设置，或取消勾选后重试：\n"
-                + "\n".join("  - " + reason for reason in sparse_blockers)
-            )
+            if sparse_blockers:
+                raise ShapeKeyDirectExportError(
+                    "「顶点命中索引（稀疏查找）」无法启用。请修正以下设置，或取消勾选后重试：\n"
+                    + "\n".join("  - " + reason for reason in sparse_blockers)
+                )
         if frame_table_mode:
             freq_params = {
                 name: self.node.get_shape_key_export_variable_name(name) for name in all_unique_names

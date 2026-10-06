@@ -9,6 +9,7 @@
 - 数据生成（`_process_merged_shapekey_Meshess`）：关闭时增量记录 3 float/条，
   开启时 9 float/条，且法线/切线分量确实来自形态键缓冲。
 """
+import ast
 import importlib.util
 import json
 import re
@@ -824,6 +825,45 @@ class StorageGroupLayoutTests(unittest.TestCase):
         source = self._source()
         for label in ("计算优化", "空间优化", "导出优化"):
             self.assertIn(f'label(text="{label}"', source)
+
+    def test_every_bool_switch_is_drawn_in_a_group(self):
+        """定义了开关却没画进 draw_buttons，用户就永远看不到它。
+
+        「顶点命中索引（稀疏查找）」第一次提交就漏在这里：属性、导出逻辑、测试
+        全都有，唯独没挂进面板，于是功能存在但 UI 上找不到。
+        """
+        tree = ast.parse(self._source())
+        draw_owner = None
+        for candidate in ast.walk(tree):
+            if not isinstance(candidate, ast.ClassDef):
+                continue
+            if any(
+                isinstance(item, ast.FunctionDef) and item.name == "draw_buttons"
+                for item in candidate.body
+            ):
+                draw_owner = candidate
+                break
+        self.assertIsNotNone(draw_owner, "未找到带 draw_buttons 的节点类")
+
+        declared = set()
+        for item in draw_owner.body:
+            if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
+                if "BoolProperty" in ast.unparse(item.annotation):
+                    declared.add(item.target.id)
+
+        drawn = set()
+        for item in ast.walk(draw_owner):
+            if not isinstance(item, ast.Call) or not isinstance(item.func, ast.Attribute):
+                continue
+            if item.func.attr != "prop" or len(item.args) < 2:
+                continue
+            if not (isinstance(item.args[0], ast.Name) and item.args[0].id == "self"):
+                continue
+            if isinstance(item.args[1], ast.Constant):
+                drawn.add(item.args[1].value)
+
+        self.assertTrue(declared, "节点类里应当有布尔开关")
+        self.assertEqual(sorted(declared - drawn), [], "这些布尔开关定义了却没画进 UI")
 
     def test_storage_switches_are_wired_to_exclusive_callbacks(self):
         source = self._source()
