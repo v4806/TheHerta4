@@ -362,7 +362,7 @@ class NTMIShapeKeyNodeAdapter:
                 "        {",
                 "            uint packed_idx = vertex_id * num_slots + slot_index;",
                 "            uint freq_idx = vertex_freq_indices[packed_idx];",
-                "            if (freq_idx == 255u)",
+                "            if (freq_idx == 0xFFFFFFFFu)",
                 "            {",
                 "                continue;",
                 "            }",

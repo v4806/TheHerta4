@@ -1,11 +1,12 @@
 """「顶点命中索引（稀疏查找）」的等价性、着色器注入与 ini 接线测试。
 
-稀疏索引把「顶点数 × 槽位数」的稠密 FREQ 表（``255`` = 该顶点不受此槽位影响）
+稀疏索引把「顶点数 × 槽位数」的稠密 FREQ 表（``NO_FREQ_INDEX`` = 该顶点不受此槽位影响，
+取值在所有合法形态键下标之外）
 转置成 CSR：``start``（行偏移，顶点数 + 1 个 uint32）+ ``packed``（位移记录下标，
 ``-1`` = 无位移数据）+ ``freq``（形态键强度下标）。换表的唯一依据是**逐格等价**，
 所以本文件分六层锁死：
 
-1. ``SparseIndexTableTests``：CSR 与稠密表逐格等价（含 255 哨兵、空表、全命中）；
+1. ``SparseIndexTableTests``：CSR 与稠密表逐格等价（含哨兵、空表、全命中、下标 255 是合法键）；
 2. ``SparseIndexWriterTests``：三份缓冲的落盘尺寸、文件名与统计；
 3. ``SparseLogicLinesTests``：注入的逻辑块只遍历命中条目（含拖拽变体与缩进）；
 4. ``SparseResourceNameTests``：资源名派生（直接加载真实 ``common/mod_path_compat.py``）；
@@ -230,17 +231,18 @@ class SparseIndexTableTests(unittest.TestCase):
         for vertex in range(len(dense)):
             entries = []
             for slot in range(len(dense[vertex])):
-                if dense[vertex][slot] == 255:
+                if dense[vertex][slot] == sparse_index.NO_FREQ_INDEX:
                     continue
                 entries.append((int(dense[vertex][slot]), int(packed[vertex][slot])))
             expected.append(entries)
         return expected
 
     def test_csr_matches_dense_table_entry_by_entry(self):
+        N = self.NO_FREQ
         dense = [
-            [255, 3, 255, 7],
-            [255, 255, 255, 255],   # 完全不命中：区间为空
-            [0, 255, 1, 255],
+            [N, 3, N, 7],
+            [N, N, N, N],   # 完全不命中：区间为空
+            [0, N, 1, N],
             [5, 6, 7, 8],           # 全命中：条目数 == 槽位数
         ]
         packed = [
@@ -260,20 +262,33 @@ class SparseIndexTableTests(unittest.TestCase):
         self.assertEqual(freq_out.tolist(), [3, 7, 0, 1, 5, 6, 7, 8])
         self.assertEqual(packed_out.tolist(), [12, 13, 0, 1, 20, 21, 22, 23])
 
-    def test_255_is_a_sentinel_not_a_shape_key_slot(self):
-        """255 表示「该顶点不受此槽位影响」，绝不能变成一条命中条目。"""
-        dense = [[255, 255], [2, 255]]
+    def test_sentinel_is_not_a_shape_key_slot(self):
+        """哨兵表示「该顶点不受此槽位影响」，绝不能变成一条命中条目。"""
+        dense = [[self.NO_FREQ, self.NO_FREQ], [2, self.NO_FREQ]]
         start, packed_out, freq_out = sparse_index.build_sparse_vertex_index(dense)
         self.assertEqual(start.tolist(), [0, 0, 1])
         self.assertEqual(freq_out.tolist(), [2])
         # 未给位移表时全部记 -1（上层据此跳过位移读取）
         self.assertEqual(packed_out.tolist(), [-1])
 
+    def test_index_255_is_a_legal_shape_key_slot(self):
+        """回归：形态键总数 > 255 时下标 255 是**合法键**，必须成为命中条目。
+
+        早期用 255 当哨兵，工程里下标恰为 255 的那个键会被写入端当成空槽位跳过、
+        被读取端当成空槽位忽略，实机上整体失效且不报错。
+        """
+        dense = [[255, 2], [self.NO_FREQ, self.NO_FREQ]]
+        start, packed_out, freq_out = sparse_index.build_sparse_vertex_index(dense)
+        self.assertEqual(start.tolist(), [0, 2, 2])
+        self.assertEqual(freq_out.tolist(), [255, 2])
+        self.assertEqual(packed_out.tolist(), [-1, -1])
+
     def test_entries_of_one_vertex_are_contiguous_and_slot_ascending(self):
+        N = self.NO_FREQ
         dense = [
-            [9, 255, 4],
-            [255, 255, 255],
-            [255, 1, 2],
+            [9, N, 4],
+            [N, N, N],
+            [N, 1, 2],
         ]
         start, packed_out, freq_out = sparse_index.build_sparse_vertex_index(dense)
         lookup = sparse_index.sparse_entry_lookup(start, packed_out, freq_out)
@@ -318,9 +333,10 @@ class SparseIndexTableTests(unittest.TestCase):
 # ============================================================================
 class SparseIndexWriterTests(unittest.TestCase):
     def test_writes_three_buffers_with_expected_sizes(self):
+        N = sparse_index.NO_FREQ_INDEX
         dense = [
-            [255, 1, 255],
-            [2, 255, 3],
+            [N, 1, N],
+            [2, N, 3],
         ]
         packed = [
             [-1, 11, -1],

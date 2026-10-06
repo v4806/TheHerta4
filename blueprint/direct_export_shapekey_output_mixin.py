@@ -27,6 +27,7 @@ from .direct_export_runtime_utils import iter_drawib_models as _iter_drawib_mode
 from .direct_export_shapekey_shared import ShapeKeyDirectExportError, _buffer_to_bytes, resolve_use_delta
 try:
     from .shapekey_sparse_index import (
+        NO_FREQ_INDEX,
         SPARSE_FREQ_REGISTER,
         SPARSE_FREQ_SUFFIX,
         SPARSE_PACKED_REGISTER,
@@ -37,6 +38,7 @@ try:
     )
 except ImportError:  # 测试 stub 包无 __path__ 时退化为绝对导入
     from blueprint.shapekey_sparse_index import (
+        NO_FREQ_INDEX,
         SPARSE_FREQ_REGISTER,
         SPARSE_FREQ_SUFFIX,
         SPARSE_PACKED_REGISTER,
@@ -364,17 +366,17 @@ class DirectShapeKeyOutputMixin:
         merged_index_map=None,
         slot_index_maps=None,
     ):
-        """构建稠密 FREQ 表（顶点数 × 槽位数，未命中为 255）。
+        """构建稠密 FREQ 表（顶点数 × 槽位数，未命中为 ``NO_FREQ_INDEX``）。
 
         稠密写出与「顶点命中索引（稀疏查找）」共用这一份结果：稀疏索引只是把
-        同一张表的非 255 条目按顶点压紧，不改变判定逻辑，避免两条路径走偏。
+        同一张表的非哨兵条目按顶点压紧，不改变判定逻辑，避免两条路径走偏。
         """
         num_slots = max(hash_slot_data.keys()) if hash_slot_data else 0
         if num_slots <= 0 or vertex_count <= 0:
             return None, 0
 
         name_to_freq_index = {name: index for index, name in enumerate(unique_names)}
-        freq_indices = np.full((vertex_count, num_slots), 255, dtype=np.uint32)
+        freq_indices = np.full((vertex_count, num_slots), NO_FREQ_INDEX, dtype=np.uint32)
         slot_index_maps = slot_index_maps or {}
 
         for slot_num, names_data in hash_slot_data.items():
@@ -382,8 +384,8 @@ class DirectShapeKeyOutputMixin:
             index_map = merged_index_map[:, slot_index] if merged_index_map is not None else slot_index_maps.get(slot_num)
 
             for shapekey_name, objects in names_data.items():
-                freq_idx = name_to_freq_index.get(shapekey_name, 255)
-                if freq_idx == 255:
+                freq_idx = name_to_freq_index.get(shapekey_name, NO_FREQ_INDEX)
+                if freq_idx == NO_FREQ_INDEX:
                     continue
 
                 for obj_name in objects:
@@ -731,7 +733,7 @@ class DirectShapeKeyOutputMixin:
         for slot_index in range(slot_count):
             key_column = freq_indices[:, slot_index]
             index_column = merged_map[:, slot_index]
-            valid = (key_column != 255) & (index_column >= 0)
+            valid = (key_column != NO_FREQ_INDEX) & (index_column >= 0)
             if not valid.any():
                 continue
             rows = np.flatnonzero(valid)

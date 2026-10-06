@@ -4,10 +4,10 @@
 
     uint packed_idx_slotK = i * num_slots + K;
     uint freq_idx_slotK = vertex_freq_indices[packed_idx_slotK];
-    if (freq_idx_slotK != 255) { ... }
+    if (freq_idx_slotK != NO_FREQ_INDEX) { ... }
 
 槽位数 = 形态键实际占用的槽位数，于是每个顶点每帧都要跑 num_slots 次
-（5 万顶点 × 700 键 ≈ 3500 万次索引读取），而 ``!= 255`` 的早退在 GPU 上会被
+（5 万顶点 × 700 键 ≈ 3500 万次索引读取），而 ``!= NO_FREQ_INDEX`` 的早退在 GPU 上会被
 warp divergence 吃掉——一个 warp 的 32 个 lane 里只要有一个命中该槽位，
 整段仍要执行。
 
@@ -44,8 +44,17 @@ except ImportError:  # pragma: no cover - Blender 内置 numpy，缺失时上层
     NUMPY_AVAILABLE = False
 
 
-#: 稠密 FREQ 表里「该顶点不受此槽位影响」的哨兵值（与 HLSL 的 NO_FREQ_INDEX 一致）
-NO_FREQ_INDEX = 255
+#: 稠密 FREQ 表里「该顶点不受此槽位影响」的哨兵值（与 HLSL 的 NO_FREQ_INDEX 一致）。
+#:
+#: 取值必须落在合法形态键下标（``0 .. len(unique_names)-1``）之外。早期取值 255，
+#: 于是形态键总数 > 255 的工程里，下标恰好为 255 的那个键会被撞上：写入端把它
+#: 当成空槽位跳过（该键的 freq_indices 全是哨兵），读取端再把它当成空槽位忽略
+#: —— 该键在实机上整体失效，且不报任何错。帧表模式下表现为「从该键起累积位移
+#: 恒定少一份」，稠密/稀疏模式下表现为该键单独无效。
+NO_FREQ_INDEX = 0xFFFFFFFF
+
+#: 同一个哨兵注入 shader 文本时使用的 HLSL 字面量写法。
+NO_FREQ_INDEX_HLSL = "0xFFFFFFFFu"
 
 #: 三份稀疏索引占用的 cs-t 寄存器。
 #: 取 96/97/98：避开 t50（基础顶点）、t51/t52/t53（合并数据/映射/FREQ）、

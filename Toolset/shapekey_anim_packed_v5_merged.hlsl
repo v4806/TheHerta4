@@ -8,7 +8,7 @@
 //   - Merge all slot index maps into one flattened index buffer.
 //   - Optional optimized FREQ lookup stays as a separate buffer.
 
-#define NO_FREQ_INDEX 255
+#define NO_FREQ_INDEX 0xFFFFFFFFu
 
 struct VertexAttributes {
     float3 position;

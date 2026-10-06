@@ -21,6 +21,8 @@ except ImportError:  # 测试 stub 包无 __path__ 时退化为绝对导入
 from .node_postprocess_base import SSMTNode_PostProcess_Base
 try:
     from .shapekey_sparse_index import (
+        NO_FREQ_INDEX,
+        NO_FREQ_INDEX_HLSL,
         SPARSE_FREQ_REGISTER,
         SPARSE_FREQ_SUFFIX,
         SPARSE_PACKED_REGISTER,
@@ -32,6 +34,8 @@ try:
     )
 except ImportError:  # 测试 stub 包无 __path__ 时退化为绝对导入
     from blueprint.shapekey_sparse_index import (
+        NO_FREQ_INDEX,
+        NO_FREQ_INDEX_HLSL,
         SPARSE_FREQ_REGISTER,
         SPARSE_FREQ_SUFFIX,
         SPARSE_PACKED_REGISTER,
@@ -2707,7 +2711,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
 
                     if use_optimized:
                         logic_lines.append(f"    uint freq_idx_slot{slot_index} = vertex_freq_indices[packed_idx_slot{slot_index}];")
-                        logic_lines.append(f"    if (freq_idx_slot{slot_index} != 255)")
+                        logic_lines.append(f"    if (freq_idx_slot{slot_index} != {NO_FREQ_INDEX_HLSL})")
                         logic_lines.append("    {")
                         if drag_drive_enabled:
                             logic_lines.append(f"        float anim_weight_slot{slot_index} = ShapeKeyWeight[freq_idx_slot{slot_index}];")
@@ -2768,7 +2772,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                     logic_lines.extend([f"    // --- Slot {slot_index} (t{51+slot_index}) ---"])
                     logic_lines.append(f"    uint packed_idx_slot{slot_index} = i * num_slots + {slot_index};")
                     logic_lines.append(f"    uint freq_idx_slot{slot_index} = vertex_freq_indices[packed_idx_slot{slot_index}];")
-                    logic_lines.append(f"    if (freq_idx_slot{slot_index} != 255)")
+                    logic_lines.append(f"    if (freq_idx_slot{slot_index} != {NO_FREQ_INDEX_HLSL})")
                     logic_lines.append("    {")
                     if drag_drive_enabled:
                         logic_lines.append(f"        float anim_weight_slot{slot_index} = ShapeKeyWeight[freq_idx_slot{slot_index}];")
@@ -2902,7 +2906,7 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
             print("    [DEBUG] 没有可用槽位或顶点数为 0，跳过 FREQ 索引生成")
             return None, 0, None
 
-        freq_indices = np.full((vertex_count, num_slots), 255, dtype=np.uint32)
+        freq_indices = np.full((vertex_count, num_slots), NO_FREQ_INDEX, dtype=np.uint32)
         merge_slot_files = self._should_merge_slot_files()
 
         merged_index_map = None
@@ -2950,9 +2954,9 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                 f"{'使用合并映射' if merged_index_map is not None else ('找到 1 个映射文件' if slot_index_map is not None else '未找到映射文件')}"
             )
             for name, objects in names_data.items():
-                freq_idx = name_to_freq_index.get(name, 255)
+                freq_idx = name_to_freq_index.get(name, NO_FREQ_INDEX)
                 print(f"      [DEBUG] 形态键 '{name}' -> FREQ索引 {freq_idx}, 物体: {objects}")
-                if freq_idx == 255:
+                if freq_idx == NO_FREQ_INDEX:
                     continue
 
                 for obj_name in objects:
