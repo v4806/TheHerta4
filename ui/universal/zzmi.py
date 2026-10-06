@@ -1359,7 +1359,8 @@ class ExportZZMI(ExportUnity):
 
         B1（契约接线）：本方法只**扫描与统计**，不中止导出——结果写入
         ``self._zzmi_merged_contract_stats``（``checkbox_enabled`` /
-        ``parts_with_data`` / ``component_count`` / ``skip_reasons``），由
+        ``parts_with_data`` / ``parts_with_global_ids`` / ``component_count`` /
+        ``skip_reasons``），由
         ``_enforce_merged_skeleton_contract`` 在写盘前判定 error/warning/notice。
         开关关闭时**不做早退**：带数据的部件照样要统计，否则「开关关闭 + 有数据」
         这条 error 永远无法被评估。
@@ -1370,6 +1371,9 @@ class ExportZZMI(ExportUnity):
         # B1：契约判定所需的统计。parts_with_data 的判据 = 子网格 json 里
         # vg_count > 0（= 导入侧写回过 VGMap）；skip_reasons 面向用户、按 DrawIB 去重。
         parts_with_data: set[str] = set()
+        # 契约判据修正：几何**确实**按全局骨骼编号导出的部件（判据 = 顶点组编号
+        # 空间，而不是「json 里有缓存」——后者是导入侧无条件生成的派生数据）。
+        parts_with_global_ids: set[str] = set()
         skip_reasons: dict[str, str] = {}
         # 阻断修复（t80 §2.4）：按「内容可用」而**不是**按版本号放行的旧缓存，
         # 逐 DrawIB 记一条可读痕迹（绝不静默降级）。
@@ -1389,6 +1393,8 @@ class ExportZZMI(ExportUnity):
                     continue
                 # B1：**先**统计带数据的部件（开关关闭时同样统计）。
                 parts_with_data.add(draw_ib)
+                if self._submesh_uses_global_bone_ids(submesh_model, vg_count):
+                    parts_with_global_ids.add(draw_ib)
                 if not checkbox_enabled:
                     # 开关关闭：本部件不进入合并骨架（导出仍走局部编号），但**不早退**——
                     # 「开关关闭 + 有数据」必须交给契约判定（否则导出会静默退化成
@@ -1581,6 +1587,7 @@ class ExportZZMI(ExportUnity):
         self._zzmi_merged_contract_stats = {
             "checkbox_enabled": checkbox_enabled,
             "parts_with_data": len(parts_with_data),
+            "parts_with_global_ids": len(parts_with_global_ids),
             "component_count": len(components),
             "skip_reasons": dict(skip_reasons),
             # 阻断修复（t80 §2.4）：因「版本号旧但内容完整」而按当前算法就地补算
@@ -1647,11 +1654,59 @@ class ExportZZMI(ExportUnity):
             return False
         return all(0 <= slot <= 0xFFFFFFFF for slot in normalized.values())
 
+    @staticmethod
+    def _submesh_uses_global_bone_ids(submesh_model, vg_count: int) -> bool:
+        """该部件的**几何**顶点组是否落在全局骨骼编号空间（契约判据修正）。
+
+        契约原先只看「json 里有没有 VGMap 缓存」就断定几何用全局编号，但这份缓存
+        是导入侧**无条件**落盘的派生数据（ui/ui_func_import_ssmt.py「生成侧与消费侧
+        分离」），与「本次导入是否按合并骨架建顶点组」无关 ⇒ 只要工作区被无条件
+        生成过缓存，从未开启过该开关的普通导出也会被判成致命错误。
+
+        几何的真实编号空间只能从顶点组本身读：
+        - 普通导入：组名 = 部件局部编号 ``0..vg_count-1``（消费侧的合并骨架预处理
+          完全由「使用融合统一顶点组」门控，见 common/submesh_model.py）；
+        - 合并导入：组名 = 全局骨骼 id ``[VGOffset, VGOffset+VGCount)``。
+
+        `_prepare_merged_skeleton_vertex_groups` 只补缺/排序、**不改数值**，所以
+        「最大数字组名 >= vg_count」是全局编号的充分判据：全局最大组名
+        = ``VGOffset + vg_count - 1 >= vg_count``（``VGOffset >= 1``）；而
+        ``VGOffset == 0`` 时全局与局部编号完全重合、导出结果一致，判为局部无害。
+
+        拿不到对象（被删/改名）或无数字组时返回 False——契约只在**确证**几何是
+        全局编号时才中止导出，不再把普通导出误判为致命错误。
+        """
+        try:
+            expected = int(vg_count)
+        except (TypeError, ValueError):
+            return False
+        if expected <= 0:
+            return False
+        saw_object = False
+        max_numeric_id = -1
+        for draw_call in getattr(submesh_model, "drawcall_model_list", []) or []:
+            try:
+                obj_name = draw_call.get_blender_obj_name()
+            except Exception:
+                continue
+            obj = bpy.data.objects.get(obj_name) if obj_name else None
+            if obj is None:
+                continue
+            saw_object = True
+            for vertex_group in getattr(obj, "vertex_groups", []) or []:
+                name = str(getattr(vertex_group, "name", ""))
+                if name.isascii() and name.isdigit():
+                    max_numeric_id = max(max_numeric_id, int(name))
+        if not saw_object:
+            return False
+        return max_numeric_id >= expected
+
     def _enforce_merged_skeleton_contract(self) -> dict:
         """B1：按合并骨架契约判定「继续 / 中止」，**必须在任何写盘之前调用**。
 
         判据与行动（契约实现见 ``common/zzmi_merged_contract.py``）：
-        - ``error``（有数据但一个组件都没收到）⇒ 抛 ``Fatal``（仓库既有的致命错误
+        - ``error``（有数据但一个组件都没收到，且**几何确实使用全局骨骼编号**，
+          或开关开启后部件全部被拒）⇒ 抛 ``Fatal``（仓库既有的致命错误
           通道）：导出操作符的 ``except Exception`` 会把它变成用户可见的
           ``self.report({'ERROR'}, "导出失败: …")``（``ui/ui_func_export.py``），
           并行轮次的 ``_run_worker`` 也把 ``str(error)`` 回传到主进程报错；
@@ -1677,6 +1732,7 @@ class ExportZZMI(ExportUnity):
         decision = evaluate_merged_skeleton_contract(
             checkbox_enabled=bool(stats.get("checkbox_enabled")),
             parts_with_data=int(stats.get("parts_with_data") or 0),
+            parts_with_global_ids=int(stats.get("parts_with_global_ids") or 0),
             component_count=int(stats.get("component_count") or 0),
             skip_reasons=stats.get("skip_reasons") or {},
         )
