@@ -71,19 +71,31 @@ class BMTP_ShapeKeyUtils:
             curr_time = time.time()
             elapsed_time = curr_time - start_time
 
+            # 显式重置选择集：duplicate_move 会复制所有被选中的物体。
+            bpy.ops.object.select_all(action='DESELECT')
             context.view_layer.objects.active = copy_object
             copy_object.select_set(True)
             
             bpy.ops.object.duplicate_move(OBJECT_OT_duplicate={"linked":False, "mode":'TRANSLATION'}, TRANSFORM_OT_translate={"value":(0, 0, 0), "orient_type":'GLOBAL', "orient_matrix":((1, 0, 0), (0, 1, 0), (0, 0, 1)), "orient_matrix_type":'GLOBAL', "constraint_axis":(False, False, False), "mirror":True, "use_proportional_edit":False, "proportional_edit_falloff":'SMOOTH', "proportional_size":1, "use_proportional_connected":False, "use_proportional_projected":False, "snap":False, "snap_target":'CLOSEST', "snap_point":(0, 0, 0), "snap_align":False, "snap_normal":(0, 0, 0), "gpencil_strokes":False, "cursor_transform":False, "texture_space":False, "remove_on_cancel":False, "release_confirm":False, "use_accurate":False})
             tmp_object = context.view_layer.objects.active
-            bpy.ops.object.shape_key_remove(all=True)
-            copy_object.select_set(True)
-            copy_object.active_shape_key_index = i
+            copy_object.select_set(False)
             
-            bpy.ops.object.shape_key_transfer()
-            context.object.active_shape_key_index = 0
-            bpy.ops.object.shape_key_remove()
-            bpy.ops.object.shape_key_remove(all=True)
+            # 不用 bpy.ops.object.shape_key_transfer()：它要求"除活动物体外恰好还有
+            # 1 个可编辑网格物体被选中"，视图层选择一旦被污染就直接抛 RuntimeError
+            # 中止整个导出。把第 i 个键值设 1.0、其余键 0.0，再 apply_mix 移除形态键，
+            # 得到的就是第 i 个键烘进网格后的形状。
+            tmp_key_blocks = tmp_object.data.shape_keys.key_blocks
+            for key_index, key_block in enumerate(tmp_key_blocks):
+                key_block.mute = False
+                if key_index == i:
+                    key_block.vertex_group = ""
+                    key_block.slider_min = min(key_block.slider_min, 0.0)
+                    key_block.slider_max = max(key_block.slider_max, 1.0)
+                    key_block.value = 1.0
+                else:
+                    key_block.value = 0.0
+            bpy.ops.object.shape_key_remove(all=True, apply_mix=True)
+
             
             for modifier_name in selected_modifiers:
                 bpy.ops.object.modifier_apply(modifier=modifier_name)
@@ -106,9 +118,11 @@ class BMTP_ShapeKeyUtils:
             original_object.select_set(False)
             context.view_layer.objects.active = tmp_object
             
+            # 不用 bpy.ops.object.delete：它删除的是所有选中物体。
             tmp_mesh = tmp_object.data
-            bpy.ops.object.delete(use_global=False)
-            bpy.data.meshes.remove(tmp_mesh)
+            bpy.data.objects.remove(tmp_object, do_unlink=True)
+            if tmp_mesh and tmp_mesh.users == 0:
+                bpy.data.meshes.remove(tmp_mesh)
         
         context.view_layer.objects.active = original_object
         for i in range(0, shapes_count):
@@ -134,9 +148,10 @@ class BMTP_ShapeKeyUtils:
         original_object.select_set(False)
         context.view_layer.objects.active = copy_object
         copy_object.select_set(True)
-        tmp_mesh = copy_object.data
-        bpy.ops.object.delete(use_global=False)
-        bpy.data.meshes.remove(tmp_mesh)
+        copy_mesh = copy_object.data
+        bpy.data.objects.remove(copy_object, do_unlink=True)
+        if copy_mesh and copy_mesh.users == 0:
+            bpy.data.meshes.remove(copy_mesh)
         
         context.view_layer.objects.active = original_object
         context.view_layer.objects.active.select_set(True)

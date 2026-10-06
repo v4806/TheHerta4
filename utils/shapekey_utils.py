@@ -664,21 +664,34 @@ class ShapeKeyUtils:
             elapsedTime = currTime - startTime
 
             print("applyModifierForObjectWithShapeKeys: Applying shape key %d/%d ('%s', %0.2f seconds since start)" % (i+1, shapesCount, list_properties[i]["name"], elapsedTime))
+            # 显式重置选择集：duplicate_move 会复制所有被选中的物体，残留选中/其它插件的
+            # handler 会让 tmpObject 不是唯一副本（也是下面 shape key 算子报错的来源）。
+            bpy.ops.object.select_all(action='DESELECT')
             context.view_layer.objects.active = copyObject
             copyObject.select_set(True)
             
             # Copy temp object.
             bpy.ops.object.duplicate_move(OBJECT_OT_duplicate={"linked":False, "mode":'TRANSLATION'}, TRANSFORM_OT_translate={"value":(0, 0, 0), "orient_type":'GLOBAL', "orient_matrix":((1, 0, 0), (0, 1, 0), (0, 0, 1)), "orient_matrix_type":'GLOBAL', "constraint_axis":(False, False, False), "mirror":True, "use_proportional_edit":False, "proportional_edit_falloff":'SMOOTH', "proportional_size":1, "use_proportional_connected":False, "use_proportional_projected":False, "snap":False, "snap_target":'CLOSEST', "snap_point":(0, 0, 0), "snap_align":False, "snap_normal":(0, 0, 0), "gpencil_strokes":False, "cursor_transform":False, "texture_space":False, "remove_on_cancel":False, "release_confirm":False, "use_accurate":False})
             tmpObject = context.view_layer.objects.active
-            cls.remove_shape_keys(tmpObject, all=True)
-            copyObject.select_set(True)
-            copyObject.active_shape_key_index = i
+            copyObject.select_set(False)
             
-            # Get right shape-key.
-            bpy.ops.object.shape_key_transfer()
-            context.object.active_shape_key_index = 0
-            cls.remove_shape_keys(tmpObject, all=False)
-            cls.remove_shape_keys(tmpObject, all=True)
+            # Get right shape-key: 把第 i 个键的形状烘进网格数据。
+            # 这里**不能**用 bpy.ops.object.shape_key_transfer()：该算子要求"除活动物体外
+            # 恰好还有 1 个可编辑网格物体被选中"，前提一旦被破坏（副本不可选、视图层多出
+            # 选中物体）就直接抛 RuntimeError: Expected one other selected mesh object
+            # to copy from，整个导出中断。改成"该键值 1.0、其余键 0.0，再 apply_mix 移除
+            # 形态键"，得到的形状与 transfer 一致，但完全不依赖选择集。
+            tmp_key_blocks = tmpObject.data.shape_keys.key_blocks
+            for key_index, key_block in enumerate(tmp_key_blocks):
+                key_block.mute = False
+                if key_index == i:
+                    key_block.vertex_group = ""
+                    key_block.slider_min = min(key_block.slider_min, 0.0)
+                    key_block.slider_max = max(key_block.slider_max, 1.0)
+                    key_block.value = 1.0
+                else:
+                    key_block.value = 0.0
+            cls.remove_shape_keys(tmpObject, all=True, apply_mix=True)
             
             # Time to apply modifiers.
             for modifierName in selectedModifiers:
@@ -718,10 +731,13 @@ class ShapeKeyUtils:
             originalObject.select_set(False)
             context.view_layer.objects.active = tmpObject
             
-            # Remove tmpObject
+            # Remove tmpObject。
+            # 不用 bpy.ops.object.delete(use_global=False)：那个算子删除的是"所有选中物体"，
+            # 一旦有外来选中，用户自己的物体会被连带删除。
             tmpMesh = tmpObject.data
-            bpy.ops.object.delete(use_global=False)
-            bpy.data.meshes.remove(tmpMesh)
+            bpy.data.objects.remove(tmpObject, do_unlink=True)
+            if tmpMesh and tmpMesh.users == 0:
+                bpy.data.meshes.remove(tmpMesh)
         
         # Restore shape key properties like name, mute etc.
         context.view_layer.objects.active = originalObject
@@ -746,13 +762,11 @@ class ShapeKeyUtils:
                     key_b.relative_key = key_brel
                     break
         
-        # Remove copyObject.
-        originalObject.select_set(False)
-        context.view_layer.objects.active = copyObject
-        copyObject.select_set(True)
-        tmpMesh = copyObject.data
-        bpy.ops.object.delete(use_global=False)
-        bpy.data.meshes.remove(tmpMesh)
+        # Remove copyObject.（同样不用 bpy.ops.object.delete：它会删除所有选中物体）
+        copyMesh = copyObject.data
+        bpy.data.objects.remove(copyObject, do_unlink=True)
+        if copyMesh and copyMesh.users == 0:
+            bpy.data.meshes.remove(copyMesh)
         
         # Select originalObject.
         context.view_layer.objects.active = originalObject
