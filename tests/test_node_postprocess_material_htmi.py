@@ -1951,9 +1951,11 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             self.assertEqual(alpha_lines.count("$" + BS + "TTL" + BS + "alpha = $TTLAlpha0_75"), 2)
 
     def test_ttl_drag_hook_generates_geometry_binding_command_list(self):
-        """TTL：头部含拖拽钩子时，TTL 绘制改走显式绑定 ib 的 command list;
+        """TTL：头部含拖拽钩子时，TTL 绘制改走只绑定 jiggle 临时 VB0 的 command list;
         仅在拖拽激活时绑定 jiggle 临时 VB0,否则不覆盖 vb0(继承已蒙皮/形态键
-        的 SO 输出)。严禁生成 else 分支绑定 Position 基础输入,否则骨骼丢失。"""
+        的 SO 输出)。严禁生成 else 分支绑定 Position 基础输入,否则骨骼丢失。
+        命令列表**不写死 ib**：ib 由各 TTL copy 段自己的段头决定 —— 共用命令列表时
+        写死会被最后写入者覆盖,索引缓冲与顶点缓冲错配。"""
         with tempfile.TemporaryDirectory() as temp_dir:
             BS = chr(92)
             ttl_path = os.path.join(temp_dir, "ttl.png")
@@ -2016,7 +2018,9 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             self.assertNotIn("else", command_list_lines)
             self.assertNotIn("Resource241deac5Position", command_list_lines)
             self.assertIn("endif", command_list_lines)
-            self.assertIn("ib = Resource_LOD0.241deac5_56376_0_Index", command_list_lines)
+            self.assertNotIn("ib = ", command_list_lines,
+                             "命令列表不得写死 ib（共用时会被最后写入者覆盖，"
+                             "索引缓冲与顶点缓冲错配）")
             self.assertIn(f"run = CommandList{BS}TTL{BS}Draw", command_list_lines)
 
             new_section = next(
@@ -2103,7 +2107,86 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
                              "手改 copy 残留必须被覆盖")
             self.assertIn("if $ssmtdrag_drag_enabled_A >= 2 && $ssmtdrag_mode_A == 1",
                           cl_text)
-            self.assertIn("ib = Resource_LOD0.241deac5_56376_0_Index", cl_text)
+            self.assertNotIn("ib = ", cl_text,
+                             "命令列表不得写死 ib（共用时会被最后写入者覆盖）")
+
+    def test_ttl_drag_hook_never_crosses_drawib(self):
+        r"""回归（2026-10-07 实机：洛克茜模组模型爆炸）：jiggle 影子 VB0 是按 DrawIB
+        生成的，全表回退不得把它接到**别的 DrawIB** 的 TTL 段上。
+
+        实机链路：身体（d5e1e7ff）的 TTL copy 段带拖拽钩子，头发（4e6e989e）与
+        3f797188 的 copy 段没有钩子 → 全表回退取到身体的 jiggle VB0 → 三段共用一个
+        命令列表 → 命令列表里写死的 ib 被文件靠后的头发固化，身体 TTL 二次绘制
+        用头发的索引缓冲去配自己的 $\TTL\_1 区间（越界读）→ 乱三角形；拖拽激活时
+        头发还会绑上身体的 jiggle VB0（按住 ALT 时头发爆炸）。
+
+        修复后：跨 DrawIB 不接钩子，退回原生 run = CommandList\\TTL\\Draw，
+        索引缓冲由段内自己的 ib 行决定。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            BS = chr(92)
+            ttl_path = os.path.join(temp_dir, "ttl.png")
+            with open(ttl_path, "wb") as file_obj:
+                file_obj.write(b"ttl")
+            mesh_name = "LOD0.bbbb2222-200-0.中文中文_透明0.75_copy"
+            obj = _FakeObject(mesh_name, {}, [("TTLMap_遮罩", ttl_path)])
+            _fake_bpy.data.objects[obj.name] = obj
+
+            sections = OrderedDict([
+                # 兄弟段：拖拽钩子在此，属于另一个 DrawIB（aaaa1111）
+                ("[TextureOverride_LOD0_aaaa1111_100_0_main]", [
+                    "hash = aaaa1111",
+                    "match_first_index = 0",
+                    "    ; --- DRAG HOOK BEGIN aaaa1111P0_A ---",
+                    "    if $ssmtdrag_drag_enabled_A >= 2 && $ssmtdrag_mode_A == 1",
+                    "        vb0 = ResourceDragJiggleTempVB0_aaaa1111_A",
+                    "    endif",
+                    "    ; --- DRAG HOOK END aaaa1111P0_A ---",
+                    "; [mesh:LOD0.aaaa1111-100-0.主体] [vertex_count:100]",
+                    "drawindexed = 600, 0, 0",
+                ]),
+                # 本测试的处理对象：TTL copy 段，DrawIB = bbbb2222，头部无钩子块
+                ("[TextureOverrideLOD0_bbbb2222_200_0_copy]", [
+                    "hash = bbbb2222",
+                    "match_first_index = 0",
+                    "ib = Resource_LOD0.bbbb2222_200_0_Index",
+                    f"run = CommandList{BS}ZZMI{BS}SetTextures",
+                    "run = CommandListSkinTexture",
+                    f"; [mesh:{mesh_name}] [vertex_count:15618]",
+                    f"Resource{BS}TTL{BS}TransparencyTex = ref Resource_TTLMap_DiffuseMap_X",
+                    "$" + BS + "TTL" + BS + "mask_channel = 3",
+                    "drawindexed = 56376, 0, 0",
+                ]),
+                ("_config_path", temp_dir),
+            ])
+
+            node = node_postprocess_material.SSMTNode_PostProcess_Material()
+            node.name = "MaterialNode"
+            node.material_to_resource_override = False
+            node.material_switch_var = "$swapkey150"
+            node.process_texture_override_section(
+                "[TextureOverrideLOD0_bbbb2222_200_0_copy]",
+                sections,
+                material_group_to_swapkey={},
+                swap_key_prefix="$swapkey",
+                next_swap_key_num=150,
+                used_swap_keys=set(),
+                transparency_sections_to_add=OrderedDict(),
+            )
+
+            self.assertNotIn("[CommandListSSMTTTLDraw_aaaa1111_A]", sections,
+                             "别的 DrawIB 的 jiggle VB0 不得被本段借用")
+            new_section = next(
+                key for key in sections
+                if key.startswith("[TextureOverrideLOD0_bbbb2222")
+            )
+            new_text = "\n".join(sections[new_section])
+            self.assertIn(f"run = CommandList{BS}TTL{BS}Draw", new_text,
+                          "跨 DrawIB 时必须退回原生 TTL 绘制入口")
+            self.assertNotIn("CommandListSSMTTTLDraw_", new_text)
+            self.assertNotIn("ResourceDragJiggleTempVB0_aaaa1111_A", new_text,
+                             "别的 DrawIB 的 jiggle 影子 VB0 严禁落到本段")
+            self.assertIn("ib = Resource_LOD0.bbbb2222_200_0_Index", new_text,
+                          "索引缓冲必须仍是本段自己的 ib")
 
     def test_ttl_draw_lines_preserve_drag_vis_flags(self):
         """TTL 块重建必须保留拖拽物体显隐 flag 行（否则隐藏判定失效）。"""

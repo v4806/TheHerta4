@@ -1776,6 +1776,34 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
         return None
 
     @staticmethod
+    def _ttl_drawib_token(name):
+        """取名字里形如 8 位十六进制的 DrawIB 片段（小写）；取不到返回 None。"""
+        match = re.search(r'(?<![0-9A-Za-z])([0-9a-fA-F]{8})(?![0-9A-Za-z])', str(name or ""))
+        return match.group(1).lower() if match else None
+
+    @classmethod
+    def _ttl_drag_vb0_matches_section(cls, drag_vb0, header_lines, ib_resource):
+        """jiggle 影子 VB0 是否属于本 TTL 段所在的 DrawIB。
+
+        jiggle 影子缓冲是**按 DrawIB** 生成的（ResourceDragJiggleTempVB0_<drawib>_<实例>），
+        而命令列表会把它绑成 vb0 —— 只有同一 DrawIB 的 TTL 段才该接这根钩子。
+        判据优先级：段头 `hash = <drawib>`（权威）→ 段头 `ib = <资源名>` 里的 DrawIB
+        片段；两者都取不到（命名不是 8 位十六进制）时按「匹配」处理，不改变原有行为。
+        """
+        drag_token = cls._ttl_drawib_token(drag_vb0)
+        if not drag_token:
+            return True
+        for line in header_lines:
+            match = re.match(r'^hash\s*=\s*([0-9A-Za-z_.]+)', str(line or "").strip(), re.IGNORECASE)
+            if match:
+                section_token = cls._ttl_drawib_token(match.group(1))
+                return drag_token == section_token if section_token else True
+        ib_token = cls._ttl_drawib_token(ib_resource)
+        if ib_token:
+            return drag_token == ib_token
+        return True
+
+    @staticmethod
     def _ttl_extract_drag_condition(lines, drag_vb0):
         for index, line in enumerate(lines):
             if drag_vb0 not in str(line or ""):
@@ -1909,6 +1937,15 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
             # → TTL 断链（2026-08-30 实机回归：TTL 层吃不到形态键/拖拽交互）。
             drag_vb0, drag_vb0_lines = self._ttl_find_drag_vb0_global(all_sections)
         ib_resource = self._ttl_extract_ib(header_lines)
+        # 全表回退（54c1a91）本意是给「同一 DrawIB 的兄弟 copy 段」补钩子，却把别的
+        # DrawIB 的 TTL 段也接了进来：那些段在拖拽激活时会绑上别人的 jiggle VB0，
+        # 而命令列表里的 ib 又会被最后写入者固化（2026-10-07 实机：洛克茜模组
+        # 身体/头发共用一个命令列表 → 头发爆炸、按住 ALT 更明显）。跨 DrawIB 一律
+        # 不接拖拽钩子，退回原生 run = CommandList\TTL\Draw，索引缓冲由段内自己的
+        # ib 行决定。
+        if drag_vb0 and not self._ttl_drag_vb0_matches_section(drag_vb0, header_lines, ib_resource):
+            drag_vb0 = None
+            drag_vb0_lines = header_lines
 
         generated_section_names = set()
         ttl_sections_to_add = OrderedDict()
@@ -1971,8 +2008,11 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
                         command_list_lines.append(f"if {drag_condition}")
                         command_list_lines.append(f"    vb0 = {drag_vb0}")
                         command_list_lines.append("endif")
-                    if ib_resource:
-                        command_list_lines.append(f"ib = {ib_resource}")
+                    # 不写死 ib：每个 TTL copy 段段头本来就带自己的 ib 行（段头整段拷贝，
+                    # 见下方 header_lines 回写），而命令列表按 token 共用 —— 写死只会让
+                    # 最后写入者（文件靠后的 DrawIB/子网格）的 ib 覆盖其它调用段，
+                    # 索引缓冲与顶点缓冲错配 → 乱三角形（2026-10-07 实机：洛克茜模组
+                    # 身体/头发共用命令列表，头发爆炸、按住 ALT 更明显）。
                     command_list_lines.append("run = CommandList{}TTL{}Draw".format(chr(92), chr(92)))
                     ttl_draw_command_lists[command_list_name] = command_list_lines
                 ttl_draw_lines = [
