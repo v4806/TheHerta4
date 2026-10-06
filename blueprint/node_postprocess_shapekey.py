@@ -3023,7 +3023,8 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
     def _generate_sparse_vertex_index_Meshess(self, mod_export_path, hash_val, hash_slot_data, unique_names, vertex_count, calculated_ranges):
         """写出「顶点命中索引」三份缓冲（稀疏模式，替代稠密 FREQ 表）。
 
-        条目集合与稠密表逐位等价：稠密表里非 255 的 (顶点, 槽位) 恰好就是这里的条目；
+        条目集合与稠密表逐位等价：稠密表里不是 ``NO_FREQ_INDEX`` 的 (顶点, 槽位)
+        恰好就是这里的条目；
         位移记录下标直接取自合并映射（-1 表示该 (顶点, 槽位) 没有位移数据）。
         """
         if not NUMPY_AVAILABLE:
