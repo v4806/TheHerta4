@@ -430,6 +430,16 @@ def _configure_and_execute_efmi_lod_match(
 
 def ImprotFromWorkSpaceFull(self, context):
     """从工作空间完整导入所有子模型并构建蓝图节点树"""
+    # 每次导入都重新读 SSMT 贴图标记：工作空间里的标记可能被 SSMT 侧改过。
+    # 缓存只用于同一次导入内的去重（同一身份不会重复解析 SubmeshJson），清不掉
+    # 也不影响正确性，因此对缺失该模块的轻量宿主（测试桩）保持容错。
+    try:
+        from ..common.marked_texture_material import clear_mark_cache
+
+        clear_mark_cache()
+    except Exception:
+        pass
+
     workspace_collection = WorkSpaceHelper.create_and_get_workspace_collection()
     is_ntemi = _detect_ntemi_workspace()
 
@@ -1447,6 +1457,10 @@ class SSMT4ImportAllFromCurrentWorkSpaceBlueprint(bpy.types.Operator):
             TimerUtils.End("ImportFromWorkSpaceBlueprint")
 
         if success:
+            # 勾选了「导入后自动转为PNG」时，导入结束再调度转换：这里当场跑会拖长导入本身
+            from ..toolkit.tt_dds_to_png import schedule_auto_convert
+
+            schedule_auto_convert(context)
             return {'FINISHED'}
         return {'CANCELLED'}
 

@@ -897,6 +897,27 @@ class MeshCreateHelper:
         if logic_name is None:
             logic_name = GlobalConfig.logic_name
 
+        # SSMT 子网格标记优先：标记（SubmeshJson.TextureMarkUpInfoList）是导入/导出
+        # 两端共用的权威来源——导出 mod 时按它决定导出哪些类型贴图、写哪些 ps-tN，
+        # 没标记的类型既不会导出贴图也不会写进 ini。勾选后按标记逐类型建独立材质，
+        # 命名与「材质转资源pro」按材质名首段识别类型的口径一致。
+        # 读不到标记（旧工作空间 / 无标记部件）时返回 0，原样回退下面的文件名搜索。
+        try:
+            use_marked_materials = bool(GlobalProterties.import_materials_by_submesh_mark())
+        except Exception:
+            use_marked_materials = False
+        if use_marked_materials:
+            from .marked_texture_material import build_marked_materials
+
+            created = build_marked_materials(
+                obj=obj,
+                mesh_name=mesh_name,
+                directory=directory,
+                logic_name=logic_name,
+            )
+            if created > 0:
+                return
+
         texture_path, normal_path = MeshCreateHelper.get_import_texture_paths(mesh_name, directory)
         if texture_path is None:
             return

@@ -8,6 +8,7 @@ import shutil
 
 from ..common.global_config import GlobalConfig
 from ..common.logic_name import LogicName
+from ..toolkit.tt_dds_conversion import convert_texture_to_dds
 from . import fx_namespace
 from .node_postprocess_base import SSMTNode_PostProcess_Base
 
@@ -1345,11 +1346,29 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
             if not os.path.exists(source_path): return None
             os.makedirs(target_folder, exist_ok=True)
 
+            stem = SSMTNode_PostProcess_MaterialBase._material_resource_stem(material)
+            _, file_extension = os.path.splitext(os.path.basename(source_path))
+
+            # 导出 DDS 优先：编辑期贴图常是无损 PNG（避免反复存 DDS 时被过度压缩），但游戏
+            # 只认 DDS，所以导出时按现有 DDS 规则转一份放进 Mod，INI 的 filename 靠本函数
+            # 的返回值生成，自然跟着指向 .dds。开关在「材质转资源pro」节点上；旧版弃用壳没有
+            # 该属性，getattr 兜底为 False，行为与改动前一致。
+            if file_extension.lower() != ".dds" and getattr(self, "export_textures_as_dds", False):
+                converted_name = f"{stem}.dds"
+                converted_path = os.path.join(target_folder, converted_name)
+                if os.path.exists(converted_path) and not self.material_to_resource_override:
+                    return converted_name
+                ok, reason = convert_texture_to_dds(source_path, converted_path)
+                if ok:
+                    return converted_name
+                # 转换失败不中断导出：退回原样复制。文件名也必须用回源扩展名 ——
+                # forced_filename 可能来自上一轮成功缓存的 .dds，此刻已无对应文件。
+                print(f"贴图转 DDS 失败，回退为原样复制: {source_path} - {reason}")
+
             if forced_filename:
                 new_filename = forced_filename
             else:
-                _, file_extension = os.path.splitext(os.path.basename(source_path))
-                new_filename = f"{SSMTNode_PostProcess_MaterialBase._material_resource_stem(material)}{file_extension}"
+                new_filename = f"{stem}{file_extension}"
 
             target_path = os.path.join(target_folder, new_filename)
             if os.path.exists(target_path) and not self.material_to_resource_override:

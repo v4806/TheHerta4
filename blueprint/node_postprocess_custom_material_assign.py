@@ -1917,6 +1917,16 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
         ),
         default=False,
     )
+    export_textures_as_dds: bpy.props.BoolProperty(
+        name="导出时把贴图转成DDS",
+        description=(
+            "导出 Mod 时，材质引用的贴图若还不是 .dds（例如编辑期用的无损 PNG），"
+            "先用 texconv 按现有 DDS 转换规则转成 DDS 放进 Mod 的 Textures 目录，"
+            "INI 里的 filename 也指向转出来的 DDS。源贴图文件保留不动。"
+            "关闭时按原样复制源文件"
+        ),
+        default=True,
+    )
     use_global_assign: bpy.props.BoolProperty(
         name="使用全局指定",
         description=(
@@ -2892,6 +2902,7 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
         if not self.use_global_assign:
             options.prop(self, "clear_non_target_textures")
         options.prop(self, "debug_disable_fx_ttl")
+        options.prop(self, "export_textures_as_dds")
 
         layout.label(
             text="材质命名前缀沿用材质转资源规则（如 DiffuseMap_xxx）",

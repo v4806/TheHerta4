@@ -21,7 +21,7 @@ def _install_module(name, **attrs):
 
 
 PKG = "_node_postprocess_material_htmi_test_pkg"
-for package_name in (PKG, f"{PKG}.blueprint", f"{PKG}.utils", f"{PKG}.common"):
+for package_name in (PKG, f"{PKG}.blueprint", f"{PKG}.utils", f"{PKG}.common", f"{PKG}.toolkit"):
     package = _install_module(package_name)
     package.__path__ = []
 
@@ -90,6 +90,12 @@ _install_module(
         ZZMI="ZZMI",
         HIMI="HIMI",
     ),
+)
+# 材质转资源的导出路径会调用 toolkit 的 DDS 转换；桩成「转换成功」，
+# 这里只关心 ini/资源段生成，贴图转换本身在 test_dds_conversion 里单独覆盖。
+_install_module(
+    f"{PKG}.toolkit.tt_dds_conversion",
+    convert_texture_to_dds=lambda *_args, **_kwargs: (True, ""),
 )
 
 

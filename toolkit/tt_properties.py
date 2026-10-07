@@ -172,6 +172,7 @@ class TT_TextureToolsProperties(bpy.types.PropertyGroup):
     texconv_path: bpy.props.StringProperty(name="texconv.exe 路径", description="指定 texconv.exe 文件的完整路径。这是进行DDS格式转换所必需的工具", subtype='FILE_PATH')
     dds_delete_originals: bpy.props.BoolProperty(name="转换后删除原图", description="在成功将图片转换为.dds格式后，删除原始的.png, .jpg等文件", default=True)
     dds_reencode_existing_dds: bpy.props.BoolProperty(name="处理现有DDS", description="现有的 .dds 文件也会按目标格式重新编码，可用于更换DDS格式", default=False)
+    dds_auto_convert_png_after_import: bpy.props.BoolProperty(name="导入后自动转为PNG", description="勾选后，导入工作空间内容结束时自动把工程里指向 .dds 的图片转为同目录同名 .png 并改掉引用，避免 Blender 无法解码 BC7/BC6H 压缩 DDS 时反复刷警告。原 .dds 文件保留不动", default=False)
     dds_use_custom_rules: bpy.props.BoolProperty(name="使用自定义规则", description="启用自定义DDS转换规则，覆盖默认规则", default=False)
     dds_rules_file_path: bpy.props.StringProperty(name="规则配置文件", description="DDS转换规则的配置文件路径", subtype='FILE_PATH')
     dds_show_advanced: bpy.props.BoolProperty(name="显示高级选项", description="显示DDS转换的高级选项", default=False)

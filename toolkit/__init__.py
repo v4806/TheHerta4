@@ -54,6 +54,7 @@ from .uv_guard_unsubdivide import (
 from .tt_properties import tt_properties_list
 from .tt_dependency_check import tt_dependency_check_list
 from .tt_dds_conversion import tt_dds_conversion_list
+from .tt_dds_to_png import tt_dds_to_png_list
 from .tt_normal_map import tt_normal_map_list
 from .tt_color_bake import tt_color_bake_list
 from .tt_alpha_extract import tt_alpha_extract_list
@@ -141,6 +142,7 @@ __all__ = [
     'tt_properties_list',
     'tt_dependency_check_list',
     'tt_dds_conversion_list',
+    'tt_dds_to_png_list',
     'tt_normal_map_list',
     'tt_color_bake_list',
     'tt_alpha_extract_list',
@@ -326,6 +328,13 @@ def register():
             print(f"[TheHerta4]   已注册TT DDS转换: {op_class.__name__}")
         except Exception as e:
             print(f"[TheHerta4]   注册TT DDS转换失败: {op_class.__name__} - {e}")
+
+    for op_class in tt_dds_to_png_list:
+        try:
+            bpy.utils.register_class(op_class)
+            print(f"[TheHerta4]   已注册TT DDS转PNG: {op_class.__name__}")
+        except Exception as e:
+            print(f"[TheHerta4]   注册TT DDS转PNG失败: {op_class.__name__} - {e}")
     
     for op_class in tt_normal_map_list:
         try:
@@ -697,6 +706,12 @@ def unregister():
             pass
     
     for op_class in reversed(tt_dds_conversion_list):
+        try:
+            bpy.utils.unregister_class(op_class)
+        except Exception:
+            pass
+
+    for op_class in reversed(tt_dds_to_png_list):
         try:
             bpy.utils.unregister_class(op_class)
         except Exception:

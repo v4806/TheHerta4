@@ -365,5 +365,80 @@ class DDSRelinkPreservesSettingsTests(unittest.TestCase):
         self.assertIn("更新了 1 个图片引用", self._report_text(reports))
 
 
+class ConvertTextureToDDSTests(unittest.TestCase):
+    """导出流程复用的单文件转换：口径必须与「批量转换为 .dds」算子一致。"""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp(prefix="convert_one_")
+        self.source = os.path.join(self.temp_dir, "c209c22b-45087-0-DiffuseMap.png")
+        Path(self.source).write_bytes(b"png payload")
+        self.target = os.path.join(self.temp_dir, "out", "Body_Material.dds")
+        self.props = types.SimpleNamespace(dds_use_custom_rules=False, dds_rules=[])
+
+    def _run(self, capture=None, returncode=0):
+        def fake_run(command, **_kwargs):
+            if capture is not None:
+                capture.append(command)
+            if returncode == 0:
+                out_dir = command[command.index("-o") + 1]
+                produced = os.path.join(
+                    out_dir, os.path.splitext(os.path.basename(command[-1]))[0] + ".dds"
+                )
+                Path(produced).write_bytes(b"DDS payload")
+            return types.SimpleNamespace(
+                returncode=returncode, stdout="", stderr="boom" if returncode else ""
+            )
+
+        with mock.patch.object(dds_conversion, "find_texconv", return_value="texconv.exe"), \
+                mock.patch.object(dds_conversion.subprocess, "run", side_effect=fake_run):
+            return dds_conversion.convert_texture_to_dds(self.source, self.target, self.props)
+
+    def test_diffuse_map_uses_srgb_rule_and_writes_target(self):
+        """DiffuseMap 按规则表走 bc7_unorm_srgb，并用 --srgb-in 保证颜色不变"""
+        commands = []
+        ok, reason = self._run(capture=commands)
+
+        self.assertTrue(ok, reason)
+        self.assertTrue(os.path.exists(self.target))
+        command = commands[0]
+        self.assertEqual("bc7_unorm_srgb", command[command.index("-f") + 1])
+        self.assertIn("--srgb-in", command)
+        self.assertEqual(self.source, command[-1])
+
+    def test_normal_map_uses_linear_rule(self):
+        """NormalMap 走线性格式，用 --ignore-srgb 按原始数值读写"""
+        self.source = os.path.join(self.temp_dir, "c209c22b-45087-0-NormalMap.png")
+        Path(self.source).write_bytes(b"png payload")
+        commands = []
+        ok, reason = self._run(capture=commands)
+
+        self.assertTrue(ok, reason)
+        command = commands[0]
+        self.assertEqual("r8g8b8a8_unorm", command[command.index("-f") + 1])
+        self.assertIn("--ignore-srgb", command)
+
+    def test_source_file_is_untouched(self):
+        """编辑期的源 PNG 必须原样保留，导出只是另外产出一份 DDS"""
+        ok, _reason = self._run()
+
+        self.assertTrue(ok)
+        self.assertEqual(b"png payload", Path(self.source).read_bytes())
+
+    def test_missing_texconv_reports_failure(self):
+        with mock.patch.object(dds_conversion, "find_texconv", return_value=None):
+            ok, reason = dds_conversion.convert_texture_to_dds(self.source, self.target, self.props)
+
+        self.assertFalse(ok)
+        self.assertIn("texconv", reason)
+
+    def test_texconv_failure_reports_reason_and_leaves_no_target(self):
+        """失败时返回原因且不得留下半个目标文件"""
+        ok, reason = self._run(returncode=1)
+
+        self.assertFalse(ok)
+        self.assertIn("boom", reason)
+        self.assertFalse(os.path.exists(self.target))
+
+
 if __name__ == "__main__":
     unittest.main()

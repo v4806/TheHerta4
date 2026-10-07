@@ -6,6 +6,7 @@ import re
 from collections import OrderedDict
 from pathlib import Path
 
+from ..toolkit.tt_dds_conversion import convert_texture_to_dds
 from .node_postprocess_base import SSMTNode_PostProcess_Base
 
 
@@ -93,6 +94,16 @@ class SSMTNode_PostProcess_PSBinding(SSMTNode_PostProcess_Base):
     )
     ps_bindings: bpy.props.CollectionProperty(type=PSBindingItem)
     active_binding_index: bpy.props.IntProperty(default=0)
+    export_textures_as_dds: bpy.props.BoolProperty(
+        name="导出时把贴图转成DDS",
+        description=(
+            "导出 Mod 时，绑定的贴图若不是 .dds（例如编辑期用的无损 PNG），"
+            "先用 texconv 按现有 DDS 转换规则转成 DDS 放进 Mod 的 Textures 目录，"
+            "INI 的 filename 也指向转出来的 DDS。源贴图文件保留不动。"
+            "关闭时按原样复制源文件"
+        ),
+        default=True,
+    )
 
     def draw_buttons(self, context, layout):
         layout.prop(self, "ib_hash")
@@ -117,6 +128,7 @@ class SSMTNode_PostProcess_PSBinding(SSMTNode_PostProcess_Base):
         row = box.row(align=True)
         op = row.operator("ssmt.psbinding_add_item", text="添加绑定", icon='ADD')
         op.node_name = self.name
+        box.prop(self, "export_textures_as_dds")
 
     # ---------- INI 读写 ----------
     def _read_ini_to_ordered_dict(self, ini_file_path):
@@ -299,6 +311,20 @@ class SSMTNode_PostProcess_PSBinding(SSMTNode_PostProcess_Base):
             return None
         textures_dir = dest_dir / "Textures"
         textures_dir.mkdir(parents=True, exist_ok=True)
+
+        # 导出 DDS 优先：编辑期贴图常是无损 PNG（避免反复存 DDS 被过度压缩），但游戏只认
+        # DDS，所以导出时按现有 DDS 规则转一份放进 Mod。INI 的 filename 取本函数返回值，
+        # 因此自然跟着指向 .dds。转换失败回退为原样复制，不中断导出。
+        if getattr(self, "export_textures_as_dds", False) and src.suffix.lower() != ".dds":
+            converted = textures_dir / f"{src.stem}.dds"
+            if not converted.exists():
+                ok, reason = convert_texture_to_dds(str(src), str(converted))
+                if not ok:
+                    print(f"贴图转 DDS 失败，回退为原样复制: {src_path} - {reason}")
+                    converted = None
+            if converted is not None and converted.exists():
+                return f"Textures/{converted.name}"
+
         dest_path = textures_dir / src.name
         if dest_path.exists():
             if src.stat().st_mtime <= dest_path.stat().st_mtime:

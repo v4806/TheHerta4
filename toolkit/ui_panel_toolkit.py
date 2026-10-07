@@ -767,6 +767,14 @@ class TT_DDSConversionPanel(bpy.types.Panel):
             row.operator("toolkit.tt_save_dds_rules", text="保存规则", icon='FILE_TICK')
             row.operator("toolkit.tt_load_dds_rules", text="加载规则", icon='FILE_FOLDER')
 
+        png_box = layout.box()
+        png_box.label(text="DDS 转 PNG（解决加载警告）", icon='IMAGE_DATA')
+        png_box.label(text="自动转换开关在左侧主面板「一键导入」下方", icon='INFO')
+        png_box.operator("toolkit.tt_convert_dds_to_png", icon='FILE_REFRESH')
+        png_info = png_box.box()
+        png_info.label(text="Blender 解不了 BC7/BC6H 压缩 DDS，加载时会刷警告", icon='INFO')
+        png_info.label(text="转成同名 .png 后正常显示；原 .dds 文件保留不动。")
+
 
 class TT_ChannelCompositePanel(bpy.types.Panel):
     bl_label = "通道合成器"
