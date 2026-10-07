@@ -2611,5 +2611,94 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
         self.assertIn("namespace = Example\\Mod\n; header\n\n[Constants]", second_output)
 
 
+    def _run_transparency_move(self, temp_dir, body_lines):
+        """跑一次材质后处理，返回被搬进透明段的块内容。"""
+        BS = chr(92)
+        sections = OrderedDict([
+            ("[TextureOverride_Body]", body_lines),
+            ("_config_path", temp_dir),
+        ])
+        transparency_sections = OrderedDict()
+        node = node_postprocess_material.SSMTNode_PostProcess_Material()
+        node.name = "MaterialNode"
+        node.material_to_resource_override = False
+        node.material_switch_var = "$swapkey150"
+        node.debug_disable_fx_ttl = True
+        node.process_texture_override_section(
+            "[TextureOverride_Body]", sections, material_group_to_swapkey={},
+            swap_key_prefix="$swapkey", next_swap_key_num=150, used_swap_keys=set(),
+            transparency_sections_to_add=transparency_sections,
+        )
+        self.assertEqual(len(transparency_sections), 1)
+        return "\n".join(
+            str(line) for line in next(iter(transparency_sections.values()))
+        )
+
+    def _transparency_move_fixture(self, temp_dir, tail_lines):
+        """造化透明物体与段骨架；tail_lines 是 mesh 行之后的段内容。"""
+        BS = chr(92)
+        diffuse_path = os.path.join(temp_dir, "diffuse.png")
+        with open(diffuse_path, "wb") as file_obj:
+            file_obj.write(b"diffuse")
+        obj = _FakeObject("Body_透明0.5", {}, [("DiffuseMap_衣服", diffuse_path)])
+        _fake_bpy.data.objects[obj.name] = obj
+        sys.modules[f"{PKG}.common.global_config"].GlobalConfig.logic_name = "ZZMI"
+        body_lines = [
+            "hash = 12345678",
+            "match_first_index = 0",
+            "ib = Resource_Body_Index",
+            f"Resource{BS}ZZMI{BS}Diffuse = ref Resource-old-DiffuseMap",
+            f"run = CommandList{BS}ZZMI{BS}SetTextures",
+            "[mesh:Body_透明0.5]",
+        ] + list(tail_lines)
+        return self._run_transparency_move(temp_dir, body_lines)
+
+    def test_transparency_move_tolerates_fx_run_line_without_alias(self):
+        """块内只有一条孤立的 FX Run 行时必须照样走完（回归：NameError prev_line）。
+
+        旧实现在重构时把 ``for prev_line in final_block`` 生成器丢掉，于是只有在
+        块里出现 FX Run 行时才会求值 ``prev_line``，直出整条链路直接抛
+        ``NameError: name 'prev_line' is not defined``。这里把 ``_FX_RUN_LINES``
+        换成哨兵：真实 FX 行会被材质转资源阶段重写，哨兵行只负责让那条分支可达。
+        """
+        sentinel = f"run = CommandList{chr(92)}RabbitFX{chr(92)}SENTINEL"
+        with mock.patch.object(
+            node_postprocess_material, "_FX_RUN_LINES", (sentinel,)
+        ):
+            with tempfile.TemporaryDirectory() as temp_dir:
+                joined = self._transparency_move_fixture(temp_dir, [
+                    sentinel,
+                    "drawindexed = 100, 5, 0",
+                ])
+
+        self.assertIn("drawindexed = 100, 5, 0", joined)
+        # 整段没有别名绑定，这条 Run 是空转，按设计丢弃。
+        self.assertNotIn(sentinel, joined)
+
+    def test_transparency_move_keeps_fx_run_line_after_alias(self):
+        """块内先出现 FX 资源别名时，紧随其后的 Run 行必须继续被搬走。
+
+        别名写成注释形式：真正的 ``Resource\\RabbitFX\\FXMap = ref …`` 绑定会被
+        材质转资源阶段重写掉，注释行则原样留在块里，正好用来验证
+        ``has_resource_before`` 是对**整段已收集行**做前缀匹配，而不是只看相邻行。
+        """
+        BS = chr(92)
+        sentinel_run = f"run = CommandList{BS}RabbitFX{BS}SENTINEL"
+        sentinel_alias = f"; Resource{BS}RabbitFX{BS}FXMap = ref Resource_FXMap_Body"
+        with mock.patch.object(
+            node_postprocess_material, "_FX_RUN_LINES", (sentinel_run,)
+        ):
+            with tempfile.TemporaryDirectory() as temp_dir:
+                joined = self._transparency_move_fixture(temp_dir, [
+                    sentinel_alias,
+                    sentinel_run,
+                    "drawindexed = 100, 5, 0",
+                ])
+
+        self.assertIn(sentinel_alias, joined)
+        self.assertIn(sentinel_run, joined)
+        self.assertIn("drawindexed = 100, 5, 0", joined)
+
+
 if __name__ == "__main__":
     unittest.main()

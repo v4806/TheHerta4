@@ -2516,7 +2516,9 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
                             # Run 只有在前面已经出现过资源别名时才搬过去：整段没有
                             # 别名绑定（只剩一条孤立的 Run）时它是空转，丢掉。
                             has_resource_before = any(
-                                prefix in prev_line for prefix in _FX_RESOURCE_PREFIXES
+                                prefix in prev_line
+                                for prev_line in final_block
+                                for prefix in _FX_RESOURCE_PREFIXES
                             )
                             if has_resource_before:
                                 final_block.append(line)
