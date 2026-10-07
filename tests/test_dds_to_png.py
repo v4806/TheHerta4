@@ -26,8 +26,17 @@ for package_name in (PKG, f"{PKG}.toolkit"):
 _registered_timers = []
 
 _fake_bpy = types.SimpleNamespace(
-    types=types.SimpleNamespace(Operator=object),
-    props=types.SimpleNamespace(BoolProperty=lambda **_kwargs: None),
+    types=types.SimpleNamespace(Operator=object, Panel=object),
+    # tt_dds_conversion 的算子类体在注解里取 bpy.props.IntProperty() 等构造器
+    # （该模块没有 from __future__ import annotations），桩必须与
+    # tests/test_dds_conversion.py 同口径，否则本文件连收集都过不去。
+    props=types.SimpleNamespace(
+        BoolProperty=lambda **_kwargs: None,
+        CollectionProperty=lambda **_kwargs: None,
+        FloatProperty=lambda **_kwargs: None,
+        IntProperty=lambda **_kwargs: None,
+        StringProperty=lambda **_kwargs: None,
+    ),
     context=types.SimpleNamespace(
         scene=types.SimpleNamespace(texture_tools_props=types.SimpleNamespace())
     ),

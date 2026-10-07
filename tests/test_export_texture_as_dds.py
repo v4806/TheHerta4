@@ -203,6 +203,37 @@ class ExportTextureAsDDSTests(unittest.TestCase):
         self.assertEqual("Body_Material.png", result)
         self.assertTrue(os.path.exists(os.path.join(self.target_dir, "Body_Material.png")))
 
+    def test_stale_forced_filename_dds_is_not_reused_after_failure(self):
+        """转换失败时不得沿用缓存里的 .dds 名：此刻没有对应文件，照抄会把 PNG
+        字节写成 .dds，INI 指过去就是一张读不出来的贴图。"""
+        source = self._make_source("c209c22b-45087-0-DiffuseMap.png")
+        node = self._make_node()
+
+        with mock.patch.object(
+            node_postprocess_material, "convert_texture_to_dds", return_value=(False, "texconv 崩了")
+        ):
+            result = node.copy_texture_file(
+                _FakeImage(source),
+                self.target_dir,
+                _FakeMaterial(),
+                forced_filename="Body_Material.dds",
+            )
+
+        self.assertEqual("Body_Material.png", result)
+        self.assertTrue(os.path.exists(os.path.join(self.target_dir, "Body_Material.png")))
+        self.assertFalse(os.path.exists(os.path.join(self.target_dir, "Body_Material.dds")))
+
+    def test_matching_forced_filename_is_still_reused(self):
+        """缓存名扩展名与源一致时照旧复用（同一张贴图只写一份文件）"""
+        source = self._make_source("c209c22b-45087-0-DiffuseMap.png")
+        node = self._make_node(export_as_dds=False)
+
+        result = node.copy_texture_file(
+            _FakeImage(source), self.target_dir, _FakeMaterial(), forced_filename="Body_Material.png"
+        )
+
+        self.assertEqual("Body_Material.png", result)
+
     def test_existing_target_dds_is_reused(self):
         """目标 DDS 已存在就复用，不重复跑 texconv（重复导出要快）"""
         source = self._make_source("c209c22b-45087-0-DiffuseMap.png")

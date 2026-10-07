@@ -1365,9 +1365,12 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
                 # forced_filename 可能来自上一轮成功缓存的 .dds，此刻已无对应文件。
                 print(f"贴图转 DDS 失败，回退为原样复制: {source_path} - {reason}")
 
-            if forced_filename:
+            if forced_filename and os.path.splitext(forced_filename)[1].lower() == file_extension.lower():
                 new_filename = forced_filename
             else:
+                # 缓存名与本轮源扩展名不一致时不能沿用：forced_filename 可能是上一轮
+                # 成功转出的 .dds，此刻已无对应文件（例如本次转换失败、或编辑期贴图刚被
+                # 重链成 PNG），照抄会把 PNG 字节写成 .dds，游戏读不出来。
                 new_filename = f"{stem}{file_extension}"
 
             target_path = os.path.join(target_folder, new_filename)
