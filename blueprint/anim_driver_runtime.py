@@ -225,7 +225,7 @@ def migrate_existing_runtime_nodes() -> int:
 
 
 @bpy.app.handlers.persistent
-def _runtime_load_handler(dummy):
+def _runtime_load_handler(dummy, *args):
     migrate_existing_runtime_nodes()
 
 

@@ -505,7 +505,7 @@ def migrate_existing_accumulative_nodes() -> int:
 
 
 @bpy.app.handlers.persistent
-def _accumulative_trigger_load_handler(dummy):
+def _accumulative_trigger_load_handler(dummy, *args):
     migrate_existing_accumulative_nodes()
 
 

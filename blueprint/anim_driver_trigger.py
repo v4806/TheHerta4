@@ -236,7 +236,9 @@ _load_handler_registered = False
 
 
 @bpy.app.handlers.persistent
-def _trigger_load_handler(dummy):
+def _trigger_load_handler(dummy, *args):
+    # load_post 由 Blender 调用时会传入 2 个参数（scene, depsgraph），
+    # 必须收 *args，否则触发时 TypeError。下同。
     for tree in bpy.data.node_groups:
         if tree.bl_idname != 'SSMTBlueprintTreeType':
             continue

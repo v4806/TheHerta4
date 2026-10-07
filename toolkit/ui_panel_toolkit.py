@@ -301,7 +301,7 @@ class BMTP_WeightManagePanel(bpy.types.Panel):
         if obj and obj.type == 'MESH':
             sub_box = box.box()
             row = sub_box.row()
-            row.template_list("VGBackupListUI", "", obj, "vg_backups", obj, "vg_backups_index")
+            row.template_list("SSMT_UL_VGBackupList", "", obj, "vg_backups", obj, "vg_backups_index")
 
             col = row.column(align=True)
             col.operator("toolkit.backup_vg_weights", text="", icon='ADD')
@@ -330,7 +330,7 @@ class BMTP_WeightManagePanel(bpy.types.Panel):
         sub_box.label(text="权重调整（勾选顶点组）:", icon='GROUP_VERTEX')
         
         row = sub_box.row()
-        row.template_list("VGAdjustListUI", "available", vg_props, "vg_adjust_available_groups", vg_props, "vg_adjust_available_groups_index")
+        row.template_list("SSMT_UL_VGAdjustList", "available", vg_props, "vg_adjust_available_groups", vg_props, "vg_adjust_available_groups_index")
         
         col = row.column(align=True)
         col.operator("toolkit.refresh_vg_list", text="", icon='FILE_REFRESH')
@@ -342,7 +342,7 @@ class BMTP_WeightManagePanel(bpy.types.Panel):
         sub_box.label(text="规格化（选择顶点组）:", icon='NORMALIZE_FCURVES')
         
         row = sub_box.row()
-        row.template_list("VGAdjustListUI", "selected", vg_props, "vg_adjust_selected_groups", vg_props, "vg_adjust_selected_groups_index")
+        row.template_list("SSMT_UL_VGAdjustList", "selected", vg_props, "vg_adjust_selected_groups", vg_props, "vg_adjust_selected_groups_index")
         
         col = row.column(align=True)
         col.operator("toolkit.add_vg_to_adjust_list", text="", icon='ADD')

@@ -598,7 +598,7 @@ def updater_run_success_popup_handler(scene):
 
 
 @persistent
-def updater_run_install_popup_handler(scene):
+def updater_run_install_popup_handler(scene, *args):
     global ran_auto_check_install_popup
     ran_auto_check_install_popup = True
     updater.print_verbose("Running the install popup handler.")

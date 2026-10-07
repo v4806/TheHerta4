@@ -3347,11 +3347,36 @@ def _migrate_legacy_material_node(tree, node):
     tree.nodes.remove(node)
 
 
-def _migrate_legacy_material_nodes_handler():
+def _migrate_legacy_material_nodes_handler(*args):
+    # Blender 调用 load_post 处理器时会传入参数（本机 5.2 实测为 2 个），
+    # 而 register() 里也手动调用它（0 个参数）。所以必须收 *args，
+    # 否则 handler 一触发就 TypeError——而且这个错误发生在进入函数体之前，下面的
+    # try/except 兜不住，会在控制台刷 "Error in bpy.app.handlers.load_post[N]"。
     try:
         _migrate_legacy_material_nodes()
     except Exception as exc:
         print(f"[TheHerta4] 材质转资源节点迁移失败: {exc}")
+
+
+def _run_initial_migration():
+    _migrate_legacy_material_nodes_handler()
+    return None  # 返回 None => 定时器只执行一次
+
+
+def _schedule_initial_migration():
+    """覆盖「addon 启用时文件已经打开」的场景。
+
+    插件注册发生在 bpy.data 就绪之前，此时它是 _RestrictData，任何集合访问都会抛
+    AttributeError（旧代码因此每次都打印迁移失败）。所以推迟到主循环第一帧再跑；
+    headless 下没有事件循环，但 bpy.data 此时已就绪，直接同步执行。
+    """
+    if hasattr(bpy.data, "materials"):
+        _run_initial_migration()
+        return
+    try:
+        bpy.app.timers.register(_run_initial_migration, first_interval=0.0)
+    except Exception:
+        pass
 
 
 classes = (
@@ -3383,12 +3408,16 @@ def register():
     if _migrate_legacy_material_nodes_handler not in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.append(_migrate_legacy_material_nodes_handler)
     # 立即迁移一次：覆盖「addon 启用时文件已打开」的场景。
-    _migrate_legacy_material_nodes_handler()
+    _schedule_initial_migration()
 
 
 def unregister():
     bpy.types.VIEW3D_HT_header.remove(_draw_picking_header)
     if _migrate_legacy_material_nodes_handler in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(_migrate_legacy_material_nodes_handler)
+    try:
+        bpy.app.timers.unregister(_run_initial_migration)
+    except Exception:
+        pass
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)

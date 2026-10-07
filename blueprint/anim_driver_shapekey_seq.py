@@ -509,7 +509,7 @@ def migrate_existing_shapekey_seq_nodes() -> int:
 
 
 @bpy.app.handlers.persistent
-def _shapekey_seq_load_handler(dummy):
+def _shapekey_seq_load_handler(dummy, *args):
     migrate_existing_shapekey_seq_nodes()
 
 
