@@ -283,12 +283,12 @@ class GlobalProterties(bpy.types.PropertyGroup):
     zzmi_merged_redirect_enabled: bpy.props.BoolProperty(
         name="启用合并网格自动重定向（实验）",
         description=(
-            "ZZMI 合并骨架实验开关。关闭（默认）时保留每个合并物体的原始 IB/"
-            "Blend 输入布局，在组内宿主完成当帧重放；开启时才使用跨 DrawIB 的"
-            "RedirectSO 自动重定向。自动重定向在部分游戏帧序下会丢失整块几何，"
-            "只有在需要专门复核该路径时才开启。"
+            "ZZMI 合并骨架开关，默认开启：合并网格改用跨 DrawIB 的 RedirectSO "
+            "自动重定向，可以挂在任意 DrawIB 上。关闭后保留每个合并物体的原始 "
+            "IB/Blend 输入布局，在组内宿主完成当帧重放。注意：自动重定向在部分"
+            "游戏帧序下会丢失整块几何，遇到合并后缺块/错位时先关掉本项对照。"
         ),
-        default=False,
+        default=True,
     ) # type: ignore
 
     efmi_lod_group_projection: bpy.props.BoolProperty(
@@ -327,12 +327,6 @@ class GlobalProterties(bpy.types.PropertyGroup):
         default=True,
     ) # type: ignore
 
-    use_normal_map: bpy.props.BoolProperty(
-        name="自动上贴图时使用法线贴图",
-        description="启用后在导入模型时自动附加法线贴图节点，在材质预览模式下得到略微更好的视觉效果",
-        default=False,
-    ) # type: ignore
-
     ignore_texture_alpha: bpy.props.BoolProperty(
         name="导入贴图时忽略透明度通道",
         description='开启后，一键导入透明材质时，贴图的 Alpha 模式会被设为"无"，使透明度通道始终输出 1（不透明），且不破坏着色器连接结构',
@@ -343,12 +337,6 @@ class GlobalProterties(bpy.types.PropertyGroup):
         name="非镜像工作流",
         description="启用后，导入时会先将模型镜像、应用变换并翻转面；导出前处理时会对副本再次执行同样操作以恢复原始朝向",
         default=True,
-    ) # type: ignore
-
-    import_texture_material_strip_color_prefix: bpy.props.BoolProperty(
-        name="导入贴图材质去掉颜色贴图前缀",
-        description="开启后，从工作空间导入时创建的贴图材质名称不再携带颜色贴图（DiffuseMap）前缀，例如由 DiffuseMap_d892c658-2256-0 变为 d892c658-2256-0",
-        default=False,
     ) # type: ignore
 
     import_materials_by_submesh_mark: bpy.props.BoolProperty(
@@ -638,21 +626,6 @@ class GlobalProterties(bpy.types.PropertyGroup):
         return cls._instance().export_add_missing_vertex_groups
 
     @classmethod
-    def use_normal_map(cls):
-        return cls._bool_attr("use_normal_map", False)
-
-    @classmethod
-    def set_use_normal_map(cls, value: bool):
-        setattr(cls._instance(), "use_normal_map", bool(value))
-
-    @classmethod
-    def toggle_use_normal_map(cls) -> bool:
-        """翻转 use_normal_map，返回翻转后的新值。"""
-        instance = cls._instance()
-        instance.use_normal_map = not bool(getattr(instance, "use_normal_map", False))
-        return bool(instance.use_normal_map)
-
-    @classmethod
     def ignore_texture_alpha(cls):
         return cls._bool_attr("ignore_texture_alpha", False)
 
@@ -670,19 +643,6 @@ class GlobalProterties(bpy.types.PropertyGroup):
     @classmethod
     def enable_non_mirror_workflow(cls):
         return cls._instance().enable_non_mirror_workflow
-
-    @classmethod
-    def import_texture_material_strip_color_prefix(cls) -> bool:
-        return cls._bool_attr("import_texture_material_strip_color_prefix", False)
-
-    @classmethod
-    def toggle_import_texture_material_strip_color_prefix(cls) -> bool:
-        """翻转 import_texture_material_strip_color_prefix，返回翻转后的新值。"""
-        instance = cls._instance()
-        instance.import_texture_material_strip_color_prefix = not bool(
-            getattr(instance, "import_texture_material_strip_color_prefix", False)
-        )
-        return bool(instance.import_texture_material_strip_color_prefix)
 
     @classmethod
     def import_materials_by_submesh_mark(cls) -> bool:

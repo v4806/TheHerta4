@@ -870,12 +870,33 @@ class StorageGroupLayoutTests(unittest.TestCase):
         self.assertIn("update=sync_shapekey_delta_mode", source)
         self.assertIn("update=sync_shapekey_all_channels_mode", source)
 
-    def test_bake_switch_exists_and_defaults_to_off(self):
+    def _bool_defaults(self) -> dict:
+        """节点类里所有布尔开关的默认值（AST，避免只做字符串包含判断）。"""
+        tree = ast.parse(self._source())
+        defaults = {}
+        for item in ast.walk(tree):
+            if not isinstance(item, ast.AnnAssign) or not isinstance(item.target, ast.Name):
+                continue
+            if "BoolProperty" not in ast.unparse(item.annotation):
+                continue
+            # 本仓的写法是「注解即调用」：`name: bpy.props.BoolProperty(...)`，
+            # 所以关键字在 annotation（Call）上，AnnAssign.value 恒为 None。
+            for keyword in getattr(item.annotation, "keywords", []):
+                if keyword.arg == "default" and isinstance(keyword.value, ast.Constant):
+                    defaults[item.target.id] = keyword.value.value
+        return defaults
+
+    def test_optimization_switches_default_to_on(self):
+        """「计算优化 / 导出优化」的关键开关默认开启（用户 2026-10-07 要求）。"""
+        defaults = self._bool_defaults()
+        for name in ("merge_slot_files", "use_sparse_vertex_index", "bake_disabled_shape_keys"):
+            self.assertIn(name, defaults, f"{name} 应当是布尔开关")
+            self.assertTrue(defaults[name], f"{name} 应当默认开启")
+
+    def test_bake_switch_labels_stay_stable(self):
         source = self._source()
         self.assertIn("bake_disabled_shape_keys: bpy.props.BoolProperty(", source)
         self.assertIn('name="烘焙未勾选的形态键"', source)
-        block = source.split("bake_disabled_shape_keys: bpy.props.BoolProperty(", 1)[1][:700]
-        self.assertIn("default=False", block)
 
 
 class DisabledShapeKeyBakeWiringTests(unittest.TestCase):

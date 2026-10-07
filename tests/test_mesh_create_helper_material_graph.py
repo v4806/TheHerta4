@@ -173,7 +173,7 @@ _install_module(f"{PKG}.utils.vertexgroup_utils", VertexGroupUtils=types.SimpleN
 _install_module(f"{PKG}.common.global_config", GlobalConfig=types.SimpleNamespace(logic_name="GIMI"))
 _install_module(
     f"{PKG}.common.global_properties",
-    GlobalProterties=types.SimpleNamespace(use_normal_map=lambda: False),
+    GlobalProterties=types.SimpleNamespace(),
 )
 _install_module(
     f"{PKG}.common.logic_name",
@@ -249,27 +249,34 @@ class MeshCreateHelperMaterialGraphTests(unittest.TestCase):
                         self.assertIn("ShaderNodeMixShader", node_types)
                         self.assertIn("ShaderNodeBsdfTransparent", node_types)
 
-    def test_diffuse_material_name_strips_color_prefix_when_toggled(self):
-        """开启去掉颜色贴图前缀后，材质名 DiffuseMap_{mesh} 变为仅 {mesh}。"""
+    def test_diffuse_material_name_always_carries_the_color_prefix(self):
+        """「导入贴图材质去掉颜色贴图前缀」已移除，材质名固定为 DiffuseMap_{mesh}。"""
         with tempfile.TemporaryDirectory() as temp_dir:
             diffuse_path = os.path.join(temp_dir, "abc12345-12-DiffuseMap.dds")
             with open(diffuse_path, "wb") as file_obj:
                 file_obj.write(b"diffuse")
 
-            props = sys.modules[f"{PKG}.common.global_properties"].GlobalProterties
-            props.import_texture_material_strip_color_prefix = lambda: True
-            try:
-                obj = _FakeObject("LOD0.Body")
-                mesh_create_helper.MeshCreateHelper.create_bsdf_with_diffuse_linked(
-                    obj=obj,
-                    mesh_name="d892c658-2256-0",
-                    directory=temp_dir,
-                    logic_name="GIMI",
-                )
-            finally:
-                props.import_texture_material_strip_color_prefix = lambda: False
+            obj = _FakeObject("LOD0.Body")
+            mesh_create_helper.MeshCreateHelper.create_bsdf_with_diffuse_linked(
+                obj=obj,
+                mesh_name="d892c658-2256-0",
+                directory=temp_dir,
+                logic_name="GIMI",
+            )
 
-            self.assertEqual(obj.data.materials[0].name, "d892c658-2256-0")
+            self.assertEqual(obj.data.materials[0].name, "DiffuseMap_d892c658-2256-0")
+
+    def test_removed_import_switches_stay_removed(self):
+        """两个已移除的开关不得复活（属性与访问器都不能再出现在 GlobalProterties 上）。"""
+        props = sys.modules[f"{PKG}.common.global_properties"].GlobalProterties
+        for name in (
+            "use_normal_map",
+            "set_use_normal_map",
+            "toggle_use_normal_map",
+            "import_texture_material_strip_color_prefix",
+            "toggle_import_texture_material_strip_color_prefix",
+        ):
+            self.assertFalse(hasattr(props, name), name)
 
     def test_blend_index_sentinels_follow_dxgi_width(self):
         helper = mesh_create_helper.MeshCreateHelper

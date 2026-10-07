@@ -50,18 +50,6 @@ class SSMT4RefreshWorkspaceList(bpy.types.Operator):
         return {'FINISHED'}
 
 
-class SSMT_OT_ToggleUseNormalMap(bpy.types.Operator):
-    bl_idname = "ssmt.toggle_use_normal_map"
-    bl_label = "自动上贴图时使用法线贴图"
-    bl_description = "启用后在导入模型时自动附加法线贴图节点，在材质预览模式下得到略微更好的视觉效果"
-
-    def execute(self, context):
-        new_value = GlobalProterties.toggle_use_normal_map()
-        state_text = "已开启" if new_value else "已关闭"
-        self.report({'INFO'}, f"自动上贴图时使用法线贴图: {state_text}")
-        return {'FINISHED'}
-
-
 class SSMT_OT_ToggleIgnoreTextureAlpha(bpy.types.Operator):
     bl_idname = "ssmt.toggle_ignore_texture_alpha"
     bl_label = "导入贴图时忽略透明度通道"
@@ -71,18 +59,6 @@ class SSMT_OT_ToggleIgnoreTextureAlpha(bpy.types.Operator):
         new_value = GlobalProterties.toggle_ignore_texture_alpha()
         state_text = "已开启" if new_value else "已关闭"
         self.report({'INFO'}, f"导入贴图时忽略透明度通道: {state_text}")
-        return {'FINISHED'}
-
-
-class SSMT_OT_ToggleStripTextureColorPrefix(bpy.types.Operator):
-    bl_idname = "ssmt.toggle_strip_texture_color_prefix"
-    bl_label = "导入贴图材质去掉颜色贴图前缀"
-    bl_description = "开启后，从工作空间导入时创建的贴图材质名称不再携带颜色贴图（DiffuseMap）前缀，例如由 DiffuseMap_d892c658-2256-0 变为 d892c658-2256-0"
-
-    def execute(self, context):
-        new_value = GlobalProterties.toggle_import_texture_material_strip_color_prefix()
-        state_text = "已开启" if new_value else "已关闭"
-        self.report({'INFO'}, f"导入贴图材质去掉颜色贴图前缀: {state_text}")
         return {'FINISHED'}
 
 
@@ -261,8 +237,8 @@ class SSMT_OT_CleanupUnusedIB(bpy.types.Operator):
     导入这些 IB。支持多 LOD：按 LOD 前缀精确匹配（LOD0/xxx 只被 LOD0.xxx 保留）。
 
     安全护栏：场景为空或没有任何对象能解析出 IB 身份时（保留集合为空），
-    拒绝执行——此时“全部未保留”等于“清空整个工作空间”，必须走
-    SSMT_OT_ClearAllWorkspaceIB 的独立强确认操作。
+    拒绝执行——此时“全部未保留”等于“清空整个工作空间”，属于不可逆的高风险
+    操作，本插件不再提供任何一键清空入口（用户 2026-10-07 要求移除）。
     """
     bl_idname = "ssmt.cleanup_unused_ib"
     bl_label = "清理未使用IB文件夹"
@@ -318,14 +294,14 @@ class SSMT_OT_CleanupUnusedIB(bpy.types.Operator):
             self.report(
                 {'ERROR'},
                 "场景为空或没有可解析 IB 身份的对象，已拒绝清理；"
-                "如需清空整个工作空间的 IB 文件夹，请使用「清空全部」",
+                "请先选中要保留的物体后重试",
             )
             return {'CANCELLED'}
         if self._targets and kept_folder_count == 0:
             self.report(
                 {'ERROR'},
                 "场景中的 IB 身份与当前工作空间没有任何匹配（疑似工作空间选错），"
-                "已拒绝清理；确认要删除工作空间全部 IB 文件夹请使用「清空全部」",
+                "已拒绝清理；请确认当前工作空间选择是否正确",
             )
             return {'CANCELLED'}
         # 预览：按"全部目标都删成功"估一下会清掉多少配置引用（dry_run 不写盘）
@@ -379,14 +355,14 @@ class SSMT_OT_CleanupUnusedIB(bpy.types.Operator):
                 self.report(
                     {'ERROR'},
                     "场景为空或没有可解析 IB 身份的对象，已拒绝清理；"
-                    "如需清空整个工作空间的 IB 文件夹，请使用「清空全部」",
+                    "请先选中要保留的物体后重试",
                 )
                 return {'CANCELLED'}
             if kept_folder_count == 0:
                 self.report(
                     {'ERROR'},
                     "场景中的 IB 身份与当前工作空间没有任何匹配（疑似工作空间选错），"
-                    "已拒绝清理；确认要删除工作空间全部 IB 文件夹请使用「清空全部」",
+                    "已拒绝清理；请确认当前工作空间选择是否正确",
                 )
                 return {'CANCELLED'}
         targets = [record["folder_path"] for record in records]
@@ -406,83 +382,6 @@ class SSMT_OT_CleanupUnusedIB(bpy.types.Operator):
             + _report_config_prune(removed)
         )
         self.report({'INFO'}, message)
-        return {'FINISHED'}
-
-
-class SSMT_OT_ClearAllWorkspaceIB(bpy.types.Operator):
-    """清空整个工作空间的全部 IB 子网格文件夹（独立强确认操作）。
-
-    与 SSMT_OT_CleanupUnusedIB（按场景保留集合清理）完全分离：本算子不依赖
-    场景身份解析，默认删除工作空间中每一个子网格文件夹。为避免误触，
-    需要额外的「我确认」勾选框才会真正执行。
-    """
-    bl_idname = "ssmt.clear_all_workspace_ib"
-    bl_label = "清空全部IB文件夹"
-    bl_description = (
-        "删除当前工作空间中全部 IB 子网格文件夹（清空整个工作空间的 IB 内容，"
-        "不可恢复；删除后一键导入将不再导入任何 IB）"
-    )
-    bl_options = {'REGISTER'}
-
-    confirm_wipe: bpy.props.BoolProperty(
-        name="我确认清空工作空间全部IB文件夹",
-        description="勾选后才会真正删除；此操作不可恢复",
-        default=False,
-    )
-
-    def _compute_all_records(self, context):
-        workspace_root = GlobalConfig.path_workspace_folder()
-        if not workspace_root or not os.path.isdir(workspace_root):
-            return []
-        return WorkSpaceHelper.get_submesh_folder_records()
-
-    def invoke(self, context, event):
-        self.confirm_wipe = False  # 每次弹窗都从“未确认”开始，防止属性残留直接放行
-        self._records = self._compute_all_records(context)
-        self._targets = [record["folder_path"] for record in self._records]
-        if not self._targets:
-            self.report({'INFO'}, "工作空间中没有可删除的 IB 子网格文件夹")
-            return {'FINISHED'}
-        return context.window_manager.invoke_props_dialog(self)
-
-    def draw(self, context):
-        layout = self.layout
-        layout.alert = True
-        layout.label(
-            text=f"将清空工作空间中全部 {len(self._targets)} 个 IB 文件夹，此操作不可恢复！",
-            icon='ERROR',
-        )
-        box = layout.box()
-        for folder_path in self._targets[:10]:
-            box.label(text="· " + os.path.basename(folder_path))
-        if len(self._targets) > 10:
-            box.label(text=f"… 等共 {len(self._targets)} 个")
-        layout.label(text="并同步清理工作页/别名表/贴图标记等配置引用", icon='INFO')
-        layout.prop(self, "confirm_wipe")
-
-    def execute(self, context):
-        if not getattr(self, "confirm_wipe", False):
-            self.report({'ERROR'}, "未勾选确认项，已取消清空操作")
-            return {'CANCELLED'}
-        records = getattr(self, "_records", None)
-        if records is None:
-            records = self._compute_all_records(context)
-            self._records = records
-        targets = [record["folder_path"] for record in records]
-        deleted_paths, failed_paths = WorkSpaceHelper.delete_folder_list(targets)
-        for folder_path in failed_paths:
-            self.report({'WARNING'}, f"删除失败 {os.path.basename(folder_path)}")
-        print(f"[IB清理] 清空工作空间: 已删除 {len(deleted_paths)}/{len(targets)} 个 IB 文件夹")
-        for folder_path in deleted_paths:
-            print(f"[IB清理] 已删除: {folder_path}")
-        for folder_path in failed_paths:
-            print(f"[IB清理] 删除失败: {folder_path}")
-
-        removed = _prune_workspace_configs(_deleted_lod_bare_pairs(records, deleted_paths))
-        self.report(
-            {'INFO'},
-            f"已清空 {len(deleted_paths)} 个 IB 文件夹" + _report_config_prune(removed),
-        )
         return {'FINISHED'}
 
 
@@ -539,21 +438,8 @@ class PanelBasicInformation(bpy.types.Panel):
 
         layout.prop(global_properties, "enable_non_mirror_workflow", text="非镜像工作流", toggle=True)
 
-        # 导入贴图材质去掉颜色贴图前缀 — 以按钮呈现，按下时表示已开启
-        layout.operator(
-            SSMT_OT_ToggleStripTextureColorPrefix.bl_idname,
-            text="导入贴图材质去掉颜色贴图前缀",
-            icon='COLOR',
-            depress=GlobalProterties.import_texture_material_strip_color_prefix(),
-        )
-
-        # 自动上贴图时使用法线贴图 — 以按钮呈现，按下时表示已开启
-        layout.operator(
-            SSMT_OT_ToggleUseNormalMap.bl_idname,
-            text="自动上贴图时使用法线贴图",
-            icon='NORMALS_FACE',
-            depress=GlobalProterties.use_normal_map(),
-        )
+        # 按 SSMT 标记添加贴图材质（默认开启）—— 紧跟在非镜像工作流下面
+        layout.prop(global_properties, "import_materials_by_submesh_mark", icon='MATERIAL')
 
         # 导入贴图时忽略透明度通道 — 以按钮呈现，按下时表示已开启
         layout.operator(
@@ -563,11 +449,19 @@ class PanelBasicInformation(bpy.types.Panel):
             depress=GlobalProterties.ignore_texture_alpha(),
         )
 
+        # 导入后自动转为 PNG（一键导入完成后按帧把 .dds 转成无损 PNG）
+        layout.prop(
+            context.scene.texture_tools_props,
+            "dds_auto_convert_png_after_import",
+            icon='IMAGE_DATA',
+        )
+
+        # 给选中物体补齐贴图材质（按 SSMT 标记补齐缺失类型）
+        layout.operator(SSMT_OT_FillMarkedTextureMaterials.bl_idname, icon='MATERIAL')
+
         # 基于当前场景剩余的 IB，删除工作空间中未使用 IB 的文件夹
         ib_cleanup_row = layout.row(align=True)
         ib_cleanup_row.operator(SSMT_OT_CleanupUnusedIB.bl_idname, text="清理未使用IB文件夹", icon='TRASH')
-        # 独立强确认操作：清空整个工作空间全部 IB（不依赖场景身份解析）
-        ib_cleanup_row.operator(SSMT_OT_ClearAllWorkspaceIB.bl_idname, text="清空全部", icon='ERROR')
 
         workspace_box = layout.box()
         workspace_box.label(text="工作空间来源", icon='FILE_FOLDER')
@@ -635,26 +529,6 @@ class PanelBasicInformation(bpy.types.Panel):
             icon_only=True,
             emboss=False,
         )
-
-        # 与「一键导入」是同一件事的两半：导入会把工作空间里的 .dds 引用带进来，而 Blender
-        # 解不了 BC7/BC6H 压缩 DDS（刷警告）。勾上后导入结束自动转成无损 PNG 再编辑。
-        layout.prop(
-            context.scene.texture_tools_props,
-            "dds_auto_convert_png_after_import",
-            icon='IMAGE_DATA',
-        )
-
-        # 同一份标记也是导出 mod 时决定「导出哪些类型贴图、写哪些 ps-tN」的依据：
-        # 标记了才建，于是导入产生的材质能被「材质转资源pro」按材质名首段直接识别。
-        layout.prop(
-            global_properties,
-            "import_materials_by_submesh_mark",
-            icon='MATERIAL',
-        )
-
-        # 早先导入的物体只有漫反射材质；这个按钮按同一份标记把其余类型补齐
-        # （含槽 0 渲染材质），只处理选中的物体。
-        layout.operator(SSMT_OT_FillMarkedTextureMaterials.bl_idname, icon='MATERIAL')
 
         # Velo 工作空间入口固定显示；未切换到 Velo 时保持禁用。
         if hasattr(bpy.types, 'SSMT_OT_import_current_velo_workspace'):
@@ -734,8 +608,9 @@ class PanelBasicInformation(bpy.types.Panel):
         # 行为不变），仅用于跨 SkeletonGroup（对象变换不同）合并的实验与测试。
         if GlobalConfig.logic_name == LogicName.ZZMI:
             layout.prop(global_properties, "cross_group_merged_vgmap_test")
-            # RedirectSO 跨 DrawIB 重定向在部分运行时顺序下会丢失合并几何，默认
-            # 关闭；保留显式开关仅用于对照测试。关闭时仍使用合并骨架与单一合并对象。
+            # RedirectSO 跨 DrawIB 重定向在部分运行时顺序下会丢失合并几何，
+            # 但仍按用户要求默认开启；保留显式开关用于出问题时对照关闭。
+            # 关闭时仍使用合并骨架与单一合并对象。
             layout.prop(global_properties, "zzmi_merged_redirect_enabled")
         # EFMI 专用：多 LOD 使用 LOD0 分组投影，关闭则两侧独立去重。
         if GlobalConfig.logic_name == LogicName.EFMI:
@@ -755,24 +630,18 @@ class PanelBasicInformation(bpy.types.Panel):
 def register():
     bpy.utils.register_class(SSMT_OT_ClearPreprocessCache)
     bpy.utils.register_class(SSMT4RefreshWorkspaceList)
-    bpy.utils.register_class(SSMT_OT_ToggleUseNormalMap)
     bpy.utils.register_class(SSMT_OT_ToggleIgnoreTextureAlpha)
-    bpy.utils.register_class(SSMT_OT_ToggleStripTextureColorPrefix)
     bpy.utils.register_class(SSMT_OT_FillMarkedTextureMaterials)
     bpy.utils.register_class(SSMT_OT_ClearMergedSkeletonCache)
     bpy.utils.register_class(SSMT_OT_CleanupUnusedIB)
-    bpy.utils.register_class(SSMT_OT_ClearAllWorkspaceIB)
     bpy.utils.register_class(PanelBasicInformation)
 
 
 def unregister():
     bpy.utils.unregister_class(PanelBasicInformation)
-    bpy.utils.unregister_class(SSMT_OT_ClearAllWorkspaceIB)
     bpy.utils.unregister_class(SSMT_OT_CleanupUnusedIB)
     bpy.utils.unregister_class(SSMT_OT_ClearMergedSkeletonCache)
     bpy.utils.unregister_class(SSMT_OT_FillMarkedTextureMaterials)
-    bpy.utils.unregister_class(SSMT_OT_ToggleStripTextureColorPrefix)
     bpy.utils.unregister_class(SSMT_OT_ToggleIgnoreTextureAlpha)
-    bpy.utils.unregister_class(SSMT_OT_ToggleUseNormalMap)
     bpy.utils.unregister_class(SSMT4RefreshWorkspaceList)
     bpy.utils.unregister_class(SSMT_OT_ClearPreprocessCache)

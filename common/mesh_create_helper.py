@@ -902,6 +902,8 @@ class MeshCreateHelper:
         # 没标记的类型既不会导出贴图也不会写进 ini。勾选后按标记逐类型建独立材质，
         # 命名与「材质转资源pro」按材质名首段识别类型的口径一致。
         # 读不到标记（旧工作空间 / 无标记部件）时返回 0，原样回退下面的文件名搜索。
+        # 注：「导入贴图材质去掉颜色贴图前缀」与「自动上贴图时使用法线贴图」两个开关已移除
+        # （2026-10-07）：材质名固定带 DiffuseMap_ 前缀，法线由 IMGPV 预览材质按游戏类型接。
         try:
             use_marked_materials = bool(GlobalProterties.import_materials_by_submesh_mark())
         except Exception:
@@ -918,17 +920,11 @@ class MeshCreateHelper:
             if created > 0:
                 return
 
-        texture_path, normal_path = MeshCreateHelper.get_import_texture_paths(mesh_name, directory)
+        texture_path, _normal_path = MeshCreateHelper.get_import_texture_paths(mesh_name, directory)
         if texture_path is None:
             return
 
         material_name = f"DiffuseMap_{mesh_name}"
-        try:
-            if GlobalProterties.import_texture_material_strip_color_prefix():
-                # 开启后去掉颜色贴图（DiffuseMap）前缀，只保留网格名。
-                material_name = mesh_name
-        except Exception:
-            pass
         material = bpy.data.materials.new(name=material_name)
         material.use_nodes = True
         if logic_name == LogicName.IdentityV:
@@ -947,14 +943,6 @@ class MeshCreateHelper:
             _tex_node, diffuse = MeshCreateHelper.create_transparent_material_graph(
                 node_tree=material.node_tree,
                 texture_path=texture_path,
-            )
-
-        if normal_path is not None and GlobalProterties.use_normal_map():
-            MeshCreateHelper.apply_normal_texture(
-                node_tree=material.node_tree,
-                diffuse=diffuse,
-                normal_path=normal_path,
-                logic_name=logic_name,
             )
 
         MeshCreateHelper.assign_material(obj, material)

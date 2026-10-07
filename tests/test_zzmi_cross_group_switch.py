@@ -178,5 +178,32 @@ class SeparationContractTests(unittest.TestCase):
             self.assertIn(expected, referencing)
 
 
+class MergedRedirectDefaultTests(unittest.TestCase):
+    """「启用合并网格自动重定向（实验）」默认开启（用户 2026-10-07 要求）。"""
+
+    PROPERTY_KEY = "zzmi_merged_redirect_enabled"
+
+    def _block(self) -> str:
+        source = _read(GLOBAL_PROPERTIES)
+        block = re.search(
+            rf"^    {self.PROPERTY_KEY}: bpy\.props\.BoolProperty\((.*?)^    \) # type: ignore",
+            source,
+            re.S | re.M,
+        )
+        self.assertIsNotNone(block, f"{self.PROPERTY_KEY} 必须声明为 bpy.props.BoolProperty")
+        return block.group(1)
+
+    def test_defaults_to_on(self):
+        body = self._block()
+        self.assertIn('name="启用合并网格自动重定向（实验）"', body)
+        self.assertRegex(body, r"default=True")
+
+    def test_description_keeps_the_geometry_loss_warning(self):
+        """默认开启后仍要留住「部分帧序会丢几何」的告警与关闭方式。"""
+        body = self._block()
+        self.assertIn("丢失整块几何", body)
+        self.assertIn("关掉本项", body)
+
+
 if __name__ == "__main__":
     unittest.main()

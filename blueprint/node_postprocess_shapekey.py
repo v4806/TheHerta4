@@ -293,8 +293,8 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
     )
     merge_slot_files: bpy.props.BoolProperty(
         name="合并槽位文件",
-        description="将各槽位生成的紧凑缓冲区与索引缓冲区合并为单文件，减少着色器 T 资源位占用。当前主要在紧凑模式下生效。",
-        default=False
+        description="将各槽位生成的紧凑缓冲区与索引缓冲区合并为单文件，减少着色器 T 资源位占用。当前主要在紧凑模式下生效。默认开启。",
+        default=True
     )
     use_sparse_vertex_index: bpy.props.BoolProperty(
         name="顶点命中索引（稀疏查找）",
@@ -305,9 +305,9 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
             "逻辑块行数与键数脱钩。绝对形态键（互不相关的独立键）同样受益。"
             "需要同时开启「使用紧凑缓冲区 / 存储顶点增量 / 优化查找性能 / 合并槽位文件」，"
             "且与「帧表插值（序列组加速）」互斥：勾选本项会自动取消那一项。"
-            "与「拖拽驱动形态键」可以同时使用。需要 'numpy' 库。"
+            "与「拖拽驱动形态键」可以同时使用。默认开启。需要 'numpy' 库。"
         ),
-        default=False,
+        default=True,
         update=sync_shapekey_sparse_index_mode,
     )
     # 直出开关和同蓝图中的其他 ShapeKey 后处理节点同步，避免槽位资源生成策略不一致。
@@ -326,9 +326,9 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
             "开启后，未勾选导出的形态键会按其当前数值烘焙进基础网格（基态），"
             "其余形态键同步重基以保持各自原有的增量；"
             "关闭时与旧行为一致（未勾选键的当前数值被丢弃）。"
-            "仅在直出形态键路线生效。"
+            "仅在直出形态键路线生效。默认开启。"
         ),
-        default=False,
+        default=True,
     )
     drag_drive_enabled: bpy.props.BoolProperty(
         name="拖拽驱动形态键",

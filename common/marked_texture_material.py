@@ -20,15 +20,20 @@ Blender 里每个面由 ``material_index`` 指向**唯一一个**材质槽，一
   它的首段 ``imgpv`` 不是任何贴图类型名，导出侧会完全忽略。
 - **槽 1..N —— 规范材质** ``<类型名>_<网格名>``：一材质一张图，首段恰好是类型名，
   专供「材质转资源pro」按类型识别（见 ``blueprint/node_postprocess_material.py``
-  的 ``_find_workspace_slot_materials``）。
+  的 ``_find_workspace_slot_materials``）。它们**一律按「颜色贴图」接法**：不管标记
+  是哪种类型，都用 TheHerta4 原生的漫反射图（``ShaderNodeBsdfDiffuse`` + 透明混合，
+  与 DiffuseMap 同一套），**绝不经过原理化 BSDF**——原理化的镜面/粗糙度默认值会在
+  渲染时改变颜色（法线/光照/遮罩贴图尤其明显），而规范材质本来就只用于按材质名
+  识别类型，不需要通道语义。
 
-各通道接法对齐独立插件「快速应用纹理」（MOD 规范）：
-  - DiffuseMap  -> 规范材质沿用 TheHerta4 原生透明混合方案；渲染材质走 Base Color + Alpha
-  - NormalMap   -> Normal Map 节点；DirectX 法线（G 通道反相）；BC5 缺 Z 时用 R/G 重建
+渲染材质的各通道接法对齐独立插件「快速应用纹理」（MOD 规范）：
+  - DiffuseMap  -> Base Color + Alpha
+  - NormalMap   -> 与导入侧「自动上贴图时使用法线贴图」同一套按游戏类型接法
+                   （IdentityV 反相 G / 标准 / ZZMI·GIMI 由 R/G 重建 Z）
   - LightMap    -> 绝区零（ZZMI）走通道拆分（G->金属度、B->高光），其它走自发光
   - MaterialMap -> 粗糙度
   - BodyMaskMap -> 自发光强度（黑白遮罩，白色发光）
-  - 其它类型    -> 规范材质只挂一张图像纹理（保证导出仍能按材质名识别），渲染材质不接
+  - 其它类型    -> 不接
 """
 
 import os
@@ -77,19 +82,9 @@ _MAX_MATERIAL_NAME_BYTES = 60
 #: 取图时优先尝试的扩展名顺序（工作空间里可能同时存在原始 .dds 与转换出的 .png）。
 _PREFERRED_TEXTURE_EXTENSIONS = (".png", ".dds")
 
-#: 黑色遮罩 / 空区域的判定阈值。
-_BLANK_THRESHOLD = 0.02
-
 #: 身体发光遮罩接自发光强度时的缩放：遮罩是「哪里发光」而不是发光强度，
 #: 白色直接当强度会非常刺眼，缩小后只是「比不发光亮一点」。
 _BODYMASK_EMISSION_SCALE = 0.35
-
-
-# 法线贴图 Z 分量探测：DDS 等格式在 Blender 里恒为 4 通道，不能用 channels 判断，
-# 只能缩略采样看蓝通道中位数。与独立插件「快速应用纹理」同口径。
-_PROBE_SIZE = 128
-_Z_MEDIAN_THRESHOLD = 0.8
-_PROBE_CACHE = {}
 
 
 def _truncate_name(name: str) -> str:
@@ -205,7 +200,6 @@ _MARK_CACHE = {}
 def clear_mark_cache() -> None:
     """工作空间切换 / 重新导入后清空缓存，避免旧工作空间的标记继续生效。"""
     _MARK_CACHE.clear()
-    _PROBE_CACHE.clear()
 
 
 def resolve_mark_texture_path(extract_folder: str, mark) -> str:
@@ -231,58 +225,6 @@ def resolve_mark_texture_path(extract_folder: str, mark) -> str:
         if os.path.isfile(candidate_path):
             return candidate_path
     return ""
-
-
-def _needs_z_rebuild(image) -> bool:
-    """法线贴图是否缺少 Z（蓝）分量。
-
-    BC5 风格的两通道法线只有 R/G 有效，Blender 却会解出无意义的蓝通道（约 0.5），
-    直接使用会让法线退化成切向量、渲染大面积发黑；此时需要用 R/G 重建 Z。
-    任何采样失败都返回 False（按原图直连，不做改动）。
-    """
-    if image is None:
-        return False
-
-    key = (getattr(image, "name", ""), tuple(getattr(image, "size", ()) or ()))
-    cached = _PROBE_CACHE.get(key)
-    if cached is not None:
-        return cached
-
-    needs_z = False
-    small = None
-    try:
-        small = image.copy()
-        small.scale(_PROBE_SIZE, _PROBE_SIZE)
-        data = [0.0] * (_PROBE_SIZE * _PROBE_SIZE * 4)
-        small.pixels.foreach_get(data)
-
-        blues = []
-        for index in range(0, len(data), 4):
-            red = data[index]
-            green = data[index + 1]
-            blue = data[index + 2]
-            if (
-                red <= _BLANK_THRESHOLD
-                and green <= _BLANK_THRESHOLD
-                and blue <= _BLANK_THRESHOLD
-            ):
-                continue
-            blues.append(blue)
-        if len(blues) >= (_PROBE_SIZE * _PROBE_SIZE) * 0.05:
-            blues.sort()
-            needs_z = blues[len(blues) // 2] < _Z_MEDIAN_THRESHOLD
-    except Exception as ex:
-        print("[贴图标记] 法线 Z 分量探测失败，按原图直连: " + str(ex))
-        needs_z = False
-    finally:
-        if small is not None:
-            try:
-                bpy.data.images.remove(small)
-            except Exception:
-                pass
-
-    _PROBE_CACHE[key] = needs_z
-    return needs_z
 
 
 def _ignore_texture_alpha() -> bool:
@@ -338,46 +280,27 @@ def _link_texture_image(texture_path: str, colorspace: str):
 # ---------------------------------------------------------------
 # 通道接线（都只往已建好的节点树上加，可在同一材质里累加）
 # ---------------------------------------------------------------
-def _wire_normal(node_tree, principled, texture_path: str) -> None:
-    """法线：Normal Map 节点；DirectX 法线需反相 G；缺 Z 时用 R/G 重建。"""
-    image = _link_texture_image(texture_path, "Non-Color")
-    tex_image = _new_texture_node(node_tree, image, (-1100, -300))
+def _wire_normal(node_tree, principled, texture_path: str, logic_name: str) -> None:
+    """法线：直接复用导入侧「自动上贴图时使用法线贴图」的按类型接法。
 
-    normal_map = node_tree.nodes.new("ShaderNodeNormalMap")
-    normal_map.location = (-200, -300)
-    normal_map.uv_map = "TEXCOORD.xy"
-    if hasattr(normal_map, "space"):
-        normal_map.space = "TANGENT"
-    if "Strength" in normal_map.inputs:
-        normal_map.inputs["Strength"].default_value = 1.0
-    node_tree.links.new(normal_map.outputs["Normal"], principled.inputs["Normal"])
+    这里不自己搭图，而是转调 :meth:`MeshCreateHelper.apply_normal_texture`——
+    它与导入期是**同一份实现**，不会两边漂移。三种接法：
 
-    # Blender 的 Normal Map 节点没有 GL/DX 开关：MOD 基于 3DMigoto（DirectX），
-    # 法线 G 通道方向与 Blender 默认（OpenGL）相反，必须显式反相。
-    separate = node_tree.nodes.new("ShaderNodeSeparateColor")
-    separate.location = (-900, -300)
-    if hasattr(separate, "mode"):
-        separate.mode = "RGB"
-    node_tree.links.new(separate.inputs["Color"], tex_image.outputs["Color"])
+    - ``IdentityV``：反相 G 的简单 NormalMap；
+    - 非 ZZMI 家族且非 GIMI：标准 NormalMap（**不**反相 G）；
+    - ZZMI 家族 / GIMI：由 R/G 重建 Z（BC5 缺 Z）后再接 NormalMap。
 
-    combine = node_tree.nodes.new("ShaderNodeCombineColor")
-    combine.location = (-620, -300)
-    node_tree.links.new(combine.inputs["Red"], separate.outputs["Red"])
-    node_tree.links.new(combine.inputs["Blue"], separate.outputs["Blue"])
+    以前这里固定走「反相 G + 缺 Z 补 1」，对绝区零这类不反相 G 的游戏是错的：
+    预览材质的法线与游戏内不一致，看起来很脏。
+    """
+    from .mesh_create_helper import MeshCreateHelper
 
-    invert = node_tree.nodes.new("ShaderNodeMath")
-    invert.operation = "SUBTRACT"
-    invert.location = (-760, -560)
-    invert.inputs[0].default_value = 1.0
-    node_tree.links.new(invert.inputs[1], separate.outputs["Green"])
-    node_tree.links.new(combine.inputs["Green"], invert.outputs["Value"])
-
-    if _needs_z_rebuild(image):
-        for link in list(combine.inputs["Blue"].links):
-            node_tree.links.remove(link)
-        combine.inputs["Blue"].default_value = 1.0
-
-    node_tree.links.new(normal_map.inputs["Color"], combine.outputs["Color"])
+    MeshCreateHelper.apply_normal_texture(
+        node_tree=node_tree,
+        diffuse=principled,
+        normal_path=texture_path,
+        logic_name=logic_name,
+    )
 
 
 def _wire_emission(node_tree, principled, texture_path: str) -> None:
@@ -472,7 +395,7 @@ def _wire_bodymask(node_tree, principled, texture_path: str) -> None:
 def _wire_channel(node_tree, principled, socket_type: str, texture_path: str, logic_name: str) -> None:
     """把一张贴图接到已建好的原理化 BSDF 的对应通道上。"""
     if socket_type == "NORMAL":
-        _wire_normal(node_tree, principled, texture_path)
+        _wire_normal(node_tree, principled, texture_path, logic_name)
     elif socket_type == "LIGHTMAP":
         if LogicName.is_zzmi_family(logic_name):
             _wire_zzz_light(node_tree, principled, texture_path)
@@ -535,24 +458,17 @@ def _apply_diffuse_material(material, texture_path: str, logic_name: str) -> Non
     )
 
 
-def _apply_plain_material(material, texture_path: str) -> None:
-    """未知类型：只挂一张图像纹理（不接任何输入），保证导出侧仍能按材质名识别。"""
-    node_tree, _principled = _make_principled_material(material)
-    image = _link_texture_image(texture_path, "Non-Color")
-    _new_texture_node(node_tree, image, (-500, 0))
+def _apply_spec_material(material, texture_path: str, logic_name: str) -> None:
+    """规范材质：一律按「颜色贴图」接法，不按类型接通道。
 
-
-def _apply_material_channel(material, socket_type: str, texture_path: str, logic_name: str) -> None:
-    """规范材质：一个材质只接一个通道。"""
-    if socket_type == "DIFFUSE":
-        _apply_diffuse_material(material, texture_path, logic_name)
-        return
-    if not socket_type:
-        _apply_plain_material(material, texture_path)
-        return
-
-    node_tree, principled = _make_principled_material(material)
-    _wire_channel(node_tree, principled, socket_type, texture_path, logic_name)
+    规范材质（``<类型名>_<网格名>``）只用于让导出侧按材质名识别贴图类型，不需要通道
+    语义；而按类型接通道必须经过原理化 BSDF，原理化的镜面/粗糙度默认值会在渲染时
+    改变颜色（法线/光照/遮罩贴图尤其明显）。所以除渲染材质（``IMGPV_``，见
+    :func:`_build_render_material`）保留分通道接法外，其余材质统一走 TheHerta4
+    原生的颜色贴图图——纯漫反射 BSDF（``ShaderNodeBsdfDiffuse``）+ 透明混合，
+    与 DiffuseMap 完全同一套，节点树里不出现原理化 BSDF。
+    """
+    _apply_diffuse_material(material, texture_path, logic_name)
 
 
 def _build_render_material(material, entries, logic_name: str) -> None:
@@ -676,7 +592,7 @@ def build_marked_materials(
         socket_type = mark_socket_type(mark_name)
         material = bpy.data.materials.new(name=mark_material_name(mark_name, mesh_name))
         try:
-            _apply_material_channel(material, socket_type, texture_path, logic_name)
+            _apply_spec_material(material, texture_path, logic_name)
         except Exception as ex:
             print("[贴图标记] 建立材质失败 " + mark_name + ": " + str(ex))
             failures.append(mark_name)
@@ -778,6 +694,45 @@ def _existing_material_by_name(obj, name: str):
     return None
 
 
+def _existing_material_by_type(obj, mark_name: str):
+    """在物体**自己的材质槽**里按「类型前缀」找同类型材质。
+
+    用户 2026-10-07 反馈：物体上已经有对应类型的材质时，补齐仍会重复添加。
+    原因是补齐期的网格名与导入期口径可能不同（例如物体/网格被复制后 mesh
+    数据名带上 ``.001`` 后缀），按全名比对找不到旧材质，于是又建一份。
+    这里退一步按 ``<类型名>_`` 前缀匹配——用户语义是「物体本身已经有对应的
+    材质了就不再添加」，仍严格限制在同一物体内，不会跨物体共享材质。
+    """
+    prefix = _safe_name_token(mark_name) + "_"
+    try:
+        slots = list(obj.material_slots)
+    except Exception:
+        return None
+    for slot in slots:
+        material = getattr(slot, "material", None)
+        if material is None:
+            continue
+        name = str(getattr(material, "name", "") or "")
+        if name == prefix or name.startswith(prefix):
+            return material
+    return None
+
+
+def _existing_render_material(obj):
+    """在物体**自己的材质槽**里找已有的渲染材质（``IMGPV_`` 前缀）。"""
+    try:
+        slots = list(obj.material_slots)
+    except Exception:
+        return None
+    for slot in slots:
+        material = getattr(slot, "material", None)
+        if material is None:
+            continue
+        if str(getattr(material, "name", "") or "").startswith(RENDER_MATERIAL_PREFIX):
+            return material
+    return None
+
+
 def build_missing_marked_materials(
     obj,
     unique_str: str | None = None,
@@ -828,9 +783,11 @@ def build_missing_marked_materials(
         target_name = mark_material_name(mark_name, resolved_mesh_name)
         texture_path = resolve_mark_texture_path(extract_folder, mark)
 
-        existing = _existing_material_by_name(obj, target_name)
+        existing = _existing_material_by_name(obj, target_name) or _existing_material_by_type(
+            obj, mark_name
+        )
         if existing is not None:
-            # 已有同名词同类型材质：原样保留，只把它纳入渲染材质的接线来源。
+            # 已有同类型材质：原样保留，只把它纳入渲染材质的接线来源。
             spec_materials.append(existing)
             reused += 1
             if texture_path:
@@ -845,7 +802,7 @@ def build_missing_marked_materials(
 
         material = bpy.data.materials.new(name=target_name)
         try:
-            _apply_material_channel(material, socket_type, texture_path, logic_name)
+            _apply_spec_material(material, texture_path, logic_name)
         except Exception as ex:
             print("[贴图标记] 补齐材质失败 " + mark_name + ": " + str(ex))
             warnings.append(f"{mark_name} 建材质失败: {ex}")
@@ -859,7 +816,9 @@ def build_missing_marked_materials(
         spec_materials.append(material)
         created += 1
 
-    render_material = _existing_material_by_name(obj, render_material_name(resolved_mesh_name))
+    render_material = _existing_material_by_name(
+        obj, render_material_name(resolved_mesh_name)
+    ) or _existing_render_material(obj)
     if render_material is None and entries:
         render_material = bpy.data.materials.new(
             name=render_material_name(resolved_mesh_name)

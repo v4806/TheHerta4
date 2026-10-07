@@ -359,20 +359,36 @@ class BuildMarkedMaterialsTests(unittest.TestCase):
         self.temp_dir = tempfile.mkdtemp(prefix="marked_build_")
         self.extract_folder = os.path.join(self.temp_dir, "TYPE_A")
         os.makedirs(self.extract_folder, exist_ok=True)
-        self.channels = []
+        self.spec_calls = []
+        self.principled_calls = []
         self.render_calls = []
 
-        def _fake_channel(material, socket_type, texture_path, logic_name):
-            self.channels.append((material.name, socket_type, texture_path, logic_name))
+        def _fake_diffuse(material, texture_path, logic_name):
+            # 规范材质的真实路径：_apply_spec_material -> _apply_diffuse_material
+            self.spec_calls.append((material.name, texture_path, logic_name))
+
+        def _fake_principled(material):
+            self.principled_calls.append(material.name)
+            return types.SimpleNamespace(), types.SimpleNamespace()
+
+        def _fake_channel(node_tree, principled, socket_type, texture_path, logic_name):
+            self.principled_calls.append(socket_type)
 
         def _fake_render(material, entries, logic_name):
             self.render_calls.append((material.name, list(entries), logic_name))
 
-        self._channel_patch = mock.patch.object(
-            marked, "_apply_material_channel", _fake_channel
-        )
-        self._channel_patch.start()
-        self.addCleanup(self._channel_patch.stop)
+        # 规范材质必须走原生颜色贴图图（_apply_diffuse_material），且绝不经过
+        # 原理化 BSDF：原理化的镜面/粗糙度默认值会在渲染时改变颜色。
+        # 渲染材质的分通道接法已被 _build_render_material 的 stub 挡在外面，
+        # 所以这里任何一次原理化调用都只能来自规范材质。
+        for target, fake in (
+            ("_apply_diffuse_material", _fake_diffuse),
+            ("_make_principled_material", _fake_principled),
+            ("_wire_channel", _fake_channel),
+        ):
+            patcher = mock.patch.object(marked, target, fake)
+            patcher.start()
+            self.addCleanup(patcher.stop)
 
         # 渲染材质真的会建节点树，轻量 stub 没有 bpy 节点 API；这里只验证分派。
         self._render_patch = mock.patch.object(
@@ -459,7 +475,7 @@ class BuildMarkedMaterialsTests(unittest.TestCase):
         self.assertEqual(created, 1)
         self.assertEqual(obj.data.materials[0].name, "IMGPV_4a178546-18468-0")
         self.assertEqual(obj.data.materials[1].name, "BodyMaskMap_4a178546-18468-0")
-        self.assertEqual(self.channels[0][1], "BODYMASK")
+        self.assertEqual([call[0] for call in self.spec_calls], ["BodyMaskMap_4a178546-18468-0"])
 
     def test_unknown_mark_name_still_gets_a_material(self):
         self._write("4a178546-18468-0-SomeUnknownMap.dds")
@@ -473,7 +489,7 @@ class BuildMarkedMaterialsTests(unittest.TestCase):
         self.assertEqual(created, 1)
         self.assertEqual(obj.data.materials[0].name, "IMGPV_4a178546-18468-0")
         self.assertEqual(obj.data.materials[1].name, "SomeUnknownMap_4a178546-18468-0")
-        self.assertEqual(self.channels[0][1], "")
+        self.assertEqual([call[0] for call in self.spec_calls], ["SomeUnknownMap_4a178546-18468-0"])
 
     def test_hash_marks_are_skipped(self):
         """Hash 型标记靠贴图 hash 匹配游戏原有纹理，没有固定文件名与槽位。"""
@@ -493,16 +509,59 @@ class BuildMarkedMaterialsTests(unittest.TestCase):
         self.assertEqual(created, 1)
         self.assertEqual(len(obj.data.materials), 2)
 
-    def test_zzmi_lightmap_uses_channel_split(self):
-        """绝区零 LightMap 通道语义特殊，按 ZZMI 分派。"""
+    def test_zzmi_lightmap_split_is_left_to_the_render_material(self):
+        """绝区零 LightMap 的通道拆分只留给 IMGPV 渲染材质，规范材质一律走颜色图。"""
         self._write("4a178546-18468-0-LightMap.dds")
         self._use_marks([_mark("LightMap")])
 
         obj = _FakeObject()
         marked.build_marked_materials(obj, "4a178546-18468-0", self.extract_folder, "ZZMI")
 
-        self.assertEqual(self.channels[0][1], "LIGHTMAP")
-        self.assertEqual(self.channels[0][3], "ZZMI")
+        self.assertEqual([call[0] for call in self.spec_calls], ["LightMap_4a178546-18468-0"])
+        self.assertEqual(self.spec_calls[0][2], "ZZMI")
+        self.assertEqual(self.principled_calls, [], "规范材质不得经过原理化 BSDF")
+        render_name, entries, _logic = self.render_calls[0]
+        self.assertEqual(render_name, "IMGPV_4a178546-18468-0")
+        self.assertEqual([socket_type for socket_type, _path in entries], ["LIGHTMAP"])
+
+    def test_spec_materials_all_use_the_color_graph_without_principled(self):
+        """规范材质（除 IMGPV_ 渲染材质）一律用颜色贴图接法，与标记类型无关。
+
+        用户 2026-10-07 要求：不管标记是 DiffuseMap 还是 NormalMap/LightMap/
+        未知类型，规范材质都只用于让导出侧按材质名识别贴图类型，接通道必须经过
+        原理化 BSDF，会在渲染时改变颜色，所以一律走原生的漫反射图。
+        """
+        mark_names = (
+            "DiffuseMap",
+            "NormalMap",
+            "LightMap",
+            "MaterialMap",
+            "BodyMaskMap",
+            "SomeUnknownMap",
+        )
+        for mark_name in mark_names:
+            self._write(f"4a178546-18468-0-{mark_name}.dds")
+        self._use_marks([_mark(mark_name) for mark_name in mark_names])
+
+        obj = _FakeObject()
+        created = marked.build_marked_materials(
+            obj, "4a178546-18468-0", self.extract_folder, "ZZMI"
+        )
+
+        self.assertEqual(created, len(mark_names))
+        self.assertEqual(
+            [call[0] for call in self.spec_calls],
+            [f"{mark_name}_4a178546-18468-0" for mark_name in mark_names],
+        )
+        self.assertEqual([call[2] for call in self.spec_calls], ["ZZMI"] * len(mark_names))
+        self.assertEqual(self.principled_calls, [], "规范材质不得经过原理化 BSDF")
+        # 渲染材质仍然拿到全部通道（分通道接法是它的职责）
+        self.assertEqual(len(self.render_calls), 1)
+        _render_name, entries, _logic = self.render_calls[0]
+        self.assertEqual(
+            [socket_type for socket_type, _path in entries],
+            ["DIFFUSE", "NORMAL", "LIGHTMAP", "SURFACE", "BODYMASK", ""],
+        )
 
     def test_render_material_gets_every_wired_channel(self):
         """同一面要同时显示多种贴图，只能让它们待在同一个材质里（Blender 没有跨材质）。"""
@@ -651,18 +710,18 @@ class BuildMissingMarkedMaterialsTests(unittest.TestCase):
         self.temp_dir = tempfile.mkdtemp(prefix="marked_fill_")
         self.extract_folder = os.path.join(self.temp_dir, "TYPE_A")
         os.makedirs(self.extract_folder, exist_ok=True)
-        self.channels = []
+        self.spec_calls = []
         self.render_calls = []
         self.unique_str = "LOD0.4a178546-18468-0"
 
-        def _fake_channel(material, socket_type, texture_path, logic_name):
-            self.channels.append((material.name, socket_type, texture_path, logic_name))
+        def _fake_diffuse(material, texture_path, logic_name):
+            self.spec_calls.append((material.name, texture_path, logic_name))
 
         def _fake_render(material, entries, logic_name):
             self.render_calls.append((material.name, list(entries), logic_name))
 
         for target, fake in (
-            ("_apply_material_channel", _fake_channel),
+            ("_apply_diffuse_material", _fake_diffuse),
             ("_build_render_material", _fake_render),
         ):
             patcher = mock.patch.object(marked, target, fake)
@@ -717,11 +776,70 @@ class BuildMissingMarkedMaterialsTests(unittest.TestCase):
         marked.build_missing_marked_materials(obj)
 
         self.assertNotIn(
-            "DiffuseMap_4a178546-18468-0", [name for name, _t, _p, _l in self.channels]
+            "DiffuseMap_4a178546-18468-0", [name for name, _p, _l in self.spec_calls]
         )
         self.assertIn(
-            "NormalMap_4a178546-18468-0", [name for name, _t, _p, _l in self.channels]
+            "NormalMap_4a178546-18468-0", [name for name, _p, _l in self.spec_calls]
         )
+
+    def test_fully_populated_object_creates_nothing(self):
+        """物体已备齐全部类型时不新建任何材质数据块（用户反馈的「重复添加」）。"""
+        for mark_name in ("DiffuseMap", "NormalMap", "LightMap"):
+            self._write(f"4a178546-18468-0-{mark_name}.dds")
+        self._use_marks(["DiffuseMap", "NormalMap", "LightMap"])
+
+        obj = self._obj(
+            materials=[
+                types.SimpleNamespace(name="IMGPV_4a178546-18468-0"),
+                types.SimpleNamespace(name="DiffuseMap_4a178546-18468-0"),
+                types.SimpleNamespace(name="NormalMap_4a178546-18468-0"),
+                types.SimpleNamespace(name="LightMap_4a178546-18468-0"),
+            ]
+        )
+        created, reused, warnings = marked.build_missing_marked_materials(obj)
+
+        self.assertEqual((created, reused), (0, 3))
+        self.assertEqual(warnings, [])
+        self.assertEqual(self.spec_calls, [])
+        self.assertEqual(self.render_calls, [])
+        self.assertEqual(_MATERIALS, [])
+        self.assertEqual(
+            [material.name for material in obj.data.materials],
+            [
+                "IMGPV_4a178546-18468-0",
+                "DiffuseMap_4a178546-18468-0",
+                "NormalMap_4a178546-18468-0",
+                "LightMap_4a178546-18468-0",
+            ],
+        )
+
+    def test_existing_material_with_a_different_mesh_suffix_is_reused(self):
+        """名字口径不同（网格被复制成 .001）时按类型复用，不再重复添加。"""
+        self._write("4a178546-18468-0-DiffuseMap.dds")
+        self._use_marks(["DiffuseMap"])
+
+        existing = types.SimpleNamespace(name="DiffuseMap_4a178546-18468-0")
+        obj = self._obj(materials=[existing])
+        created, reused, warnings = marked.build_missing_marked_materials(
+            obj, mesh_name="4a178546-18468-0.001"
+        )
+
+        self.assertEqual((created, reused), (0, 1))
+        self.assertEqual(warnings, [])
+        self.assertEqual(self.spec_calls, [])
+        self.assertIn(existing, obj.data.materials)
+
+    def test_existing_render_material_with_a_different_mesh_suffix_is_reused(self):
+        """渲染材质同理：已有 IMGPV_ 材质时不再新建一份。"""
+        self._write("4a178546-18468-0-DiffuseMap.dds")
+        self._use_marks(["DiffuseMap"])
+
+        render = types.SimpleNamespace(name="IMGPV_4a178546-18468-0")
+        obj = self._obj(materials=[render])
+        marked.build_missing_marked_materials(obj, mesh_name="4a178546-18468-0.001")
+
+        self.assertEqual(self.render_calls, [])
+        self.assertIs(obj.data.materials[0], render)
 
     def test_identity_comes_from_workspace_unique_str_prop(self):
         self._write("4a178546-18468-0-DiffuseMap.dds")
@@ -831,6 +949,50 @@ class BuildMissingMarkedMaterialsTests(unittest.TestCase):
 
         self.assertEqual((created, reused), (1, 0))
         self.assertIsNot(obj.data.materials[1], other_object_material)
+
+
+class NormalWiringTests(unittest.TestCase):
+    """IMGPV 渲染材质的法线接法 = 导入侧「自动上贴图时使用法线贴图」同一套。
+
+    用户 2026-10-07 要求：预览材质的法线按游戏类型接（IdentityV 反相 G / 标准 /
+    ZZMI·GIMI 由 R/G 重建 Z），不再固定「反相 G + 缺 Z 补 1」。
+    """
+
+    def _stub_mesh_helper(self, calls):
+        module = sys.modules[f"{PKG}.common.mesh_create_helper"]
+        original = module.MeshCreateHelper
+        module.MeshCreateHelper = types.SimpleNamespace(
+            apply_normal_texture=lambda **kwargs: calls.append(kwargs)
+        )
+        self.addCleanup(setattr, module, "MeshCreateHelper", original)
+
+    def test_normal_wiring_delegates_to_mesh_create_helper(self):
+        calls = []
+        self._stub_mesh_helper(calls)
+
+        marked._wire_normal("NODE_TREE", "PRINCIPLED", "n.dds", "ZZMI")
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["logic_name"], "ZZMI")
+        self.assertEqual(calls[0]["normal_path"], "n.dds")
+        self.assertEqual(calls[0]["node_tree"], "NODE_TREE")
+        self.assertEqual(calls[0]["diffuse"], "PRINCIPLED")
+
+    def test_channel_dispatch_passes_logic_name_to_normal(self):
+        """logic_name 必须一路传到法线接法，否则绝区零又会被反相 G。"""
+        seen = []
+        original = marked._wire_normal
+        marked._wire_normal = lambda *args: seen.append(args)
+        self.addCleanup(setattr, marked, "_wire_normal", original)
+
+        marked._wire_channel("TREE", "BSDF", "NORMAL", "n.dds", "ZZMI")
+
+        self.assertEqual(seen, [("TREE", "BSDF", "n.dds", "ZZMI")])
+
+    def test_stale_z_probe_is_gone(self):
+        """旧的「缺 Z 补 1」缩略图探测已随接法统一移除，不要复活。"""
+        self.assertFalse(hasattr(marked, "_needs_z_rebuild"))
+        self.assertFalse(hasattr(marked, "_PROBE_CACHE"))
 
 
 if __name__ == "__main__":
