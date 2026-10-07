@@ -575,7 +575,10 @@ ran_background_check = False
 
 
 @persistent
-def updater_run_success_popup_handler(scene):
+def updater_run_success_popup_handler(scene, *args):
+    # 本回调被注册进 depsgraph_update_post，Blender 触发时传 (scene, depsgraph)
+    # 两个实参；只声明一个参数会在进入函数体之前就 TypeError（函数内的
+    # try/except 兜不住，控制台只会刷 "takes 1 positional argument but 2 were given"）。
     global ran_update_success_popup
     ran_update_success_popup = True
 
