@@ -10,6 +10,7 @@ from pathlib import Path
 
 import bpy
 
+from ..toolkit.tt_dds_conversion import convert_texture_to_dds
 from .node_postprocess_base import SSMTNode_PostProcess_Base
 
 
@@ -136,12 +137,25 @@ def ensure_resource(text, name, filename):
     return text.rstrip() + "\n\n" + new_block
 
 
-def copy_texture(texture_path, ini_path):
+def copy_texture(texture_path, ini_path, export_as_dds=False):
     source = abs_path(texture_path)
     if not source.is_file():
         raise FileNotFoundError(f"贴图不存在：{source}")
     texture_dir = Path(ini_path).resolve().parent / "Textures"
     texture_dir.mkdir(parents=True, exist_ok=True)
+
+    # 生成 INI 时把非 DDS 源（编辑期无损 PNG 等）转成 DDS：游戏只认 DDS，而 INI 的
+    # filename 直接取本函数返回值，所以文件名跟着变。转换失败回退为原样复制。
+    if export_as_dds and source.suffix.lower() != ".dds":
+        converted = texture_dir / f"{source.stem}.dds"
+        if not converted.exists():
+            ok, reason = convert_texture_to_dds(str(source), str(converted))
+            if not ok:
+                print(f"贴图转 DDS 失败，回退为原样复制: {source} - {reason}")
+                converted = None
+        if converted is not None and converted.exists():
+            return f"Textures/{converted.name}".replace("\\", "/")
+
     destination = texture_dir / source.name
     if source != destination.resolve():
         shutil.copy2(source, destination)
@@ -364,7 +378,11 @@ def apply_group(text, group, ini_path, owner_id):
     for index, item in enumerate(group.new_textures, start=1):
         if not item.path:
             raise ValueError(f"{group.name}：状态 {index} 没有选择贴图")
-        filename = copy_texture(item.path, ini_path)
+        filename = copy_texture(
+            item.path,
+            ini_path,
+            export_as_dds=bool(getattr(group, "export_as_dds", False)),
+        )
         resource = f"Resource_DiffuseSwitch_{resource_group_id}_B{index}"
         text = ensure_resource(text, resource, filename)
         replacement_resources.append(resource)
@@ -416,6 +434,16 @@ class SSMT_DiffuseSwitchGroup(bpy.types.PropertyGroup):
     active_target: bpy.props.IntProperty(default=0)
     backup: bpy.props.BoolProperty(name="自动备份", default=True)
     copy_b: bpy.props.BoolProperty(name="统一使用相对路径", default=True)
+    export_as_dds: bpy.props.BoolProperty(
+        name="导出时把贴图转成DDS",
+        description=(
+            "生成 INI 时，本组的切换贴图若不是 .dds（例如编辑期用的无损 PNG），"
+            "先用 texconv 按现有 DDS 转换规则转成 DDS 放进 MOD/Textures，"
+            "INI 的 filename 也指向转出来的 DDS。源贴图文件保留不动。"
+            "关闭时按原样复制源文件"
+        ),
+        default=True,
+    )
     expanded: bpy.props.BoolProperty(name="展开", default=True)
     uid: bpy.props.StringProperty(default="", options={"HIDDEN"})
 
@@ -672,6 +700,7 @@ class SSMTNode_PostProcess_DiffuseSwitch(SSMTNode_PostProcess_Base):
             options = box.row(align=True)
             options.prop(group, "backup")
             options.label(text="切换贴图固定复制到 MOD/Textures 并使用相对路径", icon="CHECKMARK")
+            box.prop(group, "export_as_dds")
 
     def _gui_only_guard(self):
         guards = []

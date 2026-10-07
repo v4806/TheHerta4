@@ -310,6 +310,12 @@ class GlobalProterties(bpy.types.PropertyGroup):
         default=False,
     ) # type: ignore
 
+    import_materials_by_submesh_mark: bpy.props.BoolProperty(
+        name="按SSMT标记添加贴图材质",
+        description="开启后，一键导入时按 SSMT 子网格里标记的贴图类型（SubmeshJson 的 TextureMarkUpInfoList，与导出 mod 用的是同一份标记）逐类型建立独立材质，材质名形如 DiffuseMap_网格名；标记了才建，没标记的类型不建。读不到标记时仍按原逻辑按文件名搜索",
+        default=True,
+    ) # type: ignore
+
     enable_preprocess_cache: bpy.props.BoolProperty(
         name="启用前处理缓存",
         description="启用后，前处理结果会被缓存到本地文件。当物体数据未变化时，下次导出将直接使用缓存，减少重复计算",
@@ -636,6 +642,23 @@ class GlobalProterties(bpy.types.PropertyGroup):
             getattr(instance, "import_texture_material_strip_color_prefix", False)
         )
         return bool(instance.import_texture_material_strip_color_prefix)
+
+    @classmethod
+    def import_materials_by_submesh_mark(cls) -> bool:
+        return cls._bool_attr("import_materials_by_submesh_mark", True)
+
+    @classmethod
+    def set_import_materials_by_submesh_mark(cls, value: bool):
+        setattr(cls._instance(), "import_materials_by_submesh_mark", bool(value))
+
+    @classmethod
+    def toggle_import_materials_by_submesh_mark(cls) -> bool:
+        """翻转 import_materials_by_submesh_mark，返回翻转后的新值。"""
+        instance = cls._instance()
+        instance.import_materials_by_submesh_mark = not bool(
+            getattr(instance, "import_materials_by_submesh_mark", True)
+        )
+        return bool(instance.import_materials_by_submesh_mark)
 
     @classmethod
     def enable_preprocess_cache(cls):

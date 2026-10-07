@@ -35,7 +35,7 @@ from pathlib import Path
 
 
 PKG = "_texture_switch_activation_gate_test_pkg"
-for package_name in (PKG, f"{PKG}.blueprint"):
+for package_name in (PKG, f"{PKG}.blueprint", f"{PKG}.toolkit"):
     package = types.ModuleType(package_name)
     package.__path__ = []
     sys.modules[package_name] = package
@@ -61,6 +61,12 @@ _fake_bpy.props = types.SimpleNamespace(
 )
 _fake_bpy.data = types.SimpleNamespace(objects={}, node_groups=[])
 sys.modules["bpy"] = _fake_bpy
+
+# 贴图切换的 copy_texture 会调用 toolkit 的 DDS 转换；本测试只关心 KeySwap 门控，
+# 桩成「转换成功」即可（真正转换在 test_dds_conversion 里单独覆盖）。
+_toolkit_stub = types.ModuleType(f"{PKG}.toolkit.tt_dds_conversion")
+_toolkit_stub.convert_texture_to_dds = lambda *_args, **_kwargs: (True, "")
+sys.modules[_toolkit_stub.__name__] = _toolkit_stub
 
 # 材质转资源pro 的基类来自 node_postprocess_material（此处用桩）。
 _material_stub = types.ModuleType(f"{PKG}.blueprint.node_postprocess_material")

@@ -3,6 +3,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 
 import bpy
 
@@ -250,6 +251,64 @@ def resolve_dds_target(filename: str, props) -> tuple[str, str, str]:
         return best_rule["texture_type"], best_rule["format"], best_rule["texture_type"]
 
     return "default", "bc7_unorm", "Default"
+
+
+def convert_texture_to_dds(source_path: str, target_path: str, props=None) -> tuple[bool, str]:
+    """把单张贴图转成 DDS 写到 ``target_path``，供 Mod 导出流程复用。
+
+    口径与「批量转换为 .dds」算子完全一致：输出格式由现有规则表
+    （:func:`resolve_dds_target`）从**源文件名**推断，色彩空间标志由
+    :func:`_texconv_colorspace_flags` 按该格式选择 —— 这正是为「PNG 这类不带色彩空间
+    信息的输入」设计的（sRGB 输出用 ``--srgb-in`` 达成恒等，线性输出用 ``--ignore-srgb``）。
+
+    **不改动源文件**，返回 ``(True, "")`` 或 ``(False, 失败原因)``。
+    """
+    texconv_executable = find_texconv()
+    if not texconv_executable:
+        return False, "未找到 texconv.exe。请将其放入插件目录的 Toolset 子文件夹，或手动指定路径。"
+
+    if props is None:
+        props = bpy.context.scene.texture_tools_props
+
+    dds_format = resolve_dds_target(os.path.basename(source_path), props)[1] or "bc7_unorm"
+
+    command = [texconv_executable, "-f", dds_format]
+    command.extend(_texconv_colorspace_flags(dds_format))
+
+    # 先转到临时目录再搬过去：texconv 的输出名固定是「源文件名词干 + .dds」，而导出侧
+    # 要的目标名通常取材质资源名，两者不同；直接 -o 目标目录会写出一个多余的错误文件名。
+    with tempfile.TemporaryDirectory(prefix="herta_dds_export_") as staging:
+        command.extend(["-o", staging, "-y", source_path])
+        try:
+            process = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+            )
+        except Exception as exc:
+            return False, f"调用 texconv 失败: {exc}"
+
+        if process.returncode != 0:
+            detail = (process.stderr or process.stdout or "").strip()
+            return False, detail or f"texconv 退出码 {process.returncode}"
+
+        produced = os.path.join(
+            staging, os.path.splitext(os.path.basename(source_path))[0] + ".dds"
+        )
+        if not os.path.exists(produced):
+            return False, f"texconv 未生成 {produced}"
+
+        target_dir = os.path.dirname(target_path)
+        if target_dir:
+            os.makedirs(target_dir, exist_ok=True)
+        try:
+            shutil.move(produced, target_path)
+        except Exception as exc:
+            return False, f"写出目标文件失败: {exc}"
+
+    return True, ""
 
 
 class TT_OT_convert_to_dds(bpy.types.Operator):

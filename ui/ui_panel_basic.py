@@ -7,6 +7,7 @@ import os
 from ..common.global_config import GlobalConfig
 from ..common.global_properties import GlobalProterties
 from ..common.logic_name import LogicName
+from ..common.marked_texture_material import build_missing_marked_materials
 from ..common.object_prefix_helper import ObjectPrefixHelper
 from ..common.workspace_config_pruner import WorkspaceConfigPruner
 from ..common.workspace_helper import WorkSpaceHelper
@@ -82,6 +83,65 @@ class SSMT_OT_ToggleStripTextureColorPrefix(bpy.types.Operator):
         new_value = GlobalProterties.toggle_import_texture_material_strip_color_prefix()
         state_text = "已开启" if new_value else "已关闭"
         self.report({'INFO'}, f"导入贴图材质去掉颜色贴图前缀: {state_text}")
+        return {'FINISHED'}
+
+
+class SSMT_OT_FillMarkedTextureMaterials(bpy.types.Operator):
+    """给选中的旧物体补齐贴图材质。
+
+    早先导入的物体只建了漫反射材质，缺其他类型；本操作按 SSMT 子网格标记
+    （物体上的 ``3DMigoto:WorkspaceUniqueStr`` 直接查工作空间 SubmeshJson，
+    与导出 mod 用的是同一份标记）补齐：槽 0 渲染材质 + 各类型规范材质。
+    已有同名词同类型的材质原样保留，不重建节点。
+    """
+
+    bl_idname = "ssmt.fill_marked_texture_materials"
+    bl_label = "给选中物体补齐贴图材质"
+    bl_description = (
+        "按 SSMT 子网格标记，给选中的物体补齐缺失的贴图材质"
+        "（槽 0 渲染材质 + 各类型规范材质）；已有同名词同类型的材质原样保留"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        selected = getattr(context, "selected_objects", None) or ()
+        return any(getattr(obj, "type", "") == 'MESH' for obj in selected)
+
+    def execute(self, context):
+        targets = [
+            obj for obj in (getattr(context, "selected_objects", None) or ())
+            if getattr(obj, "type", "") == 'MESH'
+        ]
+        if not targets:
+            self.report({'WARNING'}, "请先选中至少一个网格物体")
+            return {'CANCELLED'}
+
+        created = 0
+        reused = 0
+        touched = 0
+        warnings = []
+        for obj in targets:
+            try:
+                obj_created, obj_reused, obj_warnings = build_missing_marked_materials(obj)
+            except Exception as ex:
+                warnings.append(f"{obj.name}: {ex}")
+                continue
+            created += obj_created
+            reused += obj_reused
+            if obj_created or obj_reused:
+                touched += 1
+            warnings.extend(f"{obj.name}: {item}" for item in obj_warnings)
+
+        message = (
+            f"补齐完成：{touched}/{len(targets)} 个物体，"
+            f"新建 {created} 个材质，复用 {reused} 个"
+        )
+        if warnings:
+            for item in warnings:
+                print("[贴图标记] 补齐警告 " + item)
+            message += f"，{len(warnings)} 条警告（见控制台）"
+        self.report({'INFO'} if touched else {'WARNING'}, message)
         return {'FINISHED'}
 
 
@@ -576,6 +636,26 @@ class PanelBasicInformation(bpy.types.Panel):
             emboss=False,
         )
 
+        # 与「一键导入」是同一件事的两半：导入会把工作空间里的 .dds 引用带进来，而 Blender
+        # 解不了 BC7/BC6H 压缩 DDS（刷警告）。勾上后导入结束自动转成无损 PNG 再编辑。
+        layout.prop(
+            context.scene.texture_tools_props,
+            "dds_auto_convert_png_after_import",
+            icon='IMAGE_DATA',
+        )
+
+        # 同一份标记也是导出 mod 时决定「导出哪些类型贴图、写哪些 ps-tN」的依据：
+        # 标记了才建，于是导入产生的材质能被「材质转资源pro」按材质名首段直接识别。
+        layout.prop(
+            global_properties,
+            "import_materials_by_submesh_mark",
+            icon='MATERIAL',
+        )
+
+        # 早先导入的物体只有漫反射材质；这个按钮按同一份标记把其余类型补齐
+        # （含槽 0 渲染材质），只处理选中的物体。
+        layout.operator(SSMT_OT_FillMarkedTextureMaterials.bl_idname, icon='MATERIAL')
+
         # Velo 工作空间入口固定显示；未切换到 Velo 时保持禁用。
         if hasattr(bpy.types, 'SSMT_OT_import_current_velo_workspace'):
             velo_row = layout.row(align=True)
@@ -678,6 +758,7 @@ def register():
     bpy.utils.register_class(SSMT_OT_ToggleUseNormalMap)
     bpy.utils.register_class(SSMT_OT_ToggleIgnoreTextureAlpha)
     bpy.utils.register_class(SSMT_OT_ToggleStripTextureColorPrefix)
+    bpy.utils.register_class(SSMT_OT_FillMarkedTextureMaterials)
     bpy.utils.register_class(SSMT_OT_ClearMergedSkeletonCache)
     bpy.utils.register_class(SSMT_OT_CleanupUnusedIB)
     bpy.utils.register_class(SSMT_OT_ClearAllWorkspaceIB)
@@ -689,6 +770,7 @@ def unregister():
     bpy.utils.unregister_class(SSMT_OT_ClearAllWorkspaceIB)
     bpy.utils.unregister_class(SSMT_OT_CleanupUnusedIB)
     bpy.utils.unregister_class(SSMT_OT_ClearMergedSkeletonCache)
+    bpy.utils.unregister_class(SSMT_OT_FillMarkedTextureMaterials)
     bpy.utils.unregister_class(SSMT_OT_ToggleStripTextureColorPrefix)
     bpy.utils.unregister_class(SSMT_OT_ToggleIgnoreTextureAlpha)
     bpy.utils.unregister_class(SSMT_OT_ToggleUseNormalMap)

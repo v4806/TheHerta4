@@ -23,6 +23,7 @@ import shutil
 
 import bpy
 
+from ..toolkit.tt_dds_conversion import convert_texture_to_dds
 from .node_postprocess_base import SSMTNode_PostProcess_Base
 
 
@@ -506,18 +507,37 @@ def _apply_object_texture_replacements(ini_text, object_name, mesh_match, group,
             messages.append(f"{label}：未找到对应 {suffix} 引用")
             continue
 
-        # 2.1) 复制贴图到 mod/Textures
+        # 2.1) 复制贴图到 mod/Textures：非 DDS 源（编辑期无损 PNG 等）先按现有规则转 DDS
         texture_dir = os.path.join(mod_export_path, _TEXTURE_FOLDER)
         os.makedirs(texture_dir, exist_ok=True)
         dest_name = os.path.basename(source_path)
         dest_path = os.path.join(texture_dir, dest_name)
-        try:
-            if os.path.normcase(os.path.realpath(source_path)) != os.path.normcase(os.path.realpath(dest_path)):
-                if not os.path.exists(dest_path) or os.path.getsize(dest_path) != os.path.getsize(source_path):
-                    shutil.copy2(source_path, dest_path)
-        except OSError as exc:
-            messages.append(f"{label}：复制贴图失败 {exc}")
-            continue
+
+        converted = False
+        if getattr(group, "export_as_dds", False) and os.path.splitext(dest_name)[1].lower() != ".dds":
+            converted_name = os.path.splitext(dest_name)[0] + ".dds"
+            converted_path = os.path.join(texture_dir, converted_name)
+            if os.path.exists(converted_path):
+                converted = True
+            else:
+                ok, reason = convert_texture_to_dds(source_path, converted_path)
+                if ok and os.path.exists(converted_path):
+                    converted = True
+                else:
+                    messages.append(
+                        f"{label}：贴图转 DDS 失败，改用原文件（{reason or '未产出文件'}）"
+                    )
+            if converted:
+                dest_name, dest_path = converted_name, converted_path
+
+        if not converted:
+            try:
+                if os.path.normcase(os.path.realpath(source_path)) != os.path.normcase(os.path.realpath(dest_path)):
+                    if not os.path.exists(dest_path) or os.path.getsize(dest_path) != os.path.getsize(source_path):
+                        shutil.copy2(source_path, dest_path)
+            except OSError as exc:
+                messages.append(f"{label}：复制贴图失败 {exc}")
+                continue
 
         # 2.2) 新建/复用指向该贴图的资源段
         texture_rel = f"{_TEXTURE_FOLDER}/{dest_name}".replace("\\", "/")
@@ -713,6 +733,16 @@ class SSMT_ObjectTextureGroup(bpy.types.PropertyGroup):
     group_index: bpy.props.IntProperty(name="分组编号", default=1, min=1)
     remark: bpy.props.StringProperty(name="分组备注", default="")
     expanded: bpy.props.BoolProperty(name="展开", default=True)
+    export_as_dds: bpy.props.BoolProperty(
+        name="导出时把贴图转成DDS",
+        description=(
+            "导出 Mod 时，本组贴图若不是 .dds（例如编辑期用的无损 PNG），"
+            "先用 texconv 按现有 DDS 转换规则转成 DDS 放进 Mod 的 Textures 目录，"
+            "INI 的 filename 也指向转出来的 DDS。源贴图文件保留不动。"
+            "关闭时按原样复制源文件"
+        ),
+        default=True,
+    )
     diffuse_path: bpy.props.StringProperty(
         name="Diffuse 贴图",
         description="该组物体的 Diffuse 贴图，导出时复制进 mod/Textures 并改写对应 DiffuseMap 引用",
@@ -1153,6 +1183,7 @@ class SSMTNode_PostProcess_ObjectTextureAssign(SSMTNode_PostProcess_Base):
                 slot_row.label(text=f"{label}:", icon='IMAGE_DATA')
                 slot_row.prop(setting, _attr, text="")
             set_box.prop(setting, "remark", text="分组备注")
+            set_box.prop(setting, "export_as_dds")
 
             # 组内物体列表
             members = [entry for entry in self.object_entries if entry.group_index == setting.group_index]
