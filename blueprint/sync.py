@@ -1136,7 +1136,7 @@ def depsgraph_update_handler(scene, depsgraph):
 
 
 @persistent
-def undo_post_handler(scene):
+def undo_post_handler(scene, *args):
     """撤销/重做后重建缓存并修正节点引用。"""
 
     if not _sync_enabled:
@@ -1159,7 +1159,7 @@ def undo_post_handler(scene):
 
 
 @persistent
-def load_post_handler(scene):
+def load_post_handler(scene, *args):
     """文件加载后重建缓存并恢复消息订阅。"""
     _rebuild_object_name_cache()
     _rebuild_object_hide_state_cache()

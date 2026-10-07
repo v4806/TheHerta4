@@ -4,7 +4,7 @@ import time
 from collections import defaultdict
 
 
-class VGBackupListUI(bpy.types.UIList):
+class SSMT_UL_VGBackupList(bpy.types.UIList):
     """顶点组备份列表的UI渲染"""
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         if self.layout_type in {'DEFAULT', 'COMPACT'}:
@@ -254,7 +254,7 @@ class BatchRestoreVGWeights(bpy.types.Operator):
 
 
 vg_backup_operators = [
-    VGBackupListUI,
+    SSMT_UL_VGBackupList,
     BackupVGWeights,
     RestoreVGWeights,
     RemoveVGBackup,

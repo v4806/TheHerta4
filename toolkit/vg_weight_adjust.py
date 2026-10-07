@@ -1,7 +1,7 @@
 import bpy
 
 
-class VGAdjustListUI(bpy.types.UIList):
+class SSMT_UL_VGAdjustList(bpy.types.UIList):
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         if self.layout_type in {'DEFAULT', 'COMPACT'}:
             row = layout.row(align=True)
@@ -303,7 +303,7 @@ class NormalizeVGWeights(bpy.types.Operator):
 
 
 vg_weight_adjust_operators = [
-    VGAdjustListUI,
+    SSMT_UL_VGAdjustList,
     RefreshVGList,
     SelectAllVG,
     DeselectAllVG,

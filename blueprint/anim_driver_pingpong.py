@@ -398,7 +398,7 @@ _load_handler_registered = False
 
 
 @bpy.app.handlers.persistent
-def _pingpong_load_handler(dummy):
+def _pingpong_load_handler(dummy, *args):
     for tree in bpy.data.node_groups:
         if tree.bl_idname != 'SSMTBlueprintTreeType':
             continue

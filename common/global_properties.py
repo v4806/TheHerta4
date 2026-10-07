@@ -69,6 +69,47 @@ def _get_workspace_enum_items(self, context):
         return [("", "当前没有工作空间", "当前游戏配置下未找到可用工作空间")]
 
 
+def _sanitize_specific_workspace_name(dummy=None, *args):
+    """把已失效的「指定工作空间」重置为当前列表的第一个有效项。
+
+    背景：.blend 里保存的是【旧游戏配置】下的工作空间标识；用户切换游戏配置后，
+    该标识不在新列表里，Blender 每次读取这个枚举都会打印
+        current value '...' matches no enum in 'GlobalProterties', '', 'specific_workspace_name'
+    （实测一次启动能刷几十条）。
+
+    必须在 items 回调【之外】执行：若在 _get_workspace_enum_items 内部读
+    self.specific_workspace_name，会无限递归（实测单次读取触发近 3000 次回调，
+    5 次读取近 8000 次，直接把 UI 拖死）。
+    """
+    try:
+        scenes = list(bpy.data.scenes)
+    except Exception:
+        return  # 注册早期 bpy.data 还是 _RestrictData
+    for scene in scenes:
+        props = getattr(scene, "global_properties", None)
+        if props is None:
+            continue
+        try:
+            items = _get_workspace_enum_items(props, bpy.context)
+        except Exception:
+            continue
+        valid = [identifier for identifier, _label, _desc in items]
+        if not valid:
+            continue
+        try:
+            current = props.specific_workspace_name
+        except Exception:
+            continue
+        if current in valid:
+            continue
+        try:
+            props.specific_workspace_name = valid[0]
+            label = next((item[1] for item in items if item[0] == valid[0]), valid[0])
+            print(f"[TheHerta4] 「指定工作空间」旧值 '{current}' 在当前配置下已失效，已重置为 '{label}'")
+        except Exception as exc:
+            print(f"[TheHerta4] 重置「指定工作空间」失败: {exc}")
+
+
 def _default_parallel_instance_count() -> int:
     cpu_count = os.cpu_count() or 4
     return max(1, min(4, cpu_count))
@@ -699,6 +740,9 @@ class GlobalProterties(bpy.types.PropertyGroup):
 def register():
     bpy.utils.register_class(GlobalProterties)
     bpy.types.Scene.global_properties = bpy.props.PointerProperty(type=GlobalProterties)
+    # 加载文件后清理失效的「指定工作空间」（见函数 docstring）
+    if _sanitize_specific_workspace_name not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(_sanitize_specific_workspace_name)
     try:
         from ..blueprint.export_helper import BlueprintExportHelper
         BlueprintExportHelper.ensure_valid_selected_blueprint_name()
@@ -707,5 +751,7 @@ def register():
 
 
 def unregister():
+    if _sanitize_specific_workspace_name in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(_sanitize_specific_workspace_name)
     del bpy.types.Scene.global_properties
     bpy.utils.unregister_class(GlobalProterties)
