@@ -196,23 +196,28 @@ def _get_colorspace_name(image: bpy.types.Image) -> str:
 
 
 def _ensure_srgb_colorspace(image: bpy.types.Image) -> None:
-    """重载贴图后，确保对应的纹理节点色彩空间为 sRGB。
+    """重载贴图后兜底色彩空间。
 
-    Blender 中 ShaderNodeTexImage 在 UI 上显示的"Color Space"实际上读写的是
-    `image.colorspace_settings.name`，因此修改 image 即可影响所有引用该贴图的纹理节点。
+    注意：`bpy.types.Image.reload()` **不会**重置 `colorspace_settings`，
+    所以原来这里"无条件设成 sRGB"是错的——它会把已经按类型设好的数据贴图
+    （法线 / LightMap / MaterialMap 等 Non-Color）一并改成 sRGB，导致渲染与烘焙
+    结果都出错（法线方向、粗糙度都会被按颜色解码）。
+
+    现在只在色彩空间**为空**（未指定）时才兜底成 sRGB；已经有明确值的
+    （sRGB / Non-Color / Linear …）一律保持不动。
     """
     colorspace_settings = getattr(image, "colorspace_settings", None)
     if colorspace_settings is None:
         return
 
     current_name = str(getattr(colorspace_settings, "name", "") or "")
-    if current_name == "sRGB":
+    if current_name:
         return
 
     try:
         colorspace_settings.name = "sRGB"
         LOG.info(
-            f"[TextureAutoReload] Forced colorspace 'sRGB' on '{image.name}' (was '{current_name}')"
+            f"[TextureAutoReload] Set fallback colorspace 'sRGB' on '{image.name}'"
         )
     except Exception as exc:
         LOG.warning(
