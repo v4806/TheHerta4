@@ -7,7 +7,9 @@
 
 契约：
 - 解析路径变了（重连）⇒ 仍 `reload()` 显示新文件，但**不改写 colorspace**；
-- 路径不变、mtime/size 变了（外部改图）⇒ 保持既有语义：reload + 确保 sRGB；
+- 路径不变、mtime/size 变了（外部改图）⇒ 同样 `reload()` 显示新文件，**也不改写 colorspace**：
+  `Image.reload()` 并不会重置 `colorspace_settings`，无条件设 sRGB 只会破坏法线 / LightMap /
+  MaterialMap 这类本该 Non-Color 的数据贴图；只有色彩空间为空的图才兜底成 sRGB；
 - 首次看到某图（缓存未命中）⇒ 只登记，不 reload（既有语义）。
 """
 
@@ -144,8 +146,8 @@ class TextureAutoReloadRelinkTests(unittest.TestCase):
         self.assertIn("DiffuseMap_Body", relinked_logs[0])
         self.assertIn("colorspace kept: 'Non-Color'", relinked_logs[0])
 
-    def test_external_edit_with_same_path_still_forces_srgb(self):
-        """路径不变、size/mtime 变（外部改图）⇒ 既有语义：reload + 强制 sRGB。"""
+    def test_external_edit_with_same_path_keeps_colorspace(self):
+        """路径不变、size/mtime 变（外部改图）⇒ reload 显示新文件，但不改写 colorspace。"""
         image = _FakeImage("DiffuseMap_Body", self.png_a, colorspace="Non-Color")
         self._use_images(image)
         texture_auto_reload._prime_image_signature_cache()
@@ -155,6 +157,18 @@ class TextureAutoReloadRelinkTests(unittest.TestCase):
 
         self.assertEqual(reloaded, 1)
         self.assertEqual(image.reload_calls, 1)
+        self.assertEqual(image.colorspace_settings.name, "Non-Color")
+
+    def test_empty_colorspace_falls_back_to_srgb(self):
+        """色彩空间为空（未指定）时才兜底成 sRGB。"""
+        image = _FakeImage("Unset_Tex", self.png_a, colorspace="")
+        self._use_images(image)
+        texture_auto_reload._prime_image_signature_cache()
+
+        self.png_a.write_bytes(b"a" * 96)
+        _reloadable, reloaded = texture_auto_reload._check_and_reload_changed_images()
+
+        self.assertEqual(reloaded, 1)
         self.assertEqual(image.colorspace_settings.name, "sRGB")
 
     def test_first_sighting_only_registers_without_reload(self):
@@ -178,7 +192,7 @@ class TextureAutoReloadRelinkTests(unittest.TestCase):
         self.assertEqual(image.reload_calls, 1)
 
     def test_relink_and_external_edit_in_same_tick_are_independent(self):
-        """同一次 tick 里：重连的图保留配置、外部改图的图仍被强制 sRGB。"""
+        """同一次 tick 里：重连与外部改图都只 reload、都不改写 colorspace。"""
         relinked = _FakeImage("Relinked_Tex", self.png_a, colorspace="Non-Color")
         edited_png = self._tmpdir / "LightMap_Hair.png"
         edited_png.write_bytes(b"c" * 16)
@@ -192,7 +206,7 @@ class TextureAutoReloadRelinkTests(unittest.TestCase):
 
         self.assertEqual(reloaded, 2)
         self.assertEqual(relinked.colorspace_settings.name, "Non-Color")
-        self.assertEqual(edited.colorspace_settings.name, "sRGB")
+        self.assertEqual(edited.colorspace_settings.name, "Non-Color")
 
 
 if __name__ == "__main__":
