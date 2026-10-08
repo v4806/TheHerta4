@@ -386,59 +386,163 @@ def _link_texture_image(texture_path: str, colorspace: str):
 # 通道接线（都只往已建好的节点树上加，可在同一材质里累加）
 # ---------------------------------------------------------------
 _SRGB_GROUP = "sRGB->Non-Color"
-_NORMAL_GROUP = "法线贴图"
 _NORMAL_GROUP_Z = "法线贴图_补Z"
 
-#: 节点组资产文件的候选位置。「快速应用纹理」随插件分发这两个组，
-#: 当前 .blend 里没有同名组时从它那儿取，保证两边生成的材质完全一致。
-_HERE_DIR = os.path.dirname(os.path.abspath(__file__))
-_ADDONS_DIR = os.path.dirname(os.path.dirname(_HERE_DIR))
-_NODE_ASSET_CANDIDATES = (
-    os.path.join(_ADDONS_DIR, "快速应用纹理", "材质节点组.blend"),
-    os.path.join(os.path.dirname(_HERE_DIR), "快速应用纹理", "材质节点组.blend"),
-)
+#: 法线组里补 Z 那两个节点的标记，便于识别与清理（与工作文件同名）
+_ZREBUILD_LABEL = "IMGPV_ZREBUILD"
+
+#: sRGB 编解码用到的常量（与工作文件里的取值逐位一致）
+_SRGB_POWER = 1.0 / 2.4        # 0.416667
+_SRGB_MUL_HIGH = 1.055
+_SRGB_SUB_HIGH = 0.055
+_SRGB_MUL_LOW = 12.92
+_SRGB_THRESHOLD = 0.003131
+
+
+def _build_srgb_group():
+    """用节点搭出「sRGB->Non-Color」组：把 sRGB 读数还原回 Non-Color 数值。
+
+    逐通道做 ``x <= t ? 12.92·x : 1.055·x^(1/2.4) − 0.055``，合并成
+    ``a + cond·(b − a)`` 的形式，与工作文件里那个组的数值结果逐位一致。
+    """
+    group = bpy.data.node_groups.new(_SRGB_GROUP, "ShaderNodeTree")
+    group.interface.new_socket("Color", in_out="INPUT", socket_type="NodeSocketColor")
+    group.interface.new_socket("Color", in_out="OUTPUT", socket_type="NodeSocketColor")
+
+    nodes = group.nodes
+    links = group.links
+
+    group_in = nodes.new("NodeGroupInput")
+    group_in.location = (-400, 0)
+    separate = nodes.new("ShaderNodeSeparateColor")
+    separate.location = (-200, 0)
+    combine = nodes.new("ShaderNodeCombineColor")
+    combine.location = (1100, 0)
+    group_out = nodes.new("NodeGroupOutput")
+    group_out.location = (1300, 0)
+    links.new(group_in.outputs[0], separate.inputs["Color"])
+    links.new(combine.outputs[0], group_out.inputs[0])
+
+    for index in range(3):
+        column = -140 - index * 380
+
+        power = nodes.new("ShaderNodeMath")
+        power.operation = "POWER"
+        power.location = (column, 120)
+        power.inputs[1].default_value = _SRGB_POWER
+
+        mul_high = nodes.new("ShaderNodeMath")
+        mul_high.operation = "MULTIPLY"
+        mul_high.location = (column + 180, 120)
+        mul_high.inputs[1].default_value = _SRGB_MUL_HIGH
+
+        sub_high = nodes.new("ShaderNodeMath")
+        sub_high.operation = "SUBTRACT"
+        sub_high.location = (column + 360, 120)
+        sub_high.inputs[1].default_value = _SRGB_SUB_HIGH
+
+        mul_low = nodes.new("ShaderNodeMath")
+        mul_low.operation = "MULTIPLY"
+        mul_low.location = (column, -80)
+        mul_low.inputs[1].default_value = _SRGB_MUL_LOW
+
+        sub_delta = nodes.new("ShaderNodeMath")
+        sub_delta.operation = "SUBTRACT"
+        sub_delta.location = (column + 540, 20)
+
+        greater = nodes.new("ShaderNodeMath")
+        greater.operation = "GREATER_THAN"
+        greater.location = (column, -280)
+        greater.inputs[1].default_value = _SRGB_THRESHOLD
+
+        mul_cond = nodes.new("ShaderNodeMath")
+        mul_cond.operation = "MULTIPLY"
+        mul_cond.location = (column + 720, 20)
+
+        add = nodes.new("ShaderNodeMath")
+        add.operation = "ADD"
+        add.location = (column + 900, -80)
+
+        source = separate.outputs[index]
+        links.new(source, power.inputs[0])
+        links.new(power.outputs[0], mul_high.inputs[0])
+        links.new(mul_high.outputs[0], sub_high.inputs[0])
+        links.new(source, mul_low.inputs[0])
+        links.new(sub_high.outputs[0], sub_delta.inputs[0])
+        links.new(mul_low.outputs[0], sub_delta.inputs[1])
+        links.new(source, greater.inputs[0])
+        links.new(greater.outputs[0], mul_cond.inputs[0])
+        links.new(sub_delta.outputs[0], mul_cond.inputs[1])
+        links.new(mul_low.outputs[0], add.inputs[0])
+        links.new(mul_cond.outputs[0], add.inputs[1])
+        links.new(add.outputs[0], combine.inputs[index])
+
+    return group
+
+
+def _build_normal_group_z():
+    """用节点搭出「法线贴图_补Z」组：R 直通、G 反相、B 固定 1，再过法线贴图节点。"""
+    group = bpy.data.node_groups.new(_NORMAL_GROUP_Z, "ShaderNodeTree")
+    group.interface.new_socket("Color", in_out="INPUT", socket_type="NodeSocketColor")
+    group.interface.new_socket("Normal", in_out="OUTPUT", socket_type="NodeSocketVector")
+
+    nodes = group.nodes
+    links = group.links
+
+    group_in = nodes.new("NodeGroupInput")
+    group_in.location = (-400, 0)
+    separate = nodes.new("ShaderNodeSeparateColor")
+    separate.location = (-200, 0)
+    invert = nodes.new("ShaderNodeMath")
+    invert.operation = "SUBTRACT"
+    invert.label = _ZREBUILD_LABEL
+    invert.location = (0, -160)
+    invert.inputs[0].default_value = 1.0
+    combine = nodes.new("ShaderNodeCombineColor")
+    combine.label = _ZREBUILD_LABEL
+    combine.location = (200, 0)
+    combine.inputs["Blue"].default_value = 1.0
+    normal_map = nodes.new("ShaderNodeNormalMap")
+    normal_map.location = (400, 0)
+    normal_map.uv_map = ""
+    normal_map.inputs["Strength"].default_value = 1.0
+    group_out = nodes.new("NodeGroupOutput")
+    group_out.location = (600, 0)
+
+    links.new(group_in.outputs[0], separate.inputs["Color"])
+    links.new(separate.outputs[0], combine.inputs["Red"])       # R 直通
+    links.new(separate.outputs[1], invert.inputs[1])            # 1 − G
+    links.new(invert.outputs[0], combine.inputs["Green"])
+    links.new(combine.outputs[0], normal_map.inputs["Color"])   # B 用常量 1，不连线
+    links.new(normal_map.outputs["Normal"], group_out.inputs[0])
+    return group
+
+
+#: 组名 -> 构造函数。两个组都由本模块用节点现搭，不依赖任何外部资产文件。
+_GROUP_BUILDERS = {
+    _SRGB_GROUP: _build_srgb_group,
+    _NORMAL_GROUP_Z: _build_normal_group_z,
+}
 
 
 def _ensure_node_group(name: str):
-    """取得节点组：先复用当前 .blend 里的同名组，没有再从资产文件加载。"""
+    """取得节点组：当前 .blend 里已有同名组就复用，否则用节点现搭一个。"""
     group = bpy.data.node_groups.get(name)
     if group is not None:
         return group
-    for path in _NODE_ASSET_CANDIDATES:
-        if not os.path.isfile(path):
-            continue
-        try:
-            with bpy.data.libraries.load(path, link=False) as (src, dst):
-                dst.node_groups = [n for n in src.node_groups if n == name]
-        except Exception as ex:
-            print("[贴图标记] 载入节点组 " + name + " 失败: " + str(ex))
-            continue
-        group = bpy.data.node_groups.get(name)
-        if group is not None:
-            return group
-    return None
+    builder = _GROUP_BUILDERS.get(name)
+    if builder is None:
+        return None
+    try:
+        return builder()
+    except Exception as ex:
+        print("[贴图标记] 建立节点组 " + name + " 失败: " + str(ex))
+        return None
 
 
 def _ensure_normal_group_z():
-    """取得「法线贴图_补Z」组：由基础「法线贴图」组复制改造而来（蓝通道固定 1）。
-
-    与「快速应用纹理」同一套做法——基础形态已经翻过 G，这里只把 B 从
-    「重建 Z」改成常量 1。
-    """
-    group = bpy.data.node_groups.get(_NORMAL_GROUP_Z)
-    if group is not None:
-        return group
-    base = _ensure_node_group(_NORMAL_GROUP)
-    if base is None:
-        return None
-    group = base.copy()
-    group.name = _NORMAL_GROUP_Z
-    combine = group.nodes.get("Combine Color")
-    if combine is not None:
-        for link in list(combine.inputs["Blue"].links):
-            group.links.remove(link)
-        combine.inputs["Blue"].default_value = 1.0
-    return group
+    """取得「法线贴图_补Z」组（没有就地搭一个）。"""
+    return _ensure_node_group(_NORMAL_GROUP_Z)
 
 
 def _wire_normal(node_tree, principled, texture_path: str, logic_name: str) -> None:
