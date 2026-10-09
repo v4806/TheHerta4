@@ -5472,5 +5472,151 @@ class DragTwoComponentIndependenceTests(unittest.TestCase):
         self.assertIn("object_id_map", str(ctx.exception))
 
 
+class _FakeRefCollection:
+    """PointerProperty 集合的极简替身：可迭代、可 add()、有长度。"""
+
+    def __init__(self, refs=()):
+        self._items = list(refs)
+
+    def add(self):
+        item = types.SimpleNamespace(object=None)
+        self._items.append(item)
+        return item
+
+    def __iter__(self):
+        return iter(self._items)
+
+    def __len__(self):
+        return len(self._items)
+
+    def names(self):
+        return [getattr(item.object, "name", None) for item in self._items]
+
+
+def _fake_mesh(name):
+    return types.SimpleNamespace(name=name, type='MESH')
+
+
+class DragZoneListOperatorTests(unittest.TestCase):
+    """包含物体 / 碰撞体列表的批量添加（Shift 多选后一次加入多个）。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_drag_module()
+
+    def setUp(self):
+        # bpy.data.objects.get(name) → 本用例注册的权重球空物体
+        self.objects = {}
+        self._saved_objects = self.mod.bpy.data.objects
+        self.mod.bpy.data.objects = types.SimpleNamespace(get=self.objects.get)
+
+    def tearDown(self):
+        self.mod.bpy.data.objects = self._saved_objects
+
+    def _make_zone_empty(self):
+        settings = types.SimpleNamespace(
+            include_objects=_FakeRefCollection(),
+            collider_objects=_FakeRefCollection(),
+        )
+        empty = types.SimpleNamespace(name="SSMT_DragZone_0", ssmt_drag_zone=settings)
+        self.objects[empty.name] = empty
+        return empty, settings
+
+    def _run(self, operator_cls, empty, selected=(), active=None):
+        op = operator_cls()
+        reports = []
+        op.report = lambda level, message: reports.append((set(level), message))
+        op.empty_name = empty.name
+        context = types.SimpleNamespace(
+            active_object=active, selected_objects=list(selected),
+        )
+        result = op.execute(context)
+        return result, reports
+
+    # ---- 包含物体 ----
+
+    def test_include_add_inserts_every_selected_mesh_in_selection_order(self):
+        empty, settings = self._make_zone_empty()
+        body, skirt, hair = _fake_mesh("Body"), _fake_mesh("Skirt"), _fake_mesh("Hair")
+        result, reports = self._run(
+            self.mod.SSMT_OT_DragZoneIncludeAdd, empty,
+            selected=[hair, body, skirt], active=body,
+        )
+        self.assertEqual(result, {'FINISHED'})
+        self.assertEqual(settings.include_objects.names(), ["Hair", "Body", "Skirt"])
+        self.assertEqual(reports[0][0], {'INFO'})
+        self.assertIn("已加入 3 个包含物体", reports[0][1])
+
+    def test_include_add_skips_existing_entries_and_non_mesh_objects(self):
+        empty, settings = self._make_zone_empty()
+        existing = _fake_mesh("Body")
+        settings.include_objects.add().object = existing
+        empty_obj = types.SimpleNamespace(name="Empty", type='EMPTY')
+        fresh = _fake_mesh("Skirt")
+        result, reports = self._run(
+            self.mod.SSMT_OT_DragZoneIncludeAdd, empty,
+            selected=[existing, fresh, empty_obj], active=fresh,
+        )
+        self.assertEqual(result, {'FINISHED'})
+        self.assertEqual(settings.include_objects.names(), ["Body", "Skirt"])
+        self.assertIn("1 个已存在", reports[0][1])
+
+    def test_include_add_reports_when_everything_already_present(self):
+        empty, settings = self._make_zone_empty()
+        body = _fake_mesh("Body")
+        settings.include_objects.add().object = body
+        result, reports = self._run(
+            self.mod.SSMT_OT_DragZoneIncludeAdd, empty, selected=[body], active=body,
+        )
+        self.assertEqual(result, {'FINISHED'})
+        self.assertEqual(len(settings.include_objects), 1)
+        self.assertIn("已在包含列表", reports[0][1])
+
+    def test_include_add_falls_back_to_active_object_without_selection(self):
+        empty, settings = self._make_zone_empty()
+        body = _fake_mesh("Body")
+        result, _reports = self._run(
+            self.mod.SSMT_OT_DragZoneIncludeAdd, empty, selected=[], active=body,
+        )
+        self.assertEqual(result, {'FINISHED'})
+        self.assertEqual(settings.include_objects.names(), ["Body"])
+
+    def test_include_add_cancels_without_any_mesh_selection(self):
+        empty, settings = self._make_zone_empty()
+        empty_obj = types.SimpleNamespace(name="Empty", type='EMPTY')
+        result, reports = self._run(
+            self.mod.SSMT_OT_DragZoneIncludeAdd, empty,
+            selected=[empty_obj], active=None,
+        )
+        self.assertEqual(result, {'CANCELLED'})
+        self.assertEqual(len(settings.include_objects), 0)
+        self.assertEqual(reports[0][0], {'WARNING'})
+
+    # ---- 碰撞体 ----
+
+    def test_collider_add_inserts_every_selected_mesh(self):
+        empty, settings = self._make_zone_empty()
+        thigh, skirt = _fake_mesh("Thigh"), _fake_mesh("Skirt")
+        result, reports = self._run(
+            self.mod.SSMT_OT_DragZoneColliderAdd, empty,
+            selected=[thigh, skirt], active=thigh,
+        )
+        self.assertEqual(result, {'FINISHED'})
+        self.assertEqual(settings.collider_objects.names(), ["Thigh", "Skirt"])
+        self.assertEqual(len(settings.include_objects), 0)
+        self.assertIn("已加入 2 个碰撞体", reports[0][1])
+
+    def test_include_and_collider_lists_stay_independent(self):
+        empty, settings = self._make_zone_empty()
+        body = _fake_mesh("Body")
+        self._run(self.mod.SSMT_OT_DragZoneIncludeAdd, empty, selected=[body], active=body)
+        result, _reports = self._run(
+            self.mod.SSMT_OT_DragZoneColliderAdd, empty, selected=[body], active=body,
+        )
+        self.assertEqual(result, {'FINISHED'})
+        self.assertEqual(settings.include_objects.names(), ["Body"])
+        self.assertEqual(settings.collider_objects.names(), ["Body"])
+
+
 if __name__ == "__main__":
     unittest.main()

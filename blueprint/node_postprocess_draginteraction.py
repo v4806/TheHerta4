@@ -509,31 +509,79 @@ class SSMT_OT_DragZonePage(bpy.types.Operator):
         return {'FINISHED'}
 
 
+def _selected_mesh_objects(context):
+    """当前选中的 MESH 物体（多选，按选中顺序；活动物体一并兜底）。
+
+    ``context.selected_objects`` 在节点编辑器的算子执行期是完整场景选择，
+    因此 Shift 多选后一次点按钮即可批量加入。活动物体通常已在其中，只在
+    不在时追加，避免重复。
+    """
+    candidates = []
+    for obj in list(getattr(context, "selected_objects", None) or ()):
+        if obj is not None and obj not in candidates:
+            candidates.append(obj)
+    active = getattr(context, "active_object", None)
+    if active is not None and active not in candidates:
+        candidates.append(active)
+    return [obj for obj in candidates if getattr(obj, "type", None) == 'MESH']
+
+
+def _append_object_refs(collection, objects):
+    """把物体批量追加进 PointerProperty 集合；已存在的跳过。
+
+    返回 ``(added, skipped)``；新加入的项随即出现在 ``collection`` 里，所以
+    同一次调用内的重复物体也会被后续迭代判定为已存在。
+    """
+    added = []
+    skipped = []
+    for obj in objects:
+        if any(getattr(item, "object", None) == obj for item in collection):
+            skipped.append(obj)
+            continue
+        item = collection.add()
+        item.object = obj
+        added.append(obj)
+    return added, skipped
+
+
+def _join_object_names(objects, limit=5):
+    """报告用短名单：最多列 ``limit`` 个名字，其余折叠成计数。"""
+    names = [str(getattr(obj, "name", "") or "") for obj in list(objects)[:limit]]
+    text = "、".join(names)
+    if len(objects) > limit:
+        text += f" 等 {len(objects)} 个"
+    return text
+
+
 class SSMT_OT_DragZoneIncludeAdd(bpy.types.Operator):
-    """把当前活动 MESH 物体加入权重球的包含列表。"""
+    """把当前选中的 MESH 物体（支持多选/Shift 连选）加入权重球的包含列表。"""
     bl_idname = "ssmt.drag_zone_include_add"
     bl_label = "添加包含物体"
+    bl_description = "把场景中选中的网格物体加入包含列表（Shift 多选可一次加入多个；已存在的自动跳过）"
     bl_options = {'INTERNAL'}
 
     empty_name: bpy.props.StringProperty()
 
     def execute(self, context):
-        obj = getattr(context, "active_object", None)
-        if obj is None or getattr(obj, "type", None) != 'MESH':
-            self.report({'WARNING'}, "请先选中一个网格物体")
-            return {'CANCELLED'}
         empty = bpy.data.objects.get(self.empty_name) if self.empty_name else None
         if empty is None or not hasattr(empty, "ssmt_drag_zone"):
             self.report({'WARNING'}, "权重球不存在")
             return {'CANCELLED'}
-        settings = empty.ssmt_drag_zone
-        for item in settings.include_objects:
-            if item.object == obj:
-                self.report({'INFO'}, f"{obj.name} 已在包含列表")
-                return {'FINISHED'}
-        item = settings.include_objects.add()
-        item.object = obj
-        self.report({'INFO'}, f"已加入包含物体 {obj.name}")
+        targets = _selected_mesh_objects(context)
+        if not targets:
+            self.report({'WARNING'}, "请先选中网格物体（可按住 Shift 多选）")
+            return {'CANCELLED'}
+        added, skipped = _append_object_refs(empty.ssmt_drag_zone.include_objects, targets)
+        if not added:
+            self.report({'INFO'}, f"选中的 {len(skipped)} 个物体已在包含列表")
+        elif skipped:
+            self.report(
+                {'INFO'},
+                f"已加入 {len(added)} 个包含物体（{_join_object_names(added)}）；"
+                f"{len(skipped)} 个已存在",
+            )
+        else:
+            self.report({'INFO'}, f"已加入 {len(added)} 个包含物体（{_join_object_names(added)}）")
         return {'FINISHED'}
 
 
@@ -559,30 +607,34 @@ class SSMT_OT_DragZoneIncludeRemove(bpy.types.Operator):
 
 
 class SSMT_OT_DragZoneColliderAdd(bpy.types.Operator):
-    """把当前活动 MESH 物体加入权重球的碰撞体列表。"""
+    """把当前选中的 MESH 物体（支持多选/Shift 连选）加入权重球的碰撞体列表。"""
     bl_idname = "ssmt.drag_zone_collider_add"
     bl_label = "添加碰撞体"
+    bl_description = "把场景中选中的网格物体加入碰撞体列表（Shift 多选可一次加入多个；已存在的自动跳过）"
     bl_options = {'INTERNAL'}
 
     empty_name: bpy.props.StringProperty()
 
     def execute(self, context):
-        obj = getattr(context, "active_object", None)
-        if obj is None or getattr(obj, "type", None) != 'MESH':
-            self.report({'WARNING'}, "请先选中一个网格物体")
-            return {'CANCELLED'}
         empty = bpy.data.objects.get(self.empty_name) if self.empty_name else None
         if empty is None or not hasattr(empty, "ssmt_drag_zone"):
             self.report({'WARNING'}, "权重球不存在")
             return {'CANCELLED'}
-        settings = empty.ssmt_drag_zone
-        for item in settings.collider_objects:
-            if item.object == obj:
-                self.report({'INFO'}, f"{obj.name} 已在碰撞体列表")
-                return {'FINISHED'}
-        item = settings.collider_objects.add()
-        item.object = obj
-        self.report({'INFO'}, f"已加入碰撞体 {obj.name}")
+        targets = _selected_mesh_objects(context)
+        if not targets:
+            self.report({'WARNING'}, "请先选中网格物体（可按住 Shift 多选）")
+            return {'CANCELLED'}
+        added, skipped = _append_object_refs(empty.ssmt_drag_zone.collider_objects, targets)
+        if not added:
+            self.report({'INFO'}, f"选中的 {len(skipped)} 个物体已在碰撞体列表")
+        elif skipped:
+            self.report(
+                {'INFO'},
+                f"已加入 {len(added)} 个碰撞体（{_join_object_names(added)}）；"
+                f"{len(skipped)} 个已存在",
+            )
+        else:
+            self.report({'INFO'}, f"已加入 {len(added)} 个碰撞体（{_join_object_names(added)}）")
         return {'FINISHED'}
 
 
@@ -1108,7 +1160,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 inc_box = sub.box()
                 inc_box.label(text="包含物体（留空=全部）", icon='OBJECT_DATA')
                 inc_row = inc_box.row(align=True)
-                add_inc = inc_row.operator(SSMT_OT_DragZoneIncludeAdd.bl_idname, text="添加活动物体", icon='ADD')
+                add_inc = inc_row.operator(SSMT_OT_DragZoneIncludeAdd.bl_idname, text="添加选中物体", icon='ADD')
                 add_inc.empty_name = obj.name
                 for inc_index, inc_item in enumerate(obj.ssmt_drag_zone.include_objects):
                     inc_item_row = inc_box.row(align=True)
@@ -1121,7 +1173,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 col_box.label(text="碰撞体（防穿模，留空=不约束）", icon='PHYSICS')
                 col_box.prop(obj.ssmt_drag_zone, "collision_override", text="碰撞开关")
                 col_row = col_box.row(align=True)
-                add_col = col_row.operator(SSMT_OT_DragZoneColliderAdd.bl_idname, text="添加活动物体", icon='ADD')
+                add_col = col_row.operator(SSMT_OT_DragZoneColliderAdd.bl_idname, text="添加选中物体", icon='ADD')
                 add_col.empty_name = obj.name
                 for col_index, col_item in enumerate(obj.ssmt_drag_zone.collider_objects):
                     col_item_row = col_box.row(align=True)
