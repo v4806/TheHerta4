@@ -6,7 +6,7 @@ import re
 from collections import OrderedDict
 from pathlib import Path
 
-from ..toolkit.tt_dds_conversion import convert_texture_to_dds
+from ..toolkit.tt_dds_conversion import convert_texture_to_dds_cached
 from .node_postprocess_base import SSMTNode_PostProcess_Base
 
 
@@ -317,11 +317,10 @@ class SSMTNode_PostProcess_PSBinding(SSMTNode_PostProcess_Base):
         # 因此自然跟着指向 .dds。转换失败回退为原样复制，不中断导出。
         if getattr(self, "export_textures_as_dds", False) and src.suffix.lower() != ".dds":
             converted = textures_dir / f"{src.stem}.dds"
-            if not converted.exists():
-                ok, reason = convert_texture_to_dds(str(src), str(converted))
-                if not ok:
-                    print(f"贴图转 DDS 失败，回退为原样复制: {src_path} - {reason}")
-                    converted = None
+            ok, reason = convert_texture_to_dds_cached(str(src), str(converted))
+            if not ok:
+                print(f"贴图转 DDS 失败，回退为原样复制: {src_path} - {reason}")
+                converted = None
             if converted is not None and converted.exists():
                 return f"Textures/{converted.name}"
 

@@ -1435,6 +1435,15 @@ class BlueprintExportHelper:
 
     @staticmethod
     def clear_postprocess_caches():
+        # DDS 转换缓存（toolkit.tt_dds_conversion 模块级）：一次导出内同一个目标只真正
+        # 转一次 texconv，所以必须每次导出开始时清空 —— 否则「覆盖现有资源」在第二次
+        # 导出时会因缓存命中而不再重新生成，等于开关失灵。
+        try:
+            from ..toolkit.tt_dds_conversion import clear_dds_conversion_cache
+            clear_dds_conversion_cache()
+        except Exception:
+            pass
+
         # 工作空间格式缓存（common.submesh_metadata 模块级，含 None 负缓存）：
         # 每次导出前清理，避免同会话内「重新导入工作空间 / 编辑数据类型覆盖节点」
         # 后旧的 Position/Texcoord 布局继续生效。无蓝图树时也必须执行，故置于

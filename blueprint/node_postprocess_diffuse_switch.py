@@ -10,7 +10,7 @@ from pathlib import Path
 
 import bpy
 
-from ..toolkit.tt_dds_conversion import convert_texture_to_dds
+from ..toolkit.tt_dds_conversion import convert_texture_to_dds_cached
 from .node_postprocess_base import SSMTNode_PostProcess_Base
 
 
@@ -148,11 +148,10 @@ def copy_texture(texture_path, ini_path, export_as_dds=False):
     # filename 直接取本函数返回值，所以文件名跟着变。转换失败回退为原样复制。
     if export_as_dds and source.suffix.lower() != ".dds":
         converted = texture_dir / f"{source.stem}.dds"
-        if not converted.exists():
-            ok, reason = convert_texture_to_dds(str(source), str(converted))
-            if not ok:
-                print(f"贴图转 DDS 失败，回退为原样复制: {source} - {reason}")
-                converted = None
+        ok, reason = convert_texture_to_dds_cached(str(source), str(converted))
+        if not ok:
+            print(f"贴图转 DDS 失败，回退为原样复制: {source} - {reason}")
+            converted = None
         if converted is not None and converted.exists():
             return f"Textures/{converted.name}".replace("\\", "/")
 

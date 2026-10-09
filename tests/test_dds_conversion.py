@@ -440,5 +440,93 @@ class ConvertTextureToDDSTests(unittest.TestCase):
         self.assertFalse(os.path.exists(self.target))
 
 
+class DDSConversionCacheTests(unittest.TestCase):
+    """带缓存的转换入口：一次导出里同一个目标只真正跑一次 texconv。
+
+    一个材质被多个物体引用是常态（实测一份导出 ini 里同一张 LightMap 被引用 282 次），
+    而单张 4096² 的 BC7 转换约 4 秒 —— 每引用一次就重转一次是导出耗时的主要来源。
+    """
+
+    def setUp(self):
+        dds_conversion.clear_dds_conversion_cache()
+        self.temp_dir = tempfile.mkdtemp(prefix="dds_cache_")
+        self.source = os.path.join(self.temp_dir, "c209c22b-45087-0-DiffuseMap.png")
+        Path(self.source).write_bytes(b"png payload")
+        self.target = os.path.join(self.temp_dir, "out", "Body_Material.dds")
+        self.props = types.SimpleNamespace(dds_use_custom_rules=False, dds_rules=[])
+
+    def _run(self, force=False):
+        calls = []
+
+        def fake_run(command, **_kwargs):
+            calls.append(command)
+            out_dir = command[command.index("-o") + 1]
+            produced = os.path.join(
+                out_dir, os.path.splitext(os.path.basename(command[-1]))[0] + ".dds"
+            )
+            Path(produced).write_bytes(b"DDS payload")
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(dds_conversion, "find_texconv", return_value="texconv.exe"), \
+                mock.patch.object(dds_conversion.subprocess, "run", side_effect=fake_run):
+            result = dds_conversion.convert_texture_to_dds_cached(
+                self.source, self.target, self.props, force=force
+            )
+        return result, calls
+
+    def test_same_target_is_converted_once_even_with_force(self):
+        """核心：同一目标被反复请求时只跑一次 texconv，「覆盖现有资源」也不例外"""
+        first, first_calls = self._run(force=True)
+        second, second_calls = self._run(force=True)
+
+        self.assertTrue(first[0], first[1])
+        self.assertTrue(second[0], second[1])
+        self.assertEqual(1, len(first_calls))
+        self.assertEqual(0, len(second_calls))
+
+    def test_existing_target_is_reused_without_running_texconv(self):
+        """目标比源新时直接复用磁盘上那份 —— 即使进程内缓存已被清空"""
+        self._run()
+        dds_conversion.clear_dds_conversion_cache()
+        _result, calls = self._run()
+
+        self.assertEqual(0, len(calls))
+
+    def test_updated_source_triggers_reconversion(self):
+        """源贴图被重新编辑后必须重转，否则导出出去的是旧图"""
+        self._run()
+        stat = os.stat(self.source)
+        os.utime(self.source, (stat.st_atime + 10, stat.st_mtime + 10))
+        _result, calls = self._run()
+
+        self.assertEqual(1, len(calls))
+
+    def test_force_regenerates_after_cache_reset(self):
+        """每次导出开始清空缓存，「覆盖现有资源」在下次导出仍会重新生成一遍"""
+        self._run(force=True)
+        dds_conversion.clear_dds_conversion_cache()
+        _result, calls = self._run(force=True)
+
+        self.assertEqual(1, len(calls))
+
+    def test_deleted_target_is_regenerated(self):
+        """产物被删掉后缓存不能继续声称「已就绪」，必须重新转一份出来"""
+        self._run()
+        os.remove(self.target)
+        _result, calls = self._run()
+
+        self.assertEqual(1, len(calls))
+        self.assertTrue(os.path.exists(self.target))
+
+    def test_missing_source_reports_failure(self):
+        """源不存在时直接报错，不能凭空产出目标文件"""
+        ok, reason = dds_conversion.convert_texture_to_dds_cached(
+            os.path.join(self.temp_dir, "nope.png"), self.target, self.props
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("不存在", reason)
+
+
 if __name__ == "__main__":
     unittest.main()

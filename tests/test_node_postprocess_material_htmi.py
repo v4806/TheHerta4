@@ -95,7 +95,7 @@ _install_module(
 # 这里只关心 ini/资源段生成，贴图转换本身在 test_dds_conversion 里单独覆盖。
 _install_module(
     f"{PKG}.toolkit.tt_dds_conversion",
-    convert_texture_to_dds=lambda *_args, **_kwargs: (True, ""),
+    convert_texture_to_dds_cached=lambda *_args, **_kwargs: (True, ""),
 )
 
 

@@ -8,7 +8,7 @@ import shutil
 
 from ..common.global_config import GlobalConfig
 from ..common.logic_name import LogicName
-from ..toolkit.tt_dds_conversion import convert_texture_to_dds
+from ..toolkit.tt_dds_conversion import convert_texture_to_dds_cached
 from . import fx_namespace
 from .node_postprocess_base import SSMTNode_PostProcess_Base
 
@@ -1356,9 +1356,15 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
             if file_extension.lower() != ".dds" and getattr(self, "export_textures_as_dds", False):
                 converted_name = f"{stem}.dds"
                 converted_path = os.path.join(target_folder, converted_name)
-                if os.path.exists(converted_path) and not self.material_to_resource_override:
-                    return converted_name
-                ok, reason = convert_texture_to_dds(source_path, converted_path)
+                # 「覆盖现有资源」只表示愿意重新生成，不代表每次引用都重来一遍：带缓存的
+                # 转换入口保证同一目标在一次导出里只跑一次 texconv。同一个材质被多个物体
+                # 引用是常态（实测一份 ini 里同一张 LightMap 被引用 282 次），没有这层保护
+                # 就会转 282 次、每次约 4 秒。
+                ok, reason = convert_texture_to_dds_cached(
+                    source_path,
+                    converted_path,
+                    force=bool(self.material_to_resource_override),
+                )
                 if ok:
                     return converted_name
                 # 转换失败不中断导出：退回原样复制。文件名也必须用回源扩展名 ——

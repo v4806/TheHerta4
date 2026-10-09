@@ -23,7 +23,7 @@ import shutil
 
 import bpy
 
-from ..toolkit.tt_dds_conversion import convert_texture_to_dds
+from ..toolkit.tt_dds_conversion import convert_texture_to_dds_cached
 from .node_postprocess_base import SSMTNode_PostProcess_Base
 
 
@@ -517,16 +517,13 @@ def _apply_object_texture_replacements(ini_text, object_name, mesh_match, group,
         if getattr(group, "export_as_dds", False) and os.path.splitext(dest_name)[1].lower() != ".dds":
             converted_name = os.path.splitext(dest_name)[0] + ".dds"
             converted_path = os.path.join(texture_dir, converted_name)
-            if os.path.exists(converted_path):
+            ok, reason = convert_texture_to_dds_cached(source_path, converted_path)
+            if ok and os.path.exists(converted_path):
                 converted = True
             else:
-                ok, reason = convert_texture_to_dds(source_path, converted_path)
-                if ok and os.path.exists(converted_path):
-                    converted = True
-                else:
-                    messages.append(
-                        f"{label}：贴图转 DDS 失败，改用原文件（{reason or '未产出文件'}）"
-                    )
+                messages.append(
+                    f"{label}：贴图转 DDS 失败，改用原文件（{reason or '未产出文件'}）"
+                )
             if converted:
                 dest_name, dest_path = converted_name, converted_path
 

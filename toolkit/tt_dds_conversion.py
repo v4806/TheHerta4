@@ -253,6 +253,43 @@ def resolve_dds_target(filename: str, props) -> tuple[str, str, str]:
     return "default", "bc7_unorm", "Default"
 
 
+# 进程内转换缓存：key = 规范化后的目标绝对路径，value = 转出它时的源文件指纹。
+# 一次导出里，同一个目标 DDS 只会被真正转一次。一个材质被 N 个物体（或多个段落）
+# 引用时，导出流程会为同一个目标反复走到这里 —— 没有这层缓存就是 N 次 texconv，
+# 而单张 4096² 的 BC7 转换约 4 秒，重复转换正是导出耗时的主要来源。
+# 生命周期：由 BlueprintExportHelper.clear_postprocess_caches() 在每次导出开始时
+# 调 :func:`clear_dds_conversion_cache` 清空，所以「覆盖现有资源」每次导出仍会
+# 重新生成一遍，只是不会在一次导出里重复生成。
+_dds_conversion_cache: dict = {}
+
+
+def clear_dds_conversion_cache():
+    """清空导出期的 DDS 转换缓存（每次导出开始时调用一次）。"""
+    _dds_conversion_cache.clear()
+
+
+def _source_signature(source_path: str):
+    """源文件指纹 ``(规范化路径, mtime_ns, size)``；源不存在时返回 ``None``。"""
+    try:
+        stat = os.stat(source_path)
+    except OSError:
+        return None
+    return (os.path.normcase(os.path.abspath(source_path)), stat.st_mtime_ns, stat.st_size)
+
+
+def _target_is_current(target_path: str, signature) -> bool:
+    """目标文件是否已经是这份源文件的最新转换结果。
+
+    按 mtime 比较（等价于 make 的时间戳规则）：转换产物总是比它的源文件新。这样源
+    贴图被重新编辑后会自动重转，而没动过的贴图直接复用磁盘上那一份。
+    """
+    try:
+        target_stat = os.stat(target_path)
+    except OSError:
+        return False
+    return target_stat.st_mtime_ns >= signature[1]
+
+
 def convert_texture_to_dds(source_path: str, target_path: str, props=None) -> tuple[bool, str]:
     """把单张贴图转成 DDS 写到 ``target_path``，供 Mod 导出流程复用。
 
@@ -277,7 +314,14 @@ def convert_texture_to_dds(source_path: str, target_path: str, props=None) -> tu
 
     # 先转到临时目录再搬过去：texconv 的输出名固定是「源文件名词干 + .dds」，而导出侧
     # 要的目标名通常取材质资源名，两者不同；直接 -o 目标目录会写出一个多余的错误文件名。
-    with tempfile.TemporaryDirectory(prefix="herta_dds_export_") as staging:
+    # 临时目录必须和目标**同盘**：同卷 rename 是瞬时的，而放到系统临时目录（通常在 C 盘）
+    # 再搬到 Mod 目录（常在别的盘）会退化成「复制 21MB + 删除」，纯粹白费时间。
+    target_dir = os.path.dirname(target_path)
+    if target_dir:
+        os.makedirs(target_dir, exist_ok=True)
+
+    staging = tempfile.mkdtemp(prefix=".herta_dds_staging_", dir=target_dir or None)
+    try:
         command.extend(["-o", staging, "-y", source_path])
         try:
             process = subprocess.run(
@@ -300,15 +344,46 @@ def convert_texture_to_dds(source_path: str, target_path: str, props=None) -> tu
         if not os.path.exists(produced):
             return False, f"texconv 未生成 {produced}"
 
-        target_dir = os.path.dirname(target_path)
-        if target_dir:
-            os.makedirs(target_dir, exist_ok=True)
         try:
             shutil.move(produced, target_path)
         except Exception as exc:
             return False, f"写出目标文件失败: {exc}"
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
     return True, ""
+
+
+def convert_texture_to_dds_cached(
+    source_path: str, target_path: str, props=None, force: bool = False
+) -> tuple[bool, str]:
+    """带缓存的 :func:`convert_texture_to_dds`：同一目标在一次导出内只真正转一次。
+
+    ``force=True`` 对应节点上的「覆盖现有资源」：表示愿意重新生成，但仅限本次导出的
+    第一次 —— 同一张贴图被 N 个物体引用时不会再各转一遍。缓存每次导出开始时清空，
+    所以下次导出仍会重新生成。
+
+    复用磁盘已有产物时同样返回 ``(True, "")``：调用方只关心「目标就绪」，不关心它是
+    这一轮转出来的还是上一轮留下的。
+    """
+    signature = _source_signature(source_path)
+    if signature is None:
+        return False, f"源文件不存在: {source_path}"
+
+    cache_key = os.path.normcase(os.path.abspath(target_path))
+    # 命中缓存也要确认产物还在：同一次导出里目标目录可能被清掉（缓存只记「这一轮转过了」，
+    # 不负责保管文件），缺了这个判断就会对着不存在的目标返回成功。
+    if _dds_conversion_cache.get(cache_key) == signature and os.path.exists(target_path):
+        return True, ""
+
+    if not force and _target_is_current(target_path, signature):
+        _dds_conversion_cache[cache_key] = signature
+        return True, ""
+
+    ok, reason = convert_texture_to_dds(source_path, target_path, props)
+    if ok:
+        _dds_conversion_cache[cache_key] = signature
+    return ok, reason
 
 
 class TT_OT_convert_to_dds(bpy.types.Operator):
