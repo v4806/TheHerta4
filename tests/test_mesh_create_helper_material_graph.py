@@ -202,6 +202,19 @@ mesh_create_helper = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = mesh_create_helper
 spec.loader.exec_module(mesh_create_helper)
 
+# 规范材质（common/marked_texture_material.py）的图构建复用同一套 MeshCreateHelper，
+# 这里也把真实模块加载进来，好断言它走的是哪条路线。
+_install_module(f"{PKG}.common.submesh_metadata", SubmeshMetadataResolver=object)
+_install_module(f"{PKG}.common.texture_metadata_helper", TextureMetadataResolver=object)
+
+marked_path = Path(__file__).resolve().parents[1] / "common" / "marked_texture_material.py"
+marked_spec = importlib.util.spec_from_file_location(
+    f"{PKG}.common.marked_texture_material", marked_path
+)
+marked_material = importlib.util.module_from_spec(marked_spec)
+sys.modules[marked_spec.name] = marked_material
+marked_spec.loader.exec_module(marked_material)
+
 
 class MeshCreateHelperMaterialGraphTests(unittest.TestCase):
     """测试网格创建助手的材质图构建：不同逻辑名称下的节点结构差异"""
@@ -303,6 +316,87 @@ class MeshCreateHelperMaterialGraphTests(unittest.TestCase):
         helper = mesh_create_helper.MeshCreateHelper
         with self.assertRaises(RuntimeError):
             helper._normalize_and_validate_vg_map({"0": 3}, vg_count=2)
+
+
+class SpecMaterialRouteTests(unittest.TestCase):
+    """规范材质 ``<类型名>_<网格名>`` 必须走颜色贴图图，不得经过原理化 BSDF。"""
+
+    def setUp(self):
+        _fake_bpy.data.materials.clear()
+        self.temp_dir = tempfile.mkdtemp(prefix="spec_route_")
+        self.texture_path = os.path.join(self.temp_dir, "abc12345-12-DiffuseMap.dds")
+        with open(self.texture_path, "wb") as handle:
+            handle.write(b"diffuse")
+
+    def _make_material(self):
+        return _fake_bpy.data.materials.new("DiffuseMap_abc12345-12-0")
+
+    def _node_types(self, material):
+        return [node.bl_idname for node in material.node_tree.nodes]
+
+    def _images(self, material):
+        return [
+            node.image for node in material.node_tree.nodes
+            if node.bl_idname == "ShaderNodeTexImage"
+        ]
+
+    def test_spec_material_uses_the_color_texture_graph(self):
+        for logic_name in ("GIMI", "ZZMI", "NTEMI"):
+            with self.subTest(logic_name=logic_name):
+                material = self._make_material()
+                marked_material._apply_spec_material(
+                    material, "NORMAL", self.texture_path, logic_name
+                )
+
+                node_types = self._node_types(material)
+                self.assertNotIn("ShaderNodeBsdfPrincipled", node_types)
+                self.assertIn("ShaderNodeBsdfDiffuse", node_types)
+                self.assertIn("ShaderNodeBsdfTransparent", node_types)
+                self.assertIn("ShaderNodeMixShader", node_types)
+                self.assertIn("ShaderNodeOutputMaterial", node_types)
+                self.assertEqual(material.blend_method, "BLEND")
+                self.assertFalse(material.use_transparency_overlap)
+                self.assertEqual(self._images(material)[0].alpha_mode, "CHANNEL_PACKED")
+
+    def test_spec_material_ignores_the_socket_type(self):
+        """各种标记类型建出来的图完全一样——规范材质不按类型接通道。"""
+        shapes = []
+        for socket_type in ("DIFFUSE", "NORMAL", "LIGHTMAP", "SURFACE", "BODYMASK", ""):
+            material = self._make_material()
+            marked_material._apply_spec_material(
+                material, socket_type, self.texture_path, "ZZMI"
+            )
+            shapes.append(self._node_types(material))
+
+        self.assertEqual(shapes, [shapes[0]] * len(shapes))
+
+    def test_spec_material_for_identity_v_is_opaque(self):
+        material = self._make_material()
+        marked_material._apply_spec_material(
+            material, "DIFFUSE", self.texture_path, "IdentityV"
+        )
+
+        node_types = self._node_types(material)
+        self.assertNotIn("ShaderNodeBsdfPrincipled", node_types)
+        self.assertNotIn("ShaderNodeMixShader", node_types)
+        self.assertNotIn("ShaderNodeBsdfTransparent", node_types)
+        self.assertEqual(material.blend_method, "OPAQUE")
+        self.assertEqual(self._images(material)[0].alpha_mode, "NONE")
+
+    def test_spec_material_alpha_follows_the_ignore_alpha_switch(self):
+        """默认通道打包；开启「导入贴图时忽略透明度通道」后贴图 alpha 变「无」。"""
+        props = sys.modules[f"{PKG}.common.global_properties"].GlobalProterties
+        props.ignore_texture_alpha = staticmethod(lambda: True)
+        try:
+            material = self._make_material()
+            marked_material._apply_spec_material(
+                material, "DIFFUSE", self.texture_path, "ZZMI"
+            )
+        finally:
+            del props.ignore_texture_alpha
+
+        self.assertEqual(self._images(material)[0].alpha_mode, "NONE")
+        self.assertIn("ShaderNodeMixShader", self._node_types(material))
 
 
 if __name__ == "__main__":
