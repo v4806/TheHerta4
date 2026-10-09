@@ -2460,34 +2460,16 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
             _LOG.info(f"      调试开关已开启，跳过 {section_name} 的 FX/TTL 生成")
 
         mesh_lines_info_phase2 = [(i, self.extract_mesh_name(line)) for i, line in enumerate(lines) if self.extract_mesh_name(line)]
+        # 段体内容 -> 段名：同一个 mesh 在一个段里会随物体切换分支出现多次，
+        # 内容（材质 + drawindexed）完全一致时复用同一个透明段，不再生成
+        # _2/_3… 这样内容逐字节重复的段。
+        transparency_body_section_names: dict = {}
+        for existing_section_name, existing_section_body in transparency_sections_to_add.items():
+            transparency_body_section_names.setdefault(tuple(existing_section_body), str(existing_section_name))
         for mesh_index, mesh_name in reversed(mesh_lines_info_phase2):
             transparency_shader_name, transparency_value = self.extract_transparency_info_from_mesh_name(mesh_name)
             if transparency_shader_name:
-                base_shader_name = transparency_shader_name
-                suffix = 2
-                existing_section_names = {
-                    str(existing_name or "").strip().strip('[]').casefold()
-                    for existing_name in all_sections
-                }
-                generated_section_names = {
-                    str(existing_name or "").casefold()
-                    for existing_name in transparency_sections_to_add
-                }
-                while (
-                    transparency_shader_name.casefold() in generated_section_names
-                    or transparency_shader_name.casefold() in existing_section_names
-                ):
-                    transparency_shader_name = f"{base_shader_name}_{suffix}"
-                    suffix += 1
-                transparency_sections_to_add[transparency_shader_name] = [
-                    "blend = ADD BLEND_FACTOR INV_BLEND_FACTOR",
-                    f"blend_factor[0] = {transparency_value}", f"blend_factor[1] = {transparency_value}",
-                    f"blend_factor[2] = {transparency_value}", "blend_factor[3] = 1",
-                    "handling = skip",
-                    "; --- Start of Overridden Mesh Content ---"
-                ]
-                lines.insert(mesh_index + 1, f"run = {transparency_shader_name}")
-                start_move_idx = mesh_index + 2
+                start_move_idx = mesh_index + 1
                 end_move_idx = len(lines)
                 conditional_depth = 0
                 draw_seen = False
@@ -2509,6 +2491,7 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
                     if draw_seen and conditional_depth == 0:
                         end_move_idx = i + 1
                         break
+                final_block = []
                 if start_move_idx < end_move_idx:
                     block_to_move = lines[start_move_idx:end_move_idx]
                     reset_keywords = _FX_RESET_REF_LINES + _FX_RESET_PARAM_LINES
@@ -2516,7 +2499,6 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
                         line for line in block_to_move
                         if not any(keyword in line for keyword in reset_keywords)
                     ]
-                    final_block = []
                     for line in filtered_block_to_move:
                         if any(run_line in line for run_line in _FX_RUN_LINES):
                             # Run 只有在前面已经出现过资源别名时才搬过去：整段没有
@@ -2530,8 +2512,37 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
                                 final_block.append(line)
                         else:
                             final_block.append(line)
-                    transparency_sections_to_add[transparency_shader_name].extend(final_block)
-                    del lines[start_move_idx:end_move_idx]
+                body_lines = [
+                    "blend = ADD BLEND_FACTOR INV_BLEND_FACTOR",
+                    f"blend_factor[0] = {transparency_value}", f"blend_factor[1] = {transparency_value}",
+                    f"blend_factor[2] = {transparency_value}", "blend_factor[3] = 1",
+                    "handling = skip",
+                    "; --- Start of Overridden Mesh Content ---"
+                ] + final_block
+                reused_section_name = transparency_body_section_names.get(tuple(body_lines))
+                if reused_section_name is not None:
+                    transparency_shader_name = reused_section_name
+                else:
+                    base_shader_name = transparency_shader_name
+                    suffix = 2
+                    existing_section_names = {
+                        str(existing_name or "").strip().strip('[]').casefold()
+                        for existing_name in all_sections
+                    }
+                    generated_section_names = {
+                        str(existing_name or "").casefold()
+                        for existing_name in transparency_sections_to_add
+                    }
+                    while (
+                        transparency_shader_name.casefold() in generated_section_names
+                        or transparency_shader_name.casefold() in existing_section_names
+                    ):
+                        transparency_shader_name = f"{base_shader_name}_{suffix}"
+                        suffix += 1
+                    transparency_sections_to_add[transparency_shader_name] = body_lines
+                    transparency_body_section_names[tuple(body_lines)] = transparency_shader_name
+                lines.insert(mesh_index + 1, f"run = {transparency_shader_name}")
+                del lines[mesh_index + 2:end_move_idx + 1]
         return next_swap_key_num
 
     @staticmethod

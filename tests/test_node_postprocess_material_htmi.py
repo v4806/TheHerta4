@@ -1382,6 +1382,57 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
         self.assertEqual(len(run_targets), 2)
         self.assertEqual(len(set(run_targets)), 2)
 
+    def test_transparency_reuses_one_section_for_identical_duplicate_blocks(self):
+        """同一 mesh 在多个物体切换分支里内容一致地重复时，只生成一个透明段
+
+        回归：KK 模组里一个透明 mesh 会在每个物体切换分支下出现一次
+        （材质与 drawindexed 完全相同），旧实现只按段名占用去重，于是生成
+        CustomShaderTransparencyCloth…_2 / _3 / … 一串内容逐字节相同的段。
+        """
+        obj = _FakeObject("KK 袜子 10641_透明0.75", {}, ["ImportedObject_Material"])
+        _fake_bpy.data.objects[obj.name] = obj
+        duplicate_block = [
+            f"[mesh:{obj.name}]",
+            r"Resource\ZZMI\Diffuse = ref Resource_DiffuseMap_Color",
+            r"run = CommandList\ZZMI\SetTextures",
+            "  drawindexed = 966,601512,0",
+        ]
+        sections = OrderedDict([
+            ("[TextureOverride_Test]", [
+                "if $swapkey31 == 0", *duplicate_block, "endif",
+                "if $swapkey31 == 1", *duplicate_block, "endif",
+                "if $swapkey31 == 2", *duplicate_block, "endif",
+            ]),
+            ("_config_path", ""),
+        ])
+        transparency_sections = OrderedDict()
+        node = node_postprocess_material.SSMTNode_PostProcess_Material()
+        node.name = "MaterialNode"
+        node.material_to_resource_override = False
+        node.material_switch_var = "$swapkey150"
+
+        node.process_texture_override_section(
+            "[TextureOverride_Test]",
+            sections,
+            material_group_to_swapkey={},
+            swap_key_prefix="$swapkey",
+            next_swap_key_num=150,
+            used_swap_keys=set(),
+            transparency_sections_to_add=transparency_sections,
+        )
+
+        self.assertEqual(len(transparency_sections), 1)
+        section_name = next(iter(transparency_sections))
+        run_targets = [
+            line.split("=", 1)[1].strip()
+            for line in sections["[TextureOverride_Test]"]
+            if line.startswith("run = CustomShaderTransparencyCloth")
+        ]
+        self.assertEqual(len(run_targets), 3)
+        self.assertEqual(set(run_targets), {section_name})
+        moved_lines = transparency_sections[section_name]
+        self.assertEqual(moved_lines.count("  drawindexed = 966,601512,0"), 1)
+
     def test_transparency_avoids_existing_custom_shader_section_name(self):
         obj = _FakeObject("Body_透明0.5", {}, ["ImportedObject_Material"])
         _fake_bpy.data.objects[obj.name] = obj
