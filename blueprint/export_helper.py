@@ -96,6 +96,21 @@ class BlueprintExportHelper:
         return False
 
     @staticmethod
+    def should_disable_copy_modifiers_on_export() -> bool:
+        """当前蓝图树是否勾选了「导出前关闭副本修改器」。
+
+        勾选后前处理不再对临时副本应用修改器，而是先把副本上的修改器全部关闭
+        （等价于手动关掉修改器再导出）。无有效树或未勾选时返回 False（保持原行为）。
+        """
+        try:
+            tree = BlueprintExportHelper.get_current_blueprint_tree()
+        except Exception:
+            tree = None
+        if not tree:
+            return False
+        return bool(getattr(tree, "disable_copy_modifiers_on_export", False))
+
+    @staticmethod
     def get_exportable_shape_key_infos(obj, slot_limit: int | None = None) -> list[tuple[int, str, object]]:
         if obj is None or not getattr(obj, "data", None):
             return []
