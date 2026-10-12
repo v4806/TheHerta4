@@ -1358,6 +1358,14 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
                 converted_path = os.path.join(target_folder, converted_name)
                 if os.path.exists(converted_path) and not self.material_to_resource_override:
                     return converted_name
+                # 同一轮导出内这张图已经转过：forced_filename 是本次导出里同一材质
+                # （同一 stem）上一次调用返回的 .dds 名，且文件确实存在。此时再调一次
+                # texconv 重转同一张图，结果与上一次完全相同，纯属重复劳动 ——
+                # 实测「身体」那套 5 张贴图各被重转 14 次，一次导出 82 次转换里 70 次
+                # 是这种重复（占整次导出 ~70% 的墙钟时间）。
+                # 「覆盖现有资源」的语义不受影响：本轮第一次该覆盖的仍然覆盖了。
+                if forced_filename == converted_name and os.path.exists(converted_path):
+                    return converted_name
                 ok, reason = convert_texture_to_dds(source_path, converted_path)
                 if ok:
                     return converted_name
