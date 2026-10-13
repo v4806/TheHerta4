@@ -690,12 +690,41 @@ def ImprotFromWorkSpaceFull(self, context):
                 if zzmi_merged_consumption:
                     self.report({'INFO'}, message)
             else:
-                print(f"[ZZMI骨骼合并] 未生成骨骼数据：{message}")
+                # 部分生成 ≠ 整体失败：ensure_skeleton_data 的 json 写回发生在
+                # 返回之前，ok=False 也可能已有部件拿到 VGMap（同一 DrawIB 被多个
+                # 对象实例绘制时该 DrawIB 被逐个跳过，其余单实例部件照常生成）。
+                # 旧实现一律按整体失败处理 ⇒ 一个多实例部件即可把整批部件拖回
+                # 普通导入、并自动关掉开关。逐部件降级由 vg_count>0 门控天然完成
+                # （无 VGMap/VGCount 的部件走局部顶点组，见 common/ssmt_import_helper.py
+                # 的 wwmi_vg_map 判据与 common/submesh_model.py 的合并预处理门控）。
+                partial_ready = 0
                 if zzmi_merged_consumption:
-                    # 部分/全部子网格未生成合并骨架数据时会走普通导入路线，
-                    # 必须显式警告，避免用户误以为骨骼合并已完整生效。复选框
-                    # 关闭时只记 stdout：本次导入本来就不消费合并数据。
-                    self.report({'WARNING'}, f"骨骼合并未完整生成：{message}")
+                    try:
+                        partial_ready = (
+                            ZZMISkeletonMergeHelper.count_ready_merged_metadata(
+                                GlobalConfig.path_workspace_folder(), import_keys
+                            )
+                        )
+                    except Exception:
+                        partial_ready = 0
+                if partial_ready > 0:
+                    merged_vgmap_ready = True
+                    print(
+                        f"[ZZMI骨骼合并] 部分生成：{partial_ready} 个部件已按合并骨架"
+                        f"导入，其余部件退回普通顶点组：{message}"
+                    )
+                    self.report(
+                        {'WARNING'},
+                        f"骨骼合并部分生效：{partial_ready} 个部件按合并骨架导入，"
+                        f"其余部件已按普通顶点组导入（{message}）",
+                    )
+                else:
+                    print(f"[ZZMI骨骼合并] 未生成骨骼数据：{message}")
+                    if zzmi_merged_consumption:
+                        # 全部子网格都没生成合并骨架数据时会走普通导入路线，
+                        # 必须显式警告，避免用户误以为骨骼合并已完整生效。复选框
+                        # 关闭时只记 stdout：本次导入本来就不消费合并数据。
+                        self.report({'WARNING'}, f"骨骼合并未完整生成：{message}")
         except Exception as e:
             import traceback
             print(f"[ZZMI骨骼合并] 预生成失败（不阻断导入）: {e}")
