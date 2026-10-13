@@ -99,7 +99,7 @@ class ObjectPrefixHelper:
             return None
 
         prefix_parts = [parts[0]]
-        for part in parts[1:3]:
+        for part in parts[1:]:
             if not _PREFIX_PART_PATTERN.fullmatch(part):
                 break
             prefix_parts.append(part)
