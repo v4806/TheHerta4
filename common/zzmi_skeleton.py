@@ -1340,6 +1340,44 @@ class ZZMISkeletonMergeHelper:
         return False
 
     @classmethod
+    def count_ready_merged_metadata(
+        cls, workspace_root: str, unique_str_list: list[str]
+    ) -> int:
+        """请求集内**已具备完整骨骼合并数据**的子网格数量（0 = 一个都没有）。
+
+        供导入侧区分「整体失败」与「部分生成」（ui/ui_func_import_ssmt.py）：
+        ``ensure_skeleton_data`` 的 json 写回发生在返回之前，因此它报 ok=False 时
+        仍可能已有部件拿到 VGMap —— 同一 DrawIB 在一帧内被多个对象实例绘制
+        （对象 CB1 各不相同）时，该 DrawIB 按「无法安全确定目标模型」被跳过，
+        其它单实例部件照常生成。旧实现把这两种情形一律当成整体失败，于是
+        一个多实例部件就能把整批部件拖回普通导入并自动关闭开关。
+
+        判定口径与 ``missing_merged_metadata_exist`` 逐件完全一致（同一份
+        ``_zzmi_cache_intact``）：把一个「有没有缺失」的问题换成「有多少件就绪」。
+        """
+        if not workspace_root or not unique_str_list:
+            return 0
+        ready = 0
+        for unique_str in unique_str_list:
+            json_path = cls._resolve_submesh_json_path(workspace_root, unique_str)
+            if not json_path:
+                continue
+            try:
+                payload = JsonUtils.LoadFromFile(json_path)
+            except Exception:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if payload.get("GPU-PreSkinning") is False:
+                continue
+            if not payload.get("VGMap") or not payload.get("VGMapAlgorithmVersion"):
+                continue
+            if not cls._zzmi_cache_intact(payload, json_path, unique_str):
+                continue
+            ready += 1
+        return ready
+
+    @classmethod
     def ensure_skeleton_data(
         cls,
         workspace_root: str,
