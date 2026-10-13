@@ -4103,9 +4103,152 @@ class ExportZZMI(ExportUnity):
             section.append(f"    draw = {draw_count}, 0")
             section.append("endif")
 
+    def _zzmi_pose_expand_groups(self, drawib_model):
+        """同一 DrawIB 的多个 SubMesh 若使用**不同的预蒙皮 draw**，返回需要各自成组的组件列表。
+
+        背景：SSMT 的 ini 机制原本假设「一个 DrawIB 只有一次预蒙皮 draw」，
+        因此只按 first_submesh 的 CategoryHash 生成一组 VB 覆盖段。像翅膀喷射器这种
+        一个 IB 配了 4 次预蒙皮 draw 的部件，会导致只有其中 1 个部件被替换、其余保持原样。
+
+        本方法把「各 SubMesh 的 CategoryHash 是否相同」作为判据：
+        - 全部相同（正常角色） → 返回 []，调用方走原逻辑，行为与改动前完全一致；
+        - 存在不同（一个 IB 多次预蒙皮） → 返回 [(后缀, CategoryHash 字典, 顶点数), ...]。
+
+        返回元素的后缀取自 SubMesh 的 workspace_unique_str 末段（例如 `000014`）。
+        """
+        try:
+            from ...common.submesh_metadata import SubmeshMetadataResolver
+        except Exception:
+            return []
+
+        stride_dict = drawib_model.d3d11GameType.CategoryStrideDict
+        position_stride = int(stride_dict.get("Position", 0) or 0)
+        if position_stride <= 0:
+            return []
+
+        groups = []
+        seen_keys = set()
+        for submesh_model in drawib_model.submesh_model_list:
+            unique_str = (
+                getattr(submesh_model, "workspace_unique_str", "") or submesh_model.unique_str
+            )
+            try:
+                submesh_metadata = SubmeshMetadataResolver.resolve(unique_str)
+                category_hash_dict = dict(
+                    getattr(submesh_metadata, "category_hash_dict", {}) or {}
+                )
+            except Exception:
+                return []
+            if not category_hash_dict:
+                return []
+
+            hash_key = tuple(sorted((k, str(v)) for k, v in category_hash_dict.items()))
+            if hash_key in seen_keys:
+                continue
+            seen_keys.add(hash_key)
+
+            position_buffer = (
+                getattr(submesh_model, "category_buffer_dict", {}) or {}
+            ).get("Position")
+            if position_buffer is None:
+                return []
+            vertex_count = len(position_buffer) // position_stride
+            if vertex_count <= 0:
+                return []
+
+            groups.append((str(unique_str).rsplit("-", 1)[-1], category_hash_dict, vertex_count))
+
+        # 只有 1 组（含：多个 SubMesh 共用同一次预蒙皮）时不展开，保持原行为
+        if len(groups) <= 1:
+            return []
+        return groups
+
+    def generate_buffer_files(self, output_folder: str):
+        """基类写出合并缓冲之后，为「多次预蒙皮 draw」的每个组件另写一份独立缓冲。
+
+        仅当 _zzmi_pose_expand_groups 判定需要展开时才写；正常角色不会多出任何文件。
+        """
+        super().generate_buffer_files(output_folder)
+
+        for drawib_model in self.drawib_model_list:
+            expand_groups = self._zzmi_pose_expand_groups(drawib_model)
+            if not expand_groups:
+                continue
+
+            suffix_submesh_dict = {}
+            for submesh_model in drawib_model.submesh_model_list:
+                unique_str = (
+                    getattr(submesh_model, "workspace_unique_str", "") or submesh_model.unique_str
+                )
+                suffix_submesh_dict[str(unique_str).rsplit("-", 1)[-1]] = submesh_model
+
+            for component_suffix, _category_hash_dict, _vertex_count in expand_groups:
+                submesh_model = suffix_submesh_dict.get(component_suffix)
+                if submesh_model is None:
+                    continue
+                for category_name, category_buffer in (
+                    getattr(submesh_model, "category_buffer_dict", {}) or {}
+                ).items():
+                    buffer_path = os.path.join(
+                        output_folder,
+                        drawib_model.draw_ib
+                        + "-"
+                        + category_name
+                        + "-"
+                        + component_suffix
+                        + ".buf",
+                    )
+                    with open(buffer_path, "wb") as file_obj:
+                        category_buffer.tofile(file_obj)
+
     def add_unity_vs_texture_override_vb_sections(self, ini_builder: M_IniBuilder, drawib_model):
         d3d11_game_type = drawib_model.d3d11GameType
         draw_ib = drawib_model.draw_ib
+
+        # 一个 DrawIB 配了多次预蒙皮 draw 时（例如翅膀的 4 个推进器），
+        # 为每个组件各生成一组 VB 覆盖段；否则走下面的原逻辑（行为与改动前一致）。
+        expand_groups = self._zzmi_pose_expand_groups(drawib_model)
+        if (
+            expand_groups
+            and not self.has_cross_ib
+            and not self.merged_skeleton_component_id_dict.get(draw_ib)
+            and not self.blueprint_model.keyname_mkey_dict.keys()
+        ):
+            texture_override_vb_section = M_IniSection(M_SectionType.TextureOverrideVB)
+            texture_override_vb_section.append("; " + draw_ib + " (按预蒙皮 draw 展开)")
+            for component_suffix, category_hash_dict, component_vertex_count in expand_groups:
+                for category_name in d3d11_game_type.OrderedCategoryNameList:
+                    vb_name_suffix = (
+                        "VB_" + draw_ib + "_" + drawib_model.draw_ib_alias
+                        + "_" + component_suffix + "_" + category_name
+                    )
+                    texture_override_vb_section.append("[TextureOverride_" + vb_name_suffix + "]")
+                    texture_override_vb_section.append(
+                        "hash = " + category_hash_dict.get(category_name, "")
+                    )
+
+                    for original_category_name, draw_category_name in d3d11_game_type.CategoryDrawCategoryDict.items():
+                        if category_name != draw_category_name:
+                            continue
+                        category_original_slot = d3d11_game_type.CategoryExtractSlotDict[original_category_name]
+                        texture_override_vb_section.append(
+                            category_original_slot
+                            + " = Resource"
+                            + draw_ib
+                            + original_category_name
+                            + "_"
+                            + component_suffix
+                        )
+
+                    blend_draw_category_name = d3d11_game_type.CategoryDrawCategoryDict.get("Blend", None)
+                    if blend_draw_category_name is not None and category_name == blend_draw_category_name:
+                        texture_override_vb_section.append("handling = skip")
+                        texture_override_vb_section.append("draw = " + str(component_vertex_count) + ", 0")
+
+                    texture_override_vb_section.new_line()
+
+            ini_builder.append_section(texture_override_vb_section)
+            return
 
         so0_source_resource_names = []
         for submesh_model in drawib_model.submesh_model_list:
@@ -5833,6 +5976,28 @@ class ExportZZMI(ExportUnity):
 
     def add_unity_vs_resource_vb_sections(self, ini_builder: M_IniBuilder, drawib_model):
         super().add_unity_vs_resource_vb_sections(ini_builder=ini_builder, drawib_model=drawib_model)
+
+        # 多次预蒙皮 draw 的组件，各自的 VB 资源段（缓冲文件按组件单独写出）
+        expand_groups = self._zzmi_pose_expand_groups(drawib_model)
+        if expand_groups and not self.has_cross_ib:
+            from ...blueprint.export_helper import BlueprintExportHelper
+            buffer_folder_name = BlueprintExportHelper.get_current_buffer_folder_name()
+            expand_resource_section = M_IniSection(M_SectionType.ResourceBuffer)
+            for component_suffix, _category_hash_dict, _vertex_count in expand_groups:
+                for category_name in drawib_model.d3d11GameType.OrderedCategoryNameList:
+                    expand_resource_section.append(
+                        "[Resource" + drawib_model.draw_ib + category_name + "_" + component_suffix + "]"
+                    )
+                    expand_resource_section.append("type = Buffer")
+                    expand_resource_section.append(
+                        "stride = " + str(drawib_model.d3d11GameType.CategoryStrideDict[category_name])
+                    )
+                    expand_resource_section.append(
+                        "filename = " + buffer_folder_name + "/" + drawib_model.draw_ib
+                        + "-" + category_name + "-" + component_suffix + ".buf"
+                    )
+                    expand_resource_section.new_line()
+            ini_builder.append_section(expand_resource_section)
 
         position_stride = drawib_model.d3d11GameType.CategoryStrideDict.get("Position", 40)
         so0_resource_section = M_IniSection(M_SectionType.ResourceBuffer)
