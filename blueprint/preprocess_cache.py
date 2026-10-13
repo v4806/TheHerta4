@@ -339,6 +339,17 @@ class PreProcessCache:
         hasher.update(struct.pack('<?', GlobalProterties.enable_non_mirror_workflow()))
         hasher.update(struct.pack('<?', GlobalProterties.apply_all_modifiers()))
 
+        # 「导出前关闭副本修改器」会改变副本几何（不再应用修改器），必须进哈希，
+        # 否则切换开关后会命中按另一种语义生成的旧缓存。未勾选时不写入任何内容，
+        # 避免让既有缓存整体失效。局部 import 与本文件既有写法一致（避免循环依赖）。
+        try:
+            from .export_helper import BlueprintExportHelper
+
+            if BlueprintExportHelper.should_disable_copy_modifiers_on_export():
+                hasher.update(b"disable-copy-modifiers=on")
+        except Exception:
+            pass
+
         loc = numpy.array(obj.location, dtype=numpy.float32)
         rot = numpy.array(obj.rotation_euler, dtype=numpy.float32)
         scl = numpy.array(obj.scale, dtype=numpy.float32)

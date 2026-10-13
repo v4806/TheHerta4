@@ -88,6 +88,19 @@ class SSMTBlueprintTree(NodeTree):
         update=_on_use_blueprint_name_changed,
     ) # type: ignore
 
+    # 前处理副本上的修改器开关：勾选后导出前把临时副本的修改器全部关闭（不应用），
+    # 等价于手动关掉修改器再导出；原物体不受影响（仅对当前蓝图生效）。
+    disable_copy_modifiers_on_export: bpy.props.BoolProperty(
+        name="导出前关闭副本修改器",
+        description=(
+            "勾选后，导出前处理会把临时副本物体（xxx_copy 等）上的修改器全部关闭，"
+            "不再应用修改器。等价于手动把修改器的显示开关关掉再导出："
+            "修改器效果不会进入导出结果，含大量形态键的物体可省下大量时间。"
+            "只影响导出过程创建的临时副本，不会改动原物体上的修改器；仅对当前蓝图生效"
+        ),
+        default=False,
+    ) # type: ignore
+
 
 _NODE_COLOR_INPUT_SOURCE = (0.38, 0.39, 0.40)
 _NODE_COLOR_GROUP = (0.15, 0.16, 0.17)

@@ -414,6 +414,8 @@ class SSMTNode_Result_Output(SSMTNodeBase):
             layout.prop(context.scene.global_properties, "apply_all_modifiers")
             layout.prop(context.scene.global_properties, "export_add_missing_vertex_groups")
 
+        layout.prop(self.id_data, "disable_copy_modifiers_on_export")
+
         layout.prop(context.scene.global_properties, 
                     "forbid_auto_texture_ini",text="禁止自动贴图流程")
 

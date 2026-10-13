@@ -174,7 +174,12 @@ _install_module(
     NonMirrorWorkflowHelper=types.SimpleNamespace(),
 )
 _install_module(f"{PKG}.common.object_prefix_helper", ObjectPrefixHelper=types.SimpleNamespace())
-_install_module(f"{PKG}.blueprint.export_helper", BlueprintExportHelper=types.SimpleNamespace())
+_install_module(
+    f"{PKG}.blueprint.export_helper",
+    BlueprintExportHelper=types.SimpleNamespace(
+        should_disable_copy_modifiers_on_export=lambda: False,
+    ),
+)
 _install_module(f"{PKG}.blueprint.preprocess_cache", PreProcessCache=types.SimpleNamespace())
 _install_module(f"{PKG}.utils.log_utils", LOG=types.SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None))
 _install_module(f"{PKG}.utils.timer_utils", TimerUtils=types.SimpleNamespace(start_stage=lambda *a, **k: None, end_stage=lambda *a, **k: None))

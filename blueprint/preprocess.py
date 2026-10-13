@@ -1080,12 +1080,38 @@ class PreProcessHelper:
         LOG.info(f"   ✅ 应用约束: {applied_count} 个")
 
     @classmethod
+    def _disable_copy_modifiers(cls, object_names: List[str]) -> int:
+        """把临时副本上的修改器全部关闭（show_viewport=False），不改动原物体。
+
+        蓝图树勾选「导出前关闭副本修改器」时调用：关掉后
+        `_apply_modifiers_with_simplify_disabled` 会把这些修改器视为不可用而跳过应用，
+        等价于用户手动关掉修改器的显示开关再导出 —— 副本几何不含修改器效果，
+        含大量形态键的物体也不再逐键复制物体做保守应用。
+        """
+        disabled_count = 0
+        for obj_name in object_names:
+            obj = bpy.data.objects.get(obj_name)
+            if not obj or obj.type != 'MESH':
+                continue
+            for modifier in obj.modifiers:
+                if not modifier.show_viewport:
+                    continue
+                modifier.show_viewport = False
+                disabled_count += 1
+        return disabled_count
+
+    @classmethod
     def _apply_modifiers(cls, object_names: List[str], fail_on_error: bool = False):
         scene = bpy.context.scene
         saved_use_simplify = scene.render.use_simplify
         try:
             # Simplify can disable modifiers and make modifier_apply fail.
             scene.render.use_simplify = False
+            if BlueprintExportHelper.should_disable_copy_modifiers_on_export():
+                disabled_count = cls._disable_copy_modifiers(object_names)
+                LOG.info(
+                    f"   已按蓝图设置关闭 {disabled_count} 个副本修改器，跳过应用修改器"
+                )
             return cls._apply_modifiers_with_simplify_disabled(
                 object_names,
                 fail_on_error=fail_on_error,
