@@ -1169,9 +1169,72 @@ class ExportZZMI(ExportUnity):
             return bool(all_slots & used_group_ids)
         return bool(own_segment_slots & used_group_ids)
 
+    def _zzmi_workspace_vg_count(self, workspace_unique_str: str) -> int | None:
+        """读回工作空间里该部件的 VGCount（合并骨架数据）；无法判定返回 None。
+
+        ``None`` = 定位不到 json / 内容不可解析 ⇒ 调用方必须按旧行为（计入），
+        不得当成 0。``0`` = 确证该部件是**普通路径**导入：几何用部件局部编号
+        ``0..vg_count-1``，与合并骨架的全局槽位不是同一个编号空间。
+        """
+        workspace_root = GlobalConfig.path_workspace_folder()
+        value = str(workspace_unique_str or "").strip()
+        if not workspace_root or not value:
+            return None
+        lod_name, bare = "LOD0", value
+        if "." in value:
+            head, tail = value.split(".", 1)
+            if head.upper().startswith("LOD"):
+                lod_name, bare = head, tail
+        if not bare:
+            return None
+        submesh_dir = os.path.join(workspace_root, lod_name, bare)
+        if not os.path.isdir(submesh_dir):
+            return None
+        try:
+            type_dirs = os.listdir(submesh_dir)
+        except OSError:
+            return None
+        for type_dir in type_dirs:
+            if not type_dir.startswith("TYPE_"):
+                continue
+            json_path = os.path.join(submesh_dir, type_dir, bare + ".json")
+            if not os.path.isfile(json_path):
+                continue
+            try:
+                payload = JsonUtils.LoadFromFile(json_path)
+            except Exception:
+                return None
+            if not isinstance(payload, dict):
+                return None
+            try:
+                return int(payload.get("VGCount", 0) or 0)
+            except (TypeError, ValueError):
+                return None
+        return None
+
     def _collect_used_group_ids(self, ordered) -> set[int]:
-        """收集蓝图内全部对象实际引用（权重>0）的顶点组 id 集合。"""
+        """收集蓝图内全部对象实际引用（权重>0）的**全局骨骼槽位** id 集合。
+
+        只统计**几何确实使用全局骨骼编号**的对象（合并骨架模式导入 ⇔ 子网格
+        json ``VGCount > 0``）。普通路径导入的部件顶点组名是**部件局部编号**
+        ``0..vg_count-1``，与合并骨架的全局槽位不是同一个编号空间；把它们的
+        ``0`` 当成全局槽位，会让 `_is_drawib_absorbed` 把「另一个部件的自属段
+        槽位 0 被引用」当成几何归属证据。
+
+        实测事故（2026-10-14，快速局部导出左推进器 ``acfa670a``）：该部件
+        json ``VGCount=0``（普通路径，顶点组名只有局部编号 ``0``），而右翅膀尖
+        ``14cf141e`` 的自属声明段恰为 ``[0,1)`` ⇒ 编号空间不同却被求交命中，
+        误判「几何已被合并」并注入占位小三角面；该占位段把 ``vs-t0`` 覆盖成
+        合并骨架且**不恢复**，于是同帧紧随其后、**共享同一份 palette 资源
+        （hash 23de2d6a）因而不会重新绑定 vs-t0** 的左翅膀尖 ``1b655510``
+        被错误的骨架蒙皮 —— 游戏内消失 / 变形 + 高频闪烁（导出右推进器
+        ``760c8064`` 时左右对调，受害的是 ``14cf141e``）。
+
+        判定不到 json（``_zzmi_workspace_vg_count`` 返回 None）时按旧行为**计入**
+        —— 信息不足时宁可保守插桩，也不要漏掉真正被吸收的几何。
+        """
         used = set()
+        vg_count_cache: dict[str, int | None] = {}
         for draw_call in ordered:
             try:
                 obj_name = draw_call.get_blender_obj_name()
@@ -1180,6 +1243,19 @@ class ExportZZMI(ExportUnity):
             obj = bpy.data.objects.get(obj_name) if obj_name else None
             if obj is None or obj.get("ZZMI_STUB"):
                 continue
+            try:
+                unique_str = str(draw_call.get_workspace_unique_str() or "")
+            except Exception:
+                unique_str = ""
+            if unique_str:
+                if unique_str not in vg_count_cache:
+                    vg_count_cache[unique_str] = self._zzmi_workspace_vg_count(
+                        unique_str
+                    )
+                vg_count = vg_count_cache[unique_str]
+                if vg_count is not None and vg_count <= 0:
+                    # 局部编号空间：组名不是全局槽位，不构成「引用了别人自属段」的证据
+                    continue
             mesh = getattr(obj, "data", None) if obj is not None else None
             vertices = getattr(mesh, "vertices", None)
             if vertices is None:
@@ -4163,6 +4239,75 @@ class ExportZZMI(ExportUnity):
             return []
         return groups
 
+    def _zzmi_expand_render_representative(self, drawib_model, expand_groups) -> str:
+        """展开组里「能代表全部组件」的渲染段后缀；空串 = 必须保留每个组件各自的段。
+
+        ## 为什么需要它（2026-10-14 用户实机现象：推进器本身高频闪烁 + 多出一片扭曲网格）
+
+        实测数据链（FrameAnalysis 2026-10-13-170438 + mod 产物逐字节核对）：
+
+        - 游戏里同一个 IB（如 ``760c8064``）在一帧内被 render **4 次**，四次
+          ``DrawIndexed(IndexCount:918, StartIndexLocation:0, BaseVertexLocation:0)``
+          **参数完全相同**，唯一的区别是 vb0 指向**各自实例**的预蒙皮 SO 输出
+          （实测每个实例 vb0 hash 不同、都只有 ``count=277`` 个顶点）；
+        - 游戏原始 IB 的索引值域是 ``0..276``（R16，918 个索引）；
+        - 而展开模式给 4 个组件各发了一个 render 段（``hash`` 与
+          ``match_first_index`` 都相同）⇒ **每次实例 draw 都会把 4 个组件全部重画**；
+        - 组件 2/3/4 的索引被加了 ``277/554/831`` 的顶点段偏移（实测归一化后与
+          组件 1 逐字节相同），而当前 vb0 只有 277 顶点 ⇒ 后 3 份索引**越界**读出
+          垃圾 ⇒ 那一片「扭曲的网格」，再叠加深度冲突 ⇒ 高频闪烁。
+
+        ## 判据（只放宽「已证明是同一套索引」的情形）
+
+        仅当**全部组件的索引在减去各自段偏移后完全相同**（同一套三角形，只是被加了
+        顶点段偏移）**且代表组件本身的值域已从 0 开始**时，才返回该后缀 ——
+        此时每次实例 draw 用「本实例的 277 顶点 + 这一份归一化索引」即可正确画出该
+        实例，其余组件的几何由**它们各自实例的那次 render** 承担，一份都不会丢。
+
+        任何一条不满足（缺 ib / 索引拓扑不同 / 代表组件值域不从 0 开始）都返回空串，
+        调用方保持「每个组件各发一段」的原有行为 —— 宁可不改，也不误伤
+        「同一 IB 的不同部件需要各自渲染」的其它用法。
+        """
+        suffixes = [group[0] for group in expand_groups]
+        if len(suffixes) < 2:
+            return ""
+        ib_dict = getattr(drawib_model, "submesh_ib_dict", {}) or {}
+        signature = None
+        representative = ""
+        representative_ib = None
+        for submesh_model in drawib_model.submesh_model_list:
+            unique_str = (
+                getattr(submesh_model, "workspace_unique_str", "") or submesh_model.unique_str
+            )
+            suffix = str(unique_str).rsplit("-", 1)[-1]
+            if suffix not in suffixes:
+                continue
+            ib_buffer = ib_dict.get(getattr(submesh_model, "unique_str", unique_str))
+            if ib_buffer is None or len(ib_buffer) == 0:
+                return ""
+            try:
+                import numpy
+                indices = numpy.asarray(ib_buffer, dtype=numpy.int64).reshape(-1)
+            except Exception:
+                return ""
+            if indices.size == 0:
+                return ""
+            normalized = numpy.sort(indices - int(indices.min()))
+            digest = normalized.tobytes()
+            if signature is None:
+                signature = digest
+                representative = suffix
+                representative_ib = indices
+            elif digest != signature:
+                # 索引拓扑不同 = 不同部件，必须各自渲染
+                return ""
+        if not representative or representative_ib is None:
+            return ""
+        if int(representative_ib.min()) != 0:
+            # 代表组件的索引不从 0 开始 ⇒ 单段渲染同样会越界，保持原行为
+            return ""
+        return representative
+
     def generate_buffer_files(self, output_folder: str):
         """基类写出合并缓冲之后，为「多次预蒙皮 draw」的每个组件另写一份独立缓冲。
 
@@ -6025,12 +6170,46 @@ class ExportZZMI(ExportUnity):
 
         print(f"[CrossIB ZZMI] 处理 draw_ib={draw_ib}, has_cross_ib={self.has_cross_ib}")
 
+        # 展开模式（一个 IB 配多次预蒙皮 draw，例如翅膀的 4 个推进器）：
+        # 当各组件只是「同一套索引 + 顶点段偏移」时，**只为一个代表组件**生成 render 段。
+        # 游戏里该 IB 的多次 render draw 参数完全相同（DrawIndexed(918,0,0)），唯一区别是
+        # vb0 指向各自实例的预蒙皮 SO 输出（各 277 顶点）；逐个组件都发段会让每次实例
+        # draw 重画全部组件，其中带偏移的索引还会越界（实测用户看到的「多出一片高频
+        # 闪烁的扭曲网格」）。判据与理由见 `_zzmi_expand_render_representative`。
+        expand_render_suffix = ""
+        _expand_groups = self._zzmi_pose_expand_groups(drawib_model)
+        if (
+            _expand_groups
+            and not self.has_cross_ib
+            and not self.merged_skeleton_component_id_dict.get(draw_ib)
+            and not self.blueprint_model.keyname_mkey_dict.keys()
+        ):
+            expand_render_suffix = self._zzmi_expand_render_representative(
+                drawib_model, _expand_groups
+            )
+            if expand_render_suffix:
+                print(
+                    f"[ZZMI多预蒙皮] {draw_ib}: 展开组件索引同构（归一化后逐字节相同），"
+                    f"只为代表组件 {expand_render_suffix} 发 render 段；"
+                    "其余组件的几何由各自实例的那次 render 承担"
+                )
+
         texture_override_ib_section.append("[TextureOverride_IB_" + draw_ib + "]")
         texture_override_ib_section.append("hash = " + draw_ib)
         texture_override_ib_section.append("handling = skip")
         texture_override_ib_section.new_line()
 
         for submesh_model in drawib_model.submesh_model_list:
+            if expand_render_suffix:
+                _submesh_suffix = str(
+                    getattr(submesh_model, "workspace_unique_str", "")
+                    or submesh_model.unique_str
+                ).rsplit("-", 1)[-1]
+                if _submesh_suffix != expand_render_suffix:
+                    # 展开组（一个 IB 多次预蒙皮）：非代表组件不再发 render 段，
+                    # 否则每次实例 draw 都会重画全部组件 → 带偏移索引越界（扭曲）
+                    # 且多份几何深度冲突（高频闪烁）。见本方法开头的判定。
+                    continue
             texture_override_name_suffix = drawib_model.get_submesh_texture_override_suffix(submesh_model)
             ib_resource_name = drawib_model.get_submesh_ib_resource_name(submesh_model)
 
