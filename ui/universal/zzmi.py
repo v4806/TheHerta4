@@ -197,6 +197,21 @@ ZZMI_MERGE_DIAG_PREFIX = "; ZZMI-MERGE-DIAG"
 ZZMI_MERGE_DIAG_SLOT_BOUND = "SLOT_BOUND"
 ZZMI_MERGE_DIAG_POSE_UNAVAILABLE = "POSE_ALIGNMENT_UNAVAILABLE"
 # ---------------------------------------------------------------------------
+# F1 跨组骨骼合并（2026-10-10 用户实机复现件根因修复）
+# ---------------------------------------------------------------------------
+# 症状：`洛克茜` 复现件里 3 合 1 的那个物体整块消失，且「自身与同组件显示、
+# 跨组件消失」。实测（`Meshes\4e6e989e-Blend.buf` 4562 行）：
+#   · 宿主子网格 `4e6e989e-11700-0`（G2）与跨组件 `4e6d8882-1704-0`（G0）
+#     合并进同一网格；跨组件贡献 **624 行**，骨 id {1,2}（= G0 槽位）；
+#   · 生成的 ini 里，跨组件的 attach 只写它**自己组**的缓冲
+#     （`cs-u0 = ref ResourceZZMergedSkeleton_G0_s1`），而绘制合并几何的
+#     deform VS 绑的是**宿主组**缓冲（`vs-t0 = ..._G2_s1`）⇒ G2 的槽 1、2
+#     没有任何人写过 ⇒ deform 读到未初始化矩阵 ⇒ 624 顶点塌陷 ⇒ 部件消失。
+# 修复口径：跨组件的骨骼写进**吸收它的宿主组**缓冲（槽位 = 全局骨 id，
+# 全宽缓冲天然不冲突），由宿主组的 deform 段顶层 `run` 调用。
+# 开关：`cross_group_merged_vgmap_test`（关闭 = 恢复历史行为 + 大声报警）。
+ZZMI_MERGE_DIAG_CROSS_GROUP_ATTACH = "CROSS_GROUP_ATTACH"
+# ---------------------------------------------------------------------------
 # O3（用户裁定 (a)：诊断先行、零行为变更）——「捕获 : 消费」记账
 # ---------------------------------------------------------------------------
 # 动机（t8 块口径结论，代次 `184431` / `log.txt` sha256 `fd6efcc7…a18471`）：
@@ -2824,6 +2839,187 @@ class ExportZZMI(ExportUnity):
             if int(component["skeleton_group"]) == int(skeleton_group)
         ]
 
+    def _merged_referenced_bone_ids(self, draw_ib: str) -> set[int]:
+        """部件（DrawIB）在源对象里**实际引用**的骨骼 id 集合（导出期记忆化）。
+
+        `_collect_drawib_referenced_bone_ids` 要遍历该 DrawIB 全部源对象的顶点组
+        与顶点，而跨组判定会在「组 × 部件」上反复询问同一结果（本组合集、异组
+        反查、诊断各一次），必须记忆化，否则导出耗时随部件数成倍增长。
+        """
+        cache = getattr(self, "_merged_referenced_bone_ids_cache", None)
+        if cache is None:
+            cache = {}
+            self._merged_referenced_bone_ids_cache = cache
+        key = str(draw_ib)
+        if key not in cache:
+            cache[key] = set(self._collect_drawib_referenced_bone_ids(key))
+        return cache[key]
+
+    def _merged_cross_group_component_ids(self, skeleton_group: int) -> list[int]:
+        """本组几何里**引用到的骨骼归属在别的骨架组**的组件号（升序）。
+
+        实测场景（`洛克茜` 复现件，2026-10-10）：G0 的 `4e6d8882-1704-0`（骨 id
+        {1,2}）被合进 G2 宿主 `4e6e989e` 的 `4e6e989e-11700-0` 网格（合并 Blend
+        4562 行，其中异组 624 行、位置 [3066,3689]），而绘制合并几何的 deform VS
+        绑的是**宿主组**缓冲 ⇒ 必须在宿主组缓冲里把 {1,2} 写出来。
+
+        判据与 `_merged_component_geometry_absorbed` 同源（权威口径）：
+        `(本组各部件引用的骨骼 id 并集) − 本组合法槽位` 非空 ⇒ 存在跨组吸收；
+        再用每个组件的 `[vg_offset, vg_offset+vg_count)` 反查骨骼归属组件。
+        关闭开关时返回空列表（保持历史行为，由守卫报警）。
+        """
+        if not self._merged_cross_group_enabled():
+            return []
+        member_ids = [int(cid) for cid in self._merged_group_component_ids(skeleton_group)]
+        legal: set[int] = set()
+        referenced: set[int] = set()
+        for component_id in member_ids:
+            component = self.merged_skeleton_components[component_id]
+            offset = int(component["vg_offset"])
+            legal.update(range(offset, offset + int(component["vg_count"])))
+            referenced |= self._merged_referenced_bone_ids(component["draw_ib"])
+        offending = referenced - legal
+        if not offending:
+            return []
+        member_set = set(member_ids)
+        owners: list[int] = []
+        for component_id, component in enumerate(self.merged_skeleton_components):
+            if component_id in member_set:
+                continue
+            offset = int(component["vg_offset"])
+            if any(
+                bone_id in offending
+                for bone_id in range(offset, offset + int(component["vg_count"]))
+            ):
+                owners.append(int(component_id))
+        return owners
+
+    def _merged_cross_host_group_map(self) -> dict[int, list[int]]:
+        """跨组供骨件 → 吸收它的宿主骨架组列表（升序；开关关闭时恒空）。
+
+        `_merged_cross_group_component_ids` 的反向索引：后者按「宿主组」回答「本组
+        几何引用了哪些别组部件」，这里按「部件」回答「我被哪些宿主组吸收了」——
+        生成跨组件自己的 deform 段时需要它（跨组 attach 的 `run` 与合并几何重放的
+        落点，见 `_append_merged_cross_group_replays`）。
+        """
+        cache = getattr(self, "_merged_cross_host_group_cache", None)
+        if cache is not None:
+            return cache
+        cache: dict[int, list[int]] = {}
+        for group in self._merged_skeleton_groups():
+            for component_id in self._merged_cross_group_component_ids(int(group)):
+                cache.setdefault(int(component_id), []).append(int(group))
+        for component_id in list(cache):
+            cache[component_id] = sorted(set(cache[component_id]))
+        self._merged_cross_host_group_cache = cache
+        return cache
+
+    def _merged_cross_group_offending_bone_ids(self, skeleton_group: int) -> set[int]:
+        """本组几何引用、归属却在别组的骨骼 id（诊断用；口径同上）。"""
+        member_ids = [int(cid) for cid in self._merged_group_component_ids(skeleton_group)]
+        legal: set[int] = set()
+        referenced: set[int] = set()
+        for component_id in member_ids:
+            component = self.merged_skeleton_components[component_id]
+            offset = int(component["vg_offset"])
+            legal.update(range(offset, offset + int(component["vg_count"])))
+            referenced |= self._merged_referenced_bone_ids(component["draw_ib"])
+        return referenced - legal
+
+    def _merged_cross_group_host_component_ids(self, skeleton_group: int) -> set[int]:
+        """本组里**几何吸收了别组部件**的组件号（F3-CS；开关关闭时恒空）。
+
+        与 `_merged_group_absorbed_hosts` 的区别：后者只认**组内**吸收（`legal`
+        判据限本组合法槽位），跨组引用根本不在它的判定范围内；这里专门回答
+        「本组哪个部件的导出网格里混进了别组顶点」——它就是合并几何的**宿主**，
+        其 SO 引用必须被捕获，跨组重发布（蒙皮 CS）才有落点。
+        """
+        if not self._merged_cross_group_enabled():
+            return set()
+        offending = self._merged_cross_group_offending_bone_ids(skeleton_group)
+        if not offending:
+            return set()
+        hosts: set[int] = set()
+        for component_id in self._merged_group_component_ids(skeleton_group):
+            component = self.merged_skeleton_components[component_id]
+            if self._merged_referenced_bone_ids(component["draw_ib"]) & offending:
+                hosts.add(int(component_id))
+        return hosts
+
+    def _merged_cross_group_publish_plan(self, skeleton_group: int) -> dict | None:
+        """跨组吸收宿主组的**蒙皮 CS 发布计划**（F3-CS；只服务直连路径）。
+
+        为什么需要它（2026-10-10 FrameAnalysis + 用户实机症状「一帧延迟、运动时
+        错位、静止正常」）：合并几何挂在宿主（实测 `4e6e989e-11700-0`，G2）自己的
+        deform draw 上，而它的骨骼 = 本组 + 被吸收的跨组件（`4e6d8882`，G0）。
+        宿主那段无论怎么排都会在**自己到达时**就把 SO 写掉，此时跨组件若还没到
+        （实测宿主 deform=000020 早于跨组件 000023）⇒ 写进去的是**上一帧**的跨组
+        骨骼。把跨组件并入守卫到达集合（F3）只能让 **draw 版重放**推迟到最后一个
+        供骨件，而 draw 版重放受 IA 输入布局限制（跨组件 BI4 vs 宿主 BW16_BI16 ⇒
+        `_merged_absorbed_replay_compatible` 为假，重放会把 BLENDINDICES 按错格式
+        解释）。蒙皮 CS 从 SRV 读顶点属性、按索引写 SO ⇒ **与 IA 布局无关、幂等**，
+        最后一个到达的必需部件派发即最终内容 —— 这正是它存在的意义。
+
+        返回的字典与 `_build_merged_mesh_redirect_plan` 的计划同键（供
+        `_merged_skin_publish_supported` / `_append_merged_skin_publish_block` /
+        CS 段定义共用），`cross_group=True` 只作来源标记。取不到宿主 / 顶点数为 0
+        时返回 None（保持历史行为）。
+        """
+        hosts = self._merged_cross_group_host_component_ids(skeleton_group)
+        if not hosts:
+            return None
+        if self._merged_group_redirect_target(skeleton_group):
+            # 该宿主组走重定向路径：合并几何的发布点由它自己的计划（载体/锚点）决定，
+            # 不在这里叠加第二套。
+            return None
+        candidates = [
+            self.merged_skeleton_components[component_id] for component_id in sorted(hosts)
+        ]
+        # 合并几何挂在**导出顶点数最多**的宿主上（其余宿主是自己那段的几何）。
+        host = max(
+            candidates,
+            key=lambda component: self._drawib_exported_vertex_count(
+                str(component["draw_ib"])
+            ),
+        )
+        host_ib = str(host["draw_ib"])
+        vertex_count = int(self._drawib_exported_vertex_count(host_ib))
+        if vertex_count <= 0:
+            return None
+        position_layout = self._drawib_category_layout(host_ib, "Position") or {}
+        required = set(self._merged_group_component_ids(skeleton_group))
+        required.update(self._merged_cross_group_component_ids(skeleton_group))
+        return {
+            "cross_group": True,
+            "target_ib": host_ib,
+            "deform_draws": [
+                (
+                    f"Resource{host_ib}Position",
+                    f"Resource{host_ib}Blend",
+                    vertex_count,
+                )
+            ],
+            "deform_draw_ibs": [host_ib],
+            "so_prefix_rows": 0,
+            "so_stride": int(position_layout.get("stride", 0) or 0),
+            "anchor_layout_key": self._drawib_blend_layout_signature(host_ib),
+            "anchor_layout": self._drawib_category_layout(host_ib, "Blend"),
+            "required_component_ids": sorted(required),
+        }
+
+    def _merged_cross_group_publish_plans(self) -> dict[int, dict]:
+        """``{宿主组: 跨组发布计划}``（F3-CS；按需构建并记忆化）。"""
+        cache = getattr(self, "_merged_cross_group_publish_plan_cache", None)
+        if cache is not None:
+            return cache
+        cache: dict[int, dict] = {}
+        for group in self._merged_skeleton_groups():
+            plan = self._merged_cross_group_publish_plan(int(group))
+            if plan:
+                cache[int(group)] = plan
+        self._merged_cross_group_publish_plan_cache = cache
+        return cache
+
     def _merged_determinable_component_ids(
         self, component_ids, fallback_to_all: bool = True
     ) -> list[int]:
@@ -3676,11 +3872,36 @@ class ExportZZMI(ExportUnity):
             )
 
         # 4) 顶层无条件 attach（每个 (部件, 槽) 一条 run；run 绝不进 if）
+        #
+        # 4b) 跨组合并（F1，开关 `cross_group_merged_vgmap_test`）：本组几何里被吸收
+        #     进来的**别组**部件，其骨骼必须写进**本组**缓冲——绘制合并几何的 deform
+        #     VS 绑的是本组缓冲（`vs-t0 = ..._G<本组>_s<槽>`），写进它自己组没有任何人
+        #     读（实机症状：被吸收的顶点读到未初始化矩阵 ⇒ 塔陷 ⇒ 部件消失）。
+        #     槽位 = 全局骨 id，缓冲是全宽（array = 全部骨骼数×3），因此跨组 attach
+        #     与宿主 attach 不会写同一个槽，可以安全地叠在宿主 attach 之后。
         for slot in slots:
             for group_component_id in self._merged_group_component_ids(skeleton_group):
                 texture_override_vb_section.append(
                     f"run = {self._merged_attach_name(group_component_id, slot)}"
                 )
+            for cross_component_id in self._merged_cross_group_component_ids(skeleton_group):
+                texture_override_vb_section.append(
+                    "run = "
+                    + self._merged_cross_attach_name(
+                        cross_component_id, skeleton_group, slot
+                    )
+                )
+            # 4c) 本部件若**自己**是别组的跨组供骨件（F3）：在自己那段也跑一次「写宿主组
+            #     缓冲」的跨组 attach。宿主那段同样会跑它，但读到的是本部件**上一帧**的
+            #     palette（宿主排在前面时）⇒ 那一笔是陈旧的，必须在这里用当帧 palette 补。
+            for host_group in self._merged_cross_host_group_map().get(int(component_id), []):
+                texture_override_vb_section.append(
+                    "run = "
+                    + self._merged_cross_attach_name(component_id, int(host_group), slot)
+                )
+
+        # 4.5) 【已回退】F5 曾在此处（attach 之后）追加一次捕获以实现跨组同帧化，
+        #      用户实测导致「两侧都抖、骨骼矩阵不对」——原因见 3) 上方注释。
 
         # 5) 默认换绑本组 s<slot_first> 骨架（每槽绘制按需按槽覆盖）
         texture_override_vb_section.append(
@@ -4633,7 +4854,7 @@ class ExportZZMI(ExportUnity):
         return sorted({int(c["skeleton_group"]) for c in self.merged_skeleton_components})
 
     # ------------------------------------------------------------------
-    # 跨组别引用守卫（无校准模式：禁止跨组别骨骼合并）
+    # 跨组别引用守卫（开关关闭 = 无校准模式：禁止跨组别骨骼合并；开启 = 按来源拆分绘制已接入）
     # ------------------------------------------------------------------
 
     #: 「该骨骼不属于任何导出组件」在守卫内部的**类型统一**哨兵（负数，永不与
@@ -4681,15 +4902,34 @@ class ExportZZMI(ExportUnity):
         return used
 
     def _warn_cross_group_bone_references(self):
-        """禁止跨组别骨骼合并（无校准模式）守卫：逐部件校验引用骨骼都在本组内。
+        """跨组骨骼引用的守卫（开关感知）。
 
-        无 CB1 校准的运行时，每组骨架只在 deform pass 直拷本组骨骼；
-        顶点引用其它组的骨骼 id 时，对应槽位永远不会被写入 = 原点塌陷。
-        检出即大声报警（列出越界骨骼 id 与归属组），不中断导出——
-        与 _warn_missing_drawib_parts 同款"让用户看见"口径。
+        历史口径（`cross_group_merged_vgmap_test` 关闭时仍然适用）：无 CB1 校准的
+        运行时，每组骨架只在 deform pass 直拷本组骨骼；顶点引用其它组的骨骼 id 时，
+        对应槽位永远不会被写入 = 原点塌陷。检出即大声报警（列出越界骨骼 id 与归属
+        组），不中断导出——与 _warn_missing_drawib_parts 同款"让用户看见"口径。
+
+        开关开启后（2026-10-10 定案：**按来源拆分绘制 + 各回各家**）：这些槽位由**跨组
+        attach** 写进吸收它的宿主组缓冲（`AttachX_C<部件>_g<宿主组>_s<槽>`），骨骼按
+        全局骨 id 落在宿主组骨架的对应槽位里 ⇒ 不再是"永远不会被写入"；几何侧由
+        `_append_merged_render_split_draws` 按**顶点组归属**把合并网格的索引切成若干段，
+        每段**放回该来源自己的渲染段**里画（`ib`/`vb1`/`vb0` 由该段自己绑成合并网格的
+        那一份）——那里的 `vs-cb1` 天然就是它自己的当帧对象变换，因此**不依赖帧内绘制
+        顺序**、也不需要跨对象空间的校准矩阵。因此改为如实报告「已接入 + 剩余风险」。
+        （历史路线全部实测否决并移除：F4/F7「在宿主渲染段用当帧 cb1 重跑校准再写回顶点
+        流」——重算 CS 实际未执行，且把 mod 自建缓冲当 `vb0` 的四次尝试全部静默失败；
+        F5「把 palette 捕获也后移，让两者同属上一帧」——合并骨架缓冲是宿主与跨组供骨件
+        **共用**的 ⇒ 整块骨架（含宿主自己的骨骼）一起慢一帧 ⇒ 用户实测「无论哪边都在
+        抖、骨骼矩阵不对」，连原始物体都错。）
+        **残余**：① 某来源部件本帧未被游戏提交渲染时，它那一段不会被画（与游戏自身的
+        剔除口径一致，方向比"用陈旧 cb1 画错"更安全）；② palette / cb1 首帧未捕获时该帧
+        骨架为未初始化值（一帧闪动，随后自愈）；③ 读不到合并 Blend/Index 时退回单次绘制
+        并落 CROSS_GROUP_ATTACH 诊断。
+        绝不谎称已修复。
         """
         if not self.merged_skeleton_components:
             return
+        cross_enabled = self._merged_cross_group_enabled()
         unknown_group = int(type(self).UNKNOWN_BONE_GROUP)
         # 每组合法骨骼 id 集合 = 该组全部导出组件槽位并集（缺席部件的骨骼不会
         # attach，也不可被引用——同组缺席部件被并入现成对象同样会报警）
@@ -4730,6 +4970,23 @@ class ExportZZMI(ExportUnity):
                 "未知（不在导出组件范围）" if group_id == unknown_group else group_id
                 for group_id in offending_group_ids
             ]
+            if cross_enabled:
+                print(
+                    f"[ZZMI骨骼合并] 跨组骨骼合并已接入（按来源拆分绘制）: DrawIB {draw_ib} "
+                    f"（骨架组 G{skeleton_group}）的顶点引用了别组骨骼 id "
+                    f"{offending}（归属组: {offending_groups}）——这些槽位由跨组 attach "
+                    f"写入**吸收它的宿主组**骨架缓冲，几何侧则按顶点组把合并网格的索引"
+                    f"拆成若干段、每段放回**该来源自己的渲染段**里画（那里的 vs-cb1 天然"
+                    f"就是它自己的当帧对象变换），因此不再塌陷、也不依赖帧内绘制顺序。"
+                )
+                print(
+                    "[ZZMI骨骼合并] 残余：① 某来源部件本帧未被游戏提交渲染时，它那一段"
+                    "不会被画（与游戏自身的剔除口径一致）；② palette / cb1 首帧未捕获时"
+                    "该帧骨架为未初始化值（一帧闪动后自愈）；③ 读不到合并 Blend/Index 时"
+                    "退回单次绘制并落 CROSS_GROUP_ATTACH 诊断。历史路线 F4/F7（渲染段重算"
+                    "校准再写回顶点流）与 F5（palette 捕获后移）均已实测否决并移除。"
+                )
+                continue
             print(
                 f"[ZZMI骨骼合并] !!! 禁止跨组别骨骼合并: DrawIB {draw_ib} "
                 f"（骨架组 G{skeleton_group}）的顶点引用了非本组骨骼 id "
@@ -6053,6 +6310,85 @@ class ExportZZMI(ExportUnity):
                     section.append(f"x2 = {pose_key_var}")
                 section.new_line()
 
+        # 跨组 attach（F1）：本组几何吸收了**别组**部件时，把那些部件的骨骼写进本组
+        # 缓冲。段名带宿主组号（`AttachX_C<跨组件>_g<宿主组>_s<槽>`），与写自身组的
+        # `Attach_C<跨组件>_s<槽>` 并存、互不覆盖；调色板/VgMap 仍取**跨组件自己**的
+        # 资源（它的 deform 段照常跑、palette 照常捕获），只有写入目标换成宿主组缓冲。
+        #
+        # 残余（写进产物注释，不许当成"已修复"）：跨组件的 palette 捕获发生在它自己
+        # 的 deform 段，帧内顺序若在宿主段之后，则本段读到的是**上一帧**的姿态。
+        # 静止时帧差 ≈ 0（实测 0.00000°/6e-6 单位），运动中可能有一帧级延迟。
+        for skeleton_group in groups:
+            cross_component_ids = self._merged_cross_group_component_ids(skeleton_group)
+            if not cross_component_ids:
+                continue
+            if self._merged_cross_group_enabled():
+                offending = sorted(
+                    self._merged_cross_group_offending_bone_ids(skeleton_group)
+                )
+                self._append_merged_diag(
+                    section,
+                    self._merged_diag(
+                        ZZMI_MERGE_DIAG_CROSS_GROUP_ATTACH,
+                        "跨组骨骼合并（F1）：别组部件的骨骼写入吸收它的宿主组缓冲。",
+                        group=f"G{int(skeleton_group)}",
+                        components=",".join(str(int(cid)) for cid in cross_component_ids),
+                        bone_ids=",".join(str(int(bone_id)) for bone_id in offending),
+                        owner_groups=",".join(
+                            sorted(
+                                {
+                                    f"G{int(self.merged_skeleton_components[cid]['skeleton_group'])}"
+                                    for cid in cross_component_ids
+                                }
+                            )
+                        ),
+                    ),
+                )
+            for cross_component_id in cross_component_ids:
+                cross_component = self.merged_skeleton_components[cross_component_id]
+                vg_count = int(cross_component["vg_count"])
+                dispatch_count = max(
+                    1,
+                    (vg_count + self.MERGED_SKELETON_ATTACH_THREADS - 1)
+                    // self.MERGED_SKELETON_ATTACH_THREADS,
+                )
+                for slot in slots:
+                    section.append(
+                        "["
+                        + self._merged_cross_attach_name(
+                            cross_component_id, skeleton_group, slot
+                        )
+                        + "]"
+                    )
+                    section.append(
+                        "flags = optimization_level3 all_resources_bound skip_validation"
+                    )
+                    # 拆分绘制路线：跨组 attach 也是**直拷** —— 源件骨骼留在**它自己的
+                    # 对象空间**里（不做任何换算），几何由该来源自己的渲染段用**它自己的
+                    # cb1** 单独绘制一次摆到世界（`_append_merged_render_split_draws`）。
+                    # 因此这里既不需要校准常量缓冲，也不需要校准版 CS。
+                    section.append(
+                        "cs = " + self._merged_calibrated_attach_shader_path()
+                    )
+                    section.append("x1 = 0")
+                    section.append(f"y1 = {vg_count}")
+                    section.append(
+                        "cs-t0 = ref "
+                        + self._merged_palette_name(cross_component["draw_ib"], slot)
+                    )
+                    section.append(
+                        f"cs-t1 = ref ResourceZZVgMap_{cross_component['draw_ib']}"
+                    )
+                    # 拆分绘制路线：attach 直拷源件骨骼（留在源件自己的对象空间），
+                    # 由源件自己的 cb1 在它那一段绘制里摆到世界 ⇒ 不需要校准常量缓冲。
+                    section.append(
+                        "cs-u0 = ref "
+                        + self._merged_skeleton_name(int(skeleton_group), slot)
+                    )
+                    section.append(f"Dispatch = {dispatch_count}, 1, 1")
+                    section.append("cs-u0 = null")
+                    section.new_line()
+
         # ---------------------------------------------------------------
         # 通道骨键 → 槽位 的池（t75 唯一判定口径）
         #
@@ -6644,7 +6980,8 @@ class ExportZZMI(ExportUnity):
                 f"[ZZMI骨骼合并] 合并骨架: {len(self.merged_skeleton_components)} 个部件, "
                 f"缓冲 {buffer_slots} 槽（max(vg_offset+vg_count)）"
             )
-            # 跨组别引用守卫（无校准模式）：引用其它组骨骼 = 运行时塌陷，大声报警
+            # 跨组别引用守卫（开关关闭 = 无校准模式：引用其它组骨骼 = 运行时塌陷，大声报警；
+            # 开关开启 = F1 写进宿主组缓冲 + F2 渲染 cb1 校准）
             self._warn_cross_group_bone_references()
             # 合并网格自动重定向计划先按现有实现计算；RedirectSO 这条路径在
             # 部分 ZZMIv1 帧序下会让完整合并物体整块消失，因此默认关闭。
