@@ -875,14 +875,20 @@ class ExportZZMI(ExportUnity):
         合并骨架模式下用户可自由 join/删改。占位规则（用户拍板）：
         - **部分缺失的 DrawIB**：缺失组件直接补占位（其几何显然被同 DrawIB 的
           幸存对象接管）；
-        - **整个 DrawIB 缺席**：看它**自属声明段**内（VGMap ∪ [VGOffset, VGOffset
-          + VGCount)）的全局骨骼 id 是否被现存对象的顶点实际引用（权重>0）——
-          被引用 = 几何被合并进了别的对象 → 全组件补占位（游戏内不可见的小三角，
-          抑制原版 draw 防止重影）；零引用 = 用户压根不想生成 → 保持原样不插桩
-          （该 DrawIB 不进入 mod，游戏内显示原版）。
+        - **整个 DrawIB 缺席**：以**局部顶点组归属**为准判定「它的几何是不是被
+          并进了现存对象」——缺席部件**自属声明段**内（VGMap ∪ [VGOffset,
+          VGOffset + VGCount)）的全局骨骼 id 必须被「**现存对象自己没声明过**的
+          引用」命中才算证据（即该引用无法用引用方自己的局部顶点组解释）→
+          全组件补占位（游戏内不可见的小三角，抑制原版 draw 防止重影）；否则 =
+          用户压根不想生成 → 保持原样不插桩（该 DrawIB 不进入 mod，游戏内显示
+          原版）。
           **去重借位值不算证据**（2026-09-16 叶瞬光01 脸部被误插占位事故：借位
-          canonical 槽位被载体对象引用被误读成「几何被吸收」，详见
-          `_is_drawib_absorbed`）。
+          canonical 槽位被载体对象引用被误读成「几何被吸收」）；**引用方自己声明
+          的槽位也不算证据**（2026-10-14 合并组误判：A 的顶点组 {1,2,3,4,5}、
+          B 的 {5,6,7,8}，5 是去重时合并的「合并组」且 canonical 落在 B 的自属
+          声明段；只导出 A 时 A 用的是自己的局部骨骼 5，旧口径却读成「B 被并进
+          A」→ 给根本没被 join 的 B 补了占位）。详见 `_is_drawib_absorbed` /
+          `_collect_foreign_used_group_ids`。
         无反查数据（json 无 VGMap）的缺席 DrawIB 一律不插桩。
         - **dedup_excluded 正交**（VGMapDedupExcluded=True）：该部件即使被引用
           也不生成占位——显式排除优先于 absorbed 判定（对齐 EFMI，用户意图
@@ -948,7 +954,9 @@ class ExportZZMI(ExportUnity):
             if target_workspace:
                 present.add(self._zzmi_bare_workspace_unique(target_workspace))
 
-        used_group_ids = None  # 惰性计算：首个全缺 DrawIB 需要判定时才算
+        # 惰性计算：首个「整个 DrawIB 缺席」需要判定时才算。
+        # 只收「引用方自己没声明过」的槽位（局部顶点组归属口径）。
+        foreign_used_group_ids = None
 
         # 阻断修复（t81 阻断④）：本次决策为「按用户意图不生成」的部件身份集合。
         # 光 `continue` 只表示**不建占位**，DrawCall 仍留在
@@ -973,9 +981,13 @@ class ExportZZMI(ExportUnity):
                 # 整个 DrawIB 在场景里缺席：判定几何是否被合并进其它对象
                 # （`any(member in present ...)` 这条"有声明身份"的旧分支已并入：
                 #  两种情况下都只能靠几何吸收证据决定补不补占位）。
-                if used_group_ids is None:
-                    used_group_ids = self._collect_used_group_ids(ordered)
-                if self._is_drawib_absorbed(draw_ib, workspace_root, used_group_ids):
+                if foreign_used_group_ids is None:
+                    foreign_used_group_ids = self._collect_foreign_used_group_ids(
+                        ordered
+                    )
+                if self._is_drawib_absorbed(
+                    draw_ib, workspace_root, foreign_used_group_ids
+                ):
                     stub_members = members
                     print(
                         f"[ZZMI骨骼合并] DrawIB {draw_ib} 没有对象，但其本部件专属骨骼槽位"
@@ -983,8 +995,8 @@ class ExportZZMI(ExportUnity):
                     )
                 else:
                     print(
-                        f"[ZZMI骨骼合并] DrawIB {draw_ib} 无对象且本部件专属骨骼槽位未被引用，"
-                        "按用户意图不生成"
+                        f"[ZZMI骨骼合并] DrawIB {draw_ib} 无对象且本部件专属骨骼槽位"
+                        "未被其它模型引用，按用户意图不生成"
                     )
                     skipped_identities.update(members)
                     continue
@@ -1118,7 +1130,10 @@ class ExportZZMI(ExportUnity):
         return all_slots
 
     def _is_drawib_absorbed(
-        self, draw_ib: str, workspace_root: str, used_group_ids: set[int]
+        self,
+        draw_ib: str,
+        workspace_root: str,
+        foreign_used_group_ids: set[int],
     ) -> bool:
         """判定整个缺席的 DrawIB 的**几何**是否已被合并进其它对象（几何归属口径）。
 
@@ -1134,28 +1149,39 @@ class ExportZZMI(ExportUnity):
         槽位，仅凭这些槽位被载体对象引用就被判「已被合并」并注入极限小三角
         占位（同类样本：``869976a3-5202-0`` 的 VGMap 借位槽位 185/200）。
 
-        ## 修正后的判据（对齐 EFMI 写盘域语义）
+        ## 判据（用户 2026-10-14 裁决：**以局部顶点组为准**）
 
-        吸收证据只看**本部件自属声明段** ``[VGOffset, VGOffset + VGCount)`` 内的
-        VGMap 值是否被现存对象顶点实际引用（权重>0）：
+        参数 ``foreign_used_group_ids`` 只包含「**引用方自己没声明过**的槽位引用」
+        （见 `_collect_foreign_used_group_ids`）——即那些引用无法用引用方自己的
+        局部顶点组（统一顶点组经 VGMap 反查回局部顶点组）解释，只能是别的部件的
+        局部骨骼连同几何一起进了这个对象。
 
-        - **真被 join 走**：本部件的顶点连同权重一起进了别人的对象，其中专属
-          骨骼（自属段身份）必然随之出现 → 证据非空 → 全组件补占位抑制原版
-          防重影（计划书 R7 ③ 行为不变）；
-        - **只是共享骨骼**：借位 canonical 槽位被引用，但本部件专属槽位无人引用
-          → 证据为空 → **不判定被吸收、不注入占位**（该 DrawIB 不进 mod，游戏
-          内保留原版绘制）。
+        吸收证据 = **本部件自属声明段** ``[VGOffset, VGOffset + VGCount)`` 内的
+        VGMap 值 ∩ ``foreign_used_group_ids`` 非空：
 
-        EFMI 能用「全量值域」这一宽松口径而不误判，是因为它的写盘域被
-        ``build_per_mesh_identity_map`` + ``validate_export_indices_in_segment``
-        钉在自属段内（canonical 借位会被改写成自身份），那里的
-        ``used ∩ vg_values`` 事实上等价于本函数现在的「自属段 ∩ used」。ZZMI
-        导出侧不写这层身份域，判据就必须自己把借位值排除掉。
+        - **真被 join 走**：本部件专属骨骼（自属段身份）随几何一起出现在别人的
+          对象里，而那些槽位**不是**引用方自己声明的 → 证据非空 → 全组件补占位
+          抑制原版防重影（计划书 R7 ③ 行为不变）；
+        - **只是共享骨骼（含本轮修复的「合并组」）**：本部件自属段槽位被引用，
+          但引用它的对象**自己也声明了同一个槽位**（去重把两部件的同一骨骼并成
+          canonical）→ 该引用被归属回引用方自己的局部顶点组 → 证据为空 →
+          **不判定被吸收、不注入占位**（该 DrawIB 不进 mod，游戏内保留原版绘制）。
+          实测误判场景（用户报告）：A 的顶点组 {1,2,3,4,5}、B 的 {5,6,7,8}，5 是
+          去重合并组且 canonical 落在 B 的自属声明段；只导出 A 时 A 确实引用了
+          5，但 5 在 A 自己的 VGMap 值域里（A 借位使用 canonical 槽）⇒ 非外来
+          引用 ⇒ B 没被 join 进 A ⇒ 不得给 B 补占位。
+
+        EFMI 侧的写盘域被 ``build_per_mesh_identity_map`` +
+        ``validate_export_indices_in_segment`` 钉在自属段内（canonical 借位会被
+        改写成自身份），所以它的 ``used ∩ vg_values`` 事实上等价于本函数现在的
+        「自属段 ∩ 非自属引用」。
 
         **退化情形**（没有任何自属段内的 VGMap 值：旧缓存缺 VGOffset/VGCount，
         或该部件全部骨骼都在去重中被别的部件选为 canonical）：写盘域证据不可
         构造，退回历史宽松口径（宁松勿漏——EFMI 侧 t37 实机裁决确认过「收紧会
-        让被合并部件不再生成占位、修坏合并骨骼」）。
+        让被合并部件不再生成占位、修坏合并骨骼」）；该宽松口径**仍然**只认非
+        自属引用（引用方自己声明过的槽位一律不计入），所以上面的合并组误判不会
+        在退化路径上复现。
 
         跨组别引用由 `_warn_cross_group_bone_references` 在导出时大声报警
         （无校准模式下已禁止）。
@@ -1166,8 +1192,8 @@ class ExportZZMI(ExportUnity):
         if not all_slots:
             return False
         if not own_segment_slots:
-            return bool(all_slots & used_group_ids)
-        return bool(own_segment_slots & used_group_ids)
+            return bool(all_slots & foreign_used_group_ids)
+        return bool(own_segment_slots & foreign_used_group_ids)
 
     def _zzmi_workspace_vg_count(self, workspace_unique_str: str) -> int | None:
         """读回工作空间里该部件的 VGCount（合并骨架数据）；无法判定返回 None。
@@ -1175,6 +1201,26 @@ class ExportZZMI(ExportUnity):
         ``None`` = 定位不到 json / 内容不可解析 ⇒ 调用方必须按旧行为（计入），
         不得当成 0。``0`` = 确证该部件是**普通路径**导入：几何用部件局部编号
         ``0..vg_count-1``，与合并骨架的全局槽位不是同一个编号空间。
+        """
+        json_path = self._zzmi_workspace_part_json_path(workspace_unique_str)
+        if json_path is None:
+            return None
+        try:
+            payload = JsonUtils.LoadFromFile(json_path)
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        try:
+            return int(payload.get("VGCount", 0) or 0)
+        except (TypeError, ValueError):
+            return None
+
+    def _zzmi_workspace_part_json_path(self, workspace_unique_str: str) -> str | None:
+        """定位部件写回的子网格 json（``<ws>/<LOD>/<bare>/TYPE_*/<bare>.json``）。
+
+        ``workspace_unique_str`` 既可能是裸身份也可能是带 LOD 前缀的身份
+        （``LOD1.<bare>``）；定位不到返回 ``None``。
         """
         workspace_root = GlobalConfig.path_workspace_folder()
         value = str(workspace_unique_str or "").strip()
@@ -1198,43 +1244,84 @@ class ExportZZMI(ExportUnity):
             if not type_dir.startswith("TYPE_"):
                 continue
             json_path = os.path.join(submesh_dir, type_dir, bare + ".json")
-            if not os.path.isfile(json_path):
-                continue
-            try:
-                payload = JsonUtils.LoadFromFile(json_path)
-            except Exception:
-                return None
-            if not isinstance(payload, dict):
-                return None
-            try:
-                return int(payload.get("VGCount", 0) or 0)
-            except (TypeError, ValueError):
-                return None
+            if os.path.isfile(json_path):
+                return json_path
         return None
 
-    def _collect_used_group_ids(self, ordered) -> set[int]:
-        """收集蓝图内全部对象实际引用（权重>0）的**全局骨骼槽位** id 集合。
+    def _zzmi_workspace_declared_slots(
+        self, workspace_unique_str: str
+    ) -> set[int] | None:
+        """读回部件**自己声明**的统一顶点组槽位（子网格 json 的 ``VGMap`` 值域）。
 
-        只统计**几何确实使用全局骨骼编号**的对象（合并骨架模式导入 ⇔ 子网格
-        json ``VGCount > 0``）。普通路径导入的部件顶点组名是**部件局部编号**
-        ``0..vg_count-1``，与合并骨架的全局槽位不是同一个编号空间；把它们的
-        ``0`` 当成全局槽位，会让 `_is_drawib_absorbed` 把「另一个部件的自属段
-        槽位 0 被引用」当成几何归属证据。
+        用于「以局部顶点组为准」的吸收判定：对象顶点引用的全局槽位若落在这个
+        集合里，说明该引用能用**它自己的局部顶点组**解释（去重借位使用 canonical
+        槽位属于此列），不构成「别的部件的几何被并进来」的证据。
 
-        实测事故（2026-10-14，快速局部导出左推进器 ``acfa670a``）：该部件
-        json ``VGCount=0``（普通路径，顶点组名只有局部编号 ``0``），而右翅膀尖
-        ``14cf141e`` 的自属声明段恰为 ``[0,1)`` ⇒ 编号空间不同却被求交命中，
-        误判「几何已被合并」并注入占位小三角面；该占位段把 ``vs-t0`` 覆盖成
-        合并骨架且**不恢复**，于是同帧紧随其后、**共享同一份 palette 资源
-        （hash 23de2d6a）因而不会重新绑定 vs-t0** 的左翅膀尖 ``1b655510``
-        被错误的骨架蒙皮 —— 游戏内消失 / 变形 + 高频闪烁（导出右推进器
-        ``760c8064`` 时左右对调，受害的是 ``14cf141e``）。
-
-        判定不到 json（``_zzmi_workspace_vg_count`` 返回 None）时按旧行为**计入**
-        —— 信息不足时宁可保守插桩，也不要漏掉真正被吸收的几何。
+        ``None`` = 定位不到 json / 内容不可解析 / 无 VGMap ⇒ 调用方必须**保留**
+        该对象的全部引用（信息不足时按旧口径计入，宁松勿漏）。
         """
-        used = set()
+        json_path = self._zzmi_workspace_part_json_path(workspace_unique_str)
+        if json_path is None:
+            return None
+        try:
+            payload = JsonUtils.LoadFromFile(json_path)
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        vg_map = payload.get("VGMap")
+        if not isinstance(vg_map, dict) or not vg_map:
+            return None
+        declared: set[int] = set()
+        for value in vg_map.values():
+            try:
+                slot = int(value)
+            except (TypeError, ValueError):
+                continue
+            if slot >= 0:
+                declared.add(slot)
+        return declared
+
+    def _collect_foreign_used_group_ids(self, ordered) -> set[int]:
+        """收集「引用方**自己没声明过**」的全局骨骼槽位引用（局部顶点组归属口径）。
+
+        合并骨架的去重会把跨部件共享的骨骼并成一个 canonical 全局槽位，于是
+        「引用方借位使用 canonical 槽位」与「引用方的网格里真的混进了别的部件
+        的几何」在**引用侧**长得一模一样；区分它们的唯一依据是**局部顶点组归属**
+        ——该引用能不能用引用方**自己的**局部顶点组（统一顶点组经 VGMap 反查）
+        解释。落在引用方自己 `VGMap` 值域里的槽位 = 自己的骨骼（借位或自身份），
+        不构成吸收证据；不在值域里的槽位 = 别的部件的局部骨骼连同几何一起进了
+        这个对象。
+
+        两个过滤（缺一不可）：
+
+        1. **编号空间**：只统计几何确实用**全局槽位编号**的对象（合并骨架模式
+           导入 ⇔ 子网格 json ``VGCount > 0``）。普通路径导入的部件顶点组名是
+           局部编号 ``0..vg_count-1``，与全局槽位不是同一个编号空间；把它们的
+           ``0`` 当成全局槽位，会让 `_is_drawib_absorbed` 把「另一个部件的自属段
+           槽位 0 被引用」当成几何归属证据。实测事故（2026-10-14，快速局部导出
+           左推进器 ``acfa670a``）：该部件 json ``VGCount=0``（普通路径，顶点组名
+           只有局部编号 ``0``），而右翅膀尖 ``14cf141e`` 的自属声明段恰为
+           ``[0,1)`` ⇒ 编号空间不同却被求交命中，误判「几何已被合并」并注入占位
+           小三角面；该占位段把 ``vs-t0`` 覆盖成合并骨架且**不恢复**，于是同帧
+           紧随其后、**共享同一份 palette 资源（hash 23de2d6a）因而不会重新绑定
+           vs-t0** 的左翅膀尖 ``1b655510`` 被错误的骨架蒙皮 —— 游戏内消失 /
+           变形 + 高频闪烁（导出右推进器 ``760c8064`` 时左右对调，受害的是
+           ``14cf141e``）。
+        2. **局部顶点组归属**（本次修复，2026-10-14）：引用方 json 的 ``VGMap``
+           值域内的槽位一律不计入（见 `_zzmi_workspace_declared_slots`）。实测
+           误判（用户报告）：A 的顶点组 {1,2,3,4,5}、B 的 {5,6,7,8}，5 是去重时
+           合并的「合并组」且 canonical 落在 B 的自属声明段；只导出 A 时 A 确实
+           引用了 5（用的是自己的局部顶点组），旧口径把它读成「B 被并进 A」→
+           给根本没被 join 的 B 补了占位。
+
+        判定不到部件 json（`_zzmi_workspace_vg_count` / `_zzmi_workspace_declared_slots`
+        返回 None）时按旧行为**计入** —— 信息不足时宁可保守插桩，也不要漏掉真正
+        被吸收的几何。
+        """
+        foreign = set()
         vg_count_cache: dict[str, int | None] = {}
+        declared_cache: dict[str, set[int] | None] = {}
         for draw_call in ordered:
             try:
                 obj_name = draw_call.get_blender_obj_name()
@@ -1256,6 +1343,11 @@ class ExportZZMI(ExportUnity):
                 if vg_count is not None and vg_count <= 0:
                     # 局部编号空间：组名不是全局槽位，不构成「引用了别人自属段」的证据
                     continue
+                if unique_str not in declared_cache:
+                    declared_cache[unique_str] = self._zzmi_workspace_declared_slots(
+                        unique_str
+                    )
+            declared = declared_cache.get(unique_str)
             mesh = getattr(obj, "data", None) if obj is not None else None
             vertices = getattr(mesh, "vertices", None)
             if vertices is None:
@@ -1269,9 +1361,14 @@ class ExportZZMI(ExportUnity):
                         group_name = str(obj.vertex_groups[group_index].name).strip()
                     except (AttributeError, IndexError, TypeError, ValueError):
                         continue
-                    if group_name.isdigit():
-                        used.add(int(group_name))
-        return used
+                    if not group_name.isdigit():
+                        continue
+                    slot = int(group_name)
+                    if declared is not None and slot in declared:
+                        # 引用方自己的局部顶点组：不构成几何吸收证据
+                        continue
+                    foreign.add(slot)
+        return foreign
 
     def _build_shader_replace_base_vertex_map(self) -> dict[int, int]:
         """返回重定向 DrawCall 身份到 base_vertex 的映射。"""

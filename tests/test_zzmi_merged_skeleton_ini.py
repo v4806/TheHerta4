@@ -2600,6 +2600,92 @@ class ZZMIStubObjectTests(unittest.TestCase):
         self.assertNotIn("LOD0.84618ee0-1164-22296", names)
         self.assertEqual(exporter._zzmi_stub_object_names, [])
 
+    def test_no_stub_when_shared_dedup_group_is_declared_by_referrer(self):
+        """用户报告（2026-10-14）：去重合并组不得把**未 join** 的部件误判成被吸收。
+
+        A 的顶点组 {1,2,3,4,5}、B 的 {5,6,7,8}，其中 5 是顶点组去重时合并的
+        「合并组」且 canonical 落在 **B** 的自属声明段 [5,9)；只导出 A 时 A 确实
+        引用了 5，但 5 在 **A 自己的** VGMap 值域里（A 借位使用 canonical 槽）
+        ⇒ 该引用能用 A 自己的局部顶点组解释 ⇒ B 没被 join 进 A ⇒ 不得给 B 补占位
+        （游戏内保留原版绘制）。
+
+        可证伪：修复前 foreign 集合 = 全部引用（{1,2,3,4,5}）⇒ 命中 B 自属段槽位
+        5 ⇒ 误插占位且把 B 从「不生成」名单里摘掉（必红）。
+        """
+        # B：自属声明段 [5,9)，VGMap 5..8
+        self._write_vgmap_json_full(
+            "b2222222-2-0",
+            {str(i): 5 + i for i in range(4)},
+            vg_offset=5,
+            vg_count=4,
+        )
+        # A：自属声明段 [1,6)，VGMap 1..5（5 = 借位使用 B 的 canonical 槽）
+        self._write_vgmap_json_full(
+            "a1111111-1-0",
+            {str(i): 1 + i for i in range(5)},
+            vg_offset=1,
+            vg_count=5,
+        )
+        self._write_component_map(
+            {
+                "a1111111": {"0": "a1111111-1-0"},
+                "b2222222": {"0": "b2222222-2-0"},
+            }
+        )
+        self._register_present_object_with_groups("LOD0.a1111111-1-0", [1, 2, 3, 4, 5])
+
+        dcm = sys.modules[f"{PKG}.common.draw_call_model"].DrawCallModel
+        carrier = dcm(obj_name="LOD0.a1111111-1-0")  # 场景里真实存在
+        absent = dcm(obj_name="LOD0.b2222222-2-0")  # 声明了，场景里没有
+        ordered = [carrier, absent]
+        exporter = _make_exporter([], merged_vgmap=True, ordered_drawcalls=ordered)
+
+        names = [str(dc.get_workspace_unique_str()) for dc in ordered]
+        self.assertNotIn(
+            "LOD0.b2222222-2-0",
+            names,
+            "未被 join 的部件不得被插桩（游戏内应显示原版）",
+        )
+        self.assertEqual(exporter._zzmi_stub_object_names, [])
+
+    def test_stub_when_referrer_uses_group_it_never_declared(self):
+        """对照组：引用方引用了**自己没声明过**的槽位 ⇒ 真吸收 ⇒ 仍必须补占位。
+
+        A 的对象引用 {1,2,3,4,5}，但 A 的 json 只声明 {1,2,3,4}（第 5 组来自被
+        join 进来的 B 的几何）⇒ 5 无法用 A 自己的局部顶点组解释 ⇒ B 补占位抑制
+        原版 draw 防止重影（计划书 R7 ③）。
+        """
+        self._write_vgmap_json_full(
+            "b2222222-2-0",
+            {str(i): 5 + i for i in range(4)},
+            vg_offset=5,
+            vg_count=4,
+        )
+        self._write_vgmap_json_full(
+            "a1111111-1-0",
+            {str(i): 1 + i for i in range(4)},
+            vg_offset=1,
+            vg_count=4,
+        )
+        self._write_component_map(
+            {
+                "a1111111": {"0": "a1111111-1-0"},
+                "b2222222": {"0": "b2222222-2-0"},
+            }
+        )
+        self._register_present_object_with_groups("LOD0.a1111111-1-0", [1, 2, 3, 4, 5])
+
+        dcm = sys.modules[f"{PKG}.common.draw_call_model"].DrawCallModel
+        carrier = dcm(obj_name="LOD0.a1111111-1-0")
+        absent = dcm(obj_name="LOD0.b2222222-2-0")
+        ordered = [carrier, absent]
+        exporter = _make_exporter([], merged_vgmap=True, ordered_drawcalls=ordered)
+
+        names = [str(dc.get_workspace_unique_str()) for dc in ordered]
+        self.assertIn("LOD0.b2222222-2-0", names)
+        self.assertEqual(exporter._zzmi_stub_object_names, ["LOD0.b2222222-2-0"])
+        exporter._cleanup_stub_objects()
+
     def test_absorption_uses_numeric_vertex_group_name_not_blender_index(self):
         """替换模型组名稀疏时，吸收判定必须读取组名而不是内部索引。"""
         self._write_vgmap_json("84618ee0-22296-0", 7)
