@@ -102,6 +102,38 @@ Buffer<float4> ColliderPoints                    : register(t76);
 Buffer<uint4>  ColliderCellsFine                : register(t77);
 Buffer<float4> ColliderCellsCoarse              : register(t78);
 Buffer<float4> ColliderVertexL0                 : register(t79);
+// t80 = baked signed distance field of the collider surface (R32_FLOAT, linear).
+Buffer<float>  ColliderSDF                      : register(t80);
+// t83 = 碰撞体三角形的均匀网格（R32_UINT CSR）：
+//       [0..2]=dims.xyz [3]=tri_count [4]=cell_count [5]=idx_count
+//       [6]=max_per_cell [7]=保留
+//       [8 .. 8+cell_count]=每格在索引表中的起始
+//       其后=三角形索引列表
+// t84 = 网格里的三角形本体：每三角形 4 个 float4（3 个顶点 xyz + 定向面法线）
+Buffer<uint>   ColliderTriGrid                   : register(t83);
+Buffer<float4> ColliderTriGridTris               : register(t84);
+// ── B1（t6 修法）：碰撞三角形顶点实时蒙皮 ──────────────────────────────────
+// 数据源复用模组**已有**的 Blend 视图：ini 已绑 cs-t86 = ResourceDragJiggleBlendTyped_d5e1e7ff_A
+// （type = Buffer / format = R32G32B32A32_FLOAT / filename = Meshes/d5e1e7ff-Blend.buf
+//  ⇒ 19039×32B/16B = 38078 个 float4；第 gi 顶点的 float4#0 = BLENDWEIGHTS、float4#1 = BLENDINDICES）。
+// ⇒ 无需新增缓冲、无需重新导出：补丁只在 shader 侧补一条只读声明并按下标读取。
+// 索引语义（本任务自测，可复现：skin_b1_check.json）：2643 个角点指向 519 个全局顶点（值域 18520..19038）；
+//  这些顶点的 BLENDINDICES 取值 ∈ [87,155]（15 个不同槽）、权重和 = 1.0±1.2e-7、无 0xFFFFFFFF、
+//  零权重顶点 0 个 ⇒ 与 zz_vgmap（133 项）不是同一空间，**不过 vg_map**，直接是合并骨架槽号
+//  （≤155 < 212 槽）⇒ 取矩阵用 slot*3。
+Buffer<float4> BlendTyped                       : register(t86);
+Buffer<uint>   ColliderTriGridVerts             : register(t87);
+// 合并骨架池（ResourceZZMergedSkeleton_G3_s1）：每骨骼 3 个 float4，下标 = bone*3 + m。
+// 【双缓冲 B2 · 已修】合并骨架是 s1/s2 两帧 ping-pong：本帧 deform 段按 $zz_ms_occ_0 选一份写入
+//  （洛克茜.ini:374-396），而拖拽 CS 在渲染 draw 上执行 ⇒ 固定绑 s1 时，occ==2 的帧会读到**上一帧**骨架。
+//  verifier 实测灵敏度 ≈ −1.5 mm/度：滞后 0.35° 就耗尽零滞后余量（+0.13~+0.37 mm），
+//  滞后 3° ⇒ 197~202 行穿模（与静态面同级）。⇒ ini 侧改为按 $zz_ms_occ_0 条件绑定（见本补丁 ini hunk）。
+Buffer<float4> ColliderSkinSkeleton             : register(t88);
+
+// 【前向声明 A1】ReadColliderTri 的定义在下方（T16 锦点路径在定义之后才调用）；保留声明以防顺序调整后 fxc 报 undeclared identifier。
+bool CollisionSkinActive();
+float3 SkinColliderVertex(uint i);
+void ReadColliderTri(uint tri, out float3 ta, out float3 tb, out float3 tc, out float3 nOut);
 
 Texture1D<float4> IniParams : register(t120);
 
@@ -123,6 +155,293 @@ Texture1D<float4> IniParams : register(t120);
 #define COLLISION_BOX       IniParams[102]
 #define COLLISION_GRID      IniParams[103]
 #define COLLISION_META      IniParams[104]
+// SDF（带符号距离场）：把碰撞体表面变成连续的标量场，运行时一次三线性采样
+// 就得到「到表面的带符号距离」。
+//   [105]: xyz=origin(bmin), w=cell size
+//   [106]: xyz=dims(nx,ny,nz), w=band（表面 ±band 内精确，更远处饱和）
+// 碰撞约束退化为一句 d(p) >= d(p0)：连续、无洞、无最近点跳变，同时解决
+// 「平面少→有洞穿模」与「平面多→把顶点钉死」两个极端。
+#define COLLISION_SDF       IniParams[105]
+#define COLLISION_SDF_DIMS  IniParams[106]
+// 动态三角形网格（当前首选路径）：运行时按顶点当前位置现查邻域三角形，约束 =
+// 「到碰撞体表面的带符号距离不许比绑定姿态时更小」。导出侧把碰撞体三角形装进
+// 均匀网格（CSR），shader 侧查 27 邻域后对候选三角形算精确点-三角形距离。
+//   [108]: xyz=网格 origin(bmin), w=cell size
+//   [109]: xyz=网格 dims(nx,ny,nz), w=cell_count
+// 为什么必须动态查：绑定姿态下最近的 K 个三角形只覆盖顶点附近一小片曲面。
+// 实测位移 0.25 时顶点早已离开那 K 个，静态约束完全失效 —— 真实数据 235 顶点
+// × 12 方向 × 4 长度 = 11280 案例：静态 K=8 穿模 693、最大穿深 0.175（顶点
+// v22697 沿 [0.71,0,0.71] 拉 0.25 被完全放行，实际陷进大腿 0.175）。
+#define COLLISION_TRIGRID       IniParams[108]
+#define COLLISION_TRIGRID_DIMS  IniParams[109]
+
+// ===== T16 sock slide / weight projection (safe increment) =====================
+// Three gates (no new ABI dims): master IniParams[119].x / zone bit
+// ZoneParams[zone*2+1].z / direction bit PathVectors[zone].w.  When any is 0 this
+// whole block is inert => the off state stays byte-identical.
+// Weight channel: read the Blend typed view (t86, 32 B/vertex = 2xfloat4), write
+// BlendOut (u2, structured stride 32) which the ini re-binds as vb2 for deform.
+struct SockBlendRec { float4 w; uint4 i; };
+RWStructuredBuffer<SockBlendRec> SockBlendOut    : register(u2);
+#define SOCK_STROKE      0.2520     // t15 §5: effective stroke (beyond it the sock leaves the collider patch)
+#define SOCK_ROW_END     1099u      // write segment: sock rows [0,1099) (from the IB)
+#define SOCK_TOP_K       4u
+#define SOCK_CLAMP_DW    0.05       // per-slot clamp (t15 section 4)
+#define SOCK_LAM_EPS     1e-6
+
+bool ZoneIsPathSlide(uint zone);        // forward decl (defined below, near hlsl:359)
+
+bool SockSlideEnabled(uint zone)
+{
+    if (ZONE_RUNTIME_META.x <= 0.5)      return false;   // master gate
+    if (!ZoneIsPathSlide(zone))          return false;   // zone bit
+    if (PathVectors[zone].w <= 0.5)      return false;   // direction bit
+    return true;
+}
+
+// T41: a zero |t0| row carries no anchor data at all (l0q.xyz = 0, l0n = 0, l0.w = 0).
+// Such rows must never enter the slide / weight-projection paths: the anchor search
+// would otherwise land on a triangle near the object origin (row 179: 0.17~0.33 m jump).
+bool SockHasAnchor(uint vid)
+{
+    return abs(ColliderVertexL0[vid * 2u + 0u].w) > 0.0;
+}
+
+// Closest point + barycentrics on one triangle (edge/face candidates clamped, min wins;
+// identical formulation to the CPU port .dbg/rzm10/verify_sock.py::closest_bary).
+void SockClosestOnTri(float3 p, float3 a, float3 b, float3 c, out float3 q, out float3 lam)
+{
+    float3 ab = b - a, ac = c - a, ap = p - a;
+    float d1 = dot(ab, ap), d2 = dot(ac, ap);
+    float3 bp = p - b;
+    float d3 = dot(ab, bp), d4 = dot(ac, bp);
+    float3 cp = p - c;
+    float d5 = dot(ab, cp), d6 = dot(ac, cp);
+    float ab2 = dot(ab, ab), ac2 = dot(ac, ac), abac = dot(ab, ac);
+    float den = ab2 * ac2 - abac * abac;
+    den = abs(den) < 1e-30 ? 1e-30 : den;
+    float v = saturate((d1 * ac2 - d2 * abac) / den);
+    float w = saturate((d2 * ab2 - d1 * abac) / den);
+    float s = v + w;
+    if (s > 1.0) { v /= s; w /= s; }
+    float u = saturate(1.0 - v - w);
+    float tab = saturate(d1 / (abs(d1 - d3) < 1e-30 ? 1e-30 : (d1 - d3)));
+    float tac = saturate(d2 / (abs(d2 - d6) < 1e-30 ? 1e-30 : (d2 - d6)));
+    float dbc = (d4 - d3) + (d5 - d6);
+    float tbc = saturate((d4 - d3) / (abs(dbc) < 1e-30 ? 1e-30 : dbc));
+    float3 qab = a + ab * tab, qac = a + ac * tac, qbc = b + (c - b) * tbc;
+    float3 qf = a + ab * v + ac * w;
+    float dab = length(p - qab), dac = length(p - qac), dbcv = length(p - qbc), df = length(p - qf);
+    q = qf; lam = float3(u, v, w);
+    float best = df;
+    if (dab < best) { best = dab; q = qab; lam = float3(1.0 - tab, tab, 0.0); }
+    if (dac < best) { best = dac; q = qac; lam = float3(1.0 - tac, 0.0, tac); }
+    if (dbcv < best) { best = dbcv; q = qbc; lam = float3(0.0, 1.0 - tbc, tbc); }
+}
+
+// t39：绑定姿态顶点位置（只读 SRV，stride 40 与 vb0 同构）。
+// ini 侧最小改动：抖动 CS 段（[CustomShaderDragJiggled5e1e7ff_A] 与 5 个
+// [CustomShaderDragStage0..4_d5e1e7ff_A]）各加一行 cs-t90 = Resourced5e1e7ffPosition。
+StructuredBuffer<VertexAttributes> BindPosBuf : register(t90);
+// Anchor: q0 (bind-pose surface contact point) -> nearest collider triangle.
+// Increment 1 scans all 881 triangles; after t22 that buffer is the runtime-skinned
+// collider surface, so the anchor follows the thigh pose automatically.
+bool SockFindAnchor(uint vid, float3 pLive, out uint tri, out float3 lam)
+{
+    tri = 0u; lam = float3(0.0, 0.0, 0.0);
+    if (!SockHasAnchor(vid)) return false;              // T41: q0 = 0 row -> no anchor
+    // t39：搬运式锚点 —— 查询点 = 绑定接触点 q0 + 该顶点自身的位移 (localPos - bindPos)。
+    // 位移为 0 时逐字回落到 q0（bind 静止态零回归）；姿态变化时锚点随顶点搬走（实时判定）。
+    // 空行（L0.valid=0）没有锚点 ⇒ 返回 false，调用方冻结该行。
+    if (ColliderVertexL0[vid * 2u + 1u].w < 0.5) return false;
+    float3 p = ColliderVertexL0[vid * 2u + 0u].xyz + (pLive - BindPosBuf[vid].position);
+    uint triElems;
+    ColliderTriGridTris.GetDimensions(triElems);
+    uint triCount = triElems / 4u;
+    float best = 1e30;
+    for (uint t = 0u; t < triCount; ++t)
+    {
+        uint vb = t * 4u;
+        float3 a = ColliderTriGridTris[vb + 0u].xyz;
+        float3 b = ColliderTriGridTris[vb + 1u].xyz;
+        float3 c = ColliderTriGridTris[vb + 2u].xyz;
+        float3 q, l;
+        SockClosestOnTri(p, a, b, c, q, l);
+        float d = length(p - q);
+        if (d < best) { best = d; tri = t; lam = l; }
+    }
+    return best < 1e29;
+}
+
+// top-4 merge (weight descending, equal weight -> smaller slot first)
+void SockAccumulate(inout float wTop[4], inout uint iTop[4], float w, uint idx)
+{
+    if (w <= 0.0) return;
+    for (uint k = 0u; k < 4u; ++k)
+    {
+        if (iTop[k] == idx) { wTop[k] += w; return; }
+    }
+    for (uint k2 = 0u; k2 < 4u; ++k2)
+    {
+        if (wTop[k2] <= 0.0 || w > wTop[k2] || (w == wTop[k2] && idx < iTop[k2]))
+        {
+            for (uint m = 3u; m > k2; --m) { wTop[m] = wTop[m - 1u]; iTop[m] = iTop[m - 1u]; }
+            wTop[k2] = w; iTop[k2] = idx;
+            return;
+        }
+    }
+}
+
+void SockProjectWeights(uint vid, uint tri, float3 lam)
+{
+    float wTop[4] = { 0.0, 0.0, 0.0, 0.0 };
+    uint iTop[4] = { 0u, 0u, 0u, 0u };
+    for (uint c = 0u; c < 3u; ++c)
+    {
+        if (lam[c] <= SOCK_LAM_EPS) continue;
+        uint row = ColliderTriGridVerts[tri * 3u + c];
+        if (row == 0xFFFFFFFFu) continue;
+        float4 bw = BlendTyped[row * 2u + 0u];
+        uint4 bi = asuint(BlendTyped[row * 2u + 1u]);
+        SockAccumulate(wTop, iTop, lam[c] * bw.x, bi.x);
+        SockAccumulate(wTop, iTop, lam[c] * bw.y, bi.y);
+        SockAccumulate(wTop, iTop, lam[c] * bw.z, bi.z);
+        SockAccumulate(wTop, iTop, lam[c] * bw.w, bi.w);
+    }
+    float tot = wTop[0] + wTop[1] + wTop[2] + wTop[3];
+    if (tot <= 1e-6)
+    {
+        return;                                  // degenerate: keep previous (freeze)
+    }
+    // R3（t31）：基准 = 上一帧写出的 BlendOut（u2）
+    float r3Sum = SockBlendOut[vid].w.x + SockBlendOut[vid].w.y + SockBlendOut[vid].w.z + SockBlendOut[vid].w.w;
+    float4 pw = r3Sum > 1e-3 ? SockBlendOut[vid].w : BlendTyped[vid * 2u + 0u];
+    uint4  pi = r3Sum > 1e-3 ? SockBlendOut[vid].i : asuint(BlendTyped[vid * 2u + 1u]);
+    float4 nw = float4(0.0, 0.0, 0.0, 0.0);
+    uint4 ni = uint4(0u, 0u, 0u, 0u);
+    for (uint k = 0u; k < 4u; ++k)
+    {
+        float target = wTop[k] / tot;
+        float prev = 0.0;
+        if (pi.x == iTop[k]) prev = pw.x;
+        else if (pi.y == iTop[k]) prev = pw.y;
+        else if (pi.z == iTop[k]) prev = pw.z;
+        else if (pi.w == iTop[k]) prev = pw.w;
+        float d = clamp(target - prev, -SOCK_CLAMP_DW, SOCK_CLAMP_DW);
+        nw[k] = max(prev + d, 0.0);
+        ni[k] = iTop[k];
+    }
+    float s2 = nw.x + nw.y + nw.z + nw.w;
+    if (s2 > 1e-6) nw /= s2;
+    SockBlendRec rec;
+    rec.w = nw; rec.i = ni;
+    SockBlendOut[vid] = rec;
+}
+
+// Copy-through for non-sock rows and no-anchor sock rows (idempotent; no init pass needed)
+void SockSyncRow(uint i)
+{
+    SockBlendRec rec;
+    // R3（t31）：恒等写回优先沿用「上一帧写出的 BlendOut」
+    float r3Sum = SockBlendOut[i].w.x + SockBlendOut[i].w.y + SockBlendOut[i].w.z + SockBlendOut[i].w.w;
+    rec.w = r3Sum > 1e-3 ? SockBlendOut[i].w : BlendTyped[i * 2u + 0u];
+    rec.i = r3Sum > 1e-3 ? SockBlendOut[i].i : asuint(BlendTyped[i * 2u + 1u]);
+    SockBlendOut[i] = rec;
+}
+// ===== end T16 sock slide =====================================================
+// 一次查询最多检查的三角形数（性能上限）。实测（2026-10-11 当前网格 37×37×45、
+// 881 个三角形、非空格 74 个）每格最多 115 个、27 邻域候选 233~643 个 ⇒ 当前数据
+// 下加大上限不改变结果，是纯防御性留量。【用户 m00742】要求「把面中心的优先级
+// 提高」：生成器把每格三角形按「三角形中心到格中心距离」升序登记（见
+// node_postprocess_draginteraction.py 的 `_bake_collider_tri_grid`，那里的注释即
+// 「最近的三角形才是决定带符号距离正负的那个」），所以截断 = 把最近的面中心丢掉。
+// 生成器侧 max_per_cell 默认 4096、不截断；这里与之对齐，碰撞体加密后面心优先级
+// 才不会被打折。（旧值 1024 是早期点云方案遗留的经验值。）
+#define COLLISION_GRID_MAX_TRIS  4096u
+
+#define COLLISION_NEAR_K     8u
+// 基准的防零下限（vb0 局部单位）。2026-10-11 修正：这里原先写 0.001，配合下面的
+// `max(abs(t0), COLLISION_MIN_GAP)` 会把每顶点阈值整体抬成常数 0.001 —— 而导出侧
+// 烘的 t0 实测只有 2.98e-5..1.37e-4（丝袜与大腿在绑定姿态下的真实表面距离，全部
+// < 0.2mm），于是 235/235 个顶点都被 MIN_GAP 接管，ColliderVertexL0 的 t0 通道在
+// 运行时一个都没被读到：语义从生成器的「不许比绑定时更近」变成「必须停在外侧
+// 1.43mm」，而绑定姿态下 t0 < 0.001 恒成立 ⇒ 一进拖拽就 100% 违约、整圈顶点被推离
+// 表面。现在只留一个纯防浮点零的下限，阈值语义完全由 t0 决定。
+#define COLLISION_MIN_GAP    1e-6
+// 距离阈值倍率：顶点必须离碰撞体表面至少 base * COLLISION_GAP_SCALE（base 是导出侧
+// 烘的绑定姿态间隙 t0）。
+// 【2026-10-11 晚修正，推翻同日 m00742 的 ×10】曾按「增大阈值为原本的 10 倍」取 10.0，
+// 实测那样是错的：绑定姿态本身 d == t0，而阈值被抬成 10*t0 ⇒ **绑定姿态 100% 违约**
+// ⇒ zone 一激活，影响半径内的全部顶点（本次导出 883 个）立刻被求解器外推 9*t0
+// （3~15mm），视觉上就是「模型局部鼓起来、越过阈值线」；回弹结束的那一帧又会从 10*t0
+// 一步跳回 t0（同样的 3~15mm 跳变）。用户 m01161 实机反馈「回弹还是会越过判定」正是
+// 这一条。取 1.0 ⇒ 阈值 == 绑定姿态距离 ⇒ 不变量回到生成器 _bake_collider_sdf 里写的
+// 那句「dist(p, 表面) >= dist(p0, 表面)，即离表面不许变近」：绑定姿态恰好达标（不动），
+// 只有被拖向表面内侧时才推回，归位时 gap 与 t0 相同因而没有跳变。
+#define COLLISION_GAP_SCALE  1.0
+// 基准符号【用户 2026-10-11 重新裁定】：把碰撞体表面记作 0，外侧为正、内侧为负，
+// 丝袜顶点必须停在表面**外侧**，所以基准必须取正 ⇒ gap = +t0（每顶点各自约 7e-5，
+// 即 0.1mm 量级），顶点被约束在「不比绑定姿态更靠近表面」的位置 —— 这正是丝袜
+// 贴在大腿上的实际状态。取负（旧写法）会让 gap = -t0，也就是把顶点推到表面**内侧**，
+// 那仍然是穿进大腿里，与「防穿模」的目标相悖。
+// 历史沿革：最早 MIN_GAP = 0.01 比 t0 大一个量级，取正会把贴着大腿的顶点整片推出
+// 1cm（丝袜飘起），所以当时改成取负；后来 MIN_GAP 下调到 0.001，但 t0 实测仅
+// 2.98e-5..1.37e-4 仍远小于它，取正又把整圈顶点外推 1.43mm。2026-10-11 把 MIN_GAP
+// 降为纯防零的 1e-6，阈值回到每顶点各自的 t0，取正才是「贴合的丝袜」应有的语义。
+// 1.0 = 取正（表面外侧，当前），-1.0 = 取负（旧行为）。
+#define COLLISION_BASE_SIGN  (1.0)
+// 拉伸上限（vb0 局部单位）：位移后顶点到「绑定姿态下最近的那个采样点」的
+// 距离，不得超过该距离 + 本值。这是「丝袜不能离开大腿」的直接表达 ——
+// 点云只覆盖丝袜贴着的那条腿，一旦顶点滑到腿外（另一条腿/腿背面），
+// 最近的采样点会突然跳到 0.17 之外、切平面判据全部「不违约」而放行。
+// 实测（.dbg/collision_sim/verify_combo.cjs，48 案例 × 235 顶点）：
+// 0.05 时穿模 185→29、最大穿深 0.131→0.0185，位移保留仅 0.36→0.31。
+#define COLLISION_STRETCH    0.03
+// 沿 p0→p1 的粗扫步数（之后再做 8 次二分收窄）。不加 [unroll]：
+// 本函数体内已有一个「遍历全部采样点」的动态循环，展开会让指令数爆炸
+// （上一版加 [unroll] 导致编译 525s + 画面冻结）。
+#define COLLISION_CCD_STEPS  16u
+// 收尾投影迭代的轮数。【用户 m00742/m00964】要求「回弹的计算也要受到碰撞的限制……
+// 不会越过阈值，而是直接停在阈值」「回弹过程中不能穿过碰撞体」。上面的路径采样 + rem
+// 回加在「绑定姿态下 d 恰好等于 gap」的临界情形下每轮只修正极小量，所以再补一段投影
+// 迭代把终点严格夹到 gap。
+// 【2026-10-11 全量实测】150 个可拖拽顶点 x 3 方向（+n0 / -n0 / 切向）x 7 个位移
+// （0.002..0.20）= 3150 例，统计 signed < 0（穿进碰撞体）的例数：
+//   16 轮 -> 78 例穿入，最坏 -15.42mm（约 2.2 倍 gap）
+//   32 轮 -> 8 例，最坏 -7.16mm
+//   64 轮 -> 0 例，最坏 +0.000000（完全收敛）
+//  128 轮 -> 与 64 轮逐例相同（无额外收益）
+// 另测「每步多推 5% 留余量」反而恶化到 1 例穿入 / 最坏 -12.93mm，故不做超推。
+// 多数顶点在 1~4 轮内就 pd >= gap 提前 break，只有深入或曲面难收敛的顶点才跑满。
+#define COLLISION_PROJ_STEPS 64u
+
+// 路径采样 + 推出这一步重复几轮。
+// 【用户 m01041 根因】core 循环每轮都执行一次 `p = pStarOut + rem`（把「剩余位移」加回去），
+// 所以轮数越多、位移被放大得越多，顶点最终会被推到碰撞体的另一侧 —— 而那一侧的带符号距离
+// 同样是正的，`signed >= gap` 的判据完全看不出来。实测（60 顶点 × 5 方向 × 6 位移 = 1800 例，
+// 指标 = moved / max(disp, gap) 的最坏倍数）：
+//   4 轮 → 8.54x（最坏 v585：输入 0.005，实际移动 0.0766）
+//   2 轮 → 3.71x
+//   1 轮 → 1.76x  ← 采用
+// 三轮的 thru（signed < 0）都是 0，所以减轮数不会牺牲防穿模；而 1 轮还把 grid-miss
+// （顶点被推出碰撞网格覆盖范围）从 3 降到 0。
+// 曲线路径的欠采样由下面的 COLLISION_PROJ_STEPS 投影迭代补足，不需要靠多轮 core。
+#define COLLISION_CORE_STEPS 1u
+
+// 归位后是否继续把顶点保持在阈值处。
+// 【用户 m01041】「拖拽松手……回弹它会有阻尼，就是在这样的时候，它的回弹是会越过碰撞体
+// 边界的，然后就穿模了」——回弹路径本身（nextCurrent.w > 0.5 期间）已经在走碰撞，当时
+// 怀疑的漏洞是【弹簧停下的那一帧】：stillAlive 变 false 时 nextOffset 被整体清零（w 从 1
+// 跳到 0），于是这一帧 appliedOffset = 0 ⇒ totalOffset = 0 ⇒ 碰撞门控失败 ⇒ 顶点从被约束住
+// 的 gap 处一步跳回绑定位置 t0。
+// 【2026-10-11 晚修正】那个「一步跳回」在 gap == t0 时**根本不存在**（两者相同，没有跳变），
+// 它只是在 COLLISION_GAP_SCALE 被错设成 10.0 时才表现为 3~15mm 的跳变。倍率已经改回 1.0，
+// 所以这里恢复旧行为：不再让弹簧停下后的顶点持续走碰撞求解。
+//   1 = 保持：zone 激活期间，落在影响半径内的顶点即使弹簧已停也走碰撞求解。
+//       代价（实测）：绑定姿态在 gap == 10*t0 时会整体外移 3~17mm；即使 gap == t0，
+//       也让整圈顶点每帧都进求解器（无谓开销，且会掩盖求解器本身的问题）。
+//   0 = 旧行为：弹簧一停就整波早退（在 gap == t0 下没有任何跳变）。← 采用
+#define COLLISION_HOLD_AT_THRESHOLD 0
 
 #define DETECT_SLOT_ID       0u
 #define DETECT_SLOT_HIT      1u
@@ -533,184 +852,656 @@ void ComputeNextPhysics(
 
 static const uint COLLISION_K_MAX = 32u;
 
-uint CollisionFineCellIndex(float3 p, int3 dims)
+// ============================================================
+// 碰撞求解：固定参考点 + 顶点法线切平面投影（SOFT）
+//
+// 三条结论均由模组实测取证（K:\SSMT-Package-master\3Dmigoto\ZZZ\Mods\
+// SSMTGeneratedMod\洛克茜1111，Position.buf 18231 顶点 / 点云 593 点）：
+//
+// ① 判定值必须固定参考点，不能每帧重新搜索最近采样点。
+//    重新搜索时「最近采样点」会随顶点移动切换，切平面估计与真实表面距离
+//    偏差达 ±0.02，而丝袜到大腿的真实间隙只有 0.001 —— 于是既误放行
+//    （74/235 顶点穿模），又让相邻顶点朝不同方向抽动（拖住不动时来回抖动）。
+//    固定参考点用导出侧 L0 的 q0：离线验证 t0 ≡ dot(绑定姿态位置 - q0, n0)，
+//    235/235 个权重顶点误差为 0，即 q0/n0 与 t0 同源。
+//
+// ② 约束方向必须用顶点自身法线，不能用点云法线 n0。
+//    实测 n0 与真实表面法线夹角中位 22.78 度（94/235 超过 30 度、69/235
+//    超过 45 度、最大 174.35 度），拖拽位移 maxOffset=0.5 时会漏出
+//    0.5*sin(22.8°)=0.19 的斜向穿透，远超 0.001 的真实间隙 —— 强拉穿模
+//    的主因。顶点自身法线（Position.buf offset12-23）夹角中位 11.80 度、
+//    最大 31.93 度、超过 45 度的 0 个，且 235/235 全部朝外，可靠得多。
+//
+// ③ 必须用 SOFT 投影，不能用沿位移路径的 HARD 二分。
+//    HARD 返回 p0 + offset*tLo，而 tLo 因顶点法线方向不同而不同：同一个
+//    四边形上，偏内的顶点被削到 tLo≈0.3、偏切向的顶点保持 1.0，相邻顶点
+//    位移比例差 3 倍 ⇒ 位移场不连续 ⇒ 面被折成尖角，弦切进曲面。
+//    SOFT 只裁掉沿顶点法线向内的分量（s1 < s0 时 p1 -= vn*(s1-s0)），
+//    切向完整保留，输出是位移的连续函数，面平滑变形。
+//
+// 已知局限（SOFT 分支）：约束面是「过绑定位置、以顶点法线为法线」的切平面。
+// 大腿是曲面（曲率半径约 0.05），切向滑动超过该尺度后顶点仍会离开弧面 ——
+// 回弹阶段法向分量被裁掉、切向分量占比高时尤其明显。默认改走 HARD 分支：
+// 位移方向不变、只沿路径缩短，顶点停在违约点之前，回弹时不会切向滑出去。
+// ============================================================
+
+// 顶点 p 是否满足全部碰撞约束。绑定位置 p0 处每个约束都取等号
+// （nearD[j] = dot(p0 - qj, nj)、nearLim[j] = |p0 - qj| + stretch）⇒ 恒返回 true，
+// 因此「沿 p0→p1 找第一个违约点」的二分一定有解。
+//
+// 两类约束：
+//   1) 切平面：dot(p - qj, nj) >= dot(p0 - qj, nj)，即沿该采样点法线不许向内。
+//      取绑定姿态下最近的 K 个采样点、每个点带自己的法线，K 个切平面联合起来
+//      就是弧面的多面体近似。
+//   2) 拉伸上限：|p - qj| <= |p0 - qj| + COLLISION_STRETCH，即不许离开该采样点
+//      太远。切平面约束只覆盖 qj 自己的邻域；顶点一旦滑出这个邻域（大腿是
+//      半径约 0.05 的弧面，滑 0.17 就出去了），最近的采样点会跳到腿的另一侧，
+//      切平面判据全部不违约而放行 —— 拉伸上限就是补这个洞。
+// 三线性采样 SDF：返回「到碰撞体表面的带符号距离」（正 = 表面外侧）。
+// 场外或越界返回 band（饱和值）—— 顶点跑到场外本来就该放行。
+float SampleSDF(float3 p)
 {
-    int3 c = int3(floor((p - COLLISION_BOX.xyz) / max(COLLISION_BOX.w, 1e-6)));
-    c = clamp(c, int3(0, 0, 0), dims - int3(1, 1, 1));
-    return (uint)c.x + (uint)c.y * (uint)dims.x + (uint)c.z * (uint)dims.x * (uint)dims.y;
+    float3 bmin = COLLISION_SDF.xyz;
+    float cell = max(COLLISION_SDF.w, 1e-6);
+    float3 dimsF = COLLISION_SDF_DIMS.xyz;
+    float band = max(COLLISION_SDF_DIMS.w, 1e-6);
+
+    float3 g = (p - bmin) / cell;
+    if (g.x < 0.0 || g.y < 0.0 || g.z < 0.0)
+        return band;
+    if (g.x > dimsF.x - 1.0 || g.y > dimsF.y - 1.0 || g.z > dimsF.z - 1.0)
+        return band;
+
+    int3 i0 = int3(floor(g));
+    int3 dims = int3(dimsF);
+    int3 i1 = min(i0 + 1, dims - 1);
+    float3 f = g - float3(i0);
+
+    int nx = dims.x;
+    int ny = dims.y;
+    int strideZ = nx * ny;
+
+    uint b000 = (uint)(i0.x + nx * i0.y + strideZ * i0.z);
+    uint b100 = (uint)(i1.x + nx * i0.y + strideZ * i0.z);
+    uint b010 = (uint)(i0.x + nx * i1.y + strideZ * i0.z);
+    uint b110 = (uint)(i1.x + nx * i1.y + strideZ * i0.z);
+    uint b001 = (uint)(i0.x + nx * i0.y + strideZ * i1.z);
+    uint b101 = (uint)(i1.x + nx * i0.y + strideZ * i1.z);
+    uint b011 = (uint)(i0.x + nx * i1.y + strideZ * i1.z);
+    uint b111 = (uint)(i1.x + nx * i1.y + strideZ * i1.z);
+
+    float c00 = lerp(ColliderSDF[b000], ColliderSDF[b100], f.x);
+    float c10 = lerp(ColliderSDF[b010], ColliderSDF[b110], f.x);
+    float c01 = lerp(ColliderSDF[b001], ColliderSDF[b101], f.x);
+    float c11 = lerp(ColliderSDF[b011], ColliderSDF[b111], f.x);
+    return lerp(lerp(c00, c10, f.y), lerp(c01, c11, f.y), f.z);
 }
 
-uint CollisionCoarseCellIndex(float3 p, int3 dims)
+float PointTriQuery(float3 p, float3 a, float3 b, float3 c,
+                    out float3 outQ, out float3 outN)
 {
-    int3 c = int3(floor((p - COLLISION_BOX.xyz) / max(COLLISION_GRID.w, 1e-6)));
-    c = clamp(c, int3(0, 0, 0), dims - int3(1, 1, 1));
-    return (uint)c.x + (uint)c.y * (uint)dims.x + (uint)c.z * (uint)dims.x * (uint)dims.y;
-}
+    float3 ab = b - a;
+    float3 ac = c - a;
+    float3 ap = p - a;
+    float d1 = dot(ab, ap);
+    float d2 = dot(ac, ap);
+    float3 bp = p - b;
+    float d3 = dot(ab, bp);
+    float d4 = dot(ac, bp);
+    float3 cp = p - c;
+    float d5 = dot(ab, cp);
+    float d6 = dot(ac, cp);
 
-void CollisionScanCell(uint cellIndex, float3 p, inout float bestD, inout float3 bestN, inout float3 bestQ)
-{
-    uint4 info = ColliderCellsFine[cellIndex];
-    uint offset = info.x;
-    uint count = min(info.y, COLLISION_K_MAX);
-    [loop]
-    for (uint k = 0u; k < count; ++k)
+    float va = d3 * d6 - d5 * d4;
+    float vb = d5 * d2 - d1 * d6;
+    float vc = d1 * d4 - d3 * d2;
+    float denom = va + vb + vc;
+
+    // 边投影参数 t = dot(edge, p - e0) / |edge|^2。d1/d2 就是 dot(ab, ap) /
+    // dot(ac, ap)，可直接复用；BC 边另算。注意不能用 d3/(d3-d4) 那一类公式，
+    // 那是平面重心的中间量，不是边参数（实测会把 0.081 的真实距离算成 0.346）。
+    float3 bc = c - b;
+    float3 q = a + ab * saturate(d1 / max(dot(ab, ab), 1e-30));
+    float best = distance(p, q);
+    float3 cand = a + ac * saturate(d2 / max(dot(ac, ac), 1e-30));
+    float d = distance(p, cand);
+    if (d < best) { best = d; q = cand; }
+    cand = b + bc * saturate(dot(bc, p - b) / max(dot(bc, bc), 1e-30));
+    d = distance(p, cand);
+    if (d < best) { best = d; q = cand; }
+    d = distance(p, a);
+    if (d < best) { best = d; q = a; }
+    d = distance(p, b);
+    if (d < best) { best = d; q = b; }
+    d = distance(p, c);
+    if (d < best) { best = d; q = c; }
+
+    // 面区域内才用平面投影：顶点落在三角形所在平面上但在三角形外侧时，投影
+    // 距离会是 0（实测 p=(1.3,-0.4,0) 对三角形 (0,0,0)(1,0,0)(0,1,0) 得 0.0，
+    // 真实距离 0.5），那正是「切平面」路线的老毛病。
+    if (abs(denom) > 1e-30)
     {
-        float4 q = ColliderPoints[(offset + k) * 2u];
-        float3 d = p - q.xyz;
-        float distSq = dot(d, d);
-        if (distSq < bestD * bestD)
+        float v = vb / denom;
+        float w = vc / denom;
+        if (v >= 0.0 && w >= 0.0 && v + w <= 1.0)
         {
-            bestD = sqrt(max(distSq, 1e-12));
-            bestQ = q.xyz;
-            bestN = ColliderPoints[(offset + k) * 2u + 1u].xyz;
+            cand = a + ab * v + ac * w;
+            d = distance(p, cand);
+            if (d < best) { best = d; q = cand; }
         }
+    }
+
+    outQ = q;
+    outN = cross(ab, ac);
+    outN = outN * rsqrt(max(dot(outN, outN), 1e-30));
+    return best;
+}
+
+// 动态三角形网格求解：约束 =「到碰撞体表面的带符号距离不许比绑定姿态时更小」。
+// 基准 d(p0) 在运行时现算（p0 就是绑定姿态位置），不需要额外缓冲。
+// 切向滑动时距离基本不变（放行）、往外拉变大（放行）、往里推变小甚至变负（拦住）
+// —— 这正是「任意方向都能拉，但不能穿进去」。
+//
+// 网格查询有个天然盲区：它只能看到「离表面一个格子以内」的三角形。顶点一旦
+// 离开表面超过 cell（实测 0.0585），27 邻域里一个三角形都没有，TriGridDist
+// 返回 1e30 —— 这既可能是「在外侧远处」（安全）也可能是「已经穿到内侧」（危险），
+// 光看这个数分不出来。实测 v22525 沿 [0.71,0.71,0] 拉 0.25：t=0.90 时离表面
+// +0.163，t=0.95 时已经 -0.145（穿过去了），但两个采样点网格都落空 ⇒ 全被放行。
+// 所以落空时必须换一个不依赖距离大小的判据兜底：用导出侧烘在 ColliderVertexL0
+// 里的采样点法线 n0，判「沿 p0 处外法线向内不许超过容差」。这个半空间判据在
+// 绑定姿态取等号，位移的向内分量被裁掉、切向分量保留，正好接住网格的盲区。
+// 约束判据：沿顶点法线的负方向，射线长度不许比绑定姿态时更短（容差内）。
+//   · 打空（r < 0）：顶点已滑出碰撞体表面 ⇒ 无约束，放行。
+//   · 往外拉：射线变长 ⇒ 满足。
+//   · 沿表面滑动：射线长度基本不变 ⇒ 满足（这就是「表面滑移」）。
+//   · 往里压：射线变短 ⇒ 违反，被拦停。
+// 绑定姿态处 r(p0) = base ⇒ 恒取等号，所以「沿 p0→p1 找第一个违约点」的
+// 二分一定有解。
+// 到碰撞体表面的带符号距离：内部为负、外部为正。
+// 遍历网格内三角形取最近点，用导出侧定向好的外法线判符号（与顶点位置无关，
+// 因此半闭合面上「内部」恒为负）。网格没覆盖时返回 1e30。
+// ── B1：把静态烘焙的碰撞三角形顶点按当帧骨架蒙皮 ──────────────────────────
+// 输入用表里烘的绑定坐标（已实测与 Position 缓冲逐点相同，max diff = 0.0mm）。
+bool CollisionSkinActive()
+{
+    return COLLISION_PARAMS.x > 0.5 && COLLISION_META.x >= 2.0;
+}
+
+float3 SkinColliderVertex(uint i)
+{
+    // i = 角点序号 0..2642（= tri*3 + c）；几何按**每三角形 4 个 float4** 的表取，
+    // 蒙皮按**全局顶点号** ColliderTriGridVerts[i]（18520..19038）取。
+    uint tri = i / 3u;
+    uint c = i - tri * 3u;
+    float3 pBind = ColliderTriGridTris[tri * 4u + c].xyz;    // 绑定位置（实测 = Position 缓冲同索引逐点相同）
+    uint gv = ColliderTriGridVerts[i];                       // 全局顶点号（Blend 表行号）
+    float4 bw = BlendTyped[gv * 2u + 0u];                    // 磁盘布局：float4#0 = 权重
+    float4 bi = BlendTyped[gv * 2u + 1u];                    //            float4#1 = 索引
+    uint4 idx = uint4(asuint(bi.x), asuint(bi.y), asuint(bi.z), asuint(bi.w));
+    float3 p = 0.0;
+    [unroll]
+    for (uint k = 0u; k < 4u; k++)
+    {
+        float w = bw[k];
+        if (w <= 0.0) continue;
+        if (idx[k] == 0xFFFFFFFFu) continue;                 // B3：nil 槽防护（重新导出后可能出现）
+        uint b = idx[k] * 3u;
+        float4 r0 = ColliderSkinSkeleton[b + 0u];
+        float4 r1 = ColliderSkinSkeleton[b + 1u];
+        float4 r2 = ColliderSkinSkeleton[b + 2u];
+        p += w * float3(dot(r0.xyz, pBind) + r0.w,
+                        dot(r1.xyz, pBind) + r1.w,
+                        dot(r2.xyz, pBind) + r2.w);
+    }
+    return p;
+}
+
+// 读一个碰撞三角形的 3 个顶点 + 定向面法线（B1 生效时用蒙皮结果，法线用叉积重算并按烘的表法线定向）
+void ReadColliderTri(uint tri, out float3 ta, out float3 tb, out float3 tc, out float3 nOut)
+{
+    uint vb = tri * 4u;
+    if (CollisionSkinActive())
+    {
+        uint b3 = tri * 3u;
+        ta = SkinColliderVertex(b3 + 0u);
+        tb = SkinColliderVertex(b3 + 1u);
+        tc = SkinColliderVertex(b3 + 2u);
+        float3 nBaked = ColliderTriGridTris[vb + 3u].xyz;
+        float3 g = cross(tb - ta, tc - ta);
+        float gl = length(g);
+        nOut = gl > 1e-9 ? g / gl : nBaked;
+        // 【B1：不做符号强制】三角形真翻面（>90°）时把法线掰回绑定朝向会让 DistGridSigned 的
+        //  内外符号判反、约束方向反向 ⇒ 只保留上面的退化兜底（叉积过小时回退烘的表法线）。
+    }
+    else
+    {
+        ta = ColliderTriGridTris[vb + 0u].xyz;
+        tb = ColliderTriGridTris[vb + 1u].xyz;
+        tc = ColliderTriGridTris[vb + 2u].xyz;
+        nOut = ColliderTriGridTris[vb + 3u].xyz;
     }
 }
 
-// 细网格最近点查询：本 cell + 仅必要时（越界轴方向）扩展邻居，最多 8 cell。
-void CollisionQueryFine(float3 p, inout float bestD, inout float3 bestN, inout float3 bestQ)
+// 与 DistGridSigned 同逻辑，但额外返回最近三角形的外法线（导出侧定向好的 nOut）。
+// 用于把顶点主动推离表面（外扩）—— 光靠「判据 + 砍位移」做不到外扩，因为绑定姿态
+// 下顶点本来就在 gap 以内，二分会把 tLo 直接压到 0、顶点被钉死。
+
+float DistGridSignedN(float3 p, out float3 outN)
 {
-    float h = max(COLLISION_BOX.w, 1e-6);
-    int3 dims = int3(COLLISION_GRID.xyz);
-    float3 base = COLLISION_BOX.xyz;
-    float3 coord = floor((p - base) / h);
-    int3 c0 = clamp(int3(coord), int3(0, 0, 0), dims - int3(1, 1, 1));
 
-    CollisionScanCell(
-        (uint)c0.x + (uint)c0.y * (uint)dims.x + (uint)c0.z * (uint)dims.x * (uint)dims.y,
-        p, bestD, bestN, bestQ);
+    float3 bmin = COLLISION_TRIGRID.xyz;
+    float cell = COLLISION_TRIGRID.w;
+    int3 dims = int3(max(COLLISION_TRIGRID_DIMS.xyz, 1.0));
+    uint cellCount = (uint)max(COLLISION_TRIGRID_DIMS.w, 0.0);
+    uint idxBase = 9u + cellCount;
 
-    float3 dNeg = p - (base + coord * h);
-    float3 dPos = (base + (coord + 1.0) * h) - p;
+    int3 c = (int3)floor((p - bmin) / max(cell, 1e-6));
+    c = clamp(c, int3(0, 0, 0), dims - int3(1, 1, 1));
 
-    [unroll]
-    for (int ox = -1; ox <= 1; ++ox)
+    float bestAbs = 1e30;
+    float bestSigned = 1e30;
+    float3 bestN = float3(0.0, 1.0, 0.0);
+    uint checked = 0u;
+
+    [loop]
+    for (int oz = -1; oz <= 1; ++oz)
     {
-        [unroll]
+        [loop]
         for (int oy = -1; oy <= 1; ++oy)
         {
-            [unroll]
-            for (int oz = -1; oz <= 1; ++oz)
+            [loop]
+            for (int ox = -1; ox <= 1; ++ox)
             {
-                if (ox == 0 && oy == 0 && oz == 0)
-                    continue;
-                if (ox == -1 && dNeg.x >= bestD) continue;
-                if (ox == 1 && dPos.x >= bestD) continue;
-                if (oy == -1 && dNeg.y >= bestD) continue;
-                if (oy == 1 && dPos.y >= bestD) continue;
-                if (oz == -1 && dNeg.z >= bestD) continue;
-                if (oz == 1 && dPos.z >= bestD) continue;
-                int3 c = clamp(c0 + int3(ox, oy, oz), int3(0, 0, 0), dims - int3(1, 1, 1));
-                CollisionScanCell(
-                    (uint)c.x + (uint)c.y * (uint)dims.x + (uint)c.z * (uint)dims.x * (uint)dims.y,
-                    p, bestD, bestN, bestQ);
+                int3 nn = c + int3(ox, oy, oz);
+                if (any(nn < int3(0, 0, 0)) || any(nn >= dims)) continue;
+                uint ci = (uint)(nn.x + dims.x * (nn.y + dims.y * nn.z));
+                uint s = ColliderTriGrid[8u + ci];
+                uint e = ColliderTriGrid[8u + ci + 1u];
+                if (e > s + COLLISION_GRID_MAX_TRIS) e = s + COLLISION_GRID_MAX_TRIS;
+                [loop]
+                for (uint k = s; k < e; ++k)
+                {
+                    uint tri = ColliderTriGrid[idxBase + k];
+                    uint vb = tri * 4u;
+                    float3 ta, tb, tc, nOut;
+                    ReadColliderTri(tri, ta, tb, tc, nOut);
+                    float3 q; float3 fn;
+                    PointTriQuery(p, ta, tb, tc, q, fn);
+                    float3 diff = p - q;
+                    float d = length(diff);
+                    if (d < bestAbs)
+                    {
+                        bestAbs = d;
+                        bestSigned = dot(diff, nOut);
+                        bestN = nOut;
+                    }
+                    ++checked;
+                }
             }
         }
     }
+    outN = bestN;
+    return bestSigned;
 }
 
-float3 CollisionSolve(uint i, float3 p0, float3 offset)
+// 逐顶点碰撞求解。约束语义（用户 m03851 的「表面滑移」要求）：
+//   切向位移自由保留，径向被裁到「离表面 ≥ base」。
+// 用「沿位移路径二分」是错的 —— 二分只回答「整个位移是否合法」，而曲面滑移
+// 时位移必然带一点向内的径向分量（弦切：沿切向走直线、表面是弧，弦在弧内侧），
+// 于是二分把 tLo 压到 0，顶点被完全钉死（实测拖拽位移 = 0.0000）。
+// 正确做法是投影：算出超出量，沿接触面法线推回。
+float3 CollisionSolveGrid(uint i, float3 p0, float3 offset, float3 vn)
 {
-    float3 p1 = p0 + offset;
-    float margin = COLLISION_PARAMS.y;
-
-    // ============================================================
-    // 设计语义（逐顶点导出距离阈值）：
-    // 导出时对每个权重顶点烘焙「到碰撞体表面的带符号距离」t0（ColliderVertexL0
-    // 布局：l0[2i]=(q0.xyz,t0)，l0[2i+1]=(n0.xyz,valid)，仅权重顶点 valid=1）。
-    // 运行时任何位移（拖拽/回弹）后，顶点到碰撞体表面的距离不得低于 t0：
-    //   低于阈值 → 停在阈值处（硬=沿位移路径二分到边界；软=沿法线推回，保留切向滑动）
-    //   不低于阈值 → 放行。
-    // ============================================================
-    float4 l0q = ColliderVertexL0[i * 2u];
+    float tolerance = max(COLLISION_PARAMS.y, 0.0);
+    // 【根因修复 2026-10-11】ColliderVertexL0 是每顶点 8 个 float32：
+    //   [i*2+0] = float4(q0.xyz, t0)    t0 = 绑定姿态带符号距离（实测 2.98e-5..1.37e-4）
+    //   [i*2+1] = float4(n0.xyz, valid) valid = 0/1
+    // 旧代码从 [i*2+1] 取 .w 当基准，读到的是 valid（可拖拽顶点恒 1.0）而不是 t0，
+    // 于是 base = -1.0。必须从 [i*2+0] 取 t0。
+    float4 l0q = ColliderVertexL0[i * 2u + 0u];
     float4 l0n = ColliderVertexL0[i * 2u + 1u];
-    if (l0n.w > 0.5)
+    float3 n0 = l0n.xyz;
+    float n0len = length(n0);
+    n0 = n0len > 1e-6 ? n0 / n0len : vn;
+
+    // 基准只用导出侧烘的 t0（绑定姿态下顶点到碰撞体表面的带符号距离，实测
+    // 2.98e-5..1.37e-4，235 个顶点里 0 个负值），语义取自生成器 docstring：
+    // 「运行时阈值：任何位移后该顶点到表面的距离不得低于 t0」。绝不能换成实时射线
+    // 长度 —— 运行期射线长度对退化三角形会返回很大但没到 1e29 的值，那个「无限远」一旦
+    // 进基准，投影就会把顶点推飞。
+    // gap = 顶点应当停留的带符号距离（表面记 0，外侧为正）。COLLISION_BASE_SIGN = +1.0
+    // ⇒ gap = +t0（约 7e-5）=「不比绑定姿态更靠近表面」，也就是丝袜贴在大腿上的实际
+    // 状态。这里刻意不做 max(base, 0.0)：夹取会抹平符号约定（历史 bug：base 为负时被夹
+    // 成 0，负阈值语义整体丢失，碰撞退化成「只在恰好为 0 时触发」）。
+    // 【2026-10-11 修正】原写法 max(abs(t0), COLLISION_MIN_GAP) 配 MIN_GAP = 0.001，
+    // 而 t0 全部小于 0.001 ⇒ 阈值被整体抬成常数 0.001（1.43mm），235/235 个顶点在
+    // 绑定姿态下就满足 t0 < gap ⇒ 一进拖拽就 100% 违约、整圈顶点被推离表面。
+    // MIN_GAP 已降为 1e-6 纯防零，阈值回到每顶点各自的 t0。
+    float base = COLLISION_BASE_SIGN * max(abs(l0q.w), COLLISION_MIN_GAP);
+    float gap = base * COLLISION_GAP_SCALE;
+
+    // ── 为什么不是「只查终点」────────────────────────────────────────────
+    // 网格只覆盖表面附近那一层壳（非空格 405/42630），顶点一旦深入内部，查询要么
+    // 打空、要么最近三角形跳到对面导致符号翻转 —— 实测沿顶点法线向内位移 0.10 时
+    // 191/235 个顶点被判成「在外侧」，只查终点就会放行。
+    // 从 p0（在表面外侧）出发，路径上第一次违约必然落在表面附近，那里的判据有效。
+    //
+    // ── 为什么推出方向用梯度而不是三角形外法线 ───────────────────────────
+    // 三角形外法线是分片常数，相邻顶点落在不同三角形上时方向会跳变，位移场因此
+    // 不连续 ⇒ 面被拉爆。仿真（沿腿轴拉 0.30）：用法线时最大边长比 7.64，改用
+    // 「最近点 -> 顶点」的单位向量（距离场梯度，表面附近连续）后降到 1.01。
+    float3 p = p0 + offset;
+    float dbgFirstD = -12345.0;
+    float dbgHits = 0.0;
+
+    [loop]
+    for (uint it = 0u; it < COLLISION_CORE_STEPS; ++it)
     {
-        float threshold = l0q.w;   // 导出时刻表面距离 = 最小距离阈值
+        float tStar = -1.0;
+        float dStar = 0.0;
+        float3 qStar = p;
 
-        // 粗网格下界拒绝：到粗格包络（质心+半径）的距离 > 阈值 ⇒ 必未低于阈值
-        // （仅阈值非负时成立；导出已穿透的顶点阈值<0，直接走细查询）
-        int3 cdims = int3(COLLISION_META.yzw);
-        float4 coarse = ColliderCellsCoarse[CollisionCoarseCellIndex(p1, cdims)];
-        float dc = distance(p1, coarse.xyz);
-        if (threshold >= 0.0 && dc - coarse.w > threshold)
-            return p1;
-
-        // 细网格：当前到碰撞体表面的带符号距离（最近采样点 + 外法线）
-        float bestD = 1e30;
-        float3 bestN = float3(0.0, 0.0, 1.0);
-        float3 bestQ = p1;
-        CollisionQueryFine(p1, bestD, bestN, bestQ);
-        float s1 = dot(p1 - bestQ, bestN);
-        if (s1 >= threshold)
-            return p1;   // 未低于阈值 → 放行
-
-        if (COLLISION_PARAMS.z > 0.5)
+        [loop]
+        for (uint st = 1u; st <= COLLISION_CCD_STEPS; ++st)
         {
-            // 硬模式：沿位移路径固定 5 次二分到阈值边界（该帧停止，不滑动）
-            float tLo = 0.0;
-            float tHi = 1.0;
-            [unroll]
-            for (uint b = 0u; b < 5u; ++b)
+            float t = (float)st / (float)COLLISION_CCD_STEPS;
+            float3 pt = p0 + (p - p0) * t;
+            float3 hitN;
+            float d = DistGridSignedN(pt, hitN);
+            if (st == 1u)
+                dbgFirstD = d;
+            // t33 守卫：正哨兵（打空）/负哨兵/NaN 一律不参与采样 —— 负哨兵会经
+            // (gap - dStar) 被放大成 INF（captain 线索 1/2。本数据实测负哨兵未出现，
+            // 属纵深防御：值域扫描见 probe_distrange.json）
+            if (!isfinite(d) || d > 1e29 || d < -1.0)
+                continue;
+            dbgHits += 1.0;
+            if (d < gap)
             {
-                float tMid = (tLo + tHi) * 0.5;
-                float3 query = p0 + offset * tMid;
-                float d = 1e30;
-                float3 n = float3(0.0, 0.0, 1.0);
-                float3 q = query;
-                CollisionQueryFine(query, d, n, q);
-                if (dot(query - q, n) >= threshold)
-                    tLo = tMid;
-                else
-                    tHi = tMid;
+                tStar = t;
+                dStar = d;
+                qStar = pt - hitN * d;           // d = dot(pt - q, hitN) ⇒ q = pt - hitN*d
+                break;
             }
-            return p0 + offset * tLo;
         }
-        // 软模式：沿表面法线推回至阈值，保留切向（贴表滑动）。
-        // 二次迭代：最近点/法线随曲面变化，一次投影在曲率处会欠量，再收敛一次。
-        float3 clamped = p1 - bestN * (s1 - threshold);
-        float d2 = 1e30;
-        float3 n2 = float3(0.0, 0.0, 1.0);
-        float3 q2 = clamped;
-        CollisionQueryFine(clamped, d2, n2, q2);
-        float s2 = dot(clamped - q2, n2);
-        if (s2 < threshold)
-            clamped = clamped - n2 * (s2 - threshold);
-        return clamped;
+
+        if (tStar < 0.0)
+            break;                               // 全程在外侧 ⇒ 自由位移
+
+        // 在表面附近做投影：沿梯度把违约点推到 gap 处，剩余位移裁掉向内分量。
+        float3 pStar = p0 + (p - p0) * tStar;
+        float3 g = pStar - qStar;
+        float gl = length(g);
+        if (gl < 1e-9)
+            break;
+        // 【根因修复 2026-10-11】推出方向必须朝外。(pStar - qStar) 是距离场梯度、
+        // 表面附近连续（原设计要的正是这一点），但梯度只保证「指向距离增大的一
+        // 侧」；带符号距离的符号来自三角形外法线（未定向），所以梯度在内侧时指向
+        // 内侧。旧写法直接拿它当推出方向 ⇒ 顶点穿入时被推得更深 = 越拖越陷。
+        // 这里保留梯度方向，只用顶点法线 n0（朝外、逐顶点连续）纠正其朝向。
+        // 【用户 m01041】这个循环现在只跑 COLLISION_CORE_STEPS = 1 轮：每轮都会
+        // 执行一次下面的 `p = pStarOut + rem`，轮数越多位移放大越多（实测 4 轮最坏
+        // moved/disp = 8.54x），顶点会被推到碰撞体另一侧 —— 而那一侧的 signed 也是
+        // 正的，判据看不出来。1 轮 = 1.76x，且 thru 仍为 0。
+        float3 gdir = g / gl;
+        float3 pushDir = (dot(gdir, n0) < 0.0) ? -gdir : gdir;
+        // t33 守卫：推挤量设界 —— 碰撞面陈旧时 gap - dStar 可达半身位（实机顶点
+        // 到烘焙锚点距离中位数 0.5015m），此时宁可停在原处也不瞬移
+        float guardPush = gap - dStar;
+        if (!isfinite(guardPush) || guardPush > GUARD_MAX_STEP || guardPush < -GUARD_MAX_STEP)
+            guardPush = 0.0;
+        float3 pStarOut = pStar + pushDir * guardPush;
+        float3 rem = (p - p0) * (1.0 - tStar);
+        float dn = dot(rem, pushDir);
+        if (dn < 0.0)
+            rem -= pushDir * dn;                 // 切向自由保留、径向裁掉
+        p = pStarOut + rem;
     }
 
-    // ============================================================
-    // 回退（无 L0 阈值，防御性）：最近点带符号距离 + margin 净空
-    // ============================================================
-    float bestD2 = 1e30;
-    float3 bestN2 = float3(0.0, 0.0, 1.0);
-    float3 bestQ2 = p1;
-    CollisionQueryFine(p1, bestD2, bestN2, bestQ2);
-    float s2 = dot(p1 - bestQ2, bestN2);
-    if (s2 > -margin)
-        return p1;
-    if (COLLISION_PARAMS.z > 0.5)
+    // ── 收尾：严格夹在阈值 ────────────────────────────────────────────────
+    // 【用户 m00742】「回弹的计算也要受到碰撞的限制，毕竟不能弹回来的时候他就可以穿模
+    // 了，也要严格限制在阈值 —— 就是不会越过阈值，而是直接停在阈值」。上面的路径采样
+    // 是「沿 p0→p 找第一个违约点，推到 gap 后再把剩下的位移 rem 加回去」，只要 rem 的
+    // 径向分量被裁掉就能停住；但绑定姿态下 d 恰好等于 gap（t0 就是绑定姿态的真实间隙），
+    // 第一步采样 t=1/16 就已经违约 ⇒ tStar 极小 ⇒ 每一步只修正一小段，深位移下收敛不足。
+    // 这里补一段纯投影迭代：只要终点还在内侧（pd < gap），就沿最近三角形的外法线把它
+    // 补到 gap —— 回弹阶段（位移正在衰减回 0）同样走这条路径，所以松手回弹也不会越过
+    // 阈值。
+    // 【刻意不做方向翻转】hitN 由生成器按三顶点法线均值定向过（恒朝外），而 pd 本身就是
+    // 「沿 hitN 的带符号距离」⇒ p += hitN * (gap - pd) 一步即达 gap。
+    // 历史教训（2026-10-11 仿真矩阵：10 顶点 × 5 方向 × 6 位移）：原先写成
+    // (dot(hitN,n0) < 0) ? -hitN : hitN，而 n0 是【生成时刻】最近三角形的面法线 —— 顶点
+    // 被拖走之后它已不代表当前位置的外法线，于是 pd 与 dot(hitN,n0) 异号时会把顶点朝
+    // 【内】推，pd 在 ±gap 之间来回震荡：翻转版 34 例穿入，不翻转版只有 6 例。
+    [loop]
+    for (uint pit = 0u; pit < COLLISION_PROJ_STEPS; ++pit)
     {
-        float tLo = 0.0;
-        float tHi = 1.0;
-        [unroll]
-        for (uint b = 0u; b < 5u; ++b)
+        float3 projN;
+        float pd = DistGridSignedN(p, projN);
+        if (!isfinite(pd) || pd > 1e29 || pd < -1.0)
+            break;                              // t33：NaN/正哨兵/负哨兵 ⇒ 退出（不拿 pd 修正）
+        if (pd >= gap)
+            break;                              // 已达标 ⇒ 停
+        float3 guardStep = projN * (gap - pd);
+        if (!all(isfinite(guardStep))
+            || dot(guardStep, guardStep) > GUARD_MAX_STEP * GUARD_MAX_STEP)
+            break;                              // t33：步长非有限/超大 ⇒ 停在原处
+        p += guardStep;
+    }
+
+    return p;
+}
+
+// 顶点 p 是否满足全部碰撞约束。绑定姿态 p0 处每个约束都取等号
+// （nearD[j] = dot(p0 - qj, nj)、nearLim[j] = |p0 - qj| + stretch）⇒ 恒返回 true，
+// 因此「沿 p0→p1 找第一个违约点」的二分一定有解。
+//
+// 两类约束：
+//   1) 切平面：dot(p - qj, nj) >= dot(p0 - qj, nj)，即沿该采样点法线不许向内。
+//      取绑定姿态下最近的 K 个采样点、每个点带自己的法线，K 个切平面联合起来
+//      就是弧面的多面体近似。
+//   2) 拉伸上限：|p - qj| <= |p0 - qj| + COLLISION_STRETCH，即不许离开该采样点
+//      太远。切平面约束只覆盖 qj 自己的邻域；顶点一旦滑出这个邻域，最近的采样
+//      点会换成另一个（法线也换），约束就出现断层 —— 拉伸上限把邻域边界也变成
+//      约束，消除断层。
+bool CollisionSatisfied(float3 p, float3 nearQ[COLLISION_NEAR_K],
+                        float3 nearN[COLLISION_NEAR_K],
+                        float nearD[COLLISION_NEAR_K],
+                        float nearLim[COLLISION_NEAR_K], uint nearCount)
+{
+    for (uint j = 0u; j < nearCount; ++j)
+    {
+        if (dot(p - nearQ[j], nearN[j]) < nearD[j])
+            return false;
+        if (distance(p, nearQ[j]) > nearLim[j])
+            return false;
+    }
+    return true;
+}
+
+float3 CollisionSolve(uint i, float3 p0, float3 offset, float3 vn)
+{
+    // t33 守卫：入口消毒（p0/offset/vn 非有限时不做任何求解，原样返回）
+    if (!all(isfinite(p0)) || !all(isfinite(offset)) || !all(isfinite(vn)))
+        return p0;
+    // ── 动态三角形网格路径（当前首选）────────────────────────────────
+    // 导出侧把碰撞体三角形装进均匀网格；运行时按顶点当前位置现查邻域三角形，
+    // 约束 =「到表面的带符号距离不许比绑定姿态时更小」。这是唯一一个既与真实
+    // 几何一致、又对任意位移都成立的约束形式（静态 K 个三角形会随位移失效，
+    // 见 COLLISION_TRIGRID 处的实测数据）。未标记 valid 的顶点不参与碰撞。
+    if (COLLISION_TRIGRID_DIMS.w > 0.5)
+    {
+        // 【用户 m05089】不再按 l0n.w 分流：丝袜段 291 个顶点里 56 个没有碰撞
+        // 数据（非 valid），原先它们直接 `return p0 + offset` 完全不受约束，
+        // 被拖进大腿内部是必然的。实测这 56 个顶点 signed(p0) 中位 +0.00096、
+        // 54/56 在表面外侧 ⇒ 参与碰撞安全（另 2 个已在内侧 -0.009，会被推到表面）。
+        // 网格查询是运行时现算的，本来就不依赖烘焙数据。
+        return CollisionSolveGrid(i, p0, offset, vn);
+    }
+
+    // 仅权重顶点参与碰撞（非权重顶点没有导出阈值，直接放行）
+    float4 l0n = ColliderVertexL0[i * 2u + 1u];
+    if (l0n.w <= 0.5)
+        return p0 + offset;
+
+    float3 p1 = p0 + offset;
+
+    // ── SDF 路径（首选）──────────────────────────────────────────────
+    // 约束只有一句：d(p) >= d(p0)，即「到碰撞体表面的距离不许变小」。
+    // 这是唯一一个连续、无洞、无最近点跳变的约束形式。点云多切平面的交集
+    // 在平面少时留洞（顶点滑出邻域即放行 → 大范围穿模），平面多时把顶点
+    // 圈死（位移保留 0.013 → 拖不动），本质是半空间交集无法近似「不许靠近
+    // 曲面」。SDF 是标量场，梯度连续 ⇒ 位移场连续 ⇒ 面不会被折出尖角。
+    if (COLLISION_SDF_DIMS.x > 0.5)
+    {
+        float d0 = SampleSDF(p0);
+        float tolerance = max(COLLISION_PARAMS.y, 0.0);
+
+        // 沿路径粗扫找第一个违约点：只查终点会漏掉「穿过去再落回合法位置」
+        float tBad = 1.0;
+        [loop]
+        for (uint st = 1u; st <= COLLISION_CCD_STEPS; ++st)
         {
-            float tMid = (tLo + tHi) * 0.5;
-            float3 query = p0 + offset * tMid;
-            float d = 1e30;
-            float3 n = float3(0.0, 0.0, 1.0);
-            float3 q = query;
-            CollisionQueryFine(query, d, n, q);
-            if (dot(query - q, n) >= -margin)
+            float t = (float)st / (float)COLLISION_CCD_STEPS;
+            if (SampleSDF(p0 + offset * t) < d0 - tolerance)
+            {
+                tBad = t;
+                break;
+            }
+        }
+
+        if (tBad >= 1.0)
+            return p1;
+
+        // 在 [0, tBad] 内二分收窄到临界点
+        float tLo = 0.0;
+        float tHi = tBad;
+        [loop]
+        for (uint b = 0u; b < 8u; ++b)
+        {
+            float tMid = 0.5 * (tLo + tHi);
+            if (SampleSDF(p0 + offset * tMid) >= d0 - tolerance)
                 tLo = tMid;
             else
                 tHi = tMid;
         }
         return p0 + offset * tLo;
     }
-    return p1 - bestN2 * (s2 + margin);
+
+    // ── 点云回退路径（SDF 未烘焙时）──────────────────────────────────
+    // 收集绑定姿态下最近的 K 个碰撞体采样点。每个采样点自带法线（导出侧按
+    // 「本连通块质心朝外」统一过）。约束基准直接取带符号距离 —— 不做
+    // 「base<0 就翻转法线」的处理：导出侧已统一定向，实测 235 个权重顶点里
+    // 235 个采样点法线与 L0 法线同向（平均 dot 0.9281）；翻转反而会让少数
+    // 基准为负的采样点变成「允许向内穿」。
+    uint pointCount;
+    ColliderPoints.GetDimensions(pointCount);
+    uint pointN = pointCount / 2u;
+
+    float3 nearQ[COLLISION_NEAR_K];
+    float3 nearN[COLLISION_NEAR_K];
+    float nearD[COLLISION_NEAR_K];
+    float nearLim[COLLISION_NEAR_K];
+    float nearSort[COLLISION_NEAR_K];
+    uint nearCount = 0u;
+
+    [loop]
+    for (uint k = 0u; k < pointN; ++k)
+    {
+        float3 q = ColliderPoints[k * 2u].xyz;
+        float3 n = ColliderPoints[k * 2u + 1u].xyz;
+        float nl = length(n);
+        if (nl < 1e-6)
+            continue;
+        n = n / nl;
+
+        float d = distance(p0, q);
+        float base = dot(p0 - q, n);   // 不钳到 0：采样点法线有约 23 度偏差，dot 常为负，钳零会让绑定姿态直接违约 -> 顶点被钉死
+
+        uint pos = nearCount;
+        if (nearCount >= COLLISION_NEAR_K)
+        {
+            if (d >= nearSort[COLLISION_NEAR_K - 1u])
+                continue;
+            pos = COLLISION_NEAR_K - 1u;
+        }
+        while (pos > 0u && nearSort[pos - 1u] > d)
+        {
+            nearQ[pos] = nearQ[pos - 1u];
+            nearN[pos] = nearN[pos - 1u];
+            nearD[pos] = nearD[pos - 1u];
+            nearLim[pos] = nearLim[pos - 1u];
+            nearSort[pos] = nearSort[pos - 1u];
+            --pos;
+        }
+        nearQ[pos] = q;
+        nearN[pos] = n;
+        nearD[pos] = max(base, COLLISION_MIN_GAP);
+        nearLim[pos] = d + COLLISION_STRETCH;
+        nearSort[pos] = d;
+        if (nearCount < COLLISION_NEAR_K)
+            ++nearCount;
+    }
+
+    if (nearCount == 0u)
+        return p0 + offset;
+
+    // 快路径：终点已合法
+    if (CollisionSatisfied(p1, nearQ, nearN, nearD, nearLim, nearCount))
+        return p1;
+
+    // CCD：沿 p0→p1 粗扫，找第一个违约的步（这一步之后都别去）。
+    // 只查终点是不够的：位移 0.2~0.5 时顶点可以「穿过」违约区域再落回一个
+    // 看似合法的位置（终点判据只测终点，不测路径）。
+    float tBad = 1.0;
+    [loop]
+    for (uint st = 1u; st <= COLLISION_CCD_STEPS; ++st)
+    {
+        float t = (float)st / (float)COLLISION_CCD_STEPS;
+        if (!CollisionSatisfied(p0 + offset * t, nearQ, nearN, nearD, nearLim, nearCount))
+        {
+            tBad = t;
+            break;
+        }
+    }
+
+    // 在 [0, tBad] 内二分收窄到临界点
+    float tLo = 0.0;
+    float tHi = tBad;
+    [loop]
+    for (uint b = 0u; b < 8u; ++b)
+    {
+        float tMid = 0.5 * (tLo + tHi);
+        if (CollisionSatisfied(p0 + offset * tMid, nearQ, nearN, nearD, nearLim, nearCount))
+            tLo = tMid;
+        else
+            tHi = tMid;
+    }
+
+    // SOFT：把临界点投影回所有平面半空间的交集（POCS，交替投影）。只裁掉沿
+    // 法线向内的分量、保留全部切向 ⇒ 输出仍是 offset 的连续函数（不会像
+    // 纯二分那样让相邻顶点各停在各处、把面折出尖角而穿模）。
+    if (COLLISION_PARAMS.z <= 0.5)
+    {
+        float3 ps = p0 + offset * tLo;
+        [loop]
+        for (uint it = 0u; it < 4u; ++it)
+        {
+            [loop]
+            for (uint j = 0u; j < nearCount; ++j)
+            {
+                float sj = dot(ps - nearQ[j], nearN[j]);
+                if (sj < nearD[j])
+                    ps = ps - nearN[j] * (sj - nearD[j]);
+            }
+        }
+        return ps;
+    }
+
+    // HARD：位移方向不变、只沿路径缩短，顶点停在违约点之前
+    return p0 + offset * tLo;
 }
+
 
 // ============================================================
 // MAIN
@@ -1034,8 +1825,13 @@ void main(uint3 threadID : SV_DispatchThreadID)
     // 空闲/非拉扯帧整波跳过，零成本。
     if (COLLISION_PARAMS.x > 0.5 && COLLISION_META.x >= 2.0 && (influence > 0.0 || hasPathOffset))
     {
-        float3 totalOffset = v.position - localPos;
-        v.position = CollisionSolve(i, localPos, totalOffset);
+        float3 vnRaw = v.normal;
+        float vnLen = length(vnRaw);
+        float3 vnUnit = vnLen > 1e-6 ? vnRaw / vnLen : float3(0.0, 1.0, 0.0);
+        vnUnit = GuardFinite3(vnUnit, float3(0.0, 1.0, 0.0));   // t33 守卫
+        float3 solved = CollisionSolve(i, localPos, totalOffset, vnUnit);
+        solved = GuardFinite3(solved, localPos);                // t33 守卫
+        v.position = GuardClampDelta(solved, localPos, GUARD_MAX_OFFSET);
     }
 
     // t33 守卫：唯一写回出口。非有限 ⇒ 回退本帧输入行；位移按 GUARD_MAX_OFFSET 限幅。

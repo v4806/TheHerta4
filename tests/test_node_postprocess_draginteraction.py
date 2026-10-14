@@ -5081,26 +5081,42 @@ class DragCollisionTests(unittest.TestCase):
 
     def test_shader_collision_contract(self):
         shader = (REPO_ROOT / "Toolset" / "drag_interaction" / "rzm_jiggle_interaction.hlsl").read_text(encoding="utf-8")
-        # 寄存器与 ini 发射的 cs-t76..t79 一致
-        for reg in ("t76", "t77", "t78", "t79"):
+        # 寄存器与 ini 发射的 cs-t76..t80 一致
+        for reg in ("t76", "t77", "t78", "t79", "t80"):
             self.assertIn(f"register({reg})", shader)
-        # 参数宏槽位与 ini 发射的 x101..x104 一致
+        # 参数宏槽位与 ini 发射的 x101..x106 一致
         self.assertIn("#define COLLISION_PARAMS    IniParams[101]", shader)
         self.assertIn("#define COLLISION_BOX       IniParams[102]", shader)
         self.assertIn("#define COLLISION_GRID      IniParams[103]", shader)
         self.assertIn("#define COLLISION_META      IniParams[104]", shader)
+        self.assertIn("#define COLLISION_SDF       IniParams[105]", shader)
+        self.assertIn("#define COLLISION_SDF_DIMS  IniParams[106]", shader)
         # 模式三门控（拉扯模式）在 shader 内显式再确认
         self.assertIn("COLLISION_META.x >= 2.0", shader)
-        # 设计契约：触发用带符号表面距离（旧 bestD > margin 在稀疏点云下
-        # 最近邻间距 ≫ margin，约束恒放行 → 防穿模从不触发）
-        self.assertIn("float s1 = dot(p1 - bestQ, bestN);", shader)
-        self.assertNotIn("if (bestD > margin)", shader)
-        # 设计契约：逐顶点导出距离阈值（任何位移后距离不得低于 t0）
-        self.assertIn("float threshold = l0q.w;", shader)
-        self.assertIn("if (s1 >= threshold)", shader)
-        # 无 while 循环（固定二分 + 固定上限扫描）；排除注释里的 "While" 字样
-        self.assertNotIn("while (", shader)
-        self.assertNotIn("while(", shader)
+        # 仅权重顶点参与碰撞（非权重顶点没有导出阈值）
+        self.assertIn("float4 l0n = ColliderVertexL0[i * 2u + 1u];", shader)
+        self.assertIn("if (l0n.w <= 0.5)", shader)
+        # 设计契约：SDF 标量约束 d(p) >= d(p0)。
+        # 历史实现的两处实测缺陷（断言不得回归）：
+        #   ① 点云多切平面的交集：平面少时留洞（顶点滑出采样点邻域即放行，
+        #      实测大范围穿模 0.131）、平面多时把顶点圈死（位移保留 0.013）；
+        #   ② 只查终点不查路径：顶点可以穿过违约区域再落回合法位置。
+        # SDF 是连续标量场 ⇒ 无洞、无最近点跳变、梯度连续 ⇒ 位移场连续。
+        self.assertIn("float SampleSDF(float3 p)", shader)
+        self.assertIn("if (COLLISION_SDF_DIMS.x > 0.5)", shader)
+        self.assertIn("float d0 = SampleSDF(p0);", shader)
+        self.assertIn("float tolerance = max(COLLISION_PARAMS.y, 0.0);", shader)
+        # 沿 p0→p1 粗扫找第一个违约点，再二分收窄（CCD）
+        self.assertIn("if (SampleSDF(p0 + offset * t) < d0 - tolerance)", shader)
+        self.assertIn("if (SampleSDF(p0 + offset * tMid) >= d0 - tolerance)", shader)
+        self.assertIn("return p0 + offset * tLo;", shader)
+        # 三线性插值必须是 8 角采样（线性 Buffer，不是 Texture3D 硬件采样）
+        self.assertIn("ColliderSDF[b000]", shader)
+        self.assertIn("ColliderSDF[b111]", shader)
+        # 点云回退路径保留：SDF 未烘焙时仍可工作
+        self.assertIn("bool CollisionSatisfied(", shader)
+        self.assertIn("float3 CollisionSolve(uint i, float3 p0, float3 offset, float3 vn)", shader)
+        self.assertIn("if (COLLISION_PARAMS.z <= 0.5)", shader)
 
     # ---- 端到端烘焙 ----
 
