@@ -1154,6 +1154,525 @@ class ZZMICrossGroupGuardTests(unittest.TestCase):
         self.assertEqual(groups, [0, 1])
 
 
+class ZZMICrossGroupAttachTests(unittest.TestCase):
+    """F1（2026-10-10，实机复现件根因）：被吸收进本组网格的**别组**部件，其骨骼
+    必须写进**宿主组**骨架缓冲，而不是只写它自己组。
+
+    夹具对应实机形态：G0 的 `a23aa8a3`（槽 0..104）是宿主网格，其顶点引用了 G1 的
+    骨骼 id 105（= `b20f90ea` 的槽）⇒ 105 必须写进 **G0** 缓冲。
+    实机对照：G0 的 `4e6d8882-1704-0`（骨 id {1,2}，624 顶点）被合进 G2 宿主
+    `4e6e989e-11700-0` 的网格（合并 Blend 4562 行，异组 624 行位于 [3066,3689]）；
+    旧产物把 {1,2} 只写进 G0 缓冲，而宿主 deform 段绑 `..._G2_s1` ⇒ 624 顶点读
+    未初始化矩阵 ⇒ 部件消失。
+
+    开关关闭时（默认）逐字节保持历史行为：不发射任何 `AttachX_` 段，守卫照旧报警。
+    """
+
+    SWITCH = "cross_group_merged_vgmap_test"
+
+    def setUp(self):
+        _fake_bpy_data.objects._items.clear()
+        _fake_bpy_data.meshes._items.clear()
+
+    def _register_obj(self, name, bone_ids):
+        """顶点 i 权重挂顶点组 i，组名 = bone_ids[i]（= 该对象引用的全局骨骼 id）。"""
+        mesh = _fake_bpy_data.meshes.new(name=name + "_mesh")
+        mesh.vertices = [
+            types.SimpleNamespace(
+                groups=[types.SimpleNamespace(group=i, weight=1.0)]
+            )
+            for i in range(len(bone_ids))
+        ]
+        obj = _fake_bpy_data.objects.new(name=name, object_data=mesh)
+        obj.vertex_groups = _FakeVertexGroups()
+        for bone_id in bone_ids:
+            obj.vertex_groups.append(_FakeVertexGroup(str(bone_id)))
+        return obj
+
+    def _make_fixture(self):
+        """(exporter, model)：G0 宿主引用 G1 的骨骼 105。"""
+        self._register_obj("LOD0.a23aa8a3-42759-0", [0, 100, 105])
+        submesh = _FakeSubmesh("LOD0.a23aa8a3-42759-0", 0, 105, 0)
+        dcm = sys.modules[f"{PKG}.common.draw_call_model"].DrawCallModel
+        submesh.drawcall_model_list = [dcm(obj_name=submesh.unique_str)]
+        model = _FakeDrawIBModel("a23aa8a3", [submesh])
+        exporter = _make_exporter([model], merged_vgmap=True)
+        components = _with_channel_plan(
+            [
+                {
+                    "draw_ib": "a23aa8a3", "vg_offset": 0, "vg_count": 105,
+                    "skeleton_group": 0,
+                    "vg_map": {local: local for local in range(105)},
+                },
+                {
+                    "draw_ib": "b20f90ea", "vg_offset": 105, "vg_count": 51,
+                    "skeleton_group": 1,
+                    "vg_map": {local: 105 + local for local in range(51)},
+                },
+            ]
+        )
+        exporter.merged_skeleton_components = components
+        exporter.merged_skeleton_component_id_dict = {
+            component["draw_ib"]: index for index, component in enumerate(components)
+        }
+        exporter.has_merged_skeleton = True
+        return exporter, model
+
+    @staticmethod
+    def _switch(enabled: bool):
+        return mock.patch.object(
+            sys.modules[f"{PKG}.ui.universal.zzmi"],
+            "_zzmi_prop_flag",
+            lambda name, default: (
+                True if (enabled and name == ZZMICrossGroupAttachTests.SWITCH) else bool(default)
+            ),
+        )
+
+    def _render_attach_sections(self, exporter):
+        builder = _FakeIniBuilder()
+        exporter.add_merged_skeleton_sections(builder)
+        return "\n".join(_all_builder_lines(builder))
+
+    def _render_vb_section(self, exporter, model):
+        builder = _FakeIniBuilder()
+        exporter.add_unity_vs_texture_override_vb_sections(builder, model)
+        return "\n".join(_all_builder_lines(builder))
+
+    def _render_ib_section(self, exporter, model):
+        builder = _FakeIniBuilder()
+        exporter.add_unity_vs_texture_override_ib_sections(builder, model)
+        return "\n".join(_all_builder_lines(builder))
+
+    def test_disabled_emits_no_cross_attach(self):
+        """默认关闭：检测直接返回空 ⇒ 不发射 AttachX_ 段（零行为变化）。"""
+        exporter, _model = self._make_fixture()
+        self.assertEqual(exporter._merged_cross_group_component_ids(0), [])
+        text = self._render_attach_sections(exporter)
+        self.assertNotIn("AttachX_", text)
+        self.assertNotIn("CROSS_GROUP_ATTACH", str(exporter._zzmi_merge_diagnostics))
+
+    def test_detection_identifies_foreign_owner_component(self):
+        exporter, _model = self._make_fixture()
+        with self._switch(True):
+            # G0 的几何引用了 G1 的槽 105 ⇒ 跨组件（宿主侧视角）= 组件 1
+            self.assertEqual(exporter._merged_cross_group_component_ids(0), [1])
+            self.assertEqual(exporter._merged_cross_group_offending_bone_ids(0), {105})
+            # G1 自身没有跨组引用（其对象未注册 ⇒ 无引用记录）
+            self.assertEqual(exporter._merged_cross_group_component_ids(1), [])
+
+    def test_attach_writes_foreign_palette_into_host_group_buffer(self):
+        exporter, _model = self._make_fixture()
+        with self._switch(True):
+            text = self._render_attach_sections(exporter)
+        self.assertIn("[CustomShaderZZMIMergedSkeletonAttachX_C1_g0_s1]", text)
+        self.assertIn("[CustomShaderZZMIMergedSkeletonAttachX_C1_g0_s2]", text)
+        block = text.split(
+            "[CustomShaderZZMIMergedSkeletonAttachX_C1_g0_s1]", 1
+        )[1].split("\n[", 1)[0]
+        # 拆分绘制路线：attach 一律直拷（源件骨骼留在自己的对象空间，由它自己的 cb1 摆出去）
+        self.assertIn("cs = ./res/zzmi_merged_skeleton_attach.hlsl", block)
+        self.assertIn("y1 = 51", block)
+        # 同组 attach 仍走直拷版 CS（同组=同一对象空间，校准矩阵恒为单位阵）
+        same_group_block = text.split("[CustomShaderZZMIMergedSkeletonAttach_C0_s1]", 1)[1].split(
+            "\n[", 1
+        )[0]
+        self.assertIn("cs = ./res/zzmi_merged_skeleton_attach.hlsl", same_group_block)
+        self.assertNotIn("attach_calibrated", same_group_block)
+        # 调色板/VgMap 取跨组件自己的资源；写入目标 = **宿主组**缓冲
+        self.assertIn("cs-t0 = ref ResourceZZPalette_b20f90ea_s1", block)
+        self.assertIn("cs-t1 = ref ResourceZZVgMap_b20f90ea", block)
+        self.assertIn("cs-u0 = ref ResourceZZMergedSkeleton_G0_s1", block)
+        # 拆分绘制路线不再需要校准：attach 段不绑 cb1
+        self.assertNotIn("cs-cb1", block)
+        self.assertNotIn("cs-cb2", block)
+        self.assertIn("Dispatch = 1, 1, 1", block)  # ceil(51 / 64)
+        # 诊断：列出写入的骨骼 id 与归属组（不谎称"已修复对象空间"）
+        records = [
+            record
+            for record in exporter._zzmi_merge_diagnostics
+            if record.get("code") == "CROSS_GROUP_ATTACH"
+        ]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["group"], "G0")
+        self.assertEqual(records[0]["components"], "1")
+        self.assertEqual(records[0]["bone_ids"], "105")
+        self.assertEqual(records[0]["owner_groups"], "G1")
+
+    def test_host_deform_section_runs_cross_attach(self):
+        exporter, model = self._make_fixture()
+        with self._switch(True):
+            text = self._render_vb_section(exporter, model)
+        self.assertIn("run = CustomShaderZZMIMergedSkeletonAttachX_C1_g0_s1", text)
+        self.assertIn("run = CustomShaderZZMIMergedSkeletonAttachX_C1_g0_s2", text)
+        # 同组 attach 仍在（跨组 attach 是叠加，不替换）
+        self.assertIn("run = CustomShaderZZMIMergedSkeletonAttach_C0_s1", text)
+
+    # ------------------------------------------------------------------
+    # F3（2026-10-10）：跨组吸收宿主的**一帧延迟** —— 蒙皮 CS 重发布
+    # ------------------------------------------------------------------
+
+    def _make_fixture_with_geometry(self, host_exported=4562, host_blend_stride=32):
+        """宿主网格带真实导出顶点（合并几何挂在它身上）。"""
+        exporter, model = self._make_fixture()
+        model.submesh_model_list[0].index_vertex_id_dict = list(
+            range(host_exported)
+        )
+        if host_blend_stride != 32:
+            model.d3d11GameType.CategoryStrideDict["Blend"] = host_blend_stride
+        return exporter, model
+
+    def _make_source_model(self, exported=51):
+        source = _FakeDrawIBModel(
+            "b20f90ea", [_FakeSubmesh("LOD0.b20f90ea-51-105", 105, 51, 1)]
+        )
+        source.submesh_model_list[0].index_vertex_id_dict = list(range(exported))
+        return source
+
+    def test_host_component_detected_and_publish_plan_synthesized(self):
+        """跨组吸收宿主 = 本组里引用了别组骨骼的组件；发布计划按它的导出网格合成。"""
+        exporter, _model = self._make_fixture_with_geometry()
+        with self._switch(False):
+            self.assertEqual(exporter._merged_cross_group_host_component_ids(0), set())
+            self.assertIsNone(exporter._merged_cross_group_publish_plan(0))
+        with self._switch(True):
+            self.assertEqual(exporter._merged_cross_group_host_component_ids(0), {0})
+            plan = exporter._merged_cross_group_publish_plan(0)
+        self.assertIsNotNone(plan)
+        self.assertTrue(plan["cross_group"])
+        self.assertEqual(plan["target_ib"], "a23aa8a3")
+        self.assertEqual(
+            plan["deform_draws"],
+            [("Resourcea23aa8a3Position", "Resourcea23aa8a3Blend", 4562)],
+        )
+        self.assertEqual(plan["so_stride"], 40)
+        self.assertEqual(plan["so_prefix_rows"], 0)
+        # 守卫要等**全部**供骨件（宿主 0 + 跨组供骨件 1）
+        self.assertEqual(plan["required_component_ids"], [0, 1])
+        # 行布局与蒙皮 CS 写死的一致 ⇒ CS 可用
+        self.assertTrue(exporter._merged_skin_publish_supported(plan))
+
+    def test_host_deform_section_emits_cs_publish_gated_on_all_providers(self):
+        """宿主自己那段也要发 CS 重发布，且守卫含跨组供骨件的到达项。"""
+        exporter, model = self._make_fixture_with_geometry()
+        with self._switch(True):
+            text = self._render_vb_section(exporter, model)
+        self.assertIn("run = CustomShaderZZMISkin_G0_s1", text)
+        # 捕获本轮自己的 SO 引用（CS 的落点）
+        self.assertIn("ResourceZZRedirectSO_G0_s1 = ref so0", text)
+        guard_line = [
+            line
+            for line in text.splitlines()
+            if line.startswith("if ") and "zz_ms_seen_01" in line
+        ]
+        self.assertTrue(guard_line)
+        # 宿主(0) 与跨组供骨件(1) 都必须当帧到达，守卫才会闭合
+        self.assertTrue(any("zz_ms_seen_11" in line for line in guard_line))
+        # 直连路径的兜底 draw 仍在（CS 绑定失败时行为与旧版一致）
+        self.assertIn("draw = 4562, 0", text)
+
+    def test_cross_source_section_publishes_host_geometry(self):
+        """跨组供骨件自己那段也要发一份（守卫相同 ⇒ 最后一个到达者落笔）。"""
+        exporter, _host = self._make_fixture_with_geometry()
+        source = self._make_source_model()
+        exporter.drawib_model_list.append(source)
+        with self._switch(True):
+            text = self._render_vb_section(exporter, source)
+        self.assertIn("run = CustomShaderZZMISkin_G0_s1", text)
+        self.assertIn("run = CustomShaderZZMIMergedSkeletonAttachX_C1_g0_s1", text)
+        # 守卫含宿主(0)与供骨件(1) 两侧 ⇒ 只在最后一个到达者处闭合
+        guard_line = [
+            line
+            for line in text.splitlines()
+            if line.startswith("if ") and "zz_ms_seen_11" in line
+        ]
+        self.assertTrue(guard_line)
+        self.assertTrue(any("zz_ms_seen_01" in line for line in guard_line))
+
+    def test_palette_capture_stays_before_attach(self):
+        """palette 捕获必须落在 attach **之前**（attach 读到当帧 palette）。
+
+        ⚠ 2026-10-10 教训：曾把捕获后移到 attach 之后（F5「跨组同帧化」），想让
+        attach 读到的 palette 与它读到的（必然是上一帧的）cb1 同源。但合并骨架缓冲
+        是**宿主与跨组供骨件共用**的 ⇒ 整块骨架（含宿主自己的骨骼）一起慢一帧 ⇒
+        宿主自身几何也变陈旧 ⇒ 用户实测「无论哪边都在抖、骨骼矩阵不对」。故回退：
+        开关开/关都必须保持「捕获 → attach → 换绑骨架」这一历史次序。
+        """
+        for enabled in (False, True):
+            exporter, model = self._make_fixture_with_geometry()
+            with self._switch(enabled):
+                text = self._render_vb_section(exporter, model)
+            capture = text.index(
+                "ResourceZZPalette_a23aa8a3_s1 = copy vs-t0 unless_null"
+            )
+            attach = text.index("run = CustomShaderZZMIMergedSkeletonAttach")
+            rebind = text.index("vs-t0 = ResourceZZMergedSkeleton_G0_s1")
+            self.assertLess(
+                capture, attach, f"捕获必须在 attach 之前（开关={enabled}）"
+            )
+            self.assertLess(rebind, len(text))
+
+    def test_split_draws_diagnose_when_merged_buffers_unavailable(self):
+        """合并 Blend/Index 读不到时：退回单次绘制并落一条诊断，不抛异常。"""
+        exporter, model = self._make_fixture()
+        with self._switch(True):
+            text = self._render_ib_section(exporter, model)
+        self.assertNotIn("vs-cb1 = ResourceZZCb1_G", text)
+
+    def test_source_index_runs_split_by_bone_range(self):
+        """真实读盘路径：按骨索引值域把合并网格切成按来源的连续索引段。"""
+        import struct
+
+        exporter, _model = self._make_fixture_with_geometry()
+        components = exporter.merged_skeleton_components
+        first = components[0]
+        last = components[-1]
+        bone_a = int(next(iter(first["vg_map"].values())))
+        bone_b = int(next(iter(last["vg_map"].values())))
+        self.assertNotEqual(
+            int(first.get("skeleton_group", 0)),
+            int(last.get("skeleton_group", 0)),
+        )
+        draw_ib = str(first["draw_ib"])
+        meshes = Path(_FAKE_MOD_FOLDER) / "Meshes"
+        meshes.mkdir(parents=True, exist_ok=True)
+        blend = bytearray()
+        for bone in (bone_a, bone_a, bone_a, bone_b, bone_b, bone_b):
+            blend += struct.pack("<4f", 1.0, 0.0, 0.0, 0.0)
+            blend += struct.pack("<4I", bone, 0, 0, 0)
+        (meshes / (draw_ib + "-Blend.buf")).write_bytes(bytes(blend))
+        (meshes / ("LOD0." + draw_ib + "-6-0-Index.buf")).write_bytes(
+            struct.pack("<6I", 0, 1, 2, 3, 4, 5)
+        )
+        runs = exporter._merged_source_index_runs(draw_ib)
+        self.assertEqual([(start, count) for _g, start, count in runs], [(0, 3), (3, 3)])
+        self.assertNotEqual(runs[0][0], runs[1][0])
+
+    def test_split_draws_absent_when_disabled(self):
+        """开关关闭：不发拆分绘制注释、不发诊断。"""
+        exporter, model = self._make_fixture()
+        with self._switch(False):
+            text = self._render_ib_section(exporter, model)
+        self.assertNotIn("vs-cb1 = ResourceZZCb1_G", text)
+        self.assertNotIn("CROSS_GROUP_ATTACH", text)
+
+    def _write_split_buffers(self, host_ib, host_bone, foreign_bone):
+        """合成一份合并 Blend/Index：前 3 个索引属宿主组，后 3 个属跨组。"""
+        import struct
+
+        meshes = Path(_FAKE_MOD_FOLDER) / "Meshes"
+        meshes.mkdir(parents=True, exist_ok=True)
+        blend = bytearray()
+        for bone in (
+            host_bone,
+            host_bone,
+            host_bone,
+            foreign_bone,
+            foreign_bone,
+            foreign_bone,
+        ):
+            blend += struct.pack("<4f", 1.0, 0.0, 0.0, 0.0)
+            blend += struct.pack("<4I", bone, 0, 0, 0)
+        (meshes / (host_ib + "-Blend.buf")).write_bytes(bytes(blend))
+        (meshes / ("LOD0." + host_ib + "-6-0-Index.buf")).write_bytes(
+            struct.pack("<6I", 0, 1, 2, 3, 4, 5)
+        )
+
+    def test_split_draws_go_back_to_their_own_render_sections(self):
+        """按组拆出的段必须发回**各自来源**的渲染段：那里的 vs-cb1 天然是当帧的。
+
+        旧做法把全部段塞进宿主段 ⇒ 跨组 cb1 在宿主段执行时可能还是上一帧的值 ⇒
+        影子/镜像物体（用户实测）。这条测试钉死「各回各家」+ 非宿主段自己绑
+        合并 IB / Texcoord / 宿主 SO + mesh 标注统一写合并物体的名字。
+        """
+        exporter, host_model = self._make_fixture_with_geometry()
+        source_model = self._make_source_model()
+        host_component = exporter.merged_skeleton_components[0]
+        source_component = exporter.merged_skeleton_components[-1]
+        host_bone = int(next(iter(host_component["vg_map"].values())))
+        foreign_bone = int(next(iter(source_component["vg_map"].values())))
+        self._write_split_buffers("a23aa8a3", host_bone, foreign_bone)
+        with self._switch(True):
+            host_text = self._render_ib_section(exporter, host_model)
+            source_text = self._render_ib_section(exporter, source_model)
+
+        # 宿主段：只画宿主自己那一段，且不做 ib/vb 重绑（本来就是它自己的）
+        self.assertIn("vs-cb1 = ResourceZZCb1_G0", host_text)
+        self.assertIn("drawindexed = 3, 0, 0", host_text)
+        self.assertNotIn("drawindexed = 3, 3, 0", host_text)
+        self.assertNotIn("ib = Resource_LOD0.a23aa8a3_6_0_Index", host_text)
+
+        # 跨组段：搬回它自己的渲染段，自己绑合并 IB / 合并 Texcoord / 自建蒙皮输出
+        self.assertIn("ib = Resource_LOD0.a23aa8a3_6_0_Index", source_text)
+        self.assertIn("vb1 = Resourcea23aa8a3Texcoord", source_text)
+        self.assertIn("vb0 = ResourceZZSkinOut_G0_s1", source_text)
+        self.assertIn("vb0 = ResourceZZSkinOut_G0_s2", source_text)
+        self.assertNotIn("vb0 = ResourceZZRedirectSO", source_text)
+        self.assertIn("vs-cb1 = ResourceZZCb1_G1", source_text)
+        self.assertIn("drawindexed = 3, 3, 0", source_text)
+        self.assertNotIn("drawindexed = 3, 0, 0", source_text)
+
+        # mesh 标注：所有来源段统一写**合并物体**（宿主）的名字，拖拽交互才认得出
+        host_comments = [
+            line
+            for line in host_text.splitlines()
+            if line.strip().startswith("; [mesh:")
+        ]
+        self.assertTrue(host_comments)
+        self.assertIn(host_comments[0], source_text)
+
+
+    def test_cs_section_definitions_emitted_for_cross_group_host(self):
+        """CS 段定义要指向宿主的 VB / 骨架 / **自建**蒙皮输出。
+
+        跨组路径的 UAV 写目标必须是自建缓冲（`ResourceZZSkinOut_*`）而不是
+        `ResourceZZRedirectSO_*`（= `ref so0` 别名）：别名要被拆分绘制当 `vb0`
+        读 ⇒ 目标带 `unordered_access vertex_buffer`，而游戏 SO 只有
+        `vertex_buffer shader_resource stream_output` ⇒ 视图创建失败 ⇒
+        展示页整屏卡死（日志铁证见 `_merged_skin_out_name`）。
+        """
+        exporter, _model = self._make_fixture_with_geometry()
+        with self._switch(True):
+            text = self._render_attach_sections(exporter)
+        self.assertIn("[CustomShaderZZMISkin_G0_s1]", text)
+        block = text.split("[CustomShaderZZMISkin_G0_s1]", 1)[1].split("\n[", 1)[0]
+        self.assertIn("cs = ./res/zzmi_merged_skin.hlsl", block)
+        self.assertIn("x1 = 4562", block)
+        self.assertIn("cs-t0 = ref Resourcea23aa8a3Position", block)
+        self.assertIn("cs-t1 = ref Resourcea23aa8a3Blend", block)
+        self.assertIn("cs-t2 = ref ResourceZZMergedSkeleton_G0_s1", block)
+        self.assertIn("cs-u0 = ref ResourceZZSkinOut_G0_s1", block)
+        self.assertNotIn("cs-u0 = ref ResourceZZRedirectSO", block)
+        # 自建输出必须有声明：stride = SO 行宽、array = 合并几何行数、
+        # bind_flags 同时允许 UAV 写与 VB 读
+        self.assertIn("[ResourceZZSkinOut_G0_s1]", text)
+        out_block = text.split("[ResourceZZSkinOut_G0_s1]", 1)[1].split("\n[", 1)[0]
+        self.assertIn("type = Buffer", out_block)
+        self.assertIn("stride = 40", out_block)
+        self.assertIn("array = 4562", out_block)
+        self.assertIn("bind_flags = unordered_access vertex_buffer", out_block)
+
+    def test_disabled_emits_no_cross_publish(self):
+        """默认关闭：零行为变化（无跨组发布段、无 SO 捕获、无诊断）。"""
+        exporter, model = self._make_fixture_with_geometry()
+        text = self._render_attach_sections(exporter) + self._render_vb_section(
+            exporter, model
+        )
+        self.assertNotIn("CustomShaderZZMISkin_G0", text)
+        self.assertNotIn("ResourceZZRedirectSO_G0_s1 = ref so0", text)
+        self.assertNotIn("CROSS_GROUP_PUBLISH", str(exporter._zzmi_merge_diagnostics))
+
+    def test_narrow_host_layout_skips_cs_and_diagnoses(self):
+        """宿主 Blend 行布局不在锚点内 ⇒ 不发 CS（宁可退回宿主自己的 draw）。"""
+        exporter, model = self._make_fixture_with_geometry(host_blend_stride=16)
+        with self._switch(True):
+            text = self._render_vb_section(exporter, model)
+            attach_text = self._render_attach_sections(exporter)
+        self.assertNotIn("run = CustomShaderZZMISkin_G0", text)
+        self.assertNotIn("[CustomShaderZZMISkin_G0_s1]", attach_text)
+        codes = {
+            record.get("code") for record in exporter._zzmi_merge_diagnostics
+        }
+        self.assertIn("SKIN_LAYOUT_UNSUPPORTED", codes)
+
+    def test_guard_reports_handled_instead_of_forbidden_when_enabled(self):
+        exporter, _model = self._make_fixture()
+        with self._switch(True):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                exporter._warn_cross_group_bone_references()
+        out = buf.getvalue()
+        self.assertIn("跨组骨骼合并已接入", out)
+        self.assertNotIn("禁止跨组别骨骼合并", out)
+
+    def test_guard_keeps_forbidden_warning_when_disabled(self):
+        exporter, _model = self._make_fixture()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            exporter._warn_cross_group_bone_references()
+        out = buf.getvalue()
+        self.assertIn("禁止跨组别骨骼合并", out)
+
+    # ------------------------------------------------------------------
+    # F2（2026-10-10）：跨组校准 —— 对象→世界 cb1 捕获 + 校准版 CS
+    # ------------------------------------------------------------------
+
+    def test_cb1_capture_resources_declared_only_when_enabled(self):
+        """每骨架组一份 `ResourceZZCb1_G<N>` 捕获资源；关闭时不发射（零行为变化）。"""
+        exporter, _model = self._make_fixture()
+        with self._switch(False):
+            self.assertNotIn("ResourceZZCb1_G", self._render_attach_sections(exporter))
+        with self._switch(True):
+            text = self._render_attach_sections(exporter)
+        self.assertIn("[ResourceZZCb1_G0]", text)
+        self.assertIn("[ResourceZZCb1_G1]", text)
+        # 捕获资源不声明 type/stride：`copy vs-cb1` 由源视图决定尺寸与布局
+        block = text.split("[ResourceZZCb1_G0]", 1)[1].split("\n[", 1)[0]
+        self.assertNotIn("type =", block)
+        self.assertNotIn("stride =", block)
+
+    def test_render_section_captures_group_cb1_when_enabled(self):
+        """渲染段（本部件自己的 draw）捕获本骨架组的对象→世界 cb1。
+
+        为什么必须是渲染段：只有这里能确定「此刻 vs-cb1 就是这个物体的对象→世界
+        矩阵」。历史失败版按 IB hash 匹配（`[TextureOverrideIB_*]`），同一个 IB 被
+        多个 pass 匹配 ⇒ 抓到别的 pass 的常量块（实测同帧两 pass 差 8.2°）。
+        """
+        exporter, model = self._make_fixture()
+        with self._switch(False):
+            self.assertNotIn(
+                "copy vs-cb1", self._render_ib_section(exporter, model)
+            )
+        with self._switch(True):
+            text = self._render_ib_section(exporter, model)
+        self.assertIn("ResourceZZCb1_G0 = copy vs-cb1 unless_null", text)
+        # 单条：同一 DrawIB 的多条子网格共用一个渲染段对象，不重复追加
+        self.assertEqual(text.count("copy vs-cb1 unless_null"), 1)
+
+    def test_calibrated_shader_is_copied_only_when_enabled(self):
+        """校准版 CS 已不再进 mod 的 res/（拆分绘制路线不需要校准）。"""
+        exporter = _make_exporter([], merged_vgmap=True)
+        res_dir = Path(_FAKE_MOD_FOLDER) / "res"
+        with self._switch(False):
+            exporter._copy_merged_skeleton_shader_to_mod()
+        self.assertTrue((res_dir / "zzmi_merged_skeleton_attach.hlsl").is_file())
+        self.assertFalse(
+            (res_dir / "zzmi_merged_skeleton_attach_calibrated.hlsl").is_file()
+        )
+        with self._switch(True):
+            exporter._copy_merged_skeleton_shader_to_mod()
+        self.assertFalse(
+            (res_dir / "zzmi_merged_skeleton_attach_calibrated.hlsl").is_file()
+        )
+
+    def test_calibrated_shader_implements_rigid_calibration(self):
+        """校准公式（刚体）：C_rot = Rd·Rsᵀ、C_t = Rd·(t_src − t_dst)、M' = C·M。
+
+        与 2026-08-25 被删除的那版逐项一致（那版公式本身正确，失败在 cb1 数据源
+        与 [Present] 时序）。同时必须保留兜底：cb1 形态无效 ⇒ 直拷。
+        """
+        shader = (
+            REPO_ROOT / "Toolset" / "zzmi_merged_skeleton_attach_calibrated.hlsl"
+        ).read_text(encoding="utf-8")
+        # 常量缓冲槽（**不是** SRV）：cs-cb1/cs-cb2
+        self.assertIn("cbuffer ZZCb1Src : register(b1)", shader)
+        self.assertIn("cbuffer ZZCb1Dst : register(b2)", shader)
+        # 校准公式
+        self.assertIn("float3x3 c_rot = mul(Rd, transpose(Rs));", shader)
+        self.assertIn("float3 c_t = mul(Rd, t_src - t_dst);", shader)
+        self.assertIn("float3x3 rm_out = mul(c_rot, rm);", shader)
+        self.assertIn("float3 tm_out = mul(c_rot, tm) + c_t;", shader)
+        # 直拷兜底 + 与直拷版一致的接口/守卫
+        self.assertIn("bool zz_cb1_valid(", shader)
+        self.assertIn("Buffer<float4> src_palette : register(t0);", shader)
+        self.assertIn("Buffer<uint4> vg_map : register(t1);", shader)
+        self.assertIn("uint slot = vg_map[bone_index].x;", shader)
+        self.assertIn(
+            f"[numthreads({_zzmi_module.ExportZZMI.MERGED_SKELETON_ATTACH_THREADS}, 1, 1)]",
+            shader,
+        )
+        self.assertIn("merged_count /= 3u", shader)
+
+
 class ZZSIMissingPartsGuardTests(unittest.TestCase):
     def test_warns_when_part_missing(self):
         # 工作空间有两个部件（first_index 0 / 22296），导出只找到第一个的对象
