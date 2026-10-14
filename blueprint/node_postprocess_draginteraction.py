@@ -300,6 +300,15 @@ class SSMT_DragZoneSettings(bpy.types.PropertyGroup):
     falloff: bpy.props.FloatProperty(name="衰减", default=0.0, min=0.0)
     damping: bpy.props.FloatProperty(name="阻尼", default=0.0, min=0.0)
     grabbable: bpy.props.BoolProperty(name="可抓取", default=True)
+    drag_along_normal: bpy.props.BoolProperty(
+        name="法线方向拖拽",
+        description=(
+            "开启后拖拽方向严格锁定为「点中那个面的法线」：鼠标移动只决定沿法线的推进量"
+            "（位移长度 = 强度），不再把拖拽指向鼠标方向。"
+            "关闭则沿用 screen-stable 固定局部轴拖拽"
+        ),
+        default=False,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1264,6 +1273,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 sub.prop(obj.ssmt_drag_zone, "falloff")
                 sub.prop(obj.ssmt_drag_zone, "damping")
                 sub.prop(obj.ssmt_drag_zone, "grabbable")
+                sub.prop(obj.ssmt_drag_zone, "drag_along_normal")
                 # 包含物体列表（留空 = 全部物体）
                 inc_box = sub.box()
                 inc_box.label(text="包含物体（留空=全部）", icon='OBJECT_DATA')
@@ -2434,6 +2444,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             except Exception:
                 continue
 
+
     def _write_zone_resources(self, mod_export_path, ns):
         """写每区域物理参数和路径向量；按稳定 zone_id 直接索引。"""
         entries = self._collect_enabled_zone_entries()
@@ -2456,7 +2467,10 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 float(settings.damping),
                 1.0 if settings.grabbable else 0.0,
                 0.0,  # path mode 尚未进入节点 UI，保留 ABI 槽位
-                1.0,
+                # 【用户 m01161】「法线方向拖拽」开关：1 = 拖拽轴锁定为点中面的法线，
+                # 鼠标位移只决定沿法线的推进量（强度）。这个分量此前恒 1.0 且着色器
+                # 从未读取，所以直接复用，不改变 ABI 形状。
+                1.0 if getattr(settings, "drag_along_normal", False) else 0.0,
             )
 
         res_dir = os.path.join(mod_export_path, "res", "drag_interaction")
@@ -5188,6 +5202,12 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             # 档位 0/1 仍逐字节不变：滑动只在档位 2 的拖拽通道内可达。
             "x119 = 1",
             f"y119 = {self._zone_capacity(self._collect_enabled_zone_entries())}",
+            # 法线拖拽符号模式（IniParams[119].z）：0 = 恒定 +n（用户口径，默认，位移方向
+            # 与鼠标方向无关）；1 = 随鼠标在屏幕法线上的投影翻转（旧行为，实机 A/B 回退用）。
+            "z119 = 0",
+            # t33 爆炸守卫的位移硬上限（IniParams[119].w）：0 = 用着色器默认
+            # （0.5 = 节点侧 maxOffset 上限）。非 0 = 覆盖两者（调试用）。
+            "w119 = 0",
         ])
         # 碰撞检测参数（防穿模）：仅在模式三/拉扯模式生效。槽位 101–104 在拖拽着色器族内空闲。
         # 显式写全（含关闭时的 x101 = 0），遵守「读了必设」残留纪律。

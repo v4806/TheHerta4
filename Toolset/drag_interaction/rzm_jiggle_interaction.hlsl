@@ -534,6 +534,17 @@ bool ZoneIsPathSlide(uint zone)
     return zone * 2u + 1u < count && ZoneParams[zone * 2u + 1u].z > 0.5;
 }
 
+// 【用户 m01161】「在区域空物体可拖拽旁边添加一个选项名为法线方向拖拽，拖拽方向严格
+// 按照法线方向，鼠标的移动仅控制拖拽的强度而不是把拖拽指向鼠标方向」。
+// 生成器把该区域开关写在 ZoneParams[zone*2+1].w（此前恒 1.0 且从未被读取，复用不改变
+// ABI 形状）。开启 ⇒ 位移轴锁定为点中面的法线，鼠标位移只决定沿法线的推进量。
+bool ZoneDragAlongNormal(uint zone)
+{
+    uint count;
+    ZoneParams.GetDimensions(count);
+    return zone * 2u + 1u < count && ZoneParams[zone * 2u + 1u].w > 0.5;
+}
+
 // Cheap, wave-uniform (every thread reads the same IniParams-derived value,
 // so GPUs can skip the branch's instructions entirely rather than just not
 // allocating for them) check for whether this export has ANY Path Slide
@@ -604,6 +615,67 @@ float3 OffsetToVertexSpace(float3 v)
 }
 
 // ============================================================
+// DRAG AXIS SELECTION
+//   1 = 沿「点中面的法线」拖拽（【用户 m00857】要求，当前默认）
+//   0 = 旧的 screen-stable 固定局部轴拖拽（保留以便一键回退）
+// ============================================================
+#define DRAG_ALONG_FACE_NORMAL 1
+
+// ============================================================
+// FACE-NORMAL DRAG SIGN MODE
+//   0 = 恒定 +n（默认；【用户 m01161】「鼠标的移动仅控制拖拽强度」⇒ 推进量 = 鼠标位移的
+//       长度，方向恒为点中面的法线，与鼠标往哪边拖无关）
+//   1 = 旧行为：符号取鼠标位移在屏幕法线上的投影符号（反向拖动会沿法线反向推顶点）
+// 落点 = IniParams[119].z（模组 ini 的 z119）；未写该行时读 0 = 恒定符号，向后兼容。
+// ============================================================
+#define NORMAL_SIGN_MODE (ZONE_RUNTIME_META.z)
+
+// ===== t33 explosion guard（爆炸守卫：非有限值消毒 + 位移硬上限）=================
+// 痛点（逐条数值证据见本目录 probe_explosion.txt / verify_guard.txt）：
+//   M1 非有限传播：物理状态/区域参数/上游任一环产生 NaN 时，
+//      ClampVectorLength（`lenSq > maxSq` 对 NaN 为假）、PullTowardLimit
+//      （`dragLen < 1e-6` 对 NaN 为假）、pow(saturate(..)) 全部“比较为假 ⇒ 原样返回”，
+//      NaN 一路活到 `v.position += appliedOffset` 并写回 rw_buffer。
+//   M2 求解器把静态错位放大成位移：CollisionSolveGrid 的收尾投影环每步最多 gap
+//      （≈1.7mm）× 64 步；碰撞面与当前姿态不一致时，**零位移**顶点也会被推走
+//      （实测 0.1 m 错位 ⇒ 单帧最大 0.0649 m，58/883 行打到 64 步上限）。
+//   M3 硬赋值无界：T16 滑移 `v.position = q1 + sn * gRow` 与 localPos 无关联，
+//      锚点/蒙皮面出错时位移是米级（实测 0.1~1.0 m）。
+// 守卫只做两件事，且对合法输入逐位不生效：
+//   (a) 任何非有限的中间量 → 回退到 fallback（通常是 0 或 localPos）；
+//   (b) 写回前的位移（相对 localPos）按 GUARD_MAX_OFFSET 限幅（保方向、缩长度）。
+// GUARD_MAX_OFFSET 默认 = maxOffset 的合法过冲余量：实测求解器正常收敛时会略超
+// maxOffset（A -n0 0.5 → 0.500758，+0.15%；A -n0 0.25 → 0.25029），这类过冲不该被
+// 守卫改掉（否则用户合法拖满时手感变化）；再加一次 gap 级推挤（|t0| ≤ 1.74mm）的余量。
+// 可用 IniParams[119].w 覆盖（0 = 用默认；非 0 = 绝对上限，调试用）。
+// 注意 .x 是滑移总闸、.z 已被 t7 的 NORMAL_SIGN_MODE 占用。
+#define GUARD_MAX_OFFSET (ZONE_RUNTIME_META.w > 0.0 ? ZONE_RUNTIME_META.w : (maxOffset * 1.01 + 0.005))
+// 求解器内部单步上限（投影环步长 / CCD 推挤量）：合法单步是 gap 级（≈1.7mm），
+// 50mm 已是 30 倍余量；超了说明碰撞面与当前姿态不一致（实机顶点到烘焙锚点距离
+// 中位数 0.5015m，姿态差半个身位）——此时宁可停在原处，也不把顶点瞬移半米。
+#define GUARD_MAX_STEP 0.05
+#define GUARD_EPS 1e-9
+
+float3 GuardFinite3(float3 v, float3 fallback)
+{
+    return all(isfinite(v)) ? v : fallback;
+}
+
+// 保方向、缩长度的位移限幅：|p - anchor| <= maxLen；非有限 ⇒ 直接回退到 anchor。
+float3 GuardClampDelta(float3 p, float3 anchor, float maxLen)
+{
+    float3 d = p - anchor;
+    float len2 = dot(d, d);
+    if (!all(isfinite(d)) || !isfinite(len2))
+        return anchor;
+    float maxLen2 = maxLen * maxLen;
+    if (len2 > maxLen2 && len2 > GUARD_EPS)
+        return anchor + d * (maxLen * rsqrt(len2));
+    return p;
+}
+// ===== end t33 explosion guard ===============================================
+
+// ============================================================
 // SCREEN-STABLE CURSOR DRAG (face-independent)
 // ============================================================
 
@@ -634,6 +706,45 @@ float3 BuildScreenStableDrag(float dragScale, float mouseXDirection, float mouse
     float2 delta = GetScreenDragNormalized(mouseXDirection, mouseYDirection) * dragScale;
     return basisValid ? screenRightLocal * delta.x + screenDownLocal * delta.y
                       : float3(delta.x, delta.y, 0.0);
+}
+
+// 【用户 m00857 + m01161】「拖拽始终以法线方向拖拽，就是基于当前我所点中的这个面的
+// 法线方向进行拖拽」；m01161 进一步要求「鼠标的移动仅控制拖拽的强度而不是把拖拽指向
+// 鼠标方向」。
+// 做法：位移轴恒为该面法线 normalLocal，幅度取鼠标位移的**长度**（与移动方向无关）。
+// 符号由 NORMAL_SIGN_MODE 决定：
+//   0（默认）= 恒定 +n：鼠标往哪边拖都沿法线推进，与鼠标方向完全无关 —— T3 契约裁决
+//              （docs/analysis/rzm-drag-interaction-contract.md §A：残留的投影符号会让
+//              50% 的鼠标方向把截面内侧顶点推到大腿内部，是穿模机制之一）；
+//   1 = 旧行为（投影符号，保留以便实机 A/B 回退）。
+// 历史：第一版写的是投影 dot(delta,nScreen)/|nScreen|²，垂直于法线方向拖动时推进量
+// 恒为 0、平行时最大 —— 用户实机反馈「还是根据鼠标方向来的」，故改成纯长度语义；
+// 本轮把残留的符号依赖也去掉（m01161 要求方向与鼠标无关）。
+//
+// normalLocal 与 screenRightLocal / screenDownLocal 同空间（三者都由 detect 阶段捕获、
+// 经 ini 的同一路径传入），所以符号判定放在这个空间里做是自洽的。
+float3 BuildFaceNormalDrag(float dragScale, float mouseXDirection, float mouseYDirection,
+                           float3 screenRightLocal, float3 screenDownLocal, bool basisValid,
+                           float3 normalLocal)
+{
+    float2 delta = GetScreenDragNormalized(mouseXDirection, mouseYDirection) * dragScale;
+    if (!all(isfinite(delta)))
+        delta = float2(0.0, 0.0);  // 捕获异常/退化输入：归零，别把 NaN 传进物理链
+    float3 n = SafeNormalize(normalLocal, float3(0.0, 0.0, 1.0));
+    if (!all(isfinite(n)))
+        n = float3(0.0, 0.0, 1.0);  // 法线缺省/异常：退回 vb0 +z（与 SafeNormalize 的缺省一致）
+    float2 nScreen = basisValid
+        ? float2(dot(n, screenRightLocal), dot(n, screenDownLocal))
+        : float2(n.x, n.y);
+    // 默认（NORMAL_SIGN_MODE = 0）：符号恒 +1 ⇒ 位移 = n * |delta|，与鼠标方向无关。
+    float signAlong = 1.0;
+    if (NORMAL_SIGN_MODE > 0.5)
+    {
+        // 旧行为：法线几乎正对镜头时 nScreen → 0，符号无从判断 ⇒ 退回「始终拉出」，避免抖动。
+        if (dot(nScreen, nScreen) > 0.04)
+            signAlong = dot(delta, nScreen) < 0.0 ? -1.0 : 1.0;
+    }
+    return n * (length(delta) * signAlong);
 }
 
 float ComputeRubberInfluence(float dist, float radius, float falloffPower)
@@ -710,6 +821,7 @@ void ComputeNextPhysics(
     float3 screenRightLocal,
     float3 screenDownLocal,
     bool screenBasisValid,
+    bool dragAlongNormal,
     out float4 outCurrent,
     out float4 outPrevious,
     out float4 outCenter,
@@ -774,15 +886,29 @@ void ComputeNextPhysics(
 
     if (lockedCapture)
     {
-        // Screen-stable drag (ignores face normal — see BuildScreenStableDrag).
-        // normalWorld is still frozen for state/debug, not used for axes.
+        // 【用户 m00857】「拖拽始终以法线方向拖拽，就是基于当前我所点中的这个面的
+        // 法线方向进行拖拽」⇒ 位移轴锁定为该面的法线 normalWorld（锁定期间冻结，
+        // 鼠标划过别处不会换轴），鼠标位移只决定沿法线的推进量。
+        // 【用户 m01161】该行为改由「区域空物体 → 法线方向拖拽」开关（ZoneParams
+        // 的 [zone*2+1].w）按区域控制：开启走法线轴，关闭走旧的 screen-stable 轴。
+        // 宏 DRAG_ALONG_FACE_NORMAL = 0 可整体禁用这一路（回到旧行为）。
         // strength is the raw (unscaled) drag direction; PullTowardLimit uses
         // strength as the approach rate toward maxOffset instead of a linear
         // multiplier, so maxOffset governs the whole gesture, not just a
         // rarely-reached tail-end clamp.
+#if DRAG_ALONG_FACE_NORMAL
+        float3 dragDir3D = dragAlongNormal
+            ? BuildFaceNormalDrag(
+                  dragScale, mouseXDirection, mouseYDirection,
+                  activeScreenRight, activeScreenDown, activeBasisValid, normalWorld)
+            : BuildScreenStableDrag(
+                  dragScale, mouseXDirection, mouseYDirection,
+                  activeScreenRight, activeScreenDown, activeBasisValid);
+#else
         float3 dragDir3D = BuildScreenStableDrag(
             dragScale, mouseXDirection, mouseYDirection,
             activeScreenRight, activeScreenDown, activeBasisValid);
+#endif
         rawTargetOffset = PullTowardLimit(dragDir3D, strength, maxOffset);
         spring = grabSpring;
         damping = grabDamping;
@@ -1674,6 +1800,26 @@ void main(uint3 threadID : SV_DispatchThreadID)
         nextScreenRight = ReadSharedInteraction(6u, float4(1.0, 0.0, 0.0, 0.0));
         nextScreenDown = ReadSharedInteraction(7u, float4(0.0, 1.0, 0.0, 0.0));
         nextInputFlags = float4(mouseHeld ? 1.0 : 0.0, 0.0, 0.0, 0.0);
+
+        // 【2026-10-13 修复 · 共享态路径下的法线方向拖拽】
+        // 共享态（screen_state CS）算出的位移轴 = right*dx + down*dy + n*|d|*depth，
+        // 即「屏幕平面方向 + 深度拉」，与鼠标方向绑定；而 ZoneDragAlongNormal 只在
+        // ComputeNextPhysics 分支被消费 ⇒ 共享态活跃时（拖拽 + 回弹全程）法线开关被
+        // 完全忽略，实机表现为「拖拽始终沿光标方向，开了法线拖拽也没用」。
+        // 这里在抓取期间把位移轴重投影到锁定面法线：方向 = 法线，幅度取原位移在屏幕
+        // 平面上的投影长度（= 鼠标位移强度，因 right/down 是正交单位基），与 CNP 的
+        // BuildFaceNormalDrag 语义一致（位移 = n * |delta|，与鼠标方向无关）。
+        // 松手后（mouseHeld == 0）不介入，回弹仍完全由共享态驱动。
+        if (mouseHeld && ZoneDragAlongNormal(activeZone))
+        {
+            float3 nrm = SafeNormalize(nextNormal.xyz, capturedNormalWorld);
+            if (all(isfinite(nrm)))
+            {
+                float mag = length(nextCurrent.xyz);
+                if (isfinite(mag) && mag > 1e-8)
+                    nextCurrent.xyz = nrm * mag;
+            }
+        }
     }
     else
     {
@@ -1699,6 +1845,7 @@ void main(uint3 threadID : SV_DispatchThreadID)
             capturedRight.xyz,
             capturedDown.xyz,
             screenBasisValid,
+            ZoneDragAlongNormal(activeZone),
             nextCurrent,
             nextPrevious,
             nextCenter,

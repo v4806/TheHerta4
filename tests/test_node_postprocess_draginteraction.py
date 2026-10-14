@@ -806,7 +806,7 @@ class DragNodeEmitTests(unittest.TestCase):
         return node, sections, comps
 
     @staticmethod
-    def _zone_item(zone_id, weight=1.0, enabled=True, grabbable=True):
+    def _zone_item(zone_id, weight=1.0, enabled=True, grabbable=True, drag_along_normal=False):
         settings = types.SimpleNamespace(
             enabled=enabled,
             brush_strength=weight,
@@ -817,6 +817,7 @@ class DragNodeEmitTests(unittest.TestCase):
             falloff=0.0,
             damping=0.0,
             grabbable=grabbable,
+            drag_along_normal=drag_along_normal,
         )
         empty = types.SimpleNamespace(
             name=f"zone_{zone_id}",
@@ -2389,7 +2390,7 @@ class DragNodeEmitTests(unittest.TestCase):
 
     def test_zone_params_buffer_uses_stable_id_and_grabbable_flag(self):
         import tempfile
-        item = self._zone_item(255, grabbable=False)
+        item = self._zone_item(255, grabbable=False, drag_along_normal=True)
         settings = item.zone_object.ssmt_drag_zone
         settings.radius = 0.25
         settings.strength = 1.5
