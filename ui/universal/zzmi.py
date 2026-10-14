@@ -2388,6 +2388,38 @@ class ExportZZMI(ExportUnity):
         return f"ResourceZZRedirectSO_G{skeleton_group}_s{slot}"
 
     @staticmethod
+    def _merged_skin_out_name(skeleton_group: int, slot: int) -> str:
+        """该组该槽的**自建**蒙皮输出资源名（合并几何的最终顶点缓冲）。
+
+        为什么不能继续写 `ResourceZZRedirectSO_G<g>_s<k>`（= `ref so0` 别名）：
+        别名要求源与目标的 bind flag 兼容，而游戏自己的 SO 只有
+        `vertex_buffer shader_resource stream_output`，我们的目标却因为
+        蒙皮 CS 用 `cs-u0` 写它而带上 `unordered_access` ⇒ 视图创建失败。
+        帧日志铁证（FrameAnalysis-2026-10-11-003405，draw 000028）：
+
+            src bind_flags=0x019 [vertex_buffer shader_resource stream_output]
+            dst bind_flags=0x081 [vertex_buffer unordered_access]
+            WARNING: referenced resource is missing bind flags required by
+            destination, view creation will fail
+
+        失败后该别名是无效资源 ⇒ 拆分绘制绑到无效 vb0 ⇒ 展示页整屏卡死。
+        自建缓冲自己声明 `bind_flags = unordered_access vertex_buffer` 即可同时
+        当 UAV 写与 VB 读（**且 CS 在 deform 段、VB 读在渲染段 ⇒ 不同 draw，
+        不触发 D3D11「同一次 draw 输入/输出互斥」**）。
+        """
+        return f"ResourceZZSkinOut_G{skeleton_group}_s{slot}"
+
+    @staticmethod
+    def _merged_skin_out_row_count(group_plan: dict | None) -> int:
+        """自建蒙皮输出的行数 = 各 carrier 的合并几何行数之和（与 `array` 对齐）。"""
+        if not group_plan:
+            return 0
+        return sum(
+            max(0, int(draw_count or 0))
+            for _vb0, _vb2, draw_count in group_plan.get("deform_draws", [])
+        )
+
+    @staticmethod
     def _merged_attach_name(component_id: int, slot: int) -> str:
         """(部件, 槽) 的 attach CustomShader 段名。"""
         return f"CustomShaderZZMIMergedSkeletonAttach_C{component_id}_s{slot}"
@@ -2862,6 +2894,442 @@ class ExportZZMI(ExportUnity):
                     + self._merged_skin_cs_name(skeleton_group, slot, carrier_index)
                 )
             section.append("endif")
+
+    def _append_merged_skin_cs_sections(
+        self,
+        section,
+        skeleton_group: int,
+        group_plan: dict | None,
+        slots,
+        use_skin_out: bool = False,
+    ) -> None:
+        """发一组蒙皮 CS 段定义（重定向计划与跨组发布计划共用）。
+
+        段体与历史逐字一致；抽成方法只是为了让「跨组吸收宿主组」（F3-CS，
+        `_merged_cross_group_publish_plan`）能复用同一套段定义 —— 它没有重定向
+        计划，却必须能在最后一个供骨件到达处重发布合并几何。
+
+        `use_skin_out=True`（仅跨组发布计划）把 UAV 写目标从
+        `ResourceZZRedirectSO_*`（= `ref so0` 别名）换成**自建**的
+        `ResourceZZSkinOut_*`：跨组路径下这个别名会被拆分绘制当 `vb0` 读，
+        于是目标带上 `unordered_access vertex_buffer`，而游戏 SO 只有
+        `vertex_buffer shader_resource stream_output` ⇒ 视图创建失败 ⇒
+        绑定它的绘制全部无效（展示页整屏卡死）。重定向路径不读该别名当 VB，
+        保持原样以免动到已投产行为。
+        """
+        if not group_plan:
+            return
+        if not self._merged_skin_publish_supported(group_plan):
+            # B2：锚点行布局 ≠ CS 写死的行布局 ⇒ 不发 CS 段定义（发布点也已
+            # 按同一守卫跳过，产物里不会留下任何 CS 引用）。诊断在此也留一条，
+            # 与 `_append_merged_skin_publish_block` 的同一记录去重后只打一行。
+            self._append_merged_diag(
+                section,
+                self._merged_skin_layout_diag(skeleton_group, group_plan),
+            )
+            return
+        so_prefix_rows = int(group_plan.get("so_prefix_rows", 0) or 0)
+        # 每行 float 数 = SO 行 stride / 4（Position 类目 stride = SO override_byte_stride）。
+        # 2026-09-22：skin CS 已改为从 src_rows 的 stride 自行推算行宽，这里
+        # 仍照旧写 w1 只为保持 ini 产物形状稳定（shader 不再读取该参数）。
+        row_stride = int(group_plan.get("so_stride", 40) or 40)
+        row_floats = max(1, row_stride // 4)
+        dest_start = so_prefix_rows
+        for carrier_index, (vb0_resource, vb2_resource, draw_count) in enumerate(
+            group_plan.get("deform_draws", [])
+        ):
+            if int(draw_count or 0) <= 0:
+                continue
+            for slot in slots:
+                cs_name = self._merged_skin_cs_name(skeleton_group, slot, carrier_index)
+                section.append(f"[{cs_name}]")
+                section.append(
+                    "flags = optimization_level3 all_resources_bound skip_validation"
+                )
+                section.append(f"cs = ./res/{self._merged_skin_shader_filename()}")
+                # x1 有双重身份，**不要删除、不要改语义**：
+                # ① 本 carrier 的合并几何行数（导出侧口径）；
+                # ② skin CS 判定 ini 参数纹理布局（fork 相关：本 fork 从 [1] 起、
+                #    标准版从 [0] 起）的**选组判据** —— shader 要求 x1 等于
+                #    src_rows 的元素数（cs-t0 绑的就是本 carrier 的 Position，
+                #    二者同源），据此挑出本次运行真正生效的那一组参数。
+                # 缺了它，换一套 3DMigoto 运行时整组参数读成 0 → 蒙皮不写。
+                section.append(f"x1 = {int(draw_count)}")
+                section.append(f"y1 = {int(dest_start)}")
+                section.append(
+                    f"z1 = {int(so_prefix_rows if carrier_index == 0 else 0)}"
+                )
+                section.append(f"w1 = {int(row_floats)}")
+                section.append(f"cs-t0 = ref {vb0_resource}")
+                section.append(f"cs-t1 = ref {vb2_resource}")
+                section.append(
+                    "cs-t2 = ref " + self._merged_skeleton_name(skeleton_group, slot)
+                )
+                section.append(
+                    "cs-u0 = ref "
+                    + (
+                        self._merged_skin_out_name(skeleton_group, slot)
+                        if use_skin_out
+                        else self._merged_redirect_so_name(skeleton_group, slot)
+                    )
+                )
+                section.append(
+                    "Dispatch = "
+                    + str(
+                        self._merged_skin_dispatch_count(
+                            int(draw_count),
+                            int(so_prefix_rows if carrier_index == 0 else 0),
+                        )
+                    )
+                    + ", 1, 1"
+                )
+                section.append("cs-u0 = null")
+                section.new_line()
+            dest_start += int(draw_count)
+
+    def _merged_split_group_plan(self) -> dict:
+        """参与「按组拆分绘制」的骨架组 → ``(宿主组, 宿主发布计划, 宿主 DrawIB)``。
+
+        合并物体由多个来源部件组成，每个来源部件属于一个骨架组。拆分绘制按组切段，
+        再把每一段**放回该组自己的渲染段**里画 —— 那里的 `vs-cb1` 必然是当帧的，
+        所以帧内绘制顺序不再影响正确性。旧做法把全部段塞进宿主段，跨组 cb1 在宿主段
+        执行时可能还是上一帧的值 ⇒ 影子/镜像物体。
+        """
+        cached = getattr(self, "_merged_split_group_cache", None)
+        if cached is not None:
+            return cached
+        plan_map: dict = {}
+        if self.has_merged_skeleton and self._merged_cross_group_enabled():
+            for skeleton_group in self._merged_skeleton_groups():
+                cross_component_ids = self._merged_cross_group_component_ids(
+                    skeleton_group
+                )
+                if not cross_component_ids:
+                    continue
+                group_plan = self._merged_cross_group_publish_plan(
+                    skeleton_group
+                ) or self._merged_group_redirect_plan(skeleton_group)
+                if not group_plan:
+                    continue
+                host_group = int(skeleton_group)
+                host_ib = str(group_plan.get("target_ib", ""))
+                plan_map[host_group] = (host_group, group_plan, host_ib)
+                for component_id in cross_component_ids:
+                    index = int(component_id)
+                    if not (0 <= index < len(self.merged_skeleton_components)):
+                        continue
+                    source_group = int(
+                        self.merged_skeleton_components[index].get(
+                            "skeleton_group", host_group
+                        )
+                    )
+                    if source_group == host_group:
+                        continue
+                    plan_map[source_group] = (host_group, group_plan, host_ib)
+        self._merged_split_group_cache = plan_map
+        return plan_map
+
+    def _merged_split_representative(
+        self, skeleton_group, host_group, host_ib
+    ) -> str:
+        """该骨架组的**代表段** DrawIB：一组只发一次拆分绘制，避免重复绘制。
+
+        代表段必须同时满足两件事，否则那一段绘制拿不到当帧对象变换：
+
+        1. 它是**这个组的组件**（`merged_skeleton_components` 里 `skeleton_group` 相同）；
+        2. 它的渲染段里**有 cb1 捕获** —— `= copy vs-cb1 unless_null` 只在
+           `merged_skeleton_component_id_dict` 登记过的 DrawIB 的段里发射。
+
+        第 2 条容易踩坑：同一骨架组可能有多个 DrawIB（例如 `3f797188` 的两个子网格），
+        但只有登记为组件的那个才有捕获。挑错代表段 ⇒ 该段绑的 `ResourceZZCb1_G<N>`
+        永远是空值或上一帧的值。
+        """
+        if int(skeleton_group) == int(host_group):
+            return str(host_ib)
+        best_ib = ""
+        best_score = -1
+        for component in self.merged_skeleton_components:
+            if int(component.get("skeleton_group", 0)) != int(skeleton_group):
+                continue
+            draw_ib = str(component.get("draw_ib"))
+            if draw_ib not in self.merged_skeleton_component_id_dict:
+                continue
+            score = int(component.get("vg_offset", 0)) + int(
+                component.get("vg_count", 0)
+            )
+            if score > best_score:
+                best_score = score
+                best_ib = draw_ib
+        if best_ib:
+            return best_ib
+        # 兜底：没有任何登记捕获的组件时退回本组任意组件，至少不丢几何。
+        for component in self.merged_skeleton_components:
+            if int(component.get("skeleton_group", 0)) == int(skeleton_group):
+                return str(component.get("draw_ib"))
+        return ""
+
+    def _merged_split_own_group(self, draw_ib):
+        """这个 DrawIB 的渲染段要画哪一组的拆分绘制；不参与时返回 ``None``。"""
+        plan_map = self._merged_split_group_plan()
+        for skeleton_group, (host_group, _plan, host_ib) in plan_map.items():
+            representative = self._merged_split_representative(
+                skeleton_group, host_group, host_ib
+            )
+            if str(representative) == str(draw_ib):
+                return int(skeleton_group)
+        return None
+
+    def _merged_split_draws_target(self, draw_ib) -> bool:
+        """这个 DrawIB 是否会走「按来源拆分绘制」（判定口径与发射器完全一致）。
+
+        调用方需要在**发射拆分绘制之前**知道答案：拆分绘制必须继承合并物体那行
+        `; [mesh:<名>] [vertex_count:<N>]` 标注 —— 拖拽交互（
+        `blueprint/node_postprocess_draginteraction.py`）正是靠这行注释把绘制与
+        物体配对，注释丢了整个物体的拖拽钩子就跟着丢。
+        """
+        return self._merged_split_own_group(draw_ib) is not None
+
+    def _merged_index_unique_str(self, draw_ib) -> str:
+        """合并索引缓冲的 unique_str（``LOD0.<IB>-<count>-<start>``）；读不到返回空串。
+
+        资源名规则：``"Resource_" + unique_str.replace("-", "_") + "_Index"``
+        （与 `ui/universal/yysls.py:19` 同型），产物里就是
+        `Resource_LOD0.d5e1e7ff_61305_0_Index`。非宿主段要自己绑合并 IB，必须能
+        从产物文件名反推这个名字。
+        """
+        meshes_dir = os.path.join(
+            GlobalConfig.path_generate_mod_folder(), "Meshes"
+        )
+        candidates = []
+        try:
+            for name in os.listdir(meshes_dir):
+                if (
+                    name.startswith("LOD")
+                    and str(draw_ib) in name
+                    and name.endswith("-Index.buf")
+                ):
+                    candidates.append(name)
+        except OSError:
+            return ""
+        if not candidates:
+            return ""
+        best = max(
+            candidates,
+            key=lambda item: os.path.getsize(os.path.join(meshes_dir, item)),
+        )
+        return best[: -len("-Index.buf")]
+
+    def _merged_split_mesh_comment(self, host_ib) -> str:
+        """拆分绘制用的 mesh 标注：**所有来源段统一写合并物体（宿主）的名字**。
+
+        拖拽交互（`blueprint/node_postprocess_draginteraction.py`）靠
+        `; [mesh:<名>]` 与其后的 `drawindexed` 配对，并把 `$ssmtdrag_objvis_*` 前置到那条
+        绘制上。合并后的物体在游戏里是**一个**物体，所以各来源段必须共用同一个名字，
+        否则拖拽节点会把它们当成三个不同物体（显隐/形态键只作用在其中一个上）。
+
+        取宿主 DrawIB 里顶点数最多的那个子网格的首个 drawcall（= 合并网格本身）的名字。
+        读不到时返回空串，调用方退回本段自己的名字。
+        """
+        for drawib_model in self.drawib_model_list:
+            if str(getattr(drawib_model, "draw_ib", "")) != str(host_ib):
+                continue
+            best_submesh = None
+            best_count = -1
+            for submesh_model in getattr(drawib_model, "submesh_model_list", []) or []:
+                count = int(getattr(submesh_model, "vertex_count", 0) or 0)
+                if count > best_count:
+                    best_count = count
+                    best_submesh = submesh_model
+            if best_submesh is None:
+                continue
+            drawcalls = getattr(best_submesh, "drawcall_model_list", []) or []
+            if not drawcalls:
+                continue
+            name = str(getattr(drawcalls[0], "obj_name", "") or "")
+            if not name:
+                continue
+            return (
+                f"; [mesh:{name}]"
+                f" [vertex_count:{int(getattr(drawcalls[0], 'vertex_count', 0) or 0)}]"
+            )
+        return ""
+
+    def _merged_source_index_runs(self, draw_ib) -> list[tuple[int, int, int]]:
+        """把合并网格的索引按**来源骨架组**切成连续段：``[(skeleton_group, start, count)]``。
+
+        判定用**骨索引值域**（而不是顶点行区间）：合并后的行序由外部 join 决定、不可预测，
+        但骨索引是导出侧自己写进各组件 ``vg_map`` 的，稳定可靠。逐顶点取 Blend 里权重最大
+        的那个骨索引，查它落在哪个组件的 ``vg_map`` 值域里，再按三角形把索引切成连续段。
+
+        读不到合并 Blend/Index（例如 ini 先于缓冲落盘）时返回 ``[]``，调用方退回单次绘制。
+        """
+        import struct as _struct  # 与本文件其它处一致：局部导入
+        meshes_dir = os.path.join(GlobalConfig.path_generate_mod_folder(), "Meshes")
+        blend_path = os.path.join(meshes_dir, str(draw_ib) + "-Blend.buf")
+        index_candidates = []
+        try:
+            for name in os.listdir(meshes_dir):
+                if name.startswith("LOD") and str(draw_ib) in name and name.endswith("-Index.buf"):
+                    index_candidates.append(os.path.join(meshes_dir, name))
+        except OSError:
+            return []
+        if not os.path.exists(blend_path) or not index_candidates:
+            return []
+        # 合并索引：取体积最大的那个（同一 DrawIB 可能还有空占位 IB）
+        index_path = max(index_candidates, key=lambda p: os.path.getsize(p))
+        try:
+            with open(blend_path, "rb") as handle:
+                blend_data = handle.read()
+            with open(index_path, "rb") as handle:
+                index_data = handle.read()
+        except OSError:
+            return []
+        row_count = len(blend_data) // 32
+        if row_count <= 0 or len(index_data) < 12:
+            return []
+        index_count = len(index_data) // 4
+        # 各组件的 vg_map 值域 → 骨架组
+        ranges: list[tuple[int, int, int]] = []
+        for component in self.merged_skeleton_components:
+            vg_map = component.get("vg_map") or {}
+            values = [int(v) for v in vg_map.values()]
+            if not values:
+                continue
+            ranges.append((min(values), max(values), int(component.get("skeleton_group", 0))))
+        if not ranges:
+            return []
+        owner_of_row: list[int] = []
+        for row in range(row_count):
+            offset = row * 32
+            weights = _struct.unpack_from("<4f", blend_data, offset)
+            indices = _struct.unpack_from("<4I", blend_data, offset + 16)
+            best_weight = -1.0
+            best_bone = int(indices[0])
+            for slot_index in range(4):
+                weight = float(weights[slot_index])
+                if weight > best_weight:
+                    best_weight = weight
+                    best_bone = int(indices[slot_index])
+            owner = -1
+            for low, high, group in ranges:
+                if low <= best_bone <= high:
+                    owner = group
+                    break
+            owner_of_row.append(owner)
+        runs: list[tuple[int, int, int]] = []
+        for triangle_start in range(0, index_count - 2, 3):
+            vertex = _struct.unpack_from("<I", index_data, triangle_start * 4)[0]
+            owner = owner_of_row[vertex] if vertex < row_count else -1
+            if runs and runs[-1][0] == owner:
+                group, start, count = runs[-1]
+                runs[-1] = (group, start, count + 3)
+            else:
+                runs.append((owner, triangle_start, 3))
+        return runs
+
+    def _append_merged_render_split_draws(self, section, draw_ib) -> bool:
+        """跨组拆分绘制：合并网格保持一份，但**按来源分成多次 `drawindexed`**，
+        每次绘制前换 `vs-cb1`，让每个来源用自己的对象变换。
+
+        为什么必须拆：对象变换 cb1 是**每次绘制一份**的常量（464 B，前 16 float = 3×4
+        对象→世界矩阵），顶点没有索引它的机制；而合并后的网格里有两群顶点属于**不同的
+        对象空间**（跨组件的骨骼按直拷留在各自的对象空间）。一个 draw 只能有一个 cb1
+        ⇒ 只能拆绘制。骨骼矩阵仍然全部合并在**一份**骨架缓冲里（一个物体用所有 IB 的
+        骨骼矩阵这一点不变），拆的只是绘制调用。
+
+        跨组段用的 `ResourceZZCb1_G<组>` 由各部件自己的渲染段 `copy vs-cb1 unless_null`
+        采集（同帧），因此没有「慢一帧」问题 —— 这也是它优于渲染段重算（F7）的地方。
+
+        返回 ``True`` 表示已经发过拆分绘制 ⇒ 调用方必须**跳过**原来的单次合并绘制，
+        否则合并网格会被画两遍（第二遍用错的 cb1）。
+        """
+        plan_map = self._merged_split_group_plan()
+        if not plan_map:
+            return False
+        emitted = getattr(self, "_merged_render_split_emitted", None)
+        if emitted is None:
+            emitted = set()
+            self._merged_render_split_emitted = emitted
+        if draw_ib in emitted:
+            return False
+        for skeleton_group, (host_group, group_plan, host_ib) in plan_map.items():
+            representative = self._merged_split_representative(
+                skeleton_group, host_group, host_ib
+            )
+            if str(representative) != str(draw_ib):
+                continue
+            emitted.add(draw_ib)
+            all_runs = self._merged_source_index_runs(str(host_ib))
+            if not all_runs:
+                self._append_merged_diag(
+                    section,
+                    self._merged_diag(
+                        ZZMI_MERGE_DIAG_CROSS_GROUP_ATTACH,
+                        "合并网格索引分段不可用（读不到 Blend/Index）⇒ 退回单次绘制",
+                        draw_ib=str(draw_ib),
+                    ),
+                )
+                return False
+            # 只发本组自己的段。归属判定不出来（-1）的段按宿主组处理：宿主组是唯一
+            # 保证存在 cb1 捕获的组，退化成「用宿主对象变换画」而不是绑一个不存在的
+            # ResourceZZCb1_G-1。
+            own_runs = []
+            for owner_group, run_start, run_count in all_runs:
+                resolved_group = (
+                    int(owner_group)
+                    if int(owner_group) >= 0
+                    else int(host_group)
+                )
+                if resolved_group == int(skeleton_group):
+                    own_runs.append((int(run_start), int(run_count)))
+            if not own_runs:
+                return False
+            section.new_line()
+            # 本组 cb1 就地捕获：必须与拆分绘制**同段**，否则「捕获在第一个子网格段、
+            # 拆分绘制在另一个子网格段」时（实测：`3f797188-102-1236` 画、
+            # `3f797188-1236-0` 捕获）读到的是上一帧对象变换。同段捕获 ⇒ 当帧。
+            # last-wins：与首个子网格处那次捕获同值（同组各部件对象变换逐位相同）。
+            section.append(
+                self._merged_cb1_capture_name(int(skeleton_group))
+                + " = copy vs-cb1 unless_null"
+            )
+            if int(skeleton_group) != int(host_group):
+                # 非宿主段：合并 IB / 合并 Texcoord / 合并顶点缓冲都得自己绑 ——
+                # 这些段原本绑的是自己的空占位缓冲，直接画什么都画不出来。
+                # 顶点缓冲用**自建**的 `ResourceZZSkinOut_G<宿主>_s<槽>`（蒙皮 CS
+                # 的输出）：不能用 `ResourceZZRedirectSO_*`（= `ref so0` 别名），
+                # 那条别名因 bind flag 不兼容而创建失败（见 `_merged_skin_out_name`）。
+                unique_str = self._merged_index_unique_str(str(host_ib))
+                if not unique_str:
+                    return False
+                section.append(
+                    "ib = Resource_" + unique_str.replace("-", "_") + "_Index"
+                )
+                section.append("vb1 = Resource" + str(host_ib) + "Texcoord")
+                host_component_id = int(
+                    self.merged_skeleton_component_id_dict.get(str(host_ib), -1)
+                )
+                if host_component_id < 0:
+                    return False
+                section.append("if $zz_ms_occ_%d == 2" % host_component_id)
+                section.append(
+                    "    vb0 = " + self._merged_skin_out_name(host_group, 2)
+                )
+                section.append("else")
+                section.append(
+                    "    vb0 = " + self._merged_skin_out_name(host_group, 1)
+                )
+                section.append("endif")
+            # 本段内全是同一个组 ⇒ cb1 只换绑一次。
+            section.append("vs-cb1 = " + self._merged_cb1_name(int(skeleton_group)))
+            for run_start, run_count in own_runs:
+                if run_count <= 0:
+                    continue
+                section.append(
+                    "drawindexed = %d, %d, 0" % (run_count, run_start)
+                )
+            return True
+        return False
 
     def _merged_pose_key_pool_sizes(self, groups) -> dict[int, int]:
         """每组「键 → 槽位」池的容量：``连通分量数 × 槽位数 × 实例上界（2）``。
@@ -6393,6 +6861,30 @@ class ExportZZMI(ExportUnity):
                 )
                 section.new_line()
 
+        # 自建蒙皮输出（`ResourceZZSkinOut_G<g>_s<k>`）：跨组蒙皮 CS 的 UAV 写目标，
+        # 同时是跨组拆分绘制的 `vb0`。**必须是自建缓冲**——写游戏 SO 的别名
+        # （`ResourceZZRedirectSO_* = ref so0`）会因 bind flag 不兼容而创建失败
+        # （源无 `unordered_access`、目标要当 UAV 写），失败后绑定它的绘制全部
+        # 无效 ⇒ 角色展示页整屏卡死。详见 `_merged_skin_out_name` 的日志铁证。
+        # 只给跨组发布计划发：重定向路径不读该别名当 VB，继续走 RedirectSO。
+        for skeleton_group, plan in sorted(
+            self._merged_cross_group_publish_plans().items()
+        ):
+            rows = self._merged_skin_out_row_count(plan)
+            if rows <= 0:
+                continue
+            for slot in slots:
+                section.append(
+                    f"[{self._merged_skin_out_name(skeleton_group, slot)}]"
+                )
+                section.append("type = Buffer")
+                section.append(
+                    "stride = " + str(int(plan.get("so_stride", 40) or 40))
+                )
+                section.append("array = " + str(int(rows)))
+                section.append("bind_flags = unordered_access vertex_buffer")
+                section.new_line()
+
         # RedirectSO 使用 DrawIndexed 的 base_vertex 读取合并 Position；D3D11 会
         # 将这个偏移同时应用到 vb1，因此必须给每个 carrier 的 Texcoord 前面补
         # 同样数量的顶点行。否则位置与 UV 会错位，表现为 UV 整体乱跳/串块。
@@ -6648,62 +7140,18 @@ class ExportZZMI(ExportUnity):
         # 一个供骨件到达处」用当帧骨架重发布。见 `_merged_cross_group_publish_plan`。
         # ---------------------------------------------------------------
         for skeleton_group in groups:
-            group_plan = self._merged_group_redirect_plan(skeleton_group)
-            if not group_plan:
-                continue
-            if not self._merged_skin_publish_supported(group_plan):
-                # B2：锚点行布局 ≠ CS 写死的行布局 ⇒ 不发 CS 段定义（发布点也已
-                # 按同一守卫跳过，产物里不会留下任何 CS 引用）。诊断在此也留一条，
-                # 与 `_append_merged_skin_publish_block` 的同一记录去重后只打一行。
-                self._append_merged_diag(
-                    section,
-                    self._merged_skin_layout_diag(skeleton_group, group_plan),
-                )
-                continue
-            so_prefix_rows = int(group_plan.get("so_prefix_rows", 0) or 0)
-            # 每行 float 数 = SO 行 stride / 4（Position 类目 stride = SO override_byte_stride）。
-            # 2026-09-22：skin CS 已改为从 src_rows 的 stride 自行推算行宽，这里
-            # 仍照旧写 w1 只为保持 ini 产物形状稳定（shader 不再读取该参数）。
-            row_stride = int(group_plan.get("so_stride", 40) or 40)
-            row_floats = max(1, row_stride // 4)
-            dest_start = so_prefix_rows
-            for carrier_index, (vb0_resource, vb2_resource, draw_count) in enumerate(
-                group_plan.get("deform_draws", [])
-            ):
-                if int(draw_count or 0) <= 0:
-                    continue
-                for slot in slots:
-                    cs_name = self._merged_skin_cs_name(skeleton_group, slot, carrier_index)
-                    section.append(f"[{cs_name}]")
-                    section.append(
-                        "flags = optimization_level3 all_resources_bound skip_validation"
-                    )
-                    section.append(f"cs = ./res/{self._merged_skin_shader_filename()}")
-                    # x1 有双重身份，**不要删除、不要改语义**：
-                    # ① 本 carrier 的合并几何行数（导出侧口径）；
-                    # ② skin CS 判定 ini 参数纹理布局（fork 相关：本 fork 从 [1] 起、
-                    #    标准版从 [0] 起）的**选组判据** —— shader 要求 x1 等于
-                    #    src_rows 的元素数（cs-t0 绑的就是本 carrier 的 Position，
-                    #    二者同源），据此挑出本次运行真正生效的那一组参数。
-                    # 缺了它，换一套 3DMigoto 运行时整组参数读成 0 → 蒙皮不写。
-                    section.append(f"x1 = {int(draw_count)}")
-                    section.append(f"y1 = {int(dest_start)}")
-                    section.append(f"z1 = {int(so_prefix_rows if carrier_index == 0 else 0)}")
-                    section.append(f"w1 = {int(row_floats)}")
-                    section.append(f"cs-t0 = ref {vb0_resource}")
-                    section.append(f"cs-t1 = ref {vb2_resource}")
-                    section.append(
-                        "cs-t2 = ref "
-                        + self._merged_skeleton_name(skeleton_group, slot)
-                    )
-                    section.append(
-                        "cs-u0 = ref "
-                        + self._merged_redirect_so_name(skeleton_group, slot)
-                    )
-                    section.append(f"Dispatch = {self._merged_skin_dispatch_count(int(draw_count), int(so_prefix_rows if carrier_index == 0 else 0))}, 1, 1")
-                    section.append("cs-u0 = null")
-                    section.new_line()
-                dest_start += int(draw_count)
+            self._append_merged_skin_cs_sections(
+                section,
+                int(skeleton_group),
+                self._merged_group_redirect_plan(skeleton_group),
+                slots,
+            )
+        for skeleton_group, cross_plan in sorted(
+            self._merged_cross_group_publish_plans().items()
+        ):
+            self._append_merged_skin_cs_sections(
+                section, int(skeleton_group), cross_plan, slots, use_skin_out=True
+            )
 
         # [Present]：先把本帧到达情况抄进 `$zz_ms_prev_<i><k>`（下一帧守卫的按槽预测
         # 值），再清零 occ/seen（跨帧兜底）。
@@ -6747,10 +7195,14 @@ class ExportZZMI(ExportUnity):
     def _copy_merged_skeleton_shader_to_mod(self):
         """把合并骨架 attach CS 与合并几何蒙皮 CS 复制到生成 Mod 的 res/ 目录。"""
         addon_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        shader_names = (
+        shader_names = [
             "zzmi_merged_skeleton_attach.hlsl",
             self._merged_skin_shader_filename(),
-        )
+        ]
+        # 拆分绘制路线不使用校准版 attach：跨组 attach 与同组一样是**直拷**，源件骨骼
+        # 留在自己的对象空间，由该来源自己的渲染段用**它自己的 cb1** 单独绘制一次
+        # （见 `_append_merged_render_split_draws`）。因此 res/ 里只有直拷 attach 与
+        # 蒙皮 CS 两个着色器。
         res_dir = os.path.join(GlobalConfig.path_generate_mod_folder(), "res")
         for shader_name in shader_names:
             shader_src = os.path.join(addon_root, "Toolset", shader_name)
@@ -7025,6 +7477,59 @@ class ExportZZMI(ExportUnity):
             if texture_markup_info_list:
                 texture_override_ib_section.append("run = CommandListSkinTexture")
 
+            # 跨组：合并网格按**来源骨架组**拆成多次绘制，每段放回该来源自己的渲染段里
+            # 画（`_append_merged_render_split_draws`）。对象变换 cb1 是**每次绘制一份**
+            # 的常量（464 B，前 16 float = 3×4 对象→世界矩阵），顶点没有索引它的机制，
+            # 而合并后的网格里有两群顶点属于不同对象空间 ⇒ 只能拆绘制；骨骼矩阵仍然全部
+            # 合并在同一份骨架缓冲里（「一个物体用所有 IB 的骨骼矩阵」不变）。
+            # 段放回**自己**的渲染段是关键：那一刻 `vs-cb1` 天然就是它自己的当帧对象变换，
+            # 因此既不依赖帧内绘制顺序，也不需要跨对象空间的校准矩阵。旧做法把全部段塞进
+            # 宿主段 ⇒ 跨组 cb1 在宿主段执行时可能还是上一帧的值 ⇒ 影子/镜像物体。
+            # 历史路线（全部实测否决并移除）：F7/F4 在宿主渲染段用当帧 cb1 重跑校准 + 重
+            # 蒙皮再写回顶点流——重算 CS 实际未执行，且把 mod 自建缓冲当 `vb0` 的四次尝试
+            # 全部静默失败；F5 把 palette 捕获后移让 palette 与 cb1 同源——合并骨架缓冲
+            # 宿主与跨组共用 ⇒ 整块骨架一起慢一帧，用户实测「无论哪边都在抖」，连原始
+            # 物体都错。
+            if self._merged_split_draws_target(draw_ib):
+                # 拆分绘制继承原单次绘制前面那行 mesh 标注（拖拽交互靠它配对物体）。
+                # 非宿主段统一改写成**合并物体**（宿主）的名字：合并后游戏里只有一个物体，
+                # 各来源段必须共用同一个名字，否则拖拽节点会把它们当成三个不同物体。
+                _mesh_comment = ""
+                _own_group = self._merged_split_own_group(draw_ib)
+                _split_plan = (
+                    self._merged_split_group_plan().get(int(_own_group))
+                    if _own_group is not None
+                    else None
+                )
+                if _split_plan is not None and int(_split_plan[0]) != int(_own_group):
+                    _mesh_comment = self._merged_split_mesh_comment(_split_plan[2])
+                if not _mesh_comment:
+                    for _drawindexed_line in M_IniHelper.get_drawindexed_str_list(
+                        submesh_model.drawcall_model_list,
+                        obj_name_draw_offset_dict=drawib_model.obj_name_draw_offset,
+                    ):
+                        if _drawindexed_line.strip().startswith(";"):
+                            _mesh_comment = _drawindexed_line
+                            break
+                if not _mesh_comment:
+                    # 兜底：着色器替换路径下注释由另一分支发出，这里按同一格式补一行，
+                    # 否则物体名标注会整行缺失（拖拽交互与人工排查都依赖它）。
+                    _dc = (
+                        submesh_model.drawcall_model_list[0]
+                        if submesh_model.drawcall_model_list
+                        else None
+                    )
+                    if _dc is not None:
+                        _mesh_comment = (
+                            f"; [mesh:{getattr(_dc, 'obj_name', '') or ''}]"
+                            f" [vertex_count:{getattr(_dc, 'vertex_count', 0)}]"
+                        )
+                if _mesh_comment:
+                    texture_override_ib_section.append(_mesh_comment)
+            split_draws_emitted = self._append_merged_render_split_draws(
+                texture_override_ib_section, draw_ib
+            )
+
             if is_cross_ib_source:
                 non_cross_ib_drawcalls = []
                 for drawcall_model in submesh_model.drawcall_model_list:
@@ -7040,7 +7545,11 @@ class ExportZZMI(ExportUnity):
                 )
             else:
                 print(f"[CrossIB ZZMI] 非源块绘制物体: {len(submesh_model.drawcall_model_list)} 个")
-                if redirect_carrier_info is not None:
+                if split_draws_emitted:
+                    # 合并网格已按来源拆成多次 drawindexed（每次带自己的 vs-cb1）：
+                    # 这里绝不能再发一次单次合并绘制，否则会被画两遍。
+                    print("[CrossIB ZZMI] 合并网格已按来源拆分绘制，跳过单次合并绘制")
+                elif redirect_carrier_info is not None:
                     # 合并网格重定向：drawindexed 带 base_vertex——从**本实例**的
                     # SO 中读本合并网格的区段（offset 保持本 submesh 的索引偏移）。
                     # 2026-09 多实例分离 v2（用户实测通过）：不再覆写 vb0、也不再包
