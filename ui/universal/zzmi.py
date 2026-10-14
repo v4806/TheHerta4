@@ -3765,7 +3765,29 @@ class ExportZZMI(ExportUnity):
         )
         group_plan = self._merged_group_redirect_plan(skeleton_group)
         if group_plan is None:
-            # 直连路径没有 SO 别名/合并几何发布语义，保持原行为。
+            # F3-CS：跨组合并的宿主组走直连路径（没有重定向计划），但它的合并几何
+            # 混进了别组顶点 ⇒ 必须在**最后一个供骨件到达处**用当帧骨架重发布一次
+            # （否则宿主自己那段写 SO 时跨组 palette 还是上一帧的 = 用户实测的
+            # 「一帧延迟 + 运动时错位、静止正常」）。本部件既可能是宿主，也可能是
+            # 供骨件；两个方向都发一份，守卫条件相同 ⇒ 一帧内只在最后一个供骨件
+            # 到达处闭合一次（CS 按索引写 = 幂等，不会重复叠加）。
+            cross_plans = self._merged_cross_group_publish_plans()
+            for host_group in self._merged_cross_host_group_map().get(
+                int(component_id), []
+            ):
+                host_plan = cross_plans.get(int(host_group))
+                if host_plan:
+                    self._append_merged_skin_publish_block(
+                        texture_override_vb_section,
+                        int(host_group),
+                        host_plan,
+                        draw_ib,
+                    )
+            own_plan = cross_plans.get(int(skeleton_group))
+            if own_plan:
+                self._append_merged_skin_publish_block(
+                    texture_override_vb_section, skeleton_group, own_plan, draw_ib
+                )
             return
         self._append_merged_skin_publish_block(
             texture_override_vb_section, skeleton_group, group_plan, draw_ib
@@ -3846,6 +3868,14 @@ class ExportZZMI(ExportUnity):
         is_absorbed_host = any(
             int(host["component_id"]) == int(component_id) for host in absorbed_hosts
         )
+        # F3-CS：几何吸收了**别组**部件的宿主（判据见 `_merged_cross_group_host_component_ids`）。
+        # 它的 SO 引用同样必须捕获 —— 否则跨组重发布（蒙皮 CS）没有落点，只能退回
+        # 「宿主自己那段写 SO」= 用户实测的一帧延迟。注意这里**不**改
+        # `absorbed_hosts`：那会换掉宿主的每槽守卫档位（直连路径无条件 draw 是
+        # CS 绑定失败时的兜底，必须保留）。
+        is_cross_group_host = int(component_id) in self._merged_cross_group_host_component_ids(
+            skeleton_group
+        )
         so_owner_target_ibs = self._merged_so_owner_target_ibs(draw_ib)
         # t75：**唯一判定模式**。通道骨被 ≥2 件引用（真正跨部件共享）⇒ 由键块按
         # 精确哈希算出的槽捕获 palette / SO 引用（`_append_merged_pose_key_alignment`）；
@@ -3859,30 +3889,33 @@ class ExportZZMI(ExportUnity):
         # **逐字一致**：重定向路径里作为 SO owner 的挂点，或直连路径里被吸收的合并
         # 宿主。判据换成键以后这个条件必须原样带过去——否则直连路径的宿主不再刷新
         # 自己的 SO（它的每槽重放会写上一帧的缓冲）。
-        captures_redirect_so = bool(so_owner_target_ibs) or is_absorbed_host
+        captures_redirect_so = (
+            bool(so_owner_target_ibs) or is_absorbed_host or is_cross_group_host
+        )
         if not key_driven_capture:
             for index, slot in enumerate(slots):
                 palette_line = (
                     f"{self._merged_palette_name(draw_ib, slot)} = copy vs-t0 unless_null"
                 )
                 condition = f"if {occ_var} == {slot}" if index == 0 else "else"
-                texture_override_vb_section.append(condition)
-                texture_override_vb_section.append(f"    {palette_line}")
+                capture_lines.append(condition)
+                capture_lines.append(f"    {palette_line}")
                 for _so_owner_target_ib in so_owner_target_ibs:
-                    texture_override_vb_section.append(
+                    capture_lines.append(
                         f"    {self._merged_redirect_so_name(skeleton_group, slot)} = ref so0"
                     )
                     # O3：登记 referent 捕获点（只计数，不改产物文本）
                     self._merged_reuse_capture_site(skeleton_group, slot)
-                if is_absorbed_host:
-                    # 直连路径的合并宿主：把本轮自己的 SO 引用捕获下来（与重定向路径
-                    # 同名资源、同语义），任何兼容挂点闭合守卫后都能把合并几何写进去。
-                    texture_override_vb_section.append(
+                if is_absorbed_host or is_cross_group_host:
+                    # 直连路径的合并宿主（组内被吸收 / 跨组被吸收）：把本轮自己的 SO
+                    # 引用捕获下来（与重定向路径同名资源、同语义），任何兼容挂点闭合
+                    # 守卫后都能把合并几何写进去。
+                    capture_lines.append(
                         f"    {self._merged_redirect_so_name(skeleton_group, slot)} = ref so0"
                     )
                     self._merged_reuse_capture_site(skeleton_group, slot)
             if len(slots) > 1:
-                texture_override_vb_section.append("endif")
+                capture_lines.append("endif")
 
         # 3.5) 实例对齐：把本 pass 的 palette / SO 引用按**通道骨精确哈希键**
         # 改投到正确槽位（唯一判定口径，见 `_append_merged_pose_key_alignment`）。
@@ -3890,7 +3923,7 @@ class ExportZZMI(ExportUnity):
         # 随实例变化），按出现次捕获会把两份姿态混进同一槽骨架。
         if key_driven_capture:
             self._append_merged_pose_key_alignment(
-                texture_override_vb_section,
+                capture_lines,
                 draw_ib,
                 component_id,
                 skeleton_group,
@@ -3994,6 +4027,12 @@ class ExportZZMI(ExportUnity):
             f"vs-t0 = {self._merged_skeleton_name(skeleton_group, slot_first)}"
         )
         texture_override_vb_section.append("handling = skip")
+
+        # 5b) 跨组供骨件自己那段的合并几何重放（F3）：与宿主那段同一套守卫条件，
+        #     「最后一个到达的供骨件落笔」⇒ 与引擎提交顺序无关。
+        self._append_merged_cross_group_replays(
+            texture_override_vb_section, draw_ib, component_id, slots
+        )
 
         # 6) 每槽守卫（体内只有绑定与 draw）
         #
@@ -4448,8 +4487,21 @@ class ExportZZMI(ExportUnity):
         已到齐，因此任何布局兼容的挂点闭合守卫后都能写。
         """
         gate = self._merged_so_ready_condition([int(host["component_id"])], slot)
+        # 跨组供骨件（F3）：合并几何里被吸收的**别组**顶点，其骨骼由跨组 attach 写进
+        # 本组缓冲，而那个 attach 读的是**跨组件自己那一段**捕获的 palette。守卫若不
+        # 等它们到达，就只可能在宿主自己那段闭合——而宿主常常排在跨组件**之前**
+        # （2026-10-10 FrameAnalysis 实测 洛克茜：宿主 d5e1e7ff deform=000020，跨组件
+        # 4e6d8882 deform=000023）⇒ 合并几何是用**上一帧**的跨组 palette 画出来的 =
+        # 用户实测的「一帧延迟 + 运动时错位」（静止时上一帧 == 当帧，所以看不出来）。
+        # 把跨组件并入到达集合后，守卫最早只能在「最后一个供骨件到达」处闭合；跨组件
+        # 自己那段也会发同一套守卫（`_append_merged_cross_group_replays`），落笔点
+        # 因此自动跟着引擎的提交顺序走。开关关闭时 `_merged_cross_group_component_ids`
+        # 返回空 ⇒ 条件与历史逐字一致。
         clauses = self._merged_slot_seen_condition(
-            self._merged_group_component_ids(skeleton_group), slot, cull_aware=True
+            self._merged_group_component_ids(skeleton_group)
+            + self._merged_cross_group_component_ids(skeleton_group),
+            slot,
+            cull_aware=True,
         )
         # O3：消费点标记（注释行；守卫条件与块体一字不改 ⇒ 逐字节不变量）
         self._append_merged_diag(
@@ -4470,6 +4522,40 @@ class ExportZZMI(ExportUnity):
         section.append(f"    draw = {int(host['draw_count'])}, 0")
         section.append("    so0 = null")
         section.append("endif")
+
+    def _append_merged_cross_group_replays(
+        self, section, draw_ib: str, component_id: int, slots
+    ) -> None:
+        """跨组供骨件**自己那段**的合并几何重放（F3，开关 `cross_group_merged_vgmap_test`）。
+
+        为什么必须由跨组件自己再发一份（2026-10-10 FrameAnalysis 实证，洛克茜复现件）：
+        合并几何挂在宿主（d5e1e7ff，G3）的导出 VB 上，而它的骨骼来自 G3 自己 +
+        被吸收的 G2/G0 部件。宿主那段的守卫现在要等**全部供骨件**到达（见
+        `_append_merged_absorbed_replay`），而引擎把宿主排在跨组件之前时（实测
+        deform 提交次序 000017 4e6e989e → 000020 宿主 → 000023 4e6d8882），宿主
+        那段永远等不到 ⇒ 若这里不再发一份，守卫整帧不闭合、合并几何整段不写。
+
+        守卫条件与宿主那段**逐字相同** ⇒ 一帧内只会在「最后一个供骨件到达」处闭合
+        一次（不会重复写 SO，不会翻倍顶点）。落笔点从「固定在宿主」变成「按提交
+        顺序自适应」，这是 v9.1 对**组内**挂点已经采用的同一口径，这里只是把它
+        扩到**跨组**供骨件。
+        """
+        for host_group in self._merged_cross_host_group_map().get(int(component_id), []):
+            if self._merged_group_redirect_target(int(host_group)):
+                # 该宿主组走重定向路径：合并几何的落笔点由它自己的计划（载体/锚点）
+                # 决定，不在这里叠加第二套。
+                continue
+            for host in self._merged_group_absorbed_hosts(int(host_group)):
+                if not self._merged_absorbed_replay_compatible(
+                    draw_ib, str(host["draw_ib"])
+                ):
+                    # Blend 输入布局与宿主不一致（BI4 vs BW16_BI16 之类）：重放会把
+                    # BLENDINDICES 按错误格式解释 ⇒ 流输出全零。退回宿主自己那段。
+                    continue
+                for slot in slots:
+                    self._append_merged_absorbed_replay(
+                        section, host, int(host_group), slot, consumer_ib=draw_ib
+                    )
 
     def _append_merged_direct_slot_guards(
         self,
@@ -6555,6 +6641,11 @@ class ExportZZMI(ExportUnity):
         # 帧内最后一次派发（最后一个必需部件到达处）用最完整骨架覆盖。
         # draw 版重放**保留**作为兜底（CS 绑定失败时行为与旧版一致）。
         # 详见 Toolset/zzmi_merged_skin.hlsl 顶部说明与 ZZMI骨骼合并计划书 §7 修复链 10。
+        #
+        # F3-CS（2026-10-10）：**跨组吸收宿主组**同样要发这套段定义。它没有重定向
+        # 计划（直连路径），但合并几何混进了别组顶点，宿主自己那段写 SO 时跨组
+        # palette 往往还是上一帧的（实测宿主 deform 早于跨组件）⇒ 必须能在「最后
+        # 一个供骨件到达处」用当帧骨架重发布。见 `_merged_cross_group_publish_plan`。
         # ---------------------------------------------------------------
         for skeleton_group in groups:
             group_plan = self._merged_group_redirect_plan(skeleton_group)
