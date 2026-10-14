@@ -9,10 +9,23 @@
 ``sys.modules`` 而不执行插件真实初始化。测试自身通过各自的 fake-PKG 前缀
 加载真实模块（``tests/test_efmi_*`` 等既有模式），不依赖根包被导入；
 从 ``tests/`` 目录内跑（旧式 ``cd tests && pytest``）时根包不被导入，此垫片无副作用。
+
+另有第二个垫片：把仓库根加入 ``sys.path``（**追加**，不抢占 ``tests/`` 自身的
+优先级）。原因是有测试用 ``from tests.<module> import ...`` 共享辅助函数
+（``test_drag_feature_switches.py`` / ``test_drag_present_order.py``），而
+``python -m pytest <单个文件>`` 从 ``tests/`` 内跑时 ``sys.path`` 里只有
+``tests/`` 自己 —— 包前缀 ``tests.`` 解析不到，收集期直接
+``ModuleNotFoundError: No module named 'tests'``（整文件 ERROR、退出码 2）。
+追加仓库根后两种跑法（``pytest .`` 与 ``pytest <file>``）都能收集。
 """
 
+import os
 import sys
 import types
+
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.append(_REPO_ROOT)
 
 if "TheHerta4" not in sys.modules:
     _root_pkg_stub = types.ModuleType("TheHerta4")

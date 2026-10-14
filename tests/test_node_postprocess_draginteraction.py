@@ -17,8 +17,10 @@
 
 import importlib.util
 import os
+import shutil
 import struct
 import sys
+import tempfile
 import types
 import unittest
 from collections import OrderedDict
@@ -5616,7 +5618,5 @@ class DragZoneListOperatorTests(unittest.TestCase):
         self.assertEqual(result, {'FINISHED'})
         self.assertEqual(settings.include_objects.names(), ["Body"])
         self.assertEqual(settings.collider_objects.names(), ["Body"])
-
-
 if __name__ == "__main__":
     unittest.main()
