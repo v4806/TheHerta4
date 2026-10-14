@@ -195,7 +195,7 @@ def _make_node(mod, **props):
         phys_release_kick=0.12, phys_target_follow=1.10,
         mult_radius=1.0, mult_strength=0.333, mult_spring=0.333, mult_damping=1.0,
         zone_objects=[], bake_reference_object=None, mask_plateau=0.0,
-        collision_enabled=False, collision_margin=0.002, collision_mode="SOFT",
+        collision_enabled=False, collision_margin=0.002, collision_mode="HARD",
         collision_point_budget=4096, collision_cell_size=0.0,
     )
     defaults.update(props)
@@ -4810,6 +4810,10 @@ class DragCollisionTests(unittest.TestCase):
             "h": 0.1, "h_c": 0.4,
             "dims": (10, 8, 6), "cdims": (3, 2, 2),
         }
+        comps[0]["collision_sdf"] = {
+            "bmin": (0.0, 0.0, 0.0), "cell": 0.0125,
+            "dims": (64, 34, 102), "band": 0.08,
+        }
         node._emit_sections(sections, comps, "testns")
         return node, sections, comps
 
@@ -4970,6 +4974,72 @@ class DragCollisionTests(unittest.TestCase):
         for suffix in ("ColliderPoints", "ColliderCellsFine", "ColliderCellsCoarse", "ColliderVertexL0"):
             self.assertNotIn(f"[ResourceDrag{suffix}_{cn}_testns]", sections)
 
+    # ---- SDF 烘焙 ----
+
+    def test_bake_collider_sdf_matches_analytic_sphere(self):
+        """SDF 必须在解析可验证的形状上给出正确距离。
+
+        半径 1 的 UV 球（经纬各 48/96 段，离散化误差远小于体素边长）：
+        每个采样点的值应接近 |p| - 1，正负号也必须对。
+        """
+        node = _make_node(self.mod, collision_enabled=True)
+        n_lat, n_lon = 48, 96
+        verts = []
+        for a in range(n_lat + 1):
+            theta = np.pi * a / n_lat
+            for b in range(n_lon):
+                phi = 2.0 * np.pi * b / n_lon
+                verts.append([
+                    np.sin(theta) * np.cos(phi),
+                    np.cos(theta),
+                    np.sin(theta) * np.sin(phi),
+                ])
+        verts = np.array(verts, dtype=np.float32)
+        tris = []
+        for a in range(n_lat):
+            for b in range(n_lon):
+                b1 = (b + 1) % n_lon
+                i0 = a * n_lon + b
+                i1 = a * n_lon + b1
+                i2 = (a + 1) * n_lon + b
+                i3 = (a + 1) * n_lon + b1
+                tris.append([i0, i2, i1])
+                tris.append([i1, i2, i3])
+        tris = np.array(tris, dtype=np.int32)
+        mask = np.ones(len(verts), dtype=bool)
+
+        out = node._bake_collider_sdf(verts, tris, mask, resolution=64, band=0.5)
+        self.assertIsNotNone(out)
+        sdf, bmin, cell, dims = out
+        self.assertEqual(sdf.dtype, np.float32)
+        self.assertEqual(int(np.prod(dims)), sdf.size)
+        self.assertGreater(cell, 0.0)
+
+        arr = sdf.reshape(tuple(int(d) for d in dims))
+        nx, ny, nz = (int(d) for d in dims)
+        checked = 0
+        worst = 0.0
+        for ix in range(2, nx - 2, 6):
+            for iy in range(2, ny - 2, 6):
+                for iz in range(2, nz - 2, 6):
+                    p = np.asarray(bmin, dtype=np.float64) + (
+                        np.array([ix, iy, iz], dtype=np.float64) + 0.5) * cell
+                    exact = float(np.linalg.norm(p)) - 1.0
+                    if abs(exact) > 0.35:
+                        continue
+                    worst = max(worst, abs(float(arr[ix, iy, iz]) - exact))
+                    checked += 1
+        self.assertGreater(checked, 20)
+        # 体素边长约 2/63 ≈ 0.032；最近三角形离散化 + 单精度留 3 倍余量
+        self.assertLess(worst, 3.0 * cell)
+
+    def test_bake_collider_sdf_returns_none_without_collider_triangles(self):
+        node = _make_node(self.mod, collision_enabled=True)
+        verts = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], dtype=np.float32)
+        tris = np.array([[0, 1, 2]], dtype=np.int32)
+        mask = np.zeros(3, dtype=bool)  # 没有碰撞体顶点 ⇒ 没有碰撞体三角形
+        self.assertIsNone(node._bake_collider_sdf(verts, tris, mask, resolution=32))
+
     # ---- HLSL 契约 ----
 
     def test_shader_collision_contract(self):
@@ -5027,10 +5097,92 @@ class DragCollisionTests(unittest.TestCase):
             # 点云交错布局：每点 2×float4 = 8 float
             pts = np.fromfile(p / "sampleColliderPoints.buf", dtype=np.float32)
             self.assertEqual(len(pts) % 8, 0)
-            self.assertEqual(len(pts) // 8, 8)  # 8 碰撞体顶点未抽稀
+            point_count = len(pts) // 8
+            # 8 个碰撞体顶点 + 面内采样（12 个三角形各至少 1 点）⇒ 明显多于纯顶点数
+            self.assertGreater(point_count, 8)
+            self.assertLessEqual(point_count, 4096)
             # L0：每顶点 2 float4，共 8 顶点
             l0 = np.fromfile(p / "sampleColliderVertexL0.buf", dtype=np.float32)
             self.assertEqual(len(l0), 8 * 2 * 4)
+
+    def test_collider_block_ids_splits_disconnected_blocks(self):
+        """分离的两块碰撞体各自成块（用于各自的朝外判定）。"""
+        a = np.random.RandomState(7).rand(200, 3).astype(np.float32) * 0.1
+        b = (np.random.RandomState(8).rand(200, 3).astype(np.float32) * 0.1
+             + np.array([5.0, 0.0, 0.0], dtype=np.float32))
+        pts = np.concatenate([a, b], axis=0)
+        ids, count = self.NodeCls._collider_block_ids(pts, 0.05)
+        self.assertEqual(count, 2)
+        self.assertEqual(len(set(ids[:200].tolist())), 1)
+        self.assertEqual(len(set(ids[200:].tolist())), 1)
+        self.assertNotEqual(int(ids[0]), int(ids[-1]))
+
+    def test_collider_block_ids_single_block_for_continuous_surface(self):
+        """连续曲面（近邻间距远小于格边长）必须判为一块。"""
+        grid = np.stack(np.meshgrid(np.arange(10), np.arange(10), np.arange(10)), axis=-1)
+        pts = (grid.reshape(-1, 3).astype(np.float32)) * 0.01
+        ids, count = self.NodeCls._collider_block_ids(pts, 0.05)
+        self.assertEqual(count, 1)
+        self.assertEqual(len(set(ids.tolist())), 1)
+
+    def test_collider_vertex_normals_outward_for_two_blocks(self):
+        """多块碰撞体：每块各自朝外（用整体质心会把离群块整块算反）。"""
+        def cube(offset):
+            v = np.array([
+                [-1, -1, -1], [1, -1, -1], [1, 1, -1], [-1, 1, -1],
+                [-1, -1, 1], [1, -1, 1], [1, 1, 1], [-1, 1, 1],
+            ], dtype=np.float32)
+            return v + np.asarray(offset, dtype=np.float32)
+
+        verts = np.concatenate([cube([0, 0, 0]), cube([10, 0, 0])], axis=0)
+        base = np.array([
+            [0, 1, 2], [0, 2, 3],
+            [4, 6, 5], [4, 7, 6],
+            [0, 4, 5], [0, 5, 1],
+            [3, 2, 6], [3, 6, 7],
+            [0, 3, 7], [0, 7, 4],
+            [1, 5, 6], [1, 6, 2],
+        ], dtype=np.int64)
+        tris = np.concatenate([base, base + 8], axis=0)
+        mask = np.ones(16, dtype=bool)
+        n = self.NodeCls._collider_vertex_normals(verts, tris, mask, 16)
+        centers = np.concatenate([
+            np.zeros((8, 3), dtype=np.float32),
+            np.tile(np.array([[10, 0, 0]], dtype=np.float32), (8, 1)),
+        ], axis=0)
+        dots = np.einsum("ij,ij->i", n, verts - centers)
+        self.assertTrue(np.all(dots > 0.0), f"两块都应朝外，dot={dots}")
+
+    def test_sample_collider_surface_fills_face_interior(self):
+        """面内采样点落在三角形上、法线与面法线一致，且填补顶点之间的空洞。"""
+        verts = np.array([
+            [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0],
+        ], dtype=np.float32)
+        tris = np.array([[0, 1, 2]], dtype=np.int64)
+        mask = np.ones(3, dtype=bool)
+        pts, tid, nrm = self.NodeCls._sample_collider_surface(verts, tris, mask, 256)
+        self.assertEqual(len(pts), 256)
+        self.assertEqual(len(tid), 256)
+        self.assertTrue(np.allclose(pts[:, 2], 0.0, atol=1e-6))
+        self.assertTrue(np.all(pts[:, 0] >= -1e-6))
+        self.assertTrue(np.all(pts[:, 1] >= -1e-6))
+        self.assertTrue(np.all(pts[:, 0] + pts[:, 1] <= 1.0 + 1e-6))
+        self.assertTrue(np.allclose(np.abs(nrm[:, 2]), 1.0, atol=1e-6))
+        # 面内最近邻距应显著小于纯顶点采样（1.0 量级）
+        d = np.linalg.norm(pts[:, None, :] - pts[None, :, :], axis=-1)
+        np.fill_diagonal(d, np.inf)
+        self.assertLess(float(d.min(axis=1).max()), 0.35)
+
+    def test_sample_collider_surface_deterministic(self):
+        """固定 seed ⇒ 同一模型每次导出结果一致。"""
+        verts = np.random.RandomState(11).rand(30, 3).astype(np.float32)
+        tris = np.array([[0, 1, 2], [3, 4, 5], [6, 7, 8]], dtype=np.int64)
+        mask = np.ones(30, dtype=bool)
+        p1, t1, n1 = self.NodeCls._sample_collider_surface(verts, tris, mask, 64)
+        p2, t2, n2 = self.NodeCls._sample_collider_surface(verts, tris, mask, 64)
+        np.testing.assert_array_equal(p1, p2)
+        np.testing.assert_array_equal(t1, t2)
+        np.testing.assert_array_equal(n1, n2)
 
     def test_collision_l0_pads_zzmi_redirect_vertex_prefix(self):
         import tempfile
