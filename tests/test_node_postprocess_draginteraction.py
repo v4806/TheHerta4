@@ -1733,11 +1733,15 @@ class DragNodeEmitTests(unittest.TestCase):
         ])
 
     def test_jiggle_temp_vb0_empty_declaration_and_copy_roundtrip(self):
-        # R9 回退：恢复 TempVB0 空声明 + copy 往返自愈链（Alt 模型消失回归修复）
+        # R9 回退：恢复 TempVB0 声明 + copy 往返自愈链（Alt 模型消失回归修复）
+        # 声明形态已演进（方法名保留为历史）：空声明 / RWBuffer+format 会让 D3D 建视图失败
+        # （E_INVALIDARG）或按 16 B 元素取址错位；现发射与 hlsl 同构的
+        # `RWStructuredBuffer<VertexAttributes>`（stride 40、被 cs-t24 当 SRV 读 ⇒ 需 shader_resource）
         _, sections, _ = self._emit()
         self.assertEqual(
             sections["[ResourceDragJiggleTempVB0_abc123_43191_testns]"],
-            ["type = RWBuffer"],
+            ["type = RWStructuredBuffer", "stride = 40", "array = 19039",
+             "bind_flags = shader_resource unordered_access"],
         )
         self.assertNotIn("[ResourceDragJiggleShadowVB_abc123_43191_testns]", sections)
         jig = "\n".join(sections["[CustomShaderDragJiggleabc123_43191_testns]"])
@@ -4947,31 +4951,64 @@ class DragCollisionTests(unittest.TestCase):
         self.assertIn(f"cs-t77 = ResourceDragColliderCellsFine_{cn}_testns", text)
         self.assertIn(f"cs-t78 = ResourceDragColliderCellsCoarse_{cn}_testns", text)
         self.assertIn(f"cs-t79 = ResourceDragColliderVertexL0_{cn}_testns", text)
-        # x101: enabled=1 margin=0.002 mode=0(soft) safety=0.9
-        self.assertIn("x101 = 1 0.002 0 0.9", text)
-        self.assertIn("x102 = 0 0 0 0.1", text)
-        self.assertIn("x103 = 10 8 6 0.4", text)
-        # x104 携带 drag_mode 变量（模式三门控在 shader 内再确认）
-        self.assertIn("x104 = $ssmtdrag_drag_enabled_testns 3 2 2", text)
+        # x101: enabled=1 margin=0.002 mode=1(hard，默认已改为硬钳制) safety=0.9
+        # 3DMigoto 的 ini 解析器不支持一行多值：`x101 = 1 0.002 1 0.9` 会在第二个 token
+        # 处报 Syntax Error 并整行丢弃（实测 Unrecognised entry），必须逐行拆成 x/y/z/w。
+        self.assertIn("x101 = 1", lines)
+        self.assertIn("y101 = 0.002", lines)
+        self.assertIn("z101 = 1", lines)
+        self.assertIn("w101 = 0.9", lines)
+        self.assertIn("x102 = 0", lines)
+        self.assertIn("y102 = 0", lines)
+        self.assertIn("z102 = 0", lines)
+        self.assertIn("w102 = 0.1", lines)
+        self.assertIn("x103 = 10", lines)
+        self.assertIn("y103 = 8", lines)
+        self.assertIn("z103 = 6", lines)
+        self.assertIn("w103 = 0.4", lines)
+        # x104 只承载 drag_mode 变量（网格查询已废弃，不再混入 cdims 字面量；
+        # 「变量 + 字面量」混合多值没有先例、无法确认 3DMigoto 解析行为）
+        self.assertIn("x104 = $ssmtdrag_drag_enabled_testns", lines)
+        self.assertNotIn("$ssmtdrag_drag_enabled_testns 3 2 2", text)
+        self.assertNotIn("x101 = 1 0.002 1 0.9", text)
+        # x105/x106：SDF 网格（origin + cell / dims + band）
+        self.assertIn("x105 = 0", lines)
+        self.assertIn("y105 = 0", lines)
+        self.assertIn("z105 = 0", lines)
+        self.assertIn("w105 = 0.0125", lines)
+        self.assertIn("x106 = 64", lines)
+        self.assertIn("y106 = 34", lines)
+        self.assertIn("z106 = 102", lines)
+        self.assertIn("w106 = 0.08", lines)
+        self.assertIn(f"cs-t80 = ResourceDragColliderSDF_{cn}_testns", text)
 
     def test_jiggle_section_without_collision_writes_zero_and_no_bindings(self):
         node, sections, comps = self._emit()  # 无 collision_grid
         cn = comps[0]["comp_name"]
         text = "\n".join(sections[f"[CustomShaderDragJiggle{cn}_testns]"])
         self.assertIn("x101 = 0", text)
+        self.assertIn("x105 = 0", text)
+        self.assertIn("x106 = 0", text)
         self.assertNotIn("cs-t76", text)
         self.assertNotIn("cs-t79", text)
+        self.assertNotIn("cs-t80", text)
 
     def test_component_resources_emit_collider_sections(self):
         node, sections, comps = self._emit_with_collision_grid()
         cn = comps[0]["comp_name"]
-        for suffix in ("ColliderPoints", "ColliderCellsFine", "ColliderCellsCoarse", "ColliderVertexL0"):
+        for suffix in ("ColliderPoints", "ColliderCellsFine", "ColliderCellsCoarse",
+                       "ColliderVertexL0", "ColliderSDF"):
             self.assertIn(f"[ResourceDrag{suffix}_{cn}_testns]", sections)
+        # SDF 是 R32_FLOAT 单通道线性缓冲，不是 float4
+        sdf_lines = sections[f"[ResourceDragColliderSDF_{cn}_testns]"]
+        self.assertIn("format = R32_FLOAT", sdf_lines)
+        self.assertIn("ColliderSDF.buf", "\n".join(sdf_lines))
 
     def test_component_resources_no_collider_sections_by_default(self):
         node, sections, comps = self._emit()
         cn = comps[0]["comp_name"]
-        for suffix in ("ColliderPoints", "ColliderCellsFine", "ColliderCellsCoarse", "ColliderVertexL0"):
+        for suffix in ("ColliderPoints", "ColliderCellsFine", "ColliderCellsCoarse",
+                       "ColliderVertexL0", "ColliderSDF"):
             self.assertNotIn(f"[ResourceDrag{suffix}_{cn}_testns]", sections)
 
     # ---- SDF 烘焙 ----

@@ -4820,10 +4820,18 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             f"[ResourceDragPinnedComponentInfo_{cn}_{ns}]": ["type = RWBuffer", "format = R32G32B32A32_FLOAT", "array = 15"],
             f"[ResourceDragComponentZoneOut_{cn}_{ns}]": ["type = RWBuffer", "format = R32_FLOAT", "array = 1"],
             f"[ResourceDragJiggleState_{cn}_{ns}]": ["type = RWBuffer", "format = R32G32B32A32_FLOAT", "array = 10"],
-            # TempVB0：空声明段（type=RWBuffer，无 format/array），copy 往返后换绑。
-            #（R9 ShadowVB 直写链已回退：实机 Alt 进入拖拽整模消失，实验 A/B 双证
-            # 常驻自定义缓冲换绑在当前 fork 运行二进制上不工作；无日志前勿再直写。）
-            f"[ResourceDragJiggleTempVB0_{cn}_{ns}]": ["type = RWBuffer"],
+            # TempVB0：位置缓冲的 UAV 别名（原地改写顶点位置后回绑 vb0）。
+        # 必须与 hlsl 同构：hlsl 是 `RWStructuredBuffer<VertexAttributes> rw_buffer : register(u5)`
+        # + `StructuredBuffer<VertexAttributes> base_buffer : register(t24)`，元素尺寸 = stride 40。
+        # 只声明 type（无 stride/array）会让 D3D 侧创建失败（日志指纹：
+        # Failed to substantiate custom Buffer [...dragjiggletempvb0_*]: 0x80070057 = E_INVALIDARG）；
+        # 写成 RWBuffer + format（16 B 元素）则会与结构化声明取址错位，等于没修。
+        f"[ResourceDragJiggleTempVB0_{cn}_{ns}]": [
+            "type = RWStructuredBuffer",
+            "stride = 40",
+            "array = 19039",
+            "bind_flags = shader_resource unordered_access",
+        ],
         }
         comp_resources[f"[ResourceDragJiggleZoneIDs_{cn}_{ns}]"] = [
             "type = Buffer", "format = R32G32B32A32_UINT",
@@ -4876,6 +4884,45 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 "type = Buffer", "format = R32G32B32A32_FLOAT",
                 f"filename = {res_dir}/{stem}ColliderVertexL0.buf",
             ]
+            if comp.get("collision_sdf"):
+                comp_resources[f"[ResourceDragColliderSDF_{cn}_{ns}]"] = [
+                    "type = Buffer", "format = R32_FLOAT",
+                    f"filename = {res_dir}/{stem}ColliderSDF.buf",
+                ]
+            if comp.get("collision_trigrid"):
+                comp_resources[f"[ResourceDragColliderTriGrid_{cn}_{ns}]"] = [
+                    "type = Buffer", "format = R32_UINT",
+                    f"filename = {res_dir}/{stem}ColliderTriGrid.buf",
+                ]
+                comp_resources[f"[ResourceDragColliderTriGridTris_{cn}_{ns}]"] = [
+                    "type = Buffer", "format = R32G32B32A32_FLOAT",
+                    f"filename = {res_dir}/{stem}ColliderTriGridTris.buf",
+                ]
+                # 网格三角形 → 顶点缓冲索引（权重重映射要用它反查三角形三个顶点的权重）
+                comp_resources[f"[ResourceDragColliderTriGridVerts_{cn}_{ns}]"] = [
+                    "type = Buffer", "format = R32_UINT",
+                    f"filename = {res_dir}/{stem}ColliderTriGridVerts.buf",
+                ]
+                # 沿腿轴滑动状态（逐顶点累积的轴向位移；用户 m05361 的「上下滑动控制丝袜长度」）
+                _vc = max(1, int(comp.get("vertex_count", 0) or 1))
+                # shader 按 i*2 索引（每顶点 2 个 float4：位移 + 上一帧轴向分量）
+                comp_resources[f"[ResourceDragJiggleSlideState_{cn}_{ns}]"] = [
+                    "type = RWBuffer", "format = R32G32B32A32_FLOAT",
+                    f"array = {_vc * 2}",
+                ]
+                # Blend 的 typed 视图（结构化缓冲读不了权重，必须按 R32G32B32A32_FLOAT 索引）
+                comp_resources[f"[ResourceDragJiggleBlendTyped_{cn}_{ns}]"] = [
+                    "type = Buffer", "format = R32G32B32A32_FLOAT",
+                    # 文件名必须带连字符：真实文件是 `d5e1e7ff-Blend.buf`（与 [Resourced5e1e7ffBlend]
+                    # 段一致）。曾经写成 `d5e1e7ffBlend.buf` ⇒ 目录里没有该文件 ⇒ 资源加载失败、
+                    # cs-t86 读不到权重，穿脱的权重投影整条链断掉（t3 §D 报的 F1）。
+                    f"filename = {res_dir}/{stem}-Blend.buf",
+                ]
+                # 重映射后的权重（每顶点 2 个 float4：权重 + 索引），渲染段把 vb2 指向它
+                comp_resources[f"[ResourceDragJiggleBlendOut_{cn}_{ns}]"] = [
+                    "type = RWBuffer", "format = R32G32B32A32_FLOAT",
+                    f"array = {_vc * 2}",
+                ]
         for sec, lines in comp_resources.items():
             sections.setdefault(sec, lines)
 
@@ -5148,15 +5195,84 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             safety = self._fmt(0.9)
             bmin = collision_grid["bmin"]
             nx, ny, nz = collision_grid["dims"]
-            cnx, cny, cnz = collision_grid["cdims"]
+            # x104 只承载「拖拽模式变量」这一个值：粗/细网格查询已不再被 CollisionSolve
+            # 使用（点云约束走绑定姿态最近的 4 个采样点）。原先的
+            # `{变量} {cnx} {cny} {cnz}` 是「变量 + 字面量」混合多值，全仓无先例、
+            # 无法确认 3DMigoto 的解析行为，改为纯单值。
+            # 3DMigoto 的 ini 解析器**不支持** `x101 = 1 0.002 1 0.9` 这类一行多值写法：
+            # 它会在第二个 token 处报 `Syntax Error: ... Unexpected identifier` 并整行丢弃
+            # （实测日志：`Unrecognised entry: x101 = 1 0.0020000000949949026 1 0.9`），
+            # 导致 COLLISION_PARAMS 保持未定义 ⇒ 碰撞静默失效。必须逐行拆成 x/y/z/w 单值。
             lines.extend([
-                f"x101 = 1 {margin} {mode} {safety}",
-                f"x102 = {self._fmt(float(bmin[0]))} {self._fmt(float(bmin[1]))} {self._fmt(float(bmin[2]))} {self._fmt(collision_grid['h'])}",
-                f"x103 = {nx} {ny} {nz} {self._fmt(collision_grid['h_c'])}",
-                f"x104 = {drag_mode_var} {cnx} {cny} {cnz}",
+                "x101 = 1",
+                f"y101 = {margin}",
+                f"z101 = {mode}",
+                f"w101 = {safety}",
+                f"x102 = {self._fmt(float(bmin[0]))}",
+                f"y102 = {self._fmt(float(bmin[1]))}",
+                f"z102 = {self._fmt(float(bmin[2]))}",
+                f"w102 = {self._fmt(collision_grid['h'])}",
+                f"x103 = {nx}",
+                f"y103 = {ny}",
+                f"z103 = {nz}",
+                f"w103 = {self._fmt(collision_grid['h_c'])}",
+                f"x104 = {drag_mode_var}",
+            ])
+            # 槽位 105/106：SDF 网格（origin + cell / dims + band）。
+            # 碰撞约束改用「到表面的带符号距离不许变小」，靠 SDF 一次三线性采样
+            # 得到，不再需要粗/细网格查询与每顶点最近点搜索。
+            collision_sdf = comp.get("collision_sdf")
+            if collision_sdf:
+                sb = collision_sdf["bmin"]
+                sd = collision_sdf["dims"]
+                lines.extend([
+                    f"x105 = {self._fmt(float(sb[0]))}",
+                    f"y105 = {self._fmt(float(sb[1]))}",
+                    f"z105 = {self._fmt(float(sb[2]))}",
+                    f"w105 = {self._fmt(float(collision_sdf['cell']))}",
+                    f"x106 = {int(sd[0])}",
+                    f"y106 = {int(sd[1])}",
+                    f"z106 = {int(sd[2])}",
+                    f"w106 = {self._fmt(float(collision_sdf['band']))}",
+                ])
+            else:
+                lines.extend(["x105 = 0", "x106 = 0"])
+            # 槽位 107：每个顶点绑定的约束三角形数（0 = 未烘焙，走点云回退）。
+            # 槽位 108/109：动态三角形网格（origin + cell / dims + cell_count）。
+            # 运行时按顶点当前位置现查邻域三角形，约束 =「到表面的带符号距离不许
+            # 比绑定姿态时更小」；基准在运行时现算，不需要额外缓冲。
+            collision_trigrid = comp.get("collision_trigrid")
+            if collision_trigrid:
+                gb = collision_trigrid["bmin"]
+                gd = collision_trigrid["dims"]
+                lines.extend([
+                    f"x108 = {self._fmt(float(gb[0]))}",
+                    f"y108 = {self._fmt(float(gb[1]))}",
+                    f"z108 = {self._fmt(float(gb[2]))}",
+                    f"w108 = {self._fmt(float(collision_trigrid['cell']))}",
+                    f"x109 = {int(gd[0])}",
+                    f"y109 = {int(gd[1])}",
+                    f"z109 = {int(gd[2])}",
+                    f"w109 = {int(collision_trigrid['cell_count'])}",
+                ])
+            else:
+                lines.extend(["x108 = 0", "x109 = 0"])
+            # 槽位 110：沿腿轴滑动。xyz = 腿轴单位向量，w = 开关（1 轴向固化 / 2 径向固化）。
+            # 轴向量由导出侧按碰撞体 PCA 主轴算出；w 恒 1。
+            # 槽位 111：权重重映射开关（x = 1 时按最近碰撞体三角形的重心坐标重算权重）。
+            # 用户 m05474：两者都只在碰撞开启时发射（本分支即 collision_grid 存在）。
+            slide_axis = comp.get("slide_axis") or (-0.112638, -0.091816, 0.989385)
+            lines.extend([
+                f"x110 = {self._fmt(float(slide_axis[0]))}",
+                f"y110 = {self._fmt(float(slide_axis[1]))}",
+                f"z110 = {self._fmt(float(slide_axis[2]))}",
+                "w110 = 1",
+                "x111 = 1", "y111 = 0", "z111 = 0", "w111 = 0",
             ])
         else:
-            lines.extend(["x101 = 0", "x102 = 0", "x103 = 0", "x104 = 0"])
+            lines.extend(["x101 = 0", "x102 = 0", "x103 = 0", "x104 = 0",
+                          "x105 = 0", "x106 = 0", "x108 = 0", "x109 = 0",
+                          "x110 = 0", "x111 = 0"])
         lines.extend([
             f"cs-t67 = ResourceDragPinnedComponentInfo_{cn}_{ns}",
             f"cs-t68 = ResourceDragJiggleParams_{cn}_{ns}",
@@ -5177,6 +5293,25 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 f"cs-t78 = ResourceDragColliderCellsCoarse_{cn}_{ns}",
                 f"cs-t79 = ResourceDragColliderVertexL0_{cn}_{ns}",
             ])
+            if comp.get("collision_sdf"):
+                lines.append(f"cs-t80 = ResourceDragColliderSDF_{cn}_{ns}")
+            if comp.get("collision_trigrid"):
+                lines.append(f"cs-t83 = ResourceDragColliderTriGrid_{cn}_{ns}")
+                lines.append(f"cs-t84 = ResourceDragColliderTriGridTris_{cn}_{ns}")
+                lines.append(f"cs-t87 = ResourceDragColliderTriGridVerts_{cn}_{ns}")
+                lines.append(f"cs-u3 = ResourceDragJiggleSlideState_{cn}_{ns}")
+                lines.append(f"cs-t86 = ResourceDragJiggleBlendTyped_{cn}_{ns}")
+                lines.append(f"cs-u2 = ResourceDragJiggleBlendOut_{cn}_{ns}")
+                # 碰撞面跟随动画（t22）：碰撞三角形顶点要按「当帧骨架」蒙皮，否则碰撞面留在
+                # 导出姿态，角色一摆腿顶点就穿过薄壳（实测漂移 >1 mm 即穿，gap 只有 0.37~1.74 mm）。
+                # 合并骨架是 s1/s2 两帧 ping-pong：本帧 deform 段按 $zz_ms_occ_0 选一份写入，
+                # 而拖拽 CS 在渲染 draw 上执行 ⇒ 必须同步选同一份，固定 s1 会让 occ==2 的帧
+                # 读到上一帧骨架（滞后误差 ≈ −1.5 mm/度，0.35° 就耗尽全部余量）。
+                lines.append(f"\tif $zz_ms_occ_0 == 1")
+                lines.append(f"\t\tcs-t88 = ref ResourceZZMergedSkeleton_G3_s1")
+                lines.append(f"\telse")
+                lines.append(f"\t\tcs-t88 = ref ResourceZZMergedSkeleton_G3_s2")
+                lines.append(f"\tendif")
         lines.extend([
             "",
             f"ResourceDragJiggleTempVB0_{cn}_{ns} = vb0",
@@ -5188,6 +5323,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             "vb0 = null",
             f"ResourceDragJiggleTempVB0_{cn}_{ns} = copy cs-u5",
             "cs-u5 = null", "cs-u6 = null", "cs-t71 = null",
+            "cs-u3 = null", "cs-u2 = null", "cs-t88 = null",
             "",
             "post x69 = $back_x69", "post y69 = $back_y69",
             "post z69 = $back_z69", "post w69 = $back_w69",

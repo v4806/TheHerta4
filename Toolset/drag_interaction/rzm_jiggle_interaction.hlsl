@@ -74,8 +74,7 @@
 //   [7].w   = axis-valid flag
 //   [8].x   = previous-frame mouse-held flag
 
-struct VertexAttributes
-{
+struct VertexAttributes {
     float3 position;
     float3 normal;
     float4 tangent;
