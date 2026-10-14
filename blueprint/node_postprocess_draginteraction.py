@@ -5182,7 +5182,11 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             f"z76 = $ssmtdrag_max_step_{ns}",
         ]
         lines.extend([
-            "x119 = 0",  # 是否存在 Path Slide；当前节点尚未开放路径模式
+            # 是否存在 Path Slide（IniParams[119].x = 总闸）：1 = 开放路径模式，丝袜沿大腿表面
+            # 滑动 + 逐帧权重实时投影。开启只解除 shader 侧总闸，真正触发还要求同时满足
+            # 区域位 ZoneParams[zone*2+1].z 与方向位 PathVectors[zone].w（三闸串联）。
+            # 档位 0/1 仍逐字节不变：滑动只在档位 2 的拖拽通道内可达。
+            "x119 = 1",
             f"y119 = {self._zone_capacity(self._collect_enabled_zone_entries())}",
         ])
         # 碰撞检测参数（防穿模）：仅在模式三/拉扯模式生效。槽位 101–104 在拖拽着色器族内空闲。
@@ -6210,6 +6214,23 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             f"\t\t\t{last_dispatch} = time",
             "\t\tendif",
             f"\t\tvb0 = {temp_vb0}",
+        ])
+        # 权重重映射的输出缓冲（vb2）：S3/S4 每帧把所有 19039 行都写一遍——受控行走锚点插值
+        # 权重，其余行走 SockSyncRow 自写恒等值（从 BlendTyped 读原权重），所以不存在
+        # 「未初始化行被读到」的塌陷风险（t19 的 V4 已由 S3 的逐顶点写回闭合）。
+        # 条件绑定：只在「路径滑移总闸开启」时把 vb2 指向 BlendOut，
+        # 其余情况一律绑回静态 Blend 资源 ⇒ 关态与档位 0/1 的行为逐字节不变。
+        # T62：原条件里的分阶段总闸子句已随分阶段管线一并移除——该变量在清理后不再
+        # 声明，留着会让 3DMigoto 弃载整个 deform 段（用户 2026-10-14 实机事故）。
+        if comp.get("collision_trigrid"):
+            lines.extend([
+                f"\t\tif $ssmtdrag_slide_enabled_{ns} == 1",
+                f"\t\t\tvb2 = ResourceDragJiggleBlendOut_{cn}_{ns}",
+                "\t\telse",
+                f"\t\t\tvb2 = Resource{cn}Blend",
+                "\t\tendif",
+            ])
+        lines.extend([
             "\tendif",
             f"\t; --- DRAG HOOK END {part_tag}_{ns} ---",
         ])
@@ -6292,6 +6313,14 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             # 物理步长钳到 0.0333（比原作弱约 90 倍），表现为检测有反应但形变几乎不可见。
             f"global $ssmtdrag_sim_speed_{ns} = 3.0",
             f"global $ssmtdrag_max_step_{ns} = 3.0",
+            # 丝袜穿脱（t16）的「总闸」声明。三个闸依次是：本变量（声明且为 1）/
+            # ZoneParams[zone*2+1].z（区域位）/ PathVectors[zone].w（方向位）。
+            # **必须在这里统一声明**：ini 里引用一个从未声明的变量，3DMigoto 会把它
+            # 当 0 处理并连带让所在 if/endif 解析错位、最终弃载整个
+            # [TextureOverride_VB_…_Position] 段 ⇒ 拖拽/物理/碰撞全部不执行（用户实测
+            # 「落地了但毫无变化」的根因）。默认 1 = 三闸中的总闸开启（区域位与方向位仍各自
+            # 独立把关，滑动只在档位 2 的拖拽通道内可达）；需要整段停用时改 0 再 F10 即可。
+            f"global $ssmtdrag_slide_enabled_{ns} = 1",
             f"global $ObjectDetectAllowed_{ns} = 0",
             f"global $isMouseButtonDown = 0",
             f"global $cursorX = -1", "global $cursorY = -1",

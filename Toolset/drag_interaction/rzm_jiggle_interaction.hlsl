@@ -1533,9 +1533,7 @@ void main(uint3 threadID : SV_DispatchThreadID)
     bool idleFastPath = !sharedAlive
         && !stateAlive
         && !mouseHeld
-        && !anyPathSlide
-        && DEBUG_PARAMS.x <= 0.5
-        && VERTEX_DEBUG_PARAMS.x <= 0.5;
+        && !anyPathSlide;
 
     if (idleFastPath)
     {
@@ -1798,7 +1796,53 @@ void main(uint3 threadID : SV_DispatchThreadID)
                 pathOffset = OffsetToVertexSpace(pathVec.xyz * progress) * saturate(ownWeight);
         }
     }
+    float sockSlideLen = length(pathOffset);
+    if (sockSlideLen > SOCK_STROKE) pathOffset *= SOCK_STROKE / max(sockSlideLen, 1e-6);
+    pathOffset = GuardFinite3(pathOffset, float3(0.0, 0.0, 0.0));   // t33 守卫
     bool hasPathOffset = dot(pathOffset, pathOffset) > 1e-12;
+
+    // ===== T16 sock slide: three gates + live weight projection (off = zero impact)
+    {
+        float sockOwnWeight = 0.0;
+        uint sockOwnZone = VertexOwningZone(i, sockOwnWeight);
+        bool sockOn = SockSlideEnabled(sockOwnZone);
+        if (sockOn && SockHasAnchor(i) && i < SOCK_ROW_END && sockOwnWeight > 1e-4)
+        {
+            uint sockTri; float3 sockLam;
+            if (SockFindAnchor(i, localPos, sockTri, sockLam))
+                SockProjectWeights(i, sockTri, sockLam);
+            else
+                SockSyncRow(i);                 // no anchor: keep previous (freeze)
+        }
+        else if (sockOn)
+        {
+            SockSyncRow(i);                     // non-controlled rows: copy through
+        }
+    }
+    // t16 slide (anchor reprojection, t15 §4): walk the anchor along the *skinned*
+    // collider patch, keep the standoff = gap, clamp to the effective stroke.
+    float sockSlideOwnW = 0.0;
+    uint sockSlideOwnZ = VertexOwningZone(i, sockSlideOwnW);
+    if (i < SOCK_ROW_END && SockHasAnchor(i) && sockSlideOwnW > 1e-4 && SockSlideEnabled(activeZone))
+    {
+        uint sTri; float3 sLam;
+        if (SockFindAnchor(i, localPos, sTri, sLam))
+        {
+            float3 sa, sb, sc, sn;
+            ReadColliderTri(sTri, sa, sb, sc, sn);
+            float3 q1 = sLam.x * sa + sLam.y * sb + sLam.z * sc;
+            float3 sd = PathVectors[activeZone].xyz;
+            float  sp = min(max(PathProgressState[activeZone], 0.0), 1.0);
+            float  sLen = min(length(sd) * sp, SOCK_STROKE);
+            float3 td = sd - sn * dot(sd, sn);
+            float  tl = length(td);
+            if (tl > 1e-6 && sLen > 0.0) q1 += (td / tl) * sLen;
+            float  gRow = max(abs(ColliderVertexL0[i * 2u + 0u].w), COLLISION_MIN_GAP);
+            // t33 守卫：T16 滑移是硬赋值，先消毒再按 GUARD_MAX_OFFSET 相对 localPos 限幅
+            v.position = GuardClampDelta(GuardFinite3(q1 + sn * gRow, localPos), localPos, GUARD_MAX_OFFSET);
+        }
+    }    // ===== end T16 sock slide ==================================================
+
 
     // Debug records are derived values, not a dumped VB0:
     //   3*i+0 = local position + mask
@@ -1823,7 +1867,19 @@ void main(uint3 threadID : SV_DispatchThreadID)
     // 碰撞检测（防穿模）：仅在拉扯模式（模式 2）且该顶点确实被移动时。
     // 门控为 wave-uniform（COLLISION_PARAMS.x / COLLISION_META.x 是统一参数），
     // 空闲/非拉扯帧整波跳过，零成本。
-    if (COLLISION_PARAMS.x > 0.5 && COLLISION_META.x >= 2.0 && (influence > 0.0 || hasPathOffset))
+    //
+    // 【用户 m05100】门控从 `(influence > 0.0 || hasPathOffset)` 改成「只要顶点
+    // 有任何位移」：回弹阶段光标一旦离开影响半径，influence 归零，而弹簧仍在
+    // 推动顶点 ⇒ 原先这帧不做碰撞 ⇒ 回弹穿模。位移量判据对回弹同样成立。
+    float3 totalOffset = v.position - localPos;
+#if COLLISION_HOLD_AT_THRESHOLD
+    // 位移非零 ⇒ 必须求解；位移为零但顶点仍在影响半径内 ⇒ 也要求解，把它保持在
+    // 阈值 gap 处（否则它会停在绑定位置 t0，比阈值更靠内 ⇒ 用户看到的「越过边界」）。
+    bool collisionDue = dot(totalOffset, totalOffset) > 1e-12 || needsCollisionHold;
+#else
+    bool collisionDue = dot(totalOffset, totalOffset) > 1e-12;
+#endif
+    if (COLLISION_PARAMS.x > 0.5 && COLLISION_META.x >= 2.0 && collisionDue)
     {
         float3 vnRaw = v.normal;
         float vnLen = length(vnRaw);

@@ -1960,7 +1960,9 @@ class DragNodeEmitTests(unittest.TestCase):
         self.assertIn("cs-t65 = ResourceDragJiggleZoneIDs", jig)
         self.assertIn("cs-t66 = ResourceDragJiggleZoneWeights", jig)
         self.assertIn("cs-t75 = ResourceDragZoneParams", jig)
-        self.assertIn("x119 = 0", jig)
+        # x119 = NORMAL_SIGN_MODE（丝袜滑移总闸所在参数块的 .x）：发射侧现为 1
+        # （滑移总闸改动），旧期望 0 已过期（t46 更新）
+        self.assertIn("x119 = 1", jig)
         self.assertNotIn("x77 = ", jig)
         self.assertNotIn("x99 = ", jig)
 
