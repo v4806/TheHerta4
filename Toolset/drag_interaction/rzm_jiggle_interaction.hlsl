@@ -86,8 +86,6 @@ StructuredBuffer<float4> CapturedDetect        : register(t67);
 Buffer<float4> ObjParams                       : register(t68);
 RWStructuredBuffer<VertexAttributes> rw_buffer  : register(u5);
 RWBuffer<float4> JiggleState                    : register(u6);
-RWBuffer<float4> DebugBuffer                    : register(u7);
-RWBuffer<float4> VertexDebugBuffer              : register(u4);
 Buffer<uint4> JiggleZoneIDs                    : register(t65);
 Buffer<float4> JiggleZoneWeights               : register(t66);
 Buffer<float4> SharedInteractionState           : register(t71);
@@ -115,8 +113,6 @@ Texture1D<float4> IniParams : register(t120);
 #define POLISH_PARAMS        IniParams[71]
 #define JIGGLE_MULTIPLIERS   IniParams[72]
 #define JIGGLE_MULT_EXTRA    IniParams[73]
-#define DEBUG_PARAMS         IniParams[74]
-#define VERTEX_DEBUG_PARAMS  IniParams[75]
 #define TIME_PARAMS          IniParams[76]
 #define ZONE_RUNTIME_META    IniParams[119]
 // Collision params (anti-clipping). Set by the jiggle INI section; zero = disabled.
@@ -931,42 +927,25 @@ void main(uint3 threadID : SV_DispatchThreadID)
     // Per-component resolved input/output evidence.  This is intentionally
     // tiny and contains no VB0 payload: it proves whether a shared snapshot
     // is valid in this component's local coordinate system.
-    if (i == 0u && DEBUG_PARAMS.x > 0.5)
-    {
-        uint debugCount;
-        DebugBuffer.GetDimensions(debugCount);
-        if (debugCount >= 15u)
-        {
-            DebugBuffer[0u]  = float4(2.0, capturedID, hasCapturedID ? 1.0 : 0.0, mouseHeld ? 1.0 : 0.0);
-            DebugBuffer[1u]  = float4(nextCenter.xyz, nextNormal.w);
-            DebugBuffer[2u]  = nextScreenRight;
-            DebugBuffer[3u]  = nextScreenDown;
-            DebugBuffer[4u]  = float4(objectID, stateAlive ? 1.0 : 0.0, matchedParamIndex, (float)vertexCount);
-            DebugBuffer[5u]  = float4(radius, strength, falloffPower, maxOffset);
-            DebugBuffer[6u]  = float4(grabDamping, grabSpring, releaseDamping, releaseSpring);
-            DebugBuffer[7u]  = float4(mouseXDirection, mouseYDirection, dragScale, targetFollow);
-            DebugBuffer[8u]  = nextCurrent;
-            DebugBuffer[9u]  = nextPrevious;
-            DebugBuffer[10u] = nextCenter;
-            DebugBuffer[11u] = nextNormal;
-            DebugBuffer[12u] = nextTarget;
-            DebugBuffer[13u] = nextPrevTarget;
-            DebugBuffer[14u] = nextRawTarget;
-        }
-    }
 
     // Ouroboros update: one tiny persistent buffer. No ping-pong.
     if (i == 0u)
     {
-        JiggleState[0u] = nextCurrent;
-        JiggleState[1u] = nextPrevious;
-        JiggleState[2u] = nextCenter;
-        JiggleState[3u] = nextNormal;
-        JiggleState[4u] = nextTarget;
-        JiggleState[5u] = nextPrevTarget;
-        JiggleState[6u] = nextScreenRight;
-        JiggleState[7u] = nextScreenDown;
-        JiggleState[8u] = nextInputFlags;
+        // t33 守卫：状态写回前消毒（非有限 ⇒ 保留上一帧状态，再不行 ⇒ 归零；
+        // 否则一帧 NaN 会让弹簧永久卡死，表现为「拖不动」）
+        float4 t33St[9];
+        t33St[0] = nextCurrent; t33St[1] = nextPrevious; t33St[2] = nextCenter;
+        t33St[3] = nextNormal;  t33St[4] = nextTarget;   t33St[5] = nextPrevTarget;
+        t33St[6] = nextScreenRight; t33St[7] = nextScreenDown; t33St[8] = nextInputFlags;
+        [unroll]
+        for (uint t33k = 0u; t33k < 9u; ++t33k)
+        {
+            float4 t33prev = ReadState(t33k, float4(0.0, 0.0, 0.0, 0.0));
+            t33St[t33k] = all(isfinite(t33St[t33k]))
+                ? t33St[t33k]
+                : (all(isfinite(t33prev)) ? t33prev : float4(0.0, 0.0, 0.0, 0.0));
+            JiggleState[t33k] = t33St[t33k];
+        }
     }
 
     if (i >= vertexCount)
@@ -974,6 +953,12 @@ void main(uint3 threadID : SV_DispatchThreadID)
 
     VertexAttributes v = base_buffer[i];
     float3 localPos = ToJiggleSpace(v.position);
+    // t33 守卫：输入行本身非有限 ⇒ 整行原样透传（绝不让 NaN 进入物理/碰撞/写回）
+    if (!all(isfinite(v.position)) || !all(isfinite(v.normal)))
+    {
+        rw_buffer[i] = base_buffer[i];
+        return;
+    }
     uint idCount = 0;
     uint weightCount = 0;
     JiggleZoneIDs.GetDimensions(idCount);
@@ -996,7 +981,12 @@ void main(uint3 threadID : SV_DispatchThreadID)
     // offset below, applied independently of activeZone entirely).
     bool activeIsPathSlide = ZoneIsPathSlide(activeZone);
     float influence = (!activeIsPathSlide && nextCurrent.w > 0.5) ? ComputeRubberInfluence(dist, radius, falloffPower) * mask : 0.0;
-    float3 appliedOffset = influence > 0.0 ? OffsetToVertexSpace(nextCurrent.xyz * influence) : float3(0.0, 0.0, 0.0);
+    // t33 守卫：物理位移先消毒（nextCurrent 携带上一帧状态，NaN 会一路传下去），
+    // 再在**源侧**按 maxOffset 硬限幅（captain 线索 4；写回口还有一道同值限幅）
+    float3 appliedOffset = influence > 0.0
+        ? GuardFinite3(OffsetToVertexSpace(nextCurrent.xyz * influence), float3(0.0, 0.0, 0.0))
+        : float3(0.0, 0.0, 0.0);
+    appliedOffset = ClampVectorLength(appliedOffset, maxOffset);
 
     // Path Slide: driven by this vertex's OWN owning zone, not activeZone --
     // so it keeps applying every frame regardless of what else is currently
@@ -1024,13 +1014,6 @@ void main(uint3 threadID : SV_DispatchThreadID)
     //   3*i+0 = local position + mask
     //   3*i+1 = distance, influence, applied offset length, state-alive
     //   3*i+2 = applied local offset (Jiggle + Path Slide combined)
-    if (VERTEX_DEBUG_PARAMS.x > 0.5)
-    {
-        uint debugBase = i * 3u;
-        VertexDebugBuffer[debugBase + 0u] = float4(localPos, mask);
-        VertexDebugBuffer[debugBase + 1u] = float4(dist, influence, length(appliedOffset + pathOffset), nextCurrent.w);
-        VertexDebugBuffer[debugBase + 2u] = float4(appliedOffset + pathOffset, 0.0);
-    }
 
     if ((nextCurrent.w < 0.5 || mask <= 1e-4) && !hasPathOffset)
     {
@@ -1056,5 +1039,9 @@ void main(uint3 threadID : SV_DispatchThreadID)
         v.position = CollisionSolve(i, localPos, totalOffset);
     }
 
+    // t33 守卫：唯一写回出口。非有限 ⇒ 回退本帧输入行；位移按 GUARD_MAX_OFFSET 限幅。
+    v.position = GuardClampDelta(v.position, localPos, GUARD_MAX_OFFSET);
+    if (!all(isfinite(v.position)))
+        v = base_buffer[i];
     rw_buffer[i] = v;
 }

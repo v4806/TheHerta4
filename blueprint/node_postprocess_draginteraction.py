@@ -147,7 +147,6 @@ VIEWPORT_SHADER_FILES = (
     "rzm_viewport_layout_probe.hlsl",
     "rzm_viewport_layout_decode.hlsl",
 )
-
 DEFAULT_VERTEX_STRUCT = (
     "struct VertexAttributes {\n"
     "    float3 position;\n"
@@ -170,6 +169,84 @@ DRAG_OBJVIS_LINE_RE = re.compile(r'^\s*\$ssmtdrag_objvis_[\w]*\s*=\s*1\s*$')
 
 # 导出的着色器在 ini 中的引用路径（mod 根 → res/drag_interaction/）
 RES_SHADER_DIR = "res/drag_interaction"
+
+
+# ===== t33 explosion guard（爆炸守卫，生成器侧同源注入）=========================
+# 守卫必须同时活在生成器里：_copy_shaders() 把 Toolset/*.hlsl 写进 mod 之前调用
+# _inject_explosion_guard()，这样即使 Toolset 的 hlsl 被回退到未打补丁版本，
+# 重新导出仍带着守卫（acceptance ④）。锚点缺失时只告警、原样放行，绝不阻断导出。
+_EXPLOSION_GUARD_OPS = [
+    # (名称, 正则, 替换) —— 与 .dbg/rzm15/make_guard_patch.py 的 OPS 同源
+    ('G0-定义块', '(#define NORMAL_SIGN_MODE[^\\n]*\\n)', '\\1\n// ===== t33 explosion guard（爆炸守卫：非有限值消毒 + 位移硬上限）=================\n// 痛点（逐条数值证据见本目录 probe_explosion.txt / verify_guard.txt）：\n//   M1 非有限传播：物理状态/区域参数/上游任一环产生 NaN 时，\n//      ClampVectorLength（`lenSq > maxSq` 对 NaN 为假）、PullTowardLimit\n//      （`dragLen < 1e-6` 对 NaN 为假）、pow(saturate(..)) 全部“比较为假 ⇒ 原样返回”，\n//      NaN 一路活到 `v.position += appliedOffset` 并写回 rw_buffer。\n//   M2 求解器把静态错位放大成位移：CollisionSolveGrid 的收尾投影环每步最多 gap\n//      （≈1.7mm）× 64 步；碰撞面与当前姿态不一致时，**零位移**顶点也会被推走\n//      （实测 0.1 m 错位 ⇒ 单帧最大 0.0649 m，58/883 行打到 64 步上限）。\n//   M3 硬赋值无界：T16 滑移 `v.position = q1 + sn * gRow` 与 localPos 无关联，\n//      锚点/蒙皮面出错时位移是米级（实测 0.1~1.0 m）。\n// 守卫只做两件事，且对合法输入逐位不生效：\n//   (a) 任何非有限的中间量 → 回退到 fallback（通常是 0 或 localPos）；\n//   (b) 写回前的位移（相对 localPos）按 GUARD_MAX_OFFSET 限幅（保方向、缩长度）。\n// GUARD_MAX_OFFSET 默认 = maxOffset 的合法过冲余量：实测求解器正常收敛时会略超\n// maxOffset（A -n0 0.5 → 0.500758，+0.15%；A -n0 0.25 → 0.25029），这类过冲不该被\n// 守卫改掉（否则用户合法拖满时手感变化）；再加一次 gap 级推挤（|t0| ≤ 1.74mm）的余量。\n// 可用 IniParams[119].w 覆盖（0 = 用默认；非 0 = 绝对上限，调试用）。\n// 注意 .x 是滑移总闸、.z 已被 t7 的 NORMAL_SIGN_MODE 占用。\n#define GUARD_MAX_OFFSET (ZONE_RUNTIME_META.w > 0.0 ? ZONE_RUNTIME_META.w : (maxOffset * 1.01 + 0.005))\n// 求解器内部单步上限（投影环步长 / CCD 推挤量）：合法单步是 gap 级（≈1.7mm），\n// 50mm 已是 30 倍余量；超了说明碰撞面与当前姿态不一致（实机顶点到烘焙锚点距离\n// 中位数 0.5015m，姿态差半个身位）——此时宁可停在原处，也不把顶点瞬移半米。\n#define GUARD_MAX_STEP 0.05\n#define GUARD_EPS 1e-9\n\nfloat3 GuardFinite3(float3 v, float3 fallback)\n{\n    return all(isfinite(v)) ? v : fallback;\n}\n\n// 保方向、缩长度的位移限幅：|p - anchor| <= maxLen；非有限 ⇒ 直接回退到 anchor。\nfloat3 GuardClampDelta(float3 p, float3 anchor, float maxLen)\n{\n    float3 d = p - anchor;\n    float len2 = dot(d, d);\n    if (!all(isfinite(d)) || !isfinite(len2))\n        return anchor;\n    float maxLen2 = maxLen * maxLen;\n    if (len2 > maxLen2 && len2 > GUARD_EPS)\n        return anchor + d * (maxLen * rsqrt(len2));\n    return p;\n}\n// ===== end t33 explosion guard ===============================================\n'),
+    ('G1-入参行消毒', '(    VertexAttributes v = base_buffer\\[i\\];\\n    float3 localPos = ToJiggleSpace\\(v\\.position\\);\\n)', '\\1    // t33 守卫：输入行本身非有限 ⇒ 整行原样透传（绝不让 NaN 进入物理/碰撞/写回）\n    if (!all(isfinite(v.position)) || !all(isfinite(v.normal)))\n    {\n        rw_buffer[i] = base_buffer[i];\n        return;\n    }\n'),
+    ('G2-appliedOffset 消毒+源侧限幅', '    float3 appliedOffset = influence > 0\\.0 \\? OffsetToVertexSpace\\(nextCurrent\\.xyz \\* influence\\) : float3\\(0\\.0, 0\\.0, 0\\.0\\);\\n', '    // t33 守卫：物理位移先消毒（nextCurrent 携带上一帧状态，NaN 会一路传下去），\n    // 再在**源侧**按 maxOffset 硬限幅（captain 线索 4；写回口还有一道同值限幅）\n    float3 appliedOffset = influence > 0.0\n        ? GuardFinite3(OffsetToVertexSpace(nextCurrent.xyz * influence), float3(0.0, 0.0, 0.0))\n        : float3(0.0, 0.0, 0.0);\n    appliedOffset = ClampVectorLength(appliedOffset, maxOffset);\n'),
+    ('G3-pathOffset 消毒', '(    if \\(sockSlideLen > SOCK_STROKE\\) pathOffset \\*= SOCK_STROKE / max\\(sockSlideLen, 1e-6\\);\\n)', '\\1    pathOffset = GuardFinite3(pathOffset, float3(0.0, 0.0, 0.0));   // t33 守卫\n'),
+    ('G4-T16 硬赋值限幅', '            v\\.position = q1 \\+ sn \\* gRow;\\n', '            // t33 守卫：T16 滑移是硬赋值，先消毒再按 GUARD_MAX_OFFSET 相对 localPos 限幅\n            v.position = GuardClampDelta(GuardFinite3(q1 + sn * gRow, localPos), localPos, GUARD_MAX_OFFSET);\n'),
+    ('G5-碰撞出口消毒+限幅', '(        float3 vnUnit = vnLen > 1e-6 \\? vnRaw / vnLen : float3\\(0\\.0, 1\\.0, 0\\.0\\);\\n)(        v\\.position = CollisionSolve\\(i, localPos, totalOffset, vnUnit\\);\\n)', '\\1        vnUnit = GuardFinite3(vnUnit, float3(0.0, 1.0, 0.0));   // t33 守卫\n        float3 solved = CollisionSolve(i, localPos, totalOffset, vnUnit);\n        solved = GuardFinite3(solved, localPos);                // t33 守卫\n        v.position = GuardClampDelta(solved, localPos, GUARD_MAX_OFFSET);\n'),
+    ('G6-写回唯一出口', '(    rw_buffer\\[i\\] = v;\\n\\}\\n)\\Z', '    // t33 守卫：唯一写回出口。非有限 ⇒ 回退本帧输入行；位移按 GUARD_MAX_OFFSET 限幅。\n    v.position = GuardClampDelta(v.position, localPos, GUARD_MAX_OFFSET);\n    if (!all(isfinite(v.position)))\n        v = base_buffer[i];\n    rw_buffer[i] = v;\n}\n'),
+    ('G7-投影环 哨兵/NaN/步长上限', '([ \\t]*)if \\(pd > 1e29 \\|\\| pd >= gap\\)\\n[ \\t]*break;[^\\n]*\\n([ \\t]*)p \\+= projN \\* \\(gap - pd\\);\\n', '\\1if (!isfinite(pd) || pd > 1e29 || pd < -1.0)\\n\\1    break;                              // t33：NaN/正哨兵/负哨兵 ⇒ 退出（不拿 pd 修正）\\n\\1if (pd >= gap)\\n\\1    break;                              // 已达标 ⇒ 停\\n\\1float3 guardStep = projN * (gap - pd);\\n\\1if (!all(isfinite(guardStep))\\n\\1    || dot(guardStep, guardStep) > GUARD_MAX_STEP * GUARD_MAX_STEP)\\n\\1    break;                              // t33：步长非有限/超大 ⇒ 停在原处\\n\\2p += guardStep;\\n'),
+    ('G8-CollisionSolve 入口消毒', '(float3 CollisionSolve\\(uint i, float3 p0, float3 offset, float3 vn\\)\\n\\{\\n)', '\\1    // t33 守卫：入口消毒（p0/offset/vn 非有限时不做任何求解，原样返回）\n    if (!all(isfinite(p0)) || !all(isfinite(offset)) || !all(isfinite(vn)))\n        return p0;\n'),
+    ('G9-物理状态写回消毒', '(        JiggleState\\[0u\\] = nextCurrent;\\n        JiggleState\\[1u\\] = nextPrevious;\\n        JiggleState\\[2u\\] = nextCenter;\\n        JiggleState\\[3u\\] = nextNormal;\\n        JiggleState\\[4u\\] = nextTarget;\\n        JiggleState\\[5u\\] = nextPrevTarget;\\n        JiggleState\\[6u\\] = nextScreenRight;\\n        JiggleState\\[7u\\] = nextScreenDown;\\n        JiggleState\\[8u\\] = nextInputFlags;\\n)', '        // t33 守卫：状态写回前消毒（非有限 ⇒ 保留上一帧状态，再不行 ⇒ 归零；\n        // 否则一帧 NaN 会让弹簧永久卡死，表现为「拖不动」）\n        float4 t33St[9];\n        t33St[0] = nextCurrent; t33St[1] = nextPrevious; t33St[2] = nextCenter;\n        t33St[3] = nextNormal;  t33St[4] = nextTarget;   t33St[5] = nextPrevTarget;\n        t33St[6] = nextScreenRight; t33St[7] = nextScreenDown; t33St[8] = nextInputFlags;\n        [unroll]\n        for (uint t33k = 0u; t33k < 9u; ++t33k)\n        {\n            float4 t33prev = ReadState(t33k, float4(0.0, 0.0, 0.0, 0.0));\n            t33St[t33k] = all(isfinite(t33St[t33k]))\n                ? t33St[t33k]\n                : (all(isfinite(t33prev)) ? t33prev : float4(0.0, 0.0, 0.0, 0.0));\n            JiggleState[t33k] = t33St[t33k];\n        }\n'),
+    ('G10-CCD 双侧哨兵', '([ \\t]*)if \\(d > 1e29\\)\\n[ \\t]*continue;[^\\n]*\\n', '\\1// t33 守卫：正哨兵（打空）/负哨兵/NaN 一律不参与采样 —— 负哨兵会经\\n\\1// (gap - dStar) 被放大成 INF（captain 线索 1/2。本数据实测负哨兵未出现，\\n\\1// 属纵深防御：值域扫描见 probe_distrange.json）\\n\\1if (!isfinite(d) || d > 1e29 || d < -1.0)\\n\\1    continue;\\n'),
+    ('G12-CCD 推挤量设界', '(        float3 pStarOut = pStar \\+ pushDir \\* \\(gap - dStar\\);\\n)', '        // t33 守卫：推挤量设界 —— 碰撞面陈旧时 gap - dStar 可达半身位（实机顶点\\n        // 到烘焙锚点距离中位数 0.5015m），此时宁可停在原处也不瞬移\\n        float guardPush = gap - dStar;\\n        if (!isfinite(guardPush) || guardPush > GUARD_MAX_STEP || guardPush < -GUARD_MAX_STEP)\\n            guardPush = 0.0;\\n        float3 pStarOut = pStar + pushDir * guardPush;\\n'),
+]
+
+
+
+def _require_toolset_file(path):
+    """生成器依赖文件缺失 ⇒ 硬失败，中止导出。
+
+    为什么不能只告警：发布包按 ``git ls-files`` 取文件 ⇒ 未被 git 跟踪的产物在干净检出里
+    缺席；若这里只打一行 WARNING 继续，用户重导出会得到「ini 引用了不存在的 CS」的半成品
+    模组（3DMigoto 侧 Shader not found、静默失效，看起来像修复根本没做）。
+    """
+    if not os.path.exists(path):
+        raise RuntimeError(
+            "[DragInteraction] 必需文件缺失，导出中止: %s\n"
+            "  该文件是生成器依赖；发布包只包含 git 跟踪的文件 ⇒ 未入库或缺席时重导出会产出半成品模组。\n"
+            "  修复：git add 该文件，或把它内嵌进生成器。" % path
+        )
+    return path
+
+
+
+
+def _inject_explosion_guard(text):
+    """t33 爆炸守卫注入（幂等）。返回注入后的文本；锚点不唯一时原样返回并告警。"""
+    if "GUARD_MAX_OFFSET" in text:
+        return text
+    out = text
+    for name, pat, rep in _EXPLOSION_GUARD_OPS:
+        matches = list(re.finditer(pat, out))
+        if len(matches) != 1:
+            print(
+                f"[DragInteraction][WARNING] 爆炸守卫锚点 {name} 命中 {len(matches)} 次，"
+                "跳过注入（着色器保持原样，请在 Toolset 侧修复守卫）"
+            )
+            return text
+        m = matches[0]
+        out = out[: m.start()] + re.sub(pat, rep, out[m.start(): m.end()], count=1) + out[m.end():]
+    return out
+# ===== end t33 explosion guard ===============================================
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ===== end T36 stage/cloth wiring ============================================
 
 
 # ---------------------------------------------------------------------------
@@ -2220,10 +2297,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         vertex_struct = self._get_vertex_struct_definition()
         rewritten = 0
         for fname in files:
-            src = os.path.join(toolset, fname)
-            if not os.path.exists(src):
-                print(f"[DragInteraction][WARNING] 着色器缺失: {src}")
-                continue
+            src = _require_toolset_file(os.path.join(toolset, fname))
             with open(src, 'r', encoding='utf-8') as f:
                 content = f.read()
             # 仅 1 处机械替换：struct VertexAttributes {…} → 顶点属性定义节点的 struct
@@ -2233,6 +2307,9 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 content,
                 flags=re.DOTALL,
             )
+            # t33 爆炸守卫：生成器侧同源注入（幂等；已在 Toolset 侧打过补丁时为 no-op）
+            if fname == "rzm_jiggle_interaction.hlsl":
+                content = _inject_explosion_guard(content)
             dest = os.path.join(res_dir, fname)
             # 内容没变就不写：保持 .hlsl 的 mtime，3DMigoto 的编译缓存才继续命中
             if write_text_if_changed(dest, content):
@@ -2242,21 +2319,15 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         # 不许走文本替换路径（避免行尾转换）——与原作保持字节一致。
         if self.enable_hand_cursor:
             for fname in HAND_SHADER_FILES + HAND_ASSET_FILES:
-                src = os.path.join(toolset, fname)
-                if os.path.exists(src):
-                    if copy_file_if_changed(src, os.path.join(res_dir, fname)):
-                        rewritten += 1
-                else:
-                    print(f"[DragInteraction][WARNING] 手部文件缺失: {src}")
+                src = _require_toolset_file(os.path.join(toolset, fname))
+                if copy_file_if_changed(src, os.path.join(res_dir, fname)):
+                    rewritten += 1
         # 视口探针着色器：字节级原样合并（不读角色网格，无 struct VertexAttributes）
         if self.enable_viewport_probe:
             for fname in VIEWPORT_SHADER_FILES:
-                src = os.path.join(toolset, fname)
-                if os.path.exists(src):
-                    if copy_file_if_changed(src, os.path.join(res_dir, fname)):
-                        rewritten += 1
-                else:
-                    print(f"[DragInteraction][WARNING] 视口探针着色器缺失: {src}")
+                src = _require_toolset_file(os.path.join(toolset, fname))
+                if copy_file_if_changed(src, os.path.join(res_dir, fname)):
+                    rewritten += 1
         if rewritten:
             print(f"[DragInteraction] 着色器已更新 {rewritten} 个")
 
