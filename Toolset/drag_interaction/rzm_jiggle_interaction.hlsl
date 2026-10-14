@@ -1859,6 +1859,19 @@ void main(uint3 threadID : SV_DispatchThreadID)
         );
     }
 
+    // 【2026-10-14 修复 · 开启碰撞时回弹不得越过原位置】
+    // 用户要求：在碰撞开启（CollisionSkinActive()）的情况下，松手后的回弹不得让顶点越过原始位置。
+    // 机制：共享态/CNP 算出的位移是向量，欠阻尼时它会冲过零点、反向指向原位里侧（=回弹穿模）。
+    //       这里以本次抓取面的法线为「向外」参考：位移在法线上的分量一旦为负
+    //       （顶点已经跑到原位后面），就把位移整体钉回零 = 停在原位。
+    //       共享态里那个反向位移会持续存在 ⇒ 本判据随后每帧继续成立，不会又飘回去。
+    //       只在松手后生效，拖拽期间不介入。
+    if (!mouseHeld && CollisionSkinActive())
+    {
+        float3 reboundOutN = SafeNormalize(nextNormal.xyz, capturedNormalWorld);
+        if (all(isfinite(reboundOutN)) && dot(nextCurrent.xyz, reboundOutN) < 0.0)
+            nextCurrent.xyz = float3(0.0, 0.0, 0.0);
+    }
     // Per-component resolved input/output evidence.  This is intentionally
     // tiny and contains no VB0 payload: it proves whether a shared snapshot
     // is valid in this component's local coordinate system.
@@ -1996,11 +2009,26 @@ void main(uint3 threadID : SV_DispatchThreadID)
     //   3*i+1 = distance, influence, applied offset length, state-alive
     //   3*i+2 = applied local offset (Jiggle + Path Slide combined)
 
-    if ((nextCurrent.w < 0.5 || mask <= 1e-4) && !hasPathOffset)
+#if COLLISION_HOLD_AT_THRESHOLD
+    // 【用户 m01041】回弹归位那一帧不再整波早退：zone 激活期间，只要顶点落在影响
+    // 半径内（dist < radius）就继续走碰撞求解，让它停在阈值 gap 处，而不是一步跳回
+    // 绑定位置 t0（gap = 10*t0 ⇒ 跳变 3~15mm，正是用户看到的「回弹越过边界」）。
+    // 影响半径之外的顶点仍然早退：它们本来就不受弹簧推动，不需要被约束。
+    bool needsCollisionHold = mask > 1e-4 && dist < radius;
+    if (mask <= 1e-4 && !hasPathOffset)
     {
         rw_buffer[i] = v;
         return;
     }
+#else
+    // t39：去掉 `nextCurrent.w < 0.5` —— 回弹/归位期不再整波早退；但只要没有位移
+    // （totalOffset == 0）就由 collisionDue 挡住求解 ⇒ 静止态逐位不变。
+    if (mask <= 1e-4 && !hasPathOffset)
+    {
+        rw_buffer[i] = v;
+        return;
+    }
+#endif
 
     if (influence > 0.0)
     {
