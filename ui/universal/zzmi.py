@@ -2234,6 +2234,24 @@ class ExportZZMI(ExportUnity):
         """该部件该槽的 palette 持久副本资源名。"""
         return f"ResourceZZPalette_{draw_ib}_s{slot}"
 
+    @staticmethod
+    def _merged_palette_lag_name(draw_ib: str, slot: int) -> str:
+        """该部件该槽的 **上一帧** palette 副本资源名（跨组校准专用）。
+
+        用户 2026-10-10 指出的自洽性问题：deform 段手里的 `ResourceZZCb1_G*`
+        必然是**上一帧**的对象变换（渲染 draw 才写、deform 排在帧内最前），
+        而 palette 捕获是**当帧**的 ⇒ 跨组换算拿的是
+        `C(上一帧) × palette(当帧)`，把源部件当帧的骨摆进了**上一帧的宿主对象
+        空间**，这正是「运动时错位、静止正常」。修法：跨组 attach 一律读这份
+        **滞后副本**，让 `C` 与 palette 同帧（都是上一帧），结果 = 源部件上一帧
+        的合法摆放（一致的一帧延迟，而不是两种空间的混合）。
+
+        滞后副本在每次主捕获**之前**从主副本拷出（此时主副本还装着上一帧的值）；
+        F7（宿主渲染段同帧重算）会先把主副本的当帧值刷进滞后副本，再跑同一套
+        attach ⇒ 那条路径仍是**当帧**精确。
+        """
+        return f"ResourceZZPaletteLag_{draw_ib}_s{slot}"
+
     def _merged_seen_arrived_condition(self, component_id: int, slot: int) -> str:
         """消费点谓词：「本部件**本帧**已在槽 <slot> 出现过」（`>= 1`，帧内单调）。
 
@@ -2373,6 +2391,57 @@ class ExportZZMI(ExportUnity):
     def _merged_attach_name(component_id: int, slot: int) -> str:
         """(部件, 槽) 的 attach CustomShader 段名。"""
         return f"CustomShaderZZMIMergedSkeletonAttach_C{component_id}_s{slot}"
+
+    @staticmethod
+    def _merged_cb1_name(skeleton_group: int) -> str:
+        """该骨架组当帧对象变换的捕获资源名（各部件渲染段 `copy vs-cb1 unless_null` 写入）。
+
+        跨组拆分绘制用它换绑 `vs-cb1`，让每个来源用自己的对象变换；因为采集与使用都发生在
+        渲染段（同帧），所以没有「慢一帧」问题。
+        """
+        return f"ResourceZZCb1_G{int(skeleton_group)}"
+
+    @staticmethod
+    def _merged_cross_attach_name(component_id: int, host_group: int, slot: int) -> str:
+        """跨组 attach 的 CustomShader 段名：(跨组件, **宿主组**, 槽)。
+
+        刻意与 `_merged_attach_name` 分开命名：同一个部件的同一个槽可能存在两条
+        性质不同的 attach（写自己组 / 写吸收它的宿主组），名字必须能区分，否则
+        ini 里后者会覆盖前者（3DMigoto 同名的 `[CustomShader*]` 段只保留一条）。
+        """
+        return (
+            f"CustomShaderZZMIMergedSkeletonAttachX_C{component_id}"
+            f"_g{int(host_group)}_s{slot}"
+        )
+
+    @staticmethod
+    def _merged_cross_group_enabled() -> bool:
+        """跨组骨骼合并总开关（`cross_group_merged_vgmap_test`）。
+
+        关闭时保持历史行为：跨组件骨骼只写自己组（实机上会让被吸收的顶点塌陷），
+        并由 `_warn_cross_group_bone_references` 大声报警。开启后由 `_merged_cross_*`
+        系列把它们的骨骼写进**吸收它的宿主组**缓冲。
+        """
+        return bool(_zzmi_prop_flag("cross_group_merged_vgmap_test", False))
+
+    @staticmethod
+    def _merged_cb1_capture_name(skeleton_group: int) -> str:
+        """骨架组的「对象→世界 cb1」捕获资源名（F2 跨组校准用）。
+
+        每组一份：同组部件的对象变换逐位相同（分组的定义），因此组内任一部件的
+        渲染 draw 处 `copy vs-cb1` 都是同一个矩阵（last-wins 无害）。
+        """
+        return f"ResourceZZCb1_G{int(skeleton_group)}"
+
+    @staticmethod
+    def _merged_calibrated_attach_shader_path() -> str:
+        """跨组 attach CS 的 mod 内相对路径（`[CustomShader*]` 的 cs = 值）。
+
+        2026-10-10 定案：跨组走**拆分绘制**（每个来源用自己的 cb1 单独绘制一次），
+        因此 attach 必须是**直拷**——源件骨骼留在自己的对象空间，由它自己的 cb1
+        摆到世界；不需要（也不能）在 CS 里做对象空间换算。名字保留是为了不动调用点。
+        """
+        return "./res/zzmi_merged_skeleton_attach.hlsl"
 
     @staticmethod
     def _merged_skin_shader_filename() -> str:
@@ -3497,6 +3566,11 @@ class ExportZZMI(ExportUnity):
 
         def emit_capture(target_slot: int, indent: str = "    ") -> None:
             """把当帧 palette 落到 <target_slot>，SO 别名只由 SO owner 重捕获。"""
+            # 先把**上一帧**的值留一份给跨组校准（此刻主副本还是上一帧的内容）。
+            section.append(
+                f"{indent}{self._merged_palette_lag_name(draw_ib, target_slot)} = "
+                f"copy {self._merged_palette_name(draw_ib, target_slot)}"
+            )
             section.append(
                 f"{indent}{self._merged_palette_name(draw_ib, target_slot)} = "
                 "copy vs-t0 unless_null"
@@ -3751,6 +3825,14 @@ class ExportZZMI(ExportUnity):
 
         # 3) 按槽捕获 palette（与 SO owner / 合并宿主的 SO 引用）
         #
+        # 【⚠ F5 试过并已回退（2026-10-10）】曾把本捕获整体后移到 attach 之后，
+        # 想让 attach 读到的 palette 与它读到的（必然是上一帧的）cb1 同源。**实测失败**：
+        # 合并骨架缓冲是**宿主与跨组供骨件共用**的，捕获后移会让**整块合并骨架**
+        # （含宿主自己的骨骼）一起慢一帧 ⇒ 宿主自身几何也变陈旧 ⇒ 用户实测
+        # 「无论哪边都在抖、骨骼矩阵不对」。结论：只让**跨组换算**用上一帧矩阵，
+        # 必须另开一份滞后副本（宿主当帧 + 跨组滞后），不能动主捕获的时序。
+        capture_lines: list[str] = []
+        #
         # 合并几何的归属先算出来：直连路径（该组没有重定向计划）里，宿主导出的
         # 合并几何必须能在**任何**布局兼容的挂点闭合守卫后重放——引擎把同组部件
         # 的 deform pass 排成什么顺序每帧都可能不同，只让宿主自己那段重放时，
@@ -3870,6 +3952,10 @@ class ExportZZMI(ExportUnity):
                     reason=str(channel_record.get("channel_reason") or ""),
                 ),
             )
+
+        # 3.9) 捕获按原次序落在 attach **之前**（attach 读到当帧 palette；F5 的后移已回退）。
+        for _capture_line in capture_lines:
+            texture_override_vb_section.append(_capture_line)
 
         # 4) 顶层无条件 attach（每个 (部件, 槽) 一条 run；run 绝不进 if）
         #
@@ -6123,6 +6209,15 @@ class ExportZZMI(ExportUnity):
                 section.append("stride = 48")
                 section.append(f"array = {component['vg_count']}")
                 section.new_line()
+                # 上一帧副本（跨组校准专用，见 _merged_palette_lag_name）：
+                # 声明与主副本完全一致（同为 `copy` 目标，视图格式同样由源决定）。
+                section.append(
+                    f"[{self._merged_palette_lag_name(component['draw_ib'], slot)}]"
+                )
+                section.append("type = Buffer")
+                section.append("stride = 48")
+                section.append(f"array = {component['vg_count']}")
+                section.new_line()
 
         # 每部件 vg_map 表（局部骨骼 id -> 合并骨架全局槽位）：attach CS 的 cs-t1
         # 按此写槽位——本部件引用的共享 canonical 槽位当帧覆盖，后续 deform 的
@@ -6151,6 +6246,31 @@ class ExportZZMI(ExportUnity):
                 os.path.join(mod_meshes_dir, vgmap_filename),
                 payload,
             )
+
+        # 跨组：每骨架组一份「对象→世界 cb1」捕获资源（**拆分绘制**用）。
+        # 合并网格按来源拆成多次绘制时，每次绘制要绑**该来源自己**的对象变换，而
+        # `vs-cb1` 由游戏逐 draw 上传（464 B，前 16 float = 3×4 对象→世界矩阵），在
+        # 别的段里读不到，只能在本部件自己的渲染 draw 处拷一份出来：
+        #   ResourceZZCb1_G<N> = copy vs-cb1 unless_null
+        # （见 add_unity_vs_texture_override_ib_sections，last-wins；同组部件的对象
+        # 变换逐位相同，谁写都是同一个矩阵）。
+        # **不要**退回历史失败版的「按 IB hash 匹配的 TextureOverrideIB 捕获段」：
+        # 同一个 IB 在多个 pass 下 cb1 内容不同（实测同帧两个 pass 差 8.2°），按 hash
+        # 匹配会抓到别的 pass 的常量块 ⇒ 整个变换错，这正是 2026-08-25 那版被
+        # 删除的直接原因（见 ZZMI骨骼合并计划书.md）。
+        # 资源不声明 type/stride：`copy vs-cb1` 是常量块整体拷贝，尺寸与布局由源视图
+        # 决定；随后被 `vs-cb1 = ResourceZZCb1_G<N>` 整块绑回常量槽（与已投产的
+        # `ResourceCaptureCB1_*` 完全同型，用户实测有效）。
+        if self._merged_cross_group_enabled():
+            for skeleton_group in groups:
+                section.append(
+                    f"[{self._merged_cb1_capture_name(int(skeleton_group))}]"
+                )
+                section.append(
+                    "; F2 跨组校准：由本组部件的渲染 draw 处 "
+                    "`copy vs-cb1 unless_null` 写入（last-wins）"
+                )
+                section.new_line()
 
         # 每槽一份 SO 重定向资源（**按骨架组命名空间化**）。只有 SO owner（载体）
         # 部件的 deform 段捕获 `ref so0`；target 先到时由自身捕获，纯占位 target
@@ -6706,6 +6826,39 @@ class ExportZZMI(ExportUnity):
             texture_override_ib_section.append("[TextureOverride_" + texture_override_name_suffix + "]")
             texture_override_ib_section.append("hash = " + override_hash)
             texture_override_ib_section.append("match_first_index = " + str(override_first_index))
+
+            # F2 跨组校准：在本部件**自己的渲染 draw** 处捕获本骨架组的
+            # 「对象→世界 cb1」到 `ResourceZZCb1_G<N>`。
+            #
+            # 为什么在这里：跨组 attach 需要把被吸收部件的骨骼从**源对象空间**
+            # 换算到**宿主对象空间**，换算矩阵 C = U_dst^-1 × U_src 的两个 U 就是
+            # 两个对象各自的渲染 cb1。渲染段是本 mod 唯一能确定「此刻 vs-cb1 就是
+            # 这个物体的对象→世界矩阵」的位置（游戏在该 draw 前逐物体 Map 上传 cb1，
+            # 实测 dump：draw 000204 前 `Map hash=30cb248b`）。
+            #
+            # 历史失败版是 `[TextureOverrideIB_<IB>_Cb1Capture]` + `hash = <源 IB>`：
+            # 同一个 IB 会被多个 pass 匹配（实测同帧两个 pass 的 cb1 差 8.2°），
+            # 抓到哪个 pass 取决于提交顺序 ⇒ 校准矩阵整个错、模型偏移。改到渲染段后
+            # 每个捕获都严格对应一个真实物体的渲染 draw。
+            #
+            # last-wins：同组各部件写的是同一个矩阵（分组的定义就是对象变换逐位相同），
+            # 覆盖无害。每个 DrawIB 只在本段的第一条子网格处追加一次（该 DrawIB 的
+            # 所有子网格共用同一个渲染段对象）。
+            if self.has_merged_skeleton and self._merged_cross_group_enabled():
+                first_indices = self._drawib_first_match_first_index(draw_ib)
+                if first_indices and int(override_first_index) == int(first_indices[0]):
+                    capture_component_id = self.merged_skeleton_component_id_dict.get(draw_ib)
+                    if capture_component_id is not None:
+                        capture_group = int(
+                            self.merged_skeleton_components[int(capture_component_id)].get(
+                                "skeleton_group", 0
+                            )
+                            or 0
+                        )
+                        texture_override_ib_section.append(
+                            f"{self._merged_cb1_capture_name(capture_group)}"
+                            " = copy vs-cb1 unless_null"
+                        )
 
             # 2026-09 多实例分离 v2（用户实测通过）：carrier 的渲染 draw
             # **不再覆写 vb0**。旧实现 `vb0 = ResourceZZRedirectSO_<target>` 把该
