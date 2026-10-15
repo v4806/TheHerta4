@@ -1,5 +1,17 @@
 // ZZMI 骨骼合并 - 合并骨架 attach CS（**跨组校准版**，绝区零 deform pass 专用，TheHerta4 生成）
 //
+// ⚠ **当前不参与产物：留档 + 仅供测试用**
+//   2026-10-10 落地的「按来源拆分绘制」路线里，每个来源的段各自换绑**自己的**渲染
+//   cb1（各回各家），因此**不再需要**任何跨对象空间的校准乘：
+//     · `ui/universal/zzmi.py` 的 AttachX 段改回 `cs = ./res/zzmi_merged_skeleton_attach.hlsl`
+//       （直拷版），`_copy_merged_skeleton_shader_to_mod()` 也**不**把本文件复制进 mod 的 `res/`；
+//     · 因此本文件既不在产物 ini 里被引用，也不会出现在导出目录里。
+//   保留本文件的唯一用途 = ① 校准公式（刚体 `C = U_dst⁻¹ × U_src`）的**参考实现**留档；
+//   ② 被 `tests/test_zzmi_merged_skeleton_ini.py` 的两个用例断言（**仅测试**）：
+//      `test_calibrated_shader_is_copied_only_when_enabled`、
+//      `test_calibrated_shader_implements_rigid_calibration`。
+//   将来若要重新启用校准路线，接口与公式未变，直接改回引用本文件即可。
+//
 // 与 zzmi_merged_skeleton_attach.hlsl 的关系：
 //   那是「直拷版」——同组（同一对象空间）部件把 palette 骨骼原样写进本组骨架缓冲。
 //   本文件是「跨组校准版」——被吸收进**宿主组**网格的**别组**部件，其 palette 骨骼

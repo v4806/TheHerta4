@@ -210,6 +210,10 @@ ZZMI_MERGE_DIAG_POSE_UNAVAILABLE = "POSE_ALIGNMENT_UNAVAILABLE"
 # 修复口径：跨组件的骨骼写进**吸收它的宿主组**缓冲（槽位 = 全局骨 id，
 # 全宽缓冲天然不冲突），由宿主组的 deform 段顶层 `run` 调用。
 # 开关：`cross_group_merged_vgmap_test`（关闭 = 恢复历史行为 + 大声报警）。
+# ⚠ **已知未解（2026-10-10 实机报告，原因未定）**：角色展示页（大世界之外那条渲染
+#   路径）里本方案的段命令 `draw` / `drawindexed` **不执行** —— 画面不推进、什么都
+#   看不见（大世界一切正常；进程未死、资源级覆盖仍生效）。排查存档：本仓
+#   `ZZMI骨骼合并计划书.md` ⑭ 与 §9。本开关默认关闭正是为此（关闭时逐字节保持历史行为）。
 ZZMI_MERGE_DIAG_CROSS_GROUP_ATTACH = "CROSS_GROUP_ATTACH"
 # ---------------------------------------------------------------------------
 # O3（用户裁定 (a)：诊断先行、零行为变更）——「捕获 : 消费」记账
@@ -221,6 +225,8 @@ ZZMI_MERGE_DIAG_CROSS_GROUP_ATTACH = "CROSS_GROUP_ATTACH"
 #   以及在守卫内发布合并几何的蒙皮 CS 块）旁落一行机器可读注释，并在导出期打一行结构比汇总。
 # **硬不变量**：只加注释与 stdout，**不改**任何 `draw =` / `drawindexed` / `so0 = ref` / 守卫条件行
 #   ⇒ IB 覆盖段与全部重放块**逐字节不变**（用 `dump_generated_ini.py` 的前后代次 A/B diff 证明）。
+#   该取证工具**未入库**（`reports/`、`docs/` 都在 .gitignore 里），本机路径 =
+#   `reports/zzmi-fix/evidence/dump_generated_ini.py`；引用它的说明只在本机可复现。
 # **禁止**：为它新增任何 `$zz_ms_*` 变量、闩锁、if 体内 `$` 赋值（§61）。
 ZZMI_MERGE_DIAG_REUSE_SITE = "REUSE_SITE"
 ZZMI_MERGE_DIAG_REUSE_RATIO = "REUSE_RATIO"
@@ -3252,7 +3258,7 @@ class ExportZZMI(ExportUnity):
             self._merged_render_split_emitted = emitted
         if draw_ib in emitted:
             return False
-        for skeleton_group, (host_group, group_plan, host_ib) in plan_map.items():
+        for skeleton_group, (host_group, _group_plan, host_ib) in plan_map.items():
             representative = self._merged_split_representative(
                 skeleton_group, host_group, host_ib
             )
