@@ -4833,9 +4833,9 @@ class DragCollisionTests(unittest.TestCase):
             "h": 0.1, "h_c": 0.4,
             "dims": (10, 8, 6), "cdims": (3, 2, 2),
         }
-        comps[0]["collision_sdf"] = {
+        comps[0]["collision_trigrid"] = {
             "bmin": (0.0, 0.0, 0.0), "cell": 0.0125,
-            "dims": (64, 34, 102), "band": 0.08,
+            "dims": (64, 34, 102), "cell_count": 3242,
         }
         node._emit_sections(sections, comps, "testns")
         return node, sections, comps
@@ -4967,8 +4967,6 @@ class DragCollisionTests(unittest.TestCase):
         lines = sections[f"[CustomShaderDragJiggle{cn}_testns]"]
         text = "\n".join(lines)
         self.assertIn(f"cs-t76 = ResourceDragColliderPoints_{cn}_testns", text)
-        self.assertIn(f"cs-t77 = ResourceDragColliderCellsFine_{cn}_testns", text)
-        self.assertIn(f"cs-t78 = ResourceDragColliderCellsCoarse_{cn}_testns", text)
         self.assertIn(f"cs-t79 = ResourceDragColliderVertexL0_{cn}_testns", text)
         # x101: enabled=1 margin=0.002 mode=1(hard，默认已改为硬钳制) safety=0.9
         # 3DMigoto 的 ini 解析器不支持一行多值：`x101 = 1 0.002 1 0.9` 会在第二个 token
@@ -4977,165 +4975,96 @@ class DragCollisionTests(unittest.TestCase):
         self.assertIn("y101 = 0.002", lines)
         self.assertIn("z101 = 1", lines)
         self.assertIn("w101 = 0.9", lines)
-        self.assertIn("x102 = 0", lines)
-        self.assertIn("y102 = 0", lines)
-        self.assertIn("z102 = 0", lines)
-        self.assertIn("w102 = 0.1", lines)
-        self.assertIn("x103 = 10", lines)
-        self.assertIn("y103 = 8", lines)
-        self.assertIn("z103 = 6", lines)
-        self.assertIn("w103 = 0.4", lines)
         # x104 只承载 drag_mode 变量（网格查询已废弃，不再混入 cdims 字面量；
         # 「变量 + 字面量」混合多值没有先例、无法确认 3DMigoto 解析行为）
         self.assertIn("x104 = $ssmtdrag_drag_enabled_testns", lines)
         self.assertNotIn("$ssmtdrag_drag_enabled_testns 3 2 2", text)
         self.assertNotIn("x101 = 1 0.002 1 0.9", text)
-        # x105/x106：SDF 网格（origin + cell / dims + band）
-        self.assertIn("x105 = 0", lines)
-        self.assertIn("y105 = 0", lines)
-        self.assertIn("z105 = 0", lines)
-        self.assertIn("w105 = 0.0125", lines)
-        self.assertIn("x106 = 64", lines)
-        self.assertIn("y106 = 34", lines)
-        self.assertIn("z106 = 102", lines)
-        self.assertIn("w106 = 0.08", lines)
-        self.assertIn(f"cs-t80 = ResourceDragColliderSDF_{cn}_testns", text)
+        # 已删除的槽位不得回归：102/103 = 旧粗/细网格，105/106 = 旧 SDF
+        for slot in ("x102", "y102", "z102", "w102", "x103", "y103", "z103", "w103",
+                     "x105", "y105", "z105", "w105", "x106", "y106", "z106", "w106"):
+            self.assertNotIn(f"{slot} =", text)
+        # x108/x109：动态三角形网格（origin + cell / dims + cell_count）
+        self.assertIn("x108 = 0", lines)
+        self.assertIn("y108 = 0", lines)
+        self.assertIn("z108 = 0", lines)
+        self.assertIn("w108 = 0.0125", lines)
+        self.assertIn("x109 = 64", lines)
+        self.assertIn("y109 = 34", lines)
+        self.assertIn("z109 = 102", lines)
+        self.assertIn("w109 = 3242", lines)
+        self.assertIn(f"cs-t83 = ResourceDragColliderTriGrid_{cn}_testns", text)
+        self.assertIn(f"cs-t84 = ResourceDragColliderTriGridTris_{cn}_testns", text)
+        self.assertIn(f"cs-t87 = ResourceDragColliderTriGridVerts_{cn}_testns", text)
 
     def test_jiggle_section_without_collision_writes_zero_and_no_bindings(self):
         node, sections, comps = self._emit()  # 无 collision_grid
         cn = comps[0]["comp_name"]
         text = "\n".join(sections[f"[CustomShaderDragJiggle{cn}_testns]"])
         self.assertIn("x101 = 0", text)
-        self.assertIn("x105 = 0", text)
-        self.assertIn("x106 = 0", text)
+        self.assertIn("x108 = 0", text)
+        self.assertIn("x109 = 0", text)
         self.assertNotIn("cs-t76", text)
         self.assertNotIn("cs-t79", text)
-        self.assertNotIn("cs-t80", text)
+        self.assertNotIn("cs-t83", text)
 
     def test_component_resources_emit_collider_sections(self):
         node, sections, comps = self._emit_with_collision_grid()
         cn = comps[0]["comp_name"]
-        for suffix in ("ColliderPoints", "ColliderCellsFine", "ColliderCellsCoarse",
-                       "ColliderVertexL0", "ColliderSDF"):
+        for suffix in ("ColliderPoints", "ColliderVertexL0", "ColliderTriGrid",
+                       "ColliderTriGridTris", "ColliderTriGridVerts"):
             self.assertIn(f"[ResourceDrag{suffix}_{cn}_testns]", sections)
-        # SDF 是 R32_FLOAT 单通道线性缓冲，不是 float4
-        sdf_lines = sections[f"[ResourceDragColliderSDF_{cn}_testns]"]
-        self.assertIn("format = R32_FLOAT", sdf_lines)
-        self.assertIn("ColliderSDF.buf", "\n".join(sdf_lines))
+        # 已删除的 cells / SDF 资源段不得回归
+        for suffix in ("ColliderCellsFine", "ColliderCellsCoarse", "ColliderSDF"):
+            self.assertNotIn(f"[ResourceDrag{suffix}_{cn}_testns]", sections)
 
     def test_component_resources_no_collider_sections_by_default(self):
         node, sections, comps = self._emit()
         cn = comps[0]["comp_name"]
-        for suffix in ("ColliderPoints", "ColliderCellsFine", "ColliderCellsCoarse",
-                       "ColliderVertexL0", "ColliderSDF"):
+        for suffix in ("ColliderPoints", "ColliderVertexL0", "ColliderTriGrid",
+                       "ColliderTriGridTris", "ColliderTriGridVerts",
+                       "ColliderCellsFine", "ColliderCellsCoarse", "ColliderSDF"):
             self.assertNotIn(f"[ResourceDrag{suffix}_{cn}_testns]", sections)
-
-    # ---- SDF 烘焙 ----
-
-    def test_bake_collider_sdf_matches_analytic_sphere(self):
-        """SDF 必须在解析可验证的形状上给出正确距离。
-
-        半径 1 的 UV 球（经纬各 48/96 段，离散化误差远小于体素边长）：
-        每个采样点的值应接近 |p| - 1，正负号也必须对。
-        """
-        node = _make_node(self.mod, collision_enabled=True)
-        n_lat, n_lon = 48, 96
-        verts = []
-        for a in range(n_lat + 1):
-            theta = np.pi * a / n_lat
-            for b in range(n_lon):
-                phi = 2.0 * np.pi * b / n_lon
-                verts.append([
-                    np.sin(theta) * np.cos(phi),
-                    np.cos(theta),
-                    np.sin(theta) * np.sin(phi),
-                ])
-        verts = np.array(verts, dtype=np.float32)
-        tris = []
-        for a in range(n_lat):
-            for b in range(n_lon):
-                b1 = (b + 1) % n_lon
-                i0 = a * n_lon + b
-                i1 = a * n_lon + b1
-                i2 = (a + 1) * n_lon + b
-                i3 = (a + 1) * n_lon + b1
-                tris.append([i0, i2, i1])
-                tris.append([i1, i2, i3])
-        tris = np.array(tris, dtype=np.int32)
-        mask = np.ones(len(verts), dtype=bool)
-
-        out = node._bake_collider_sdf(verts, tris, mask, resolution=64, band=0.5)
-        self.assertIsNotNone(out)
-        sdf, bmin, cell, dims = out
-        self.assertEqual(sdf.dtype, np.float32)
-        self.assertEqual(int(np.prod(dims)), sdf.size)
-        self.assertGreater(cell, 0.0)
-
-        arr = sdf.reshape(tuple(int(d) for d in dims))
-        nx, ny, nz = (int(d) for d in dims)
-        checked = 0
-        worst = 0.0
-        for ix in range(2, nx - 2, 6):
-            for iy in range(2, ny - 2, 6):
-                for iz in range(2, nz - 2, 6):
-                    p = np.asarray(bmin, dtype=np.float64) + (
-                        np.array([ix, iy, iz], dtype=np.float64) + 0.5) * cell
-                    exact = float(np.linalg.norm(p)) - 1.0
-                    if abs(exact) > 0.35:
-                        continue
-                    worst = max(worst, abs(float(arr[ix, iy, iz]) - exact))
-                    checked += 1
-        self.assertGreater(checked, 20)
-        # 体素边长约 2/63 ≈ 0.032；最近三角形离散化 + 单精度留 3 倍余量
-        self.assertLess(worst, 3.0 * cell)
-
-    def test_bake_collider_sdf_returns_none_without_collider_triangles(self):
-        node = _make_node(self.mod, collision_enabled=True)
-        verts = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], dtype=np.float32)
-        tris = np.array([[0, 1, 2]], dtype=np.int32)
-        mask = np.zeros(3, dtype=bool)  # 没有碰撞体顶点 ⇒ 没有碰撞体三角形
-        self.assertIsNone(node._bake_collider_sdf(verts, tris, mask, resolution=32))
 
     # ---- HLSL 契约 ----
 
     def test_shader_collision_contract(self):
         shader = (REPO_ROOT / "Toolset" / "drag_interaction" / "rzm_jiggle_interaction.hlsl").read_text(encoding="utf-8")
-        # 寄存器与 ini 发射的 cs-t76..t80 一致
-        for reg in ("t76", "t77", "t78", "t79", "t80"):
+        # 寄存器与 ini 发射的 cs-t76/t79（点云 + L0）与三角网格 cs-t83/t84/t87 一致
+        for reg in ("t76", "t79", "t83", "t84", "t87"):
             self.assertIn(f"register({reg})", shader)
-        # 参数宏槽位与 ini 发射的 x101..x106 一致
+        # 已删除的绑定不得回归：t77/t78 = 旧粗/细网格，t80 = 旧 SDF
+        for reg in ("t77", "t78", "t80"):
+            self.assertNotIn(f"register({reg})", shader)
+        # 参数宏槽位与 ini 发射的 x101/x104/x108/x109 一致
         self.assertIn("#define COLLISION_PARAMS    IniParams[101]", shader)
-        self.assertIn("#define COLLISION_BOX       IniParams[102]", shader)
-        self.assertIn("#define COLLISION_GRID      IniParams[103]", shader)
         self.assertIn("#define COLLISION_META      IniParams[104]", shader)
-        self.assertIn("#define COLLISION_SDF       IniParams[105]", shader)
-        self.assertIn("#define COLLISION_SDF_DIMS  IniParams[106]", shader)
+        self.assertIn("#define COLLISION_TRIGRID       IniParams[108]", shader)
+        self.assertIn("#define COLLISION_TRIGRID_DIMS  IniParams[109]", shader)
+        # 已删除的 slot 宏不得回归（102/103 = 旧网格，105/106 = 旧 SDF）
+        self.assertNotIn("COLLISION_BOX", shader)
+        self.assertNotIn("COLLISION_SDF", shader)
+        for slot in ("IniParams[102]", "IniParams[103]",
+                     "IniParams[105]", "IniParams[106]"):
+            self.assertNotIn(slot, shader)
         # 模式三门控（拉扯模式）在 shader 内显式再确认
         self.assertIn("COLLISION_META.x >= 2.0", shader)
         # 仅权重顶点参与碰撞（非权重顶点没有导出阈值）
         self.assertIn("float4 l0n = ColliderVertexL0[i * 2u + 1u];", shader)
         self.assertIn("if (l0n.w <= 0.5)", shader)
-        # 设计契约：SDF 标量约束 d(p) >= d(p0)。
-        # 历史实现的两处实测缺陷（断言不得回归）：
-        #   ① 点云多切平面的交集：平面少时留洞（顶点滑出采样点邻域即放行，
-        #      实测大范围穿模 0.131）、平面多时把顶点圈死（位移保留 0.013）；
-        #   ② 只查终点不查路径：顶点可以穿过违约区域再落回合法位置。
-        # SDF 是连续标量场 ⇒ 无洞、无最近点跳变、梯度连续 ⇒ 位移场连续。
-        self.assertIn("float SampleSDF(float3 p)", shader)
-        self.assertIn("if (COLLISION_SDF_DIMS.x > 0.5)", shader)
-        self.assertIn("float d0 = SampleSDF(p0);", shader)
-        self.assertIn("float tolerance = max(COLLISION_PARAMS.y, 0.0);", shader)
-        # 沿 p0→p1 粗扫找第一个违约点，再二分收窄（CCD）
-        self.assertIn("if (SampleSDF(p0 + offset * t) < d0 - tolerance)", shader)
-        self.assertIn("if (SampleSDF(p0 + offset * tMid) >= d0 - tolerance)", shader)
-        self.assertIn("return p0 + offset * tLo;", shader)
-        # 三线性插值必须是 8 角采样（线性 Buffer，不是 Texture3D 硬件采样）
-        self.assertIn("ColliderSDF[b000]", shader)
-        self.assertIn("ColliderSDF[b111]", shader)
-        # 点云回退路径保留：SDF 未烘焙时仍可工作
+        # 默认路径 = 动态三角形网格；DIMS.w = 0（未烘焙）时落回点云约束
+        self.assertIn("if (COLLISION_TRIGRID_DIMS.w > 0.5)", shader)
+        self.assertIn("return CollisionSolveGrid(i, p0, offset, vn);", shader)
+        # 点云回退路径保留：切平面 + 拉伸上限 + CCD 粗扫 + SOFT 投影
         self.assertIn("bool CollisionSatisfied(", shader)
         self.assertIn("float3 CollisionSolve(uint i, float3 p0, float3 offset, float3 vn)", shader)
         self.assertIn("if (COLLISION_PARAMS.z <= 0.5)", shader)
+        self.assertIn("nearLim[pos] = d + COLLISION_STRETCH;", shader)
+        # 已删除的 SDF 路径与两个编译期开关不得回归
+        self.assertNotIn("SampleSDF", shader)
+        self.assertNotIn("ColliderSDF", shader)
+        self.assertNotIn("DRAG_ALONG_FACE_NORMAL", shader)
+        self.assertNotIn("COLLISION_HOLD_AT_THRESHOLD", shader)
 
     # ---- 端到端烘焙 ----
 
@@ -5162,10 +5091,13 @@ class DragCollisionTests(unittest.TestCase):
             self.assertTrue(node._write_collision_resources(td, {}, comp, "testns"))
             p = Path(td) / "Meshes"
             self.assertTrue((p / "sampleColliderPoints.buf").exists())
-            self.assertTrue((p / "sampleColliderCellsFine.buf").exists())
-            self.assertTrue((p / "sampleColliderCellsCoarse.buf").exists())
             self.assertTrue((p / "sampleColliderVertexL0.buf").exists())
+            # 已删除的 cells / SDF 烘盘不得回归
+            self.assertFalse((p / "sampleColliderCellsFine.buf").exists())
+            self.assertFalse((p / "sampleColliderCellsCoarse.buf").exists())
+            self.assertFalse((p / "sampleColliderSDF.buf").exists())
             self.assertIn("collision_grid", comp)
+            self.assertNotIn("collision_sdf", comp)
             # 点云交错布局：每点 2×float4 = 8 float
             pts = np.fromfile(p / "sampleColliderPoints.buf", dtype=np.float32)
             self.assertEqual(len(pts) % 8, 0)

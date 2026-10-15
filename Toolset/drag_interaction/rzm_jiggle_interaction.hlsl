@@ -95,15 +95,9 @@ Buffer<float> PathProgressState                 : register(t74);
 Buffer<float4> ZoneParams                       : register(t75);
 // Collision (anti-clipping): baked at export from the collider's vb0 subset.
 //   t76 = interleaved point cloud (position float4 + unit normal float4 per point)
-//   t77 = fine uniform-grid cells (offset, count) uint4 per cell
-//   t78 = coarse uniform-grid cells (centroid.xyz, radius) float4 per cell
 //   t79 = per-vertex L0 contact data (q0.xyz,t0)(n0.xyz,valid)
 Buffer<float4> ColliderPoints                    : register(t76);
-Buffer<uint4>  ColliderCellsFine                : register(t77);
-Buffer<float4> ColliderCellsCoarse              : register(t78);
 Buffer<float4> ColliderVertexL0                 : register(t79);
-// t80 = baked signed distance field of the collider surface (R32_FLOAT, linear).
-Buffer<float>  ColliderSDF                      : register(t80);
 // t83 = 碰撞体三角形的均匀网格（R32_UINT CSR）：
 //       [0..2]=dims.xyz [3]=tri_count [4]=cell_count [5]=idx_count
 //       [6]=max_per_cell [7]=保留
@@ -148,21 +142,9 @@ Texture1D<float4> IniParams : register(t120);
 #define ZONE_RUNTIME_META    IniParams[119]
 // Collision params (anti-clipping). Set by the jiggle INI section; zero = disabled.
 //   [101]: x=enabled, y=margin, z=mode (0=soft-slide, 1=hard-clamp), w=safety
-//   [102]: xyz=bmin, w=h (fine cell size)
-//   [103]: xyz=fine grid dims (nx,ny,nz), w=h_c (coarse cell size)
-//   [104]: x=drag mode variable, yzw=coarse grid dims (cnx,cny,cnz)
+//   [104]: x=drag mode variable
 #define COLLISION_PARAMS    IniParams[101]
-#define COLLISION_BOX       IniParams[102]
-#define COLLISION_GRID      IniParams[103]
 #define COLLISION_META      IniParams[104]
-// SDF（带符号距离场）：把碰撞体表面变成连续的标量场，运行时一次三线性采样
-// 就得到「到表面的带符号距离」。
-//   [105]: xyz=origin(bmin), w=cell size
-//   [106]: xyz=dims(nx,ny,nz), w=band（表面 ±band 内精确，更远处饱和）
-// 碰撞约束退化为一句 d(p) >= d(p0)：连续、无洞、无最近点跳变，同时解决
-// 「平面少→有洞穿模」与「平面多→把顶点钉死」两个极端。
-#define COLLISION_SDF       IniParams[105]
-#define COLLISION_SDF_DIMS  IniParams[106]
 // 动态三角形网格（当前首选路径）：运行时按顶点当前位置现查邻域三角形，约束 =
 // 「到碰撞体表面的带符号距离不许比绑定姿态时更小」。导出侧把碰撞体三角形装进
 // 均匀网格（CSR），shader 侧查 27 邻域后对候选三角形算精确点-三角形距离。
@@ -185,7 +167,6 @@ struct SockBlendRec { float4 w; uint4 i; };
 RWStructuredBuffer<SockBlendRec> SockBlendOut    : register(u2);
 #define SOCK_STROKE      0.2520     // t15 §5: effective stroke (beyond it the sock leaves the collider patch)
 #define SOCK_ROW_END     1099u      // write segment: sock rows [0,1099) (from the IB)
-#define SOCK_TOP_K       4u
 #define SOCK_CLAMP_DW    0.05       // per-slot clamp (t15 section 4)
 #define SOCK_LAM_EPS     1e-6
 
@@ -428,20 +409,10 @@ void SockSyncRow(uint i)
 // 曲线路径的欠采样由下面的 COLLISION_PROJ_STEPS 投影迭代补足，不需要靠多轮 core。
 #define COLLISION_CORE_STEPS 1u
 
-// 归位后是否继续把顶点保持在阈值处。
-// 【用户 m01041】「拖拽松手……回弹它会有阻尼，就是在这样的时候，它的回弹是会越过碰撞体
-// 边界的，然后就穿模了」——回弹路径本身（nextCurrent.w > 0.5 期间）已经在走碰撞，当时
-// 怀疑的漏洞是【弹簧停下的那一帧】：stillAlive 变 false 时 nextOffset 被整体清零（w 从 1
-// 跳到 0），于是这一帧 appliedOffset = 0 ⇒ totalOffset = 0 ⇒ 碰撞门控失败 ⇒ 顶点从被约束住
-// 的 gap 处一步跳回绑定位置 t0。
-// 【2026-10-11 晚修正】那个「一步跳回」在 gap == t0 时**根本不存在**（两者相同，没有跳变），
-// 它只是在 COLLISION_GAP_SCALE 被错设成 10.0 时才表现为 3~15mm 的跳变。倍率已经改回 1.0，
-// 所以这里恢复旧行为：不再让弹簧停下后的顶点持续走碰撞求解。
-//   1 = 保持：zone 激活期间，落在影响半径内的顶点即使弹簧已停也走碰撞求解。
-//       代价（实测）：绑定姿态在 gap == 10*t0 时会整体外移 3~17mm；即使 gap == t0，
-//       也让整圈顶点每帧都进求解器（无谓开销，且会掩盖求解器本身的问题）。
-//   0 = 旧行为：弹簧一停就整波早退（在 gap == t0 下没有任何跳变）。← 采用
-#define COLLISION_HOLD_AT_THRESHOLD 0
+// 归位（弹簧停下）那一帧不继续走碰撞求解。
+// 【2026-10-11 晚实测】「保持在阈值处」这条对照分支的代价：绑定姿态在 gap == 10*t0
+// 时会整体外移 3~17mm；而 gap == t0 时所谓「一步跳回」根本不存在（两者相同，无跳变）。
+// ⇒ 采用「弹簧一停就整波早退」，不保留该开关。
 
 #define DETECT_SLOT_ID       0u
 #define DETECT_SLOT_HIT      1u
@@ -613,13 +584,6 @@ float3 OffsetToVertexSpace(float3 v)
 {
     return v;
 }
-
-// ============================================================
-// DRAG AXIS SELECTION
-//   1 = 沿「点中面的法线」拖拽（【用户 m00857】要求，当前默认）
-//   0 = 旧的 screen-stable 固定局部轴拖拽（保留以便一键回退）
-// ============================================================
-#define DRAG_ALONG_FACE_NORMAL 1
 
 // ============================================================
 // FACE-NORMAL DRAG SIGN MODE
@@ -891,12 +855,10 @@ void ComputeNextPhysics(
         // 鼠标划过别处不会换轴），鼠标位移只决定沿法线的推进量。
         // 【用户 m01161】该行为改由「区域空物体 → 法线方向拖拽」开关（ZoneParams
         // 的 [zone*2+1].w）按区域控制：开启走法线轴，关闭走旧的 screen-stable 轴。
-        // 宏 DRAG_ALONG_FACE_NORMAL = 0 可整体禁用这一路（回到旧行为）。
         // strength is the raw (unscaled) drag direction; PullTowardLimit uses
         // strength as the approach rate toward maxOffset instead of a linear
         // multiplier, so maxOffset governs the whole gesture, not just a
         // rarely-reached tail-end clamp.
-#if DRAG_ALONG_FACE_NORMAL
         float3 dragDir3D = dragAlongNormal
             ? BuildFaceNormalDrag(
                   dragScale, mouseXDirection, mouseYDirection,
@@ -904,11 +866,6 @@ void ComputeNextPhysics(
             : BuildScreenStableDrag(
                   dragScale, mouseXDirection, mouseYDirection,
                   activeScreenRight, activeScreenDown, activeBasisValid);
-#else
-        float3 dragDir3D = BuildScreenStableDrag(
-            dragScale, mouseXDirection, mouseYDirection,
-            activeScreenRight, activeScreenDown, activeBasisValid);
-#endif
         rawTargetOffset = PullTowardLimit(dragDir3D, strength, maxOffset);
         spring = grabSpring;
         damping = grabDamping;
@@ -976,8 +933,6 @@ void ComputeNextPhysics(
 // 旧实现用「距最近采样点」的无符号距离 bestD 做触发，稀疏点云下恒放行 → 无效果。
 // ============================================================
 
-static const uint COLLISION_K_MAX = 32u;
-
 // ============================================================
 // 碰撞求解：固定参考点 + 顶点法线切平面投影（SOFT）
 //
@@ -1023,45 +978,6 @@ static const uint COLLISION_K_MAX = 32u;
 //      太远。切平面约束只覆盖 qj 自己的邻域；顶点一旦滑出这个邻域（大腿是
 //      半径约 0.05 的弧面，滑 0.17 就出去了），最近的采样点会跳到腿的另一侧，
 //      切平面判据全部不违约而放行 —— 拉伸上限就是补这个洞。
-// 三线性采样 SDF：返回「到碰撞体表面的带符号距离」（正 = 表面外侧）。
-// 场外或越界返回 band（饱和值）—— 顶点跑到场外本来就该放行。
-float SampleSDF(float3 p)
-{
-    float3 bmin = COLLISION_SDF.xyz;
-    float cell = max(COLLISION_SDF.w, 1e-6);
-    float3 dimsF = COLLISION_SDF_DIMS.xyz;
-    float band = max(COLLISION_SDF_DIMS.w, 1e-6);
-
-    float3 g = (p - bmin) / cell;
-    if (g.x < 0.0 || g.y < 0.0 || g.z < 0.0)
-        return band;
-    if (g.x > dimsF.x - 1.0 || g.y > dimsF.y - 1.0 || g.z > dimsF.z - 1.0)
-        return band;
-
-    int3 i0 = int3(floor(g));
-    int3 dims = int3(dimsF);
-    int3 i1 = min(i0 + 1, dims - 1);
-    float3 f = g - float3(i0);
-
-    int nx = dims.x;
-    int ny = dims.y;
-    int strideZ = nx * ny;
-
-    uint b000 = (uint)(i0.x + nx * i0.y + strideZ * i0.z);
-    uint b100 = (uint)(i1.x + nx * i0.y + strideZ * i0.z);
-    uint b010 = (uint)(i0.x + nx * i1.y + strideZ * i0.z);
-    uint b110 = (uint)(i1.x + nx * i1.y + strideZ * i0.z);
-    uint b001 = (uint)(i0.x + nx * i0.y + strideZ * i1.z);
-    uint b101 = (uint)(i1.x + nx * i0.y + strideZ * i1.z);
-    uint b011 = (uint)(i0.x + nx * i1.y + strideZ * i1.z);
-    uint b111 = (uint)(i1.x + nx * i1.y + strideZ * i1.z);
-
-    float c00 = lerp(ColliderSDF[b000], ColliderSDF[b100], f.x);
-    float c10 = lerp(ColliderSDF[b010], ColliderSDF[b110], f.x);
-    float c01 = lerp(ColliderSDF[b001], ColliderSDF[b101], f.x);
-    float c11 = lerp(ColliderSDF[b011], ColliderSDF[b111], f.x);
-    return lerp(lerp(c00, c10, f.y), lerp(c01, c11, f.y), f.z);
-}
 
 float PointTriQuery(float3 p, float3 a, float3 b, float3 c,
                     out float3 outQ, out float3 outN)
@@ -1472,49 +1388,7 @@ float3 CollisionSolve(uint i, float3 p0, float3 offset, float3 vn)
 
     float3 p1 = p0 + offset;
 
-    // ── SDF 路径（首选）──────────────────────────────────────────────
-    // 约束只有一句：d(p) >= d(p0)，即「到碰撞体表面的距离不许变小」。
-    // 这是唯一一个连续、无洞、无最近点跳变的约束形式。点云多切平面的交集
-    // 在平面少时留洞（顶点滑出邻域即放行 → 大范围穿模），平面多时把顶点
-    // 圈死（位移保留 0.013 → 拖不动），本质是半空间交集无法近似「不许靠近
-    // 曲面」。SDF 是标量场，梯度连续 ⇒ 位移场连续 ⇒ 面不会被折出尖角。
-    if (COLLISION_SDF_DIMS.x > 0.5)
-    {
-        float d0 = SampleSDF(p0);
-        float tolerance = max(COLLISION_PARAMS.y, 0.0);
-
-        // 沿路径粗扫找第一个违约点：只查终点会漏掉「穿过去再落回合法位置」
-        float tBad = 1.0;
-        [loop]
-        for (uint st = 1u; st <= COLLISION_CCD_STEPS; ++st)
-        {
-            float t = (float)st / (float)COLLISION_CCD_STEPS;
-            if (SampleSDF(p0 + offset * t) < d0 - tolerance)
-            {
-                tBad = t;
-                break;
-            }
-        }
-
-        if (tBad >= 1.0)
-            return p1;
-
-        // 在 [0, tBad] 内二分收窄到临界点
-        float tLo = 0.0;
-        float tHi = tBad;
-        [loop]
-        for (uint b = 0u; b < 8u; ++b)
-        {
-            float tMid = 0.5 * (tLo + tHi);
-            if (SampleSDF(p0 + offset * tMid) >= d0 - tolerance)
-                tLo = tMid;
-            else
-                tHi = tMid;
-        }
-        return p0 + offset * tLo;
-    }
-
-    // ── 点云回退路径（SDF 未烘焙时）──────────────────────────────────
+    // ── 点云回退路径（三角网格未烘焙时）──────────────────────────────
     // 收集绑定姿态下最近的 K 个碰撞体采样点。每个采样点自带法线（导出侧按
     // 「本连通块质心朝外」统一过）。约束基准直接取带符号距离 —— 不做
     // 「base<0 就翻转法线」的处理：导出侧已统一定向，实测 235 个权重顶点里
@@ -2009,26 +1883,15 @@ void main(uint3 threadID : SV_DispatchThreadID)
     //   3*i+1 = distance, influence, applied offset length, state-alive
     //   3*i+2 = applied local offset (Jiggle + Path Slide combined)
 
-#if COLLISION_HOLD_AT_THRESHOLD
-    // 【用户 m01041】回弹归位那一帧不再整波早退：zone 激活期间，只要顶点落在影响
-    // 半径内（dist < radius）就继续走碰撞求解，让它停在阈值 gap 处，而不是一步跳回
-    // 绑定位置 t0（gap = 10*t0 ⇒ 跳变 3~15mm，正是用户看到的「回弹越过边界」）。
-    // 影响半径之外的顶点仍然早退：它们本来就不受弹簧推动，不需要被约束。
-    bool needsCollisionHold = mask > 1e-4 && dist < radius;
-    if (mask <= 1e-4 && !hasPathOffset)
-    {
-        rw_buffer[i] = v;
-        return;
-    }
-#else
     // t39：去掉 `nextCurrent.w < 0.5` —— 回弹/归位期不再整波早退；但只要没有位移
     // （totalOffset == 0）就由 collisionDue 挡住求解 ⇒ 静止态逐位不变。
+    // 不再提供「保持在阈值 gap 处」的对照分支：实测 gap == 10*t0 时它会把绑定姿态
+    // 整体外移 3~17mm，而 gap == t0 时「一步跳回」根本不存在，故不采用。
     if (mask <= 1e-4 && !hasPathOffset)
     {
         rw_buffer[i] = v;
         return;
     }
-#endif
 
     if (influence > 0.0)
     {
@@ -2047,13 +1910,7 @@ void main(uint3 threadID : SV_DispatchThreadID)
     // 有任何位移」：回弹阶段光标一旦离开影响半径，influence 归零，而弹簧仍在
     // 推动顶点 ⇒ 原先这帧不做碰撞 ⇒ 回弹穿模。位移量判据对回弹同样成立。
     float3 totalOffset = v.position - localPos;
-#if COLLISION_HOLD_AT_THRESHOLD
-    // 位移非零 ⇒ 必须求解；位移为零但顶点仍在影响半径内 ⇒ 也要求解，把它保持在
-    // 阈值 gap 处（否则它会停在绑定位置 t0，比阈值更靠内 ⇒ 用户看到的「越过边界」）。
-    bool collisionDue = dot(totalOffset, totalOffset) > 1e-12 || needsCollisionHold;
-#else
     bool collisionDue = dot(totalOffset, totalOffset) > 1e-12;
-#endif
     if (COLLISION_PARAMS.x > 0.5 && COLLISION_META.x >= 2.0 && collisionDue)
     {
         float3 vnRaw = v.normal;

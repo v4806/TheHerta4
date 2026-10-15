@@ -177,7 +177,7 @@ RES_SHADER_DIR = "res/drag_interaction"
 # 重新导出仍带着守卫（acceptance ④）。锚点缺失时只告警、原样放行，绝不阻断导出。
 _EXPLOSION_GUARD_OPS = [
     # (名称, 正则, 替换) —— 与 .dbg/rzm15/make_guard_patch.py 的 OPS 同源
-    ('G0-定义块', '(#define NORMAL_SIGN_MODE[^\\n]*\\n)', '\\1\n// ===== t33 explosion guard（爆炸守卫：非有限值消毒 + 位移硬上限）=================\n// 痛点（逐条数值证据见本目录 probe_explosion.txt / verify_guard.txt）：\n//   M1 非有限传播：物理状态/区域参数/上游任一环产生 NaN 时，\n//      ClampVectorLength（`lenSq > maxSq` 对 NaN 为假）、PullTowardLimit\n//      （`dragLen < 1e-6` 对 NaN 为假）、pow(saturate(..)) 全部“比较为假 ⇒ 原样返回”，\n//      NaN 一路活到 `v.position += appliedOffset` 并写回 rw_buffer。\n//   M2 求解器把静态错位放大成位移：CollisionSolveGrid 的收尾投影环每步最多 gap\n//      （≈1.7mm）× 64 步；碰撞面与当前姿态不一致时，**零位移**顶点也会被推走\n//      （实测 0.1 m 错位 ⇒ 单帧最大 0.0649 m，58/883 行打到 64 步上限）。\n//   M3 硬赋值无界：T16 滑移 `v.position = q1 + sn * gRow` 与 localPos 无关联，\n//      锚点/蒙皮面出错时位移是米级（实测 0.1~1.0 m）。\n// 守卫只做两件事，且对合法输入逐位不生效：\n//   (a) 任何非有限的中间量 → 回退到 fallback（通常是 0 或 localPos）；\n//   (b) 写回前的位移（相对 localPos）按 GUARD_MAX_OFFSET 限幅（保方向、缩长度）。\n// GUARD_MAX_OFFSET 默认 = maxOffset 的合法过冲余量：实测求解器正常收敛时会略超\n// maxOffset（A -n0 0.5 → 0.500758，+0.15%；A -n0 0.25 → 0.25029），这类过冲不该被\n// 守卫改掉（否则用户合法拖满时手感变化）；再加一次 gap 级推挤（|t0| ≤ 1.74mm）的余量。\n// 可用 IniParams[119].w 覆盖（0 = 用默认；非 0 = 绝对上限，调试用）。\n// 注意 .x 是滑移总闸、.z 已被 t7 的 NORMAL_SIGN_MODE 占用。\n#define GUARD_MAX_OFFSET (ZONE_RUNTIME_META.w > 0.0 ? ZONE_RUNTIME_META.w : (maxOffset * 1.01 + 0.005))\n// 求解器内部单步上限（投影环步长 / CCD 推挤量）：合法单步是 gap 级（≈1.7mm），\n// 50mm 已是 30 倍余量；超了说明碰撞面与当前姿态不一致（实机顶点到烘焙锚点距离\n// 中位数 0.5015m，姿态差半个身位）——此时宁可停在原处，也不把顶点瞬移半米。\n#define GUARD_MAX_STEP 0.05\n#define GUARD_EPS 1e-9\n\nfloat3 GuardFinite3(float3 v, float3 fallback)\n{\n    return all(isfinite(v)) ? v : fallback;\n}\n\n// 保方向、缩长度的位移限幅：|p - anchor| <= maxLen；非有限 ⇒ 直接回退到 anchor。\nfloat3 GuardClampDelta(float3 p, float3 anchor, float maxLen)\n{\n    float3 d = p - anchor;\n    float len2 = dot(d, d);\n    if (!all(isfinite(d)) || !isfinite(len2))\n        return anchor;\n    float maxLen2 = maxLen * maxLen;\n    if (len2 > maxLen2 && len2 > GUARD_EPS)\n        return anchor + d * (maxLen * rsqrt(len2));\n    return p;\n}\n// ===== end t33 explosion guard ===============================================\n'),
+    ('G0-定义块', '(#define NORMAL_SIGN_MODE[^\\n]*\\n)', '\\1\n// ===== t33 explosion guard（爆炸守卫：非有限值消毒 + 位移硬上限）=================\n// 痛点（逐条数值证据见 .dbg/rzm15/probe_explosion.txt / .dbg/rzm15/verify_guard.txt（未入库的本地取证存档）：\n//   M1 非有限传播：物理状态/区域参数/上游任一环产生 NaN 时，\n//      ClampVectorLength（`lenSq > maxSq` 对 NaN 为假）、PullTowardLimit\n//      （`dragLen < 1e-6` 对 NaN 为假）、pow(saturate(..)) 全部“比较为假 ⇒ 原样返回”，\n//      NaN 一路活到 `v.position += appliedOffset` 并写回 rw_buffer。\n//   M2 求解器把静态错位放大成位移：CollisionSolveGrid 的收尾投影环每步最多 gap\n//      （≈1.7mm）× 64 步；碰撞面与当前姿态不一致时，**零位移**顶点也会被推走\n//      （实测 0.1 m 错位 ⇒ 单帧最大 0.0649 m，58/883 行打到 64 步上限）。\n//   M3 硬赋值无界：T16 滑移 `v.position = q1 + sn * gRow` 与 localPos 无关联，\n//      锚点/蒙皮面出错时位移是米级（实测 0.1~1.0 m）。\n// 守卫只做两件事，且对合法输入逐位不生效：\n//   (a) 任何非有限的中间量 → 回退到 fallback（通常是 0 或 localPos）；\n//   (b) 写回前的位移（相对 localPos）按 GUARD_MAX_OFFSET 限幅（保方向、缩长度）。\n// GUARD_MAX_OFFSET 默认 = maxOffset 的合法过冲余量：实测求解器正常收敛时会略超\n// maxOffset（A -n0 0.5 → 0.500758，+0.15%；A -n0 0.25 → 0.25029），这类过冲不该被\n// 守卫改掉（否则用户合法拖满时手感变化）；再加一次 gap 级推挤（|t0| ≤ 1.74mm）的余量。\n// 可用 IniParams[119].w 覆盖（0 = 用默认；非 0 = 绝对上限，调试用）。\n// 注意 .x 是滑移总闸、.z 已被 t7 的 NORMAL_SIGN_MODE 占用。\n#define GUARD_MAX_OFFSET (ZONE_RUNTIME_META.w > 0.0 ? ZONE_RUNTIME_META.w : (maxOffset * 1.01 + 0.005))\n// 求解器内部单步上限（投影环步长 / CCD 推挤量）：合法单步是 gap 级（≈1.7mm），\n// 50mm 已是 30 倍余量；超了说明碰撞面与当前姿态不一致（实机顶点到烘焙锚点距离\n// 中位数 0.5015m，姿态差半个身位）——此时宁可停在原处，也不把顶点瞬移半米。\n#define GUARD_MAX_STEP 0.05\n#define GUARD_EPS 1e-9\n\nfloat3 GuardFinite3(float3 v, float3 fallback)\n{\n    return all(isfinite(v)) ? v : fallback;\n}\n\n// 保方向、缩长度的位移限幅：|p - anchor| <= maxLen；非有限 ⇒ 直接回退到 anchor。\nfloat3 GuardClampDelta(float3 p, float3 anchor, float maxLen)\n{\n    float3 d = p - anchor;\n    float len2 = dot(d, d);\n    if (!all(isfinite(d)) || !isfinite(len2))\n        return anchor;\n    float maxLen2 = maxLen * maxLen;\n    if (len2 > maxLen2 && len2 > GUARD_EPS)\n        return anchor + d * (maxLen * rsqrt(len2));\n    return p;\n}\n// ===== end t33 explosion guard ===============================================\n'),
     ('G1-入参行消毒', '(    VertexAttributes v = base_buffer\\[i\\];\\n    float3 localPos = ToJiggleSpace\\(v\\.position\\);\\n)', '\\1    // t33 守卫：输入行本身非有限 ⇒ 整行原样透传（绝不让 NaN 进入物理/碰撞/写回）\n    if (!all(isfinite(v.position)) || !all(isfinite(v.normal)))\n    {\n        rw_buffer[i] = base_buffer[i];\n        return;\n    }\n'),
     ('G2-appliedOffset 消毒+源侧限幅', '    float3 appliedOffset = influence > 0\\.0 \\? OffsetToVertexSpace\\(nextCurrent\\.xyz \\* influence\\) : float3\\(0\\.0, 0\\.0, 0\\.0\\);\\n', '    // t33 守卫：物理位移先消毒（nextCurrent 携带上一帧状态，NaN 会一路传下去），\n    // 再在**源侧**按 maxOffset 硬限幅（captain 线索 4；写回口还有一道同值限幅）\n    float3 appliedOffset = influence > 0.0\n        ? GuardFinite3(OffsetToVertexSpace(nextCurrent.xyz * influence), float3(0.0, 0.0, 0.0))\n        : float3(0.0, 0.0, 0.0);\n    appliedOffset = ClampVectorLength(appliedOffset, maxOffset);\n'),
     ('G3-pathOffset 消毒', '(    if \\(sockSlideLen > SOCK_STROKE\\) pathOffset \\*= SOCK_STROKE / max\\(sockSlideLen, 1e-6\\);\\n)', '\\1    pathOffset = GuardFinite3(pathOffset, float3(0.0, 0.0, 0.0));   // t33 守卫\n'),
@@ -973,34 +973,12 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         description="均匀网格细格边长（vb0 局部单位）；0=按点云平均间距自适应",
         default=0.0, min=0.0, max=10.0,
     )
-    collision_sdf_resolution: bpy.props.IntProperty(
-        name="SDF 分辨率",
-        description=(
-            "带符号距离场沿最长轴的体素数（0=不烘焙 SDF，退回点云约束）。"
-            "实测：丝袜到大腿的真实间隙只有 0.00007，而 SDF 带宽最小只能取到"
-            "0.005，位移 0.5 还会跳出网格（越界按「很远」放行），所以 64~192 "
-            "分辨率下穿模量是点云路线的上百倍，提高分辨率也无效。默认关闭，"
-            "仅在碰撞体与目标间隙远大于 0.01 时才值得启用"
-        ),
-        default=0, min=0, max=192,
-    )
-    collision_sdf_band: bpy.props.FloatProperty(
-        name="SDF 有效带宽",
-        description=(
-            "SDF 只在表面 ±该距离内保存精确值，更远处饱和（vb0 局部单位）。"
-            "顶点跑到带宽外本来就该放行，取 0.05~0.10 即可"
-        ),
-        default=0.08, min=0.005, max=0.5,
-    )
     collision_tri_count: bpy.props.IntProperty(
         name="约束三角形数",
         description=(
-            "每个受碰撞约束的顶点绑定多少个「绑定姿态下最近的碰撞体三角形」"
-            "（0=不烘焙，退回点云约束）。约束是「到这些三角形的距离不许比初始"
-            "更近」，即布料碰撞用的 vertex-triangle 距离约束。实测 235 个丝袜"
-            "顶点 × 6 方向 × 0.5 位移：K=4 穿模 0、位移保留 0.990；K=8 穿模 0、"
-            "保留 0.980；K=16 保留 0.882；K=24 保留 0.735。K 越大约束越紧"
-            "（更容易被拦住），4~8 是手感与安全性的平衡点"
+            "动态三角形网格的烘焙开关（0=不烘焙，退回点云约束）。烘焙后运行时按"
+            "顶点当前位置现查邻域三角形，约束是「到碰撞体表面的带符号距离不许比"
+            "绑定姿态时更小」——不再按固定 K 个最近三角形绑定，具体数值不影响结果"
         ),
         default=8, min=0, max=32,
     )
@@ -1314,8 +1292,6 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             col.prop(self, "collision_margin")
             col.prop(self, "collision_point_budget")
             col.prop(self, "collision_cell_size")
-            col.prop(self, "collision_sdf_resolution")
-            col.prop(self, "collision_sdf_band")
             col.prop(self, "collision_tri_count")
             col_box.label(text="在下方区域的「碰撞体」列表中指定被遮挡物体（如大腿）", icon='INFO')
 
@@ -3337,206 +3313,6 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 out[2 * sel + 1, 3] = 1.0
         return out
 
-    @staticmethod
-    def _bake_collider_sdf(positions, triangles, collider_mask, resolution=64,
-                           band=0.08, pad=0.02):
-        """把碰撞体表面烘成均匀网格上的带符号距离场（SDF）。
-
-        返回 (sdf, bmin, cell, dims)：
-          sdf  —— float32 一维数组，长度 nx*ny*nz，索引 x + nx*(y + ny*z)
-          bmin —— 网格原点（体素 (0,0,0) 的中心 = bmin）
-          cell —— 体素边长（三轴相同）
-          dims —— (nx, ny, nz)
-
-        为什么需要它：现有「点云 + 每顶点最近 K 点 + 多切平面」路线在真实数据上
-        只能落在两个极端之一 —— 太松（点云稀疏，顶点沿切向滑出采样点邻域后所有
-        切平面都判「不违约」而放行，实测 11280 个样本里 201 个穿模）或太紧（换成
-        连续三角形后，12 个半空间半平面的交集把顶点钉死，位移保留只剩 0.013）。
-        正确的不变量是标量：dist(p, 表面) >= dist(p0, 表面)，即「离表面不许变近」。
-        SDF 是唯一同时满足「连续、无洞、可一次采样」的表示。
-
-        band 之外的体素饱和到 ±band：顶点真要跑到那么远，本来就该放行。
-        """
-        pos = np.asarray(positions, dtype=np.float64)
-        tris = np.asarray(triangles, dtype=np.int64)
-        keep = np.all(collider_mask[tris], axis=1)
-        ctris = tris[keep]
-        if len(ctris) == 0:
-            return None
-        A = pos[ctris[:, 0]]
-        B = pos[ctris[:, 1]]
-        C = pos[ctris[:, 2]]
-        fn = np.cross(B - A, C - A)
-        area2 = np.linalg.norm(fn, axis=1)
-        good = area2 > 1e-12
-        A, B, C, fn, area2 = A[good], B[good], C[good], fn[good], area2[good]
-        if len(A) == 0:
-            return None
-        nf = fn / area2[:, None]
-
-        tmin = np.minimum(np.minimum(A, B), C).min(axis=0) - pad
-        tmax = np.maximum(np.maximum(A, B), C).max(axis=0) + pad
-        # 法线统一「远离碰撞体 AABB 中心」：大腿是圆柱，AABB 中心落在轴线上，
-        # 于是每条腿的三角形法线都朝外。用「全体质心」会落在两腿之间而失效。
-        center = 0.5 * (tmin + tmax)
-        tri_c = (A + B + C) / 3.0
-        flip = np.einsum("cd,cd->c", tri_c - center, nf) < 0.0
-        nf = np.where(flip[:, None], -nf, nf)
-
-        extent = tmax - tmin
-        cell = float(extent.max()) / float(max(int(resolution) - 1, 1))
-        dims = np.maximum(np.ceil(extent / cell).astype(np.int64) + 1, 2)
-        nx, ny, nz = int(dims[0]), int(dims[1]), int(dims[2])
-        gx = tmin[0] + np.arange(nx) * cell
-        gy = tmin[1] + np.arange(ny) * cell
-        gz = tmin[2] + np.arange(nz) * cell
-
-        best = np.full(nx * ny * nz, np.inf, dtype=np.float64)
-        signed = np.full(nx * ny * nz, float(band), dtype=np.float64)
-
-        for k in range(len(A)):
-            a, b, c, n = A[k], B[k], C[k], nf[k]
-            lo = np.minimum(np.minimum(a, b), c) - band
-            hi = np.maximum(np.maximum(a, b), c) + band
-            i0 = max(0, int(np.floor((lo[0] - tmin[0]) / cell)))
-            i1 = min(nx - 1, int(np.ceil((hi[0] - tmin[0]) / cell)))
-            j0 = max(0, int(np.floor((lo[1] - tmin[1]) / cell)))
-            j1 = min(ny - 1, int(np.ceil((hi[1] - tmin[1]) / cell)))
-            k0 = max(0, int(np.floor((lo[2] - tmin[2]) / cell)))
-            k1 = min(nz - 1, int(np.ceil((hi[2] - tmin[2]) / cell)))
-            if i1 < i0 or j1 < j0 or k1 < k0:
-                continue
-            X, Y, Z = np.meshgrid(gx[i0:i1 + 1], gy[j0:j1 + 1], gz[k0:k1 + 1],
-                                  indexing="ij")
-            P = np.stack([X.ravel(), Y.ravel(), Z.ravel()], axis=1)
-            v0 = b - a
-            v1 = c - a
-            d00 = float(v0 @ v0)
-            d01 = float(v0 @ v1)
-            d11 = float(v1 @ v1)
-            den = d00 * d11 - d01 * d01
-            if abs(den) < 1e-20:
-                continue
-            v2 = P - a
-            d20 = v2 @ v0
-            d21 = v2 @ v1
-            wb = (d11 * d20 - d01 * d21) / den
-            wc = (d00 * d21 - d01 * d20) / den
-            wa = 1.0 - wb - wc
-            wa = np.clip(wa, 0.0, 1.0)
-            wb = np.clip(wb, 0.0, 1.0)
-            wc = np.clip(wc, 0.0, 1.0)
-            wsum = wa + wb + wc
-            wsum = np.where(wsum < 1e-12, 1.0, wsum)
-            wa = wa / wsum
-            wb = wb / wsum
-            wc = wc / wsum
-            Q = (a[None, :] * wa[:, None] + b[None, :] * wb[:, None]
-                 + c[None, :] * wc[:, None])
-            diff = P - Q
-            dd = np.linalg.norm(diff, axis=1)
-            sd = diff @ n
-            sd = np.where(sd < 0.0, -dd, dd)
-
-            ii = np.arange(i0, i1 + 1)
-            jj = np.arange(j0, j1 + 1)
-            kk = np.arange(k0, k1 + 1)
-            flat = (ii[:, None, None]
-                    + nx * (jj[None, :, None] + ny * kk[None, None, :])).ravel()
-            absd = np.abs(sd)
-            cur = best[flat]
-            upd = absd < cur
-            if np.any(upd):
-                best[flat[upd]] = absd[upd]
-                signed[flat[upd]] = sd[upd]
-
-        signed = np.clip(signed, -band, band)
-        return signed.astype(np.float32), tmin.astype(np.float32), float(cell), (nx, ny, nz)
-
-    @staticmethod
-    def _point_tri_dist(p, a, b, c):
-        """精确的点到三角形距离（Ericson 区域法）。
-
-        p 是 (3,) 单点，a/b/c 是 (n,3) 三角形顶点批次，返回 (n,) 距离。
-        与「到三角形所在平面的距离」不同：顶点落在三角形外侧（边区域/顶点区域）
-        时返回的是到边或顶点的真实距离，不会像平面那样无限延伸出去。
-        """
-        return SSMTNode_PostProcess_DragInteraction._point_tri_query(p, a, b, c)[0]
-
-    @staticmethod
-    def _point_tri_query(p, a, b, c):
-        """精确的点到三角形查询，返回 (dist, q, n)。
-
-        dist —— 无符号距离（点到三角形最近点的真实距离）
-        q    —— 三角形上的最近点
-        n    —— 单位面法线（方向由三角形绕序决定，调用方按需定向）
-
-        为什么必须带符号：丝袜与大腿在绑定姿态下**完全重合**（实测 235 个权重
-        顶点的真实距离恒为 0）。这时无符号距离恒等于 0，约束「dist(p) >= 0」
-        永远成立、什么都拦不住。带符号距离才能区分「贴在大腿上」（0）、
-        「拉离大腿」（正）、「推进大腿里」（负）。
-        """
-        ab = b - a
-        ac = c - a
-        ap = p - a
-        d1 = np.einsum("ij,ij->i", ab, ap)
-        d2 = np.einsum("ij,ij->i", ac, ap)
-        bp = p - b
-        d3 = np.einsum("ij,ij->i", ab, bp)
-        d4 = np.einsum("ij,ij->i", ac, bp)
-        cp = p - c
-        d5 = np.einsum("ij,ij->i", ab, cp)
-        d6 = np.einsum("ij,ij->i", ac, cp)
-
-        va = d3 * d6 - d5 * d4
-        vb = d5 * d2 - d1 * d6
-        vc = d1 * d4 - d3 * d2
-        denom = va + vb + vc
-        safe = np.where(np.abs(denom) < 1e-30, 1e-30, denom)
-        v = vb / safe
-        w = vc / safe
-
-        def edge_pt(e0, dvec, num):
-            # 边投影参数 t = dot(edge, p - e0) / |edge|^2（钳到 [0,1]）。
-            den = np.maximum(np.einsum("ij,ij->i", dvec, dvec), 1e-30)
-            t = np.clip(num / den, 0.0, 1.0)
-            return e0 + dvec * t[:, None]
-
-        # 面区域内才用平面投影；区域外置 1e30 交给边/顶点候选。不能无条件取
-        # 平面投影：顶点落在三角形所在平面上但在三角形外侧时投影距离会是 0
-        # （实测 p=(1.3,-0.4,0) 对三角形 (0,0,0)(1,0,0)(0,1,0) 得 0.0，真实是 0.5）。
-        q_face = a + ab * v[:, None] + ac * w[:, None]
-        inside = (v >= 0) & (w >= 0) & (v + w <= 1)
-        d_face = np.where(inside, np.linalg.norm(p - q_face, axis=1), 1e30)
-
-        bc = c - b
-        q_ab = edge_pt(a, ab, d1)
-        q_ac = edge_pt(a, ac, d2)
-        q_bc = edge_pt(b, bc, np.einsum("ij,ij->i", bc, p - b))
-        shape = q_face.shape
-        cand_d = np.stack([
-            d_face,
-            np.linalg.norm(p - q_ab, axis=1),
-            np.linalg.norm(p - q_ac, axis=1),
-            np.linalg.norm(p - q_bc, axis=1),
-            np.linalg.norm(p - a, axis=1),
-            np.linalg.norm(p - b, axis=1),
-            np.linalg.norm(p - c, axis=1),
-        ])
-        cand_q = np.stack([
-            q_face, q_ab, q_ac, q_bc,
-            np.broadcast_to(a, shape), np.broadcast_to(b, shape),
-            np.broadcast_to(c, shape),
-        ])
-        pick = np.argmin(cand_d, axis=0)
-        rows = np.arange(len(pick))
-        q = cand_q[pick, rows]
-        dist = cand_d[pick, rows]
-
-        n = np.cross(ab, ac)
-        n = n / np.maximum(np.linalg.norm(n, axis=1, keepdims=True), 1e-30)
-        return dist, q, n
-
     def _bake_collider_tri_grid(self, positions, triangles, collider_mask,
                                 vertex_normals=None, cell_size=0.0,
                                 max_per_cell=4096, reach=0.6, min_cell=0.0):
@@ -3714,7 +3490,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             return None
 
     def _write_collision_resources(self, mod_export_path, sections, comp, ns):
-        """烘焙碰撞检测资源：ColliderPoints / ColliderCellsFine / ColliderCellsCoarse / ColliderVertexL0。
+        """烘焙碰撞检测资源：ColliderPoints / ColliderVertexL0。
 
         返回 True = 已写出；False = 无可烘焙内容（碰撞体选择为空/不在本组件）。
         """
@@ -3726,7 +3502,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         # 顶点法线只用于给碰撞体三角形法线定向：绑定姿态下丝袜与大腿几乎重合
         # （实测间隙 0.0001），靠几何自身分不出「哪一侧是外」，只能靠法线。
         vertex_normals = self._read_vertex_normals(
-            mod_export_path, sections, comp, vertex_count
+            mod_export_path, sections, comp
         )
         source_vertex_count = len(positions)
         vertex_base, vertex_count = self._runtime_vertex_layout(
@@ -3819,8 +3595,6 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         interleaved[0::2, 0:3] = grid["sorted_points"]
         interleaved[1::2, 0:3] = reordered_normals
         interleaved.tofile(os.path.join(out_dir, f"{stem}ColliderPoints.buf"))
-        grid["fine_cells"].tofile(os.path.join(out_dir, f"{stem}ColliderCellsFine.buf"))
-        grid["coarse_cells"].tofile(os.path.join(out_dir, f"{stem}ColliderCellsCoarse.buf"))
         l0.tofile(os.path.join(out_dir, f"{stem}ColliderVertexL0.buf"))
 
         # 【t42】导出侧接触覆盖自检（只打印，不写任何 .buf —— 见 t42 裁定：
@@ -3848,20 +3622,6 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         # 三角形约束表（首选路径）：把每个受碰撞约束的顶点绑定到绑定姿态下最近的
         # K 个碰撞体三角形。运行时零搜索，约束 = dist(p, tri_j) >= base_j。
         tri_k = int(getattr(self, "collision_tri_count", 8) or 0)  # 仅用于「动态三角形网格」烘焙的开关（静态 K 表路径已于 2026-10-14 移除）
-
-        # SDF：把碰撞体表面烘成均匀网格上的带符号距离场。运行时一次三线性采样
-        # 就得到「到表面的带符号距离」，碰撞约束退化为一句 d(p) >= d(p0)。
-        sdf_res = int(getattr(self, "collision_sdf_resolution", 0) or 0)
-        sdf_band = float(getattr(self, "collision_sdf_band", 0.08) or 0.08)
-        sdf_baked = None
-        if sdf_res > 0:
-            sdf_baked = self._bake_collider_sdf(
-                positions, triangles, collider_mask,
-                resolution=sdf_res, band=sdf_band,
-            )
-        if sdf_baked is not None:
-            sdf_arr, sdf_bmin, sdf_cell, sdf_dims = sdf_baked
-            sdf_arr.tofile(os.path.join(out_dir, f"{stem}ColliderSDF.buf"))
 
         # 动态三角形网格（当前首选路径）：把碰撞体三角形装进均匀网格，运行时按
         # 顶点当前位置现查邻域三角形，约束 =「到表面的带符号距离不许变小」。
@@ -3895,14 +3655,6 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             "dims": tuple(int(d) for d in grid["dims"]),
             "cdims": tuple(int(d) for d in grid["cdims"]),
         }
-        if sdf_baked is not None:
-            sdf_arr, sdf_bmin, sdf_cell, sdf_dims = sdf_baked
-            comp["collision_sdf"] = {
-                "bmin": tuple(float(x) for x in sdf_bmin),
-                "cell": float(sdf_cell),
-                "dims": tuple(int(d) for d in sdf_dims),
-                "band": float(sdf_band),
-            }
         if grid_baked is not None:
             _g_arr, _g_tris, _g_vidx, g_meta = grid_baked
             comp["collision_trigrid"] = {
@@ -3980,7 +3732,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             print(f"[DragInteraction][WARNING] 读取 Position.buf 失败: {e}")
             return None
 
-    def _read_vertex_normals(self, mod_export_path, sections, comp, vertex_count):
+    def _read_vertex_normals(self, mod_export_path, sections, comp):
         """从 ini 的 Position 资源段读取顶点法线（顶点结构里的 normal 属性）。
 
         与 `_read_position_buf` 读同一份 buf、同一 stride，只换属性偏移。
@@ -4894,23 +4646,10 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 "type = Buffer", "format = R32G32B32A32_FLOAT",
                 f"filename = {res_dir}/{stem}ColliderPoints.buf",
             ]
-            comp_resources[f"[ResourceDragColliderCellsFine_{cn}_{ns}]"] = [
-                "type = Buffer", "format = R32G32B32A32_UINT",
-                f"filename = {res_dir}/{stem}ColliderCellsFine.buf",
-            ]
-            comp_resources[f"[ResourceDragColliderCellsCoarse_{cn}_{ns}]"] = [
-                "type = Buffer", "format = R32G32B32A32_FLOAT",
-                f"filename = {res_dir}/{stem}ColliderCellsCoarse.buf",
-            ]
             comp_resources[f"[ResourceDragColliderVertexL0_{cn}_{ns}]"] = [
                 "type = Buffer", "format = R32G32B32A32_FLOAT",
                 f"filename = {res_dir}/{stem}ColliderVertexL0.buf",
             ]
-            if comp.get("collision_sdf"):
-                comp_resources[f"[ResourceDragColliderSDF_{cn}_{ns}]"] = [
-                    "type = Buffer", "format = R32_FLOAT",
-                    f"filename = {res_dir}/{stem}ColliderSDF.buf",
-                ]
             if comp.get("collision_trigrid"):
                 comp_resources[f"[ResourceDragColliderTriGrid_{cn}_{ns}]"] = [
                     "type = Buffer", "format = R32_UINT",
@@ -5224,8 +4963,6 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             mode = 0 if getattr(self, "collision_mode", 'SOFT') == 'SOFT' else 1
             margin = self._fmt(float(getattr(self, "collision_margin", 0.002) or 0.0))
             safety = self._fmt(0.9)
-            bmin = collision_grid["bmin"]
-            nx, ny, nz = collision_grid["dims"]
             # x104 只承载「拖拽模式变量」这一个值：粗/细网格查询已不再被 CollisionSolve
             # 使用（点云约束走绑定姿态最近的 4 个采样点）。原先的
             # `{变量} {cnx} {cny} {cnz}` 是「变量 + 字面量」混合多值，全仓无先例、
@@ -5239,35 +4976,8 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 f"y101 = {margin}",
                 f"z101 = {mode}",
                 f"w101 = {safety}",
-                f"x102 = {self._fmt(float(bmin[0]))}",
-                f"y102 = {self._fmt(float(bmin[1]))}",
-                f"z102 = {self._fmt(float(bmin[2]))}",
-                f"w102 = {self._fmt(collision_grid['h'])}",
-                f"x103 = {nx}",
-                f"y103 = {ny}",
-                f"z103 = {nz}",
-                f"w103 = {self._fmt(collision_grid['h_c'])}",
                 f"x104 = {drag_mode_var}",
             ])
-            # 槽位 105/106：SDF 网格（origin + cell / dims + band）。
-            # 碰撞约束改用「到表面的带符号距离不许变小」，靠 SDF 一次三线性采样
-            # 得到，不再需要粗/细网格查询与每顶点最近点搜索。
-            collision_sdf = comp.get("collision_sdf")
-            if collision_sdf:
-                sb = collision_sdf["bmin"]
-                sd = collision_sdf["dims"]
-                lines.extend([
-                    f"x105 = {self._fmt(float(sb[0]))}",
-                    f"y105 = {self._fmt(float(sb[1]))}",
-                    f"z105 = {self._fmt(float(sb[2]))}",
-                    f"w105 = {self._fmt(float(collision_sdf['cell']))}",
-                    f"x106 = {int(sd[0])}",
-                    f"y106 = {int(sd[1])}",
-                    f"z106 = {int(sd[2])}",
-                    f"w106 = {self._fmt(float(collision_sdf['band']))}",
-                ])
-            else:
-                lines.extend(["x105 = 0", "x106 = 0"])
             # 槽位 107：每个顶点绑定的约束三角形数（0 = 未烘焙，走点云回退）。
             # 槽位 108/109：动态三角形网格（origin + cell / dims + cell_count）。
             # 运行时按顶点当前位置现查邻域三角形，约束 =「到表面的带符号距离不许
@@ -5320,12 +5030,8 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         if collision_grid:
             lines.extend([
                 f"cs-t76 = ResourceDragColliderPoints_{cn}_{ns}",
-                f"cs-t77 = ResourceDragColliderCellsFine_{cn}_{ns}",
-                f"cs-t78 = ResourceDragColliderCellsCoarse_{cn}_{ns}",
                 f"cs-t79 = ResourceDragColliderVertexL0_{cn}_{ns}",
             ])
-            if comp.get("collision_sdf"):
-                lines.append(f"cs-t80 = ResourceDragColliderSDF_{cn}_{ns}")
             if comp.get("collision_trigrid"):
                 lines.append(f"cs-t83 = ResourceDragColliderTriGrid_{cn}_{ns}")
                 lines.append(f"cs-t84 = ResourceDragColliderTriGridTris_{cn}_{ns}")
