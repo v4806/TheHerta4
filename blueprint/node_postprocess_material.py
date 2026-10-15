@@ -1360,10 +1360,14 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
                 # 转换入口保证同一目标在一次导出里只跑一次 texconv。同一个材质被多个物体
                 # 引用是常态（实测一份 ini 里同一张 LightMap 被引用 282 次），没有这层保护
                 # 就会转 282 次、每次约 4 秒。
+                # 格式按**材质资源名**判定（stem 就是材质名，也是写出去的 .dds 文件名词干），
+                # 不看源 PNG 名：导出侧的名字才是用户在 Blender 里按贴图类型命名的
+                # （DiffuseMap_/NormalMap_…），源贴图则常是带哈希前缀或原始名的中间文件。
                 ok, reason = convert_texture_to_dds_cached(
                     source_path,
                     converted_path,
                     force=bool(self.material_to_resource_override),
+                    match_name=stem,
                 )
                 if ok:
                     return converted_name

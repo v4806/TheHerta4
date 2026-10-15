@@ -135,7 +135,7 @@ class ExportTextureAsDDSTests(unittest.TestCase):
         node = self._make_node()
         calls = []
 
-        def fake_convert(source_path, target_path, props=None, force=False):
+        def fake_convert(source_path, target_path, props=None, force=False, match_name=None):
             calls.append((source_path, target_path))
             with open(target_path, "wb") as handle:
                 handle.write(b"DDS payload")
@@ -150,6 +150,21 @@ class ExportTextureAsDDSTests(unittest.TestCase):
         self.assertEqual([(source, os.path.join(self.target_dir, "Body_Material.dds"))], calls)
         # 源 PNG 必须原样保留：编辑期还要继续用它
         self.assertTrue(os.path.exists(source))
+
+    def test_material_name_is_used_for_format_resolution(self):
+        """格式判定串是材质名（= 目标 .dds 名），不是源 PNG 名"""
+        source = self._make_source("c209c22b-45087-0-NormalMap.png")
+        node = self._make_node()
+
+        with mock.patch.object(
+            node_postprocess_material, "convert_texture_to_dds_cached"
+        ) as convert_mock:
+            convert_mock.return_value = (True, "")
+            node.copy_texture_file(
+                _FakeImage(source), self.target_dir, _FakeMaterial("DiffuseMap_Body")
+            )
+
+        self.assertEqual("DiffuseMap_Body", convert_mock.call_args.kwargs["match_name"])
 
     def test_switch_off_copies_source_as_is(self):
         """开关关闭时保持改动前的行为：原样复制源文件，不调用转换"""

@@ -9,6 +9,11 @@ import bpy
 
 TOOLSET_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "Toolset")
 
+# 内置格式规则：**颜色贴图（DiffuseMap）用 sRGB，其余类型一律线性 bc7_unorm**。
+# 表里保留各类型条目只是为了让类型名可读（批量算子的报告、规则列表的「重置默认」都按
+# 类型列出），它们的 format 与兜底值相同 —— 要单独给某个类型换格式，改这里就行。
+# 注意：把磁盘上本来是 _SRGB 的现有 DDS 按非 sRGB 规则重编码会净压暗一次（实测见
+# :func:`_texconv_colorspace_flags` 的说明），所以给某类型降级前先确认那份贴图的来源。
 DDS_DEFAULT_RULES = [
     {
         "texture_type": "DiffuseMap",
@@ -18,7 +23,7 @@ DDS_DEFAULT_RULES = [
     {
         "texture_type": "NormalMap",
         "pattern": r"(?i)(?:^|[_\-. ])NormalMap(?:[_\-. ]|$)",
-        "format": "r8g8b8a8_unorm",
+        "format": "bc7_unorm",
     },
     {
         "texture_type": "LightMap",
@@ -33,12 +38,12 @@ DDS_DEFAULT_RULES = [
     {
         "texture_type": "RampMap",
         "pattern": r"(?i)(?:^|[_\-. ])RampMap(?:[_\-. ]|$)",
-        "format": "bc7_unorm_srgb",
+        "format": "bc7_unorm",
     },
     {
         "texture_type": "HighLightMap",
         "pattern": r"(?i)(?:^|[_\-. ])HighLightMap(?:[_\-. ]|$)",
-        "format": "bc7_unorm_srgb",
+        "format": "bc7_unorm",
     },
     {
         "texture_type": "WengineFX",
@@ -48,7 +53,7 @@ DDS_DEFAULT_RULES = [
     {
         "texture_type": "Glowmap",
         "pattern": r"(?i)(?:^|[_\-. ])Glowmap(?:[_\-. ]|$)",
-        "format": "bc7_unorm_srgb",
+        "format": "bc7_unorm",
     },
     {
         "texture_type": "FXMap",
@@ -215,6 +220,11 @@ def _restore_image_display_state(image, snapshot, dds_format: str) -> None:
 
 
 def resolve_dds_target(filename: str, props) -> tuple[str, str, str]:
+    """名称 → ``(类型, 格式, 命中规则)``：先自定义规则（列表顺序首条命中），再内置规则
+    （取匹配位置最靠左的那条），都不中则是 ``("default", "bc7_unorm", "Default")``。
+
+    参数名沿用 ``filename``，但判定串由调用方决定：导出侧传材质资源名，批量算子传文件名。
+    """
     if getattr(props, "dds_use_custom_rules", False):
         for rule in getattr(props, "dds_rules", []) or []:
             if not getattr(rule, "enabled", True):
@@ -290,11 +300,17 @@ def _target_is_current(target_path: str, signature) -> bool:
     return target_stat.st_mtime_ns >= signature[1]
 
 
-def convert_texture_to_dds(source_path: str, target_path: str, props=None) -> tuple[bool, str]:
+def convert_texture_to_dds(
+    source_path: str,
+    target_path: str,
+    props=None,
+    match_name: str | None = None,
+) -> tuple[bool, str]:
     """把单张贴图转成 DDS 写到 ``target_path``，供 Mod 导出流程复用。
 
-    口径与「批量转换为 .dds」算子完全一致：输出格式由现有规则表
-    （:func:`resolve_dds_target`）从**源文件名**推断，色彩空间标志由
+    输出格式由现有规则表（:func:`resolve_dds_target`）推断，判定串取 ``match_name``：
+    「材质转资源」导出传**材质资源名**（就是目标 ``.dds`` 的文件名词干），为 ``None`` 时
+    退回源文件名（「批量转换为 .dds」算子与其它导出节点沿用原口径）。色彩空间标志由
     :func:`_texconv_colorspace_flags` 按该格式选择 —— 这正是为「PNG 这类不带色彩空间
     信息的输入」设计的（sRGB 输出用 ``--srgb-in`` 达成恒等，线性输出用 ``--ignore-srgb``）。
 
@@ -307,7 +323,8 @@ def convert_texture_to_dds(source_path: str, target_path: str, props=None) -> tu
     if props is None:
         props = bpy.context.scene.texture_tools_props
 
-    dds_format = resolve_dds_target(os.path.basename(source_path), props)[1] or "bc7_unorm"
+    match_target = match_name or os.path.basename(source_path)
+    dds_format = resolve_dds_target(match_target, props)[1] or "bc7_unorm"
 
     command = [texconv_executable, "-f", dds_format]
     command.extend(_texconv_colorspace_flags(dds_format))
@@ -355,9 +372,16 @@ def convert_texture_to_dds(source_path: str, target_path: str, props=None) -> tu
 
 
 def convert_texture_to_dds_cached(
-    source_path: str, target_path: str, props=None, force: bool = False
+    source_path: str,
+    target_path: str,
+    props=None,
+    force: bool = False,
+    match_name: str | None = None,
 ) -> tuple[bool, str]:
     """带缓存的 :func:`convert_texture_to_dds`：同一目标在一次导出内只真正转一次。
+
+    ``match_name`` 是「按哪个名字判定格式」，原样透传下去；缓存键仍只用目标路径 ——
+    判定串由目标名派生，同一次导出里同一个目标的格式不会变。
 
     ``force=True`` 对应节点上的「覆盖现有资源」：表示愿意重新生成，但仅限本次导出的
     第一次 —— 同一张贴图被 N 个物体引用时不会再各转一遍。缓存每次导出开始时清空，
@@ -380,7 +404,7 @@ def convert_texture_to_dds_cached(
         _dds_conversion_cache[cache_key] = signature
         return True, ""
 
-    ok, reason = convert_texture_to_dds(source_path, target_path, props)
+    ok, reason = convert_texture_to_dds(source_path, target_path, props, match_name)
     if ok:
         _dds_conversion_cache[cache_key] = signature
     return ok, reason

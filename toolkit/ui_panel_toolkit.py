@@ -732,6 +732,7 @@ class TT_DDSConversionPanel(bpy.types.Panel):
         if not props.dds_use_custom_rules:
             info_box = rules_box.box()
             info_box.label(text="当前使用内置贴图类型规则:", icon='INFO')
+            info_box.label(text="- 格式：DiffuseMap（颜色贴图）用 bc7_unorm_srgb，其余一律 bc7_unorm")
             info_box.label(text="- DiffuseMap / NormalMap / LightMap / MaterialMap / ORMMap")
             info_box.label(text="- RampMap / HighLightMap / WengineFX")
             info_box.label(text="- Glowmap / FXMap / RoughnessMap")

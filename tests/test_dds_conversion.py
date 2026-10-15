@@ -111,20 +111,51 @@ class DDSConversionTests(unittest.TestCase):
         self.assertEqual(matched_by, r"(?i)(?:^|[_\-. ])DiffuseMap_high(?:[_\-. ]|$)")
 
     def test_default_rules_pick_first_matching_keyword(self):
-        """测试文件名同时包含 NormalMap 和 DiffuseMap 时，取最先出现的匹配规则"""
+        """测试文件名同时包含 NormalMap 和 DiffuseMap 时，取最先出现的匹配规则
+
+        （两个类型格式不同：命中错了会从线性变成 sRGB，断言能看出来。）
+        """
         props = types.SimpleNamespace(dds_use_custom_rules=False, dds_rules=[])
         texture_type, dds_format, _matched_by = dds_conversion.resolve_dds_target(
             "NormalMap_DiffuseMap_high_丝袜.png", props
         )
         self.assertEqual(texture_type, "NormalMap")
-        self.assertEqual(dds_format, "r8g8b8a8_unorm")
+        self.assertEqual(dds_format, "bc7_unorm")
 
     def test_default_rules_single_keyword_normalmap(self):
-        """测试仅包含 NormalMap 时正常匹配"""
+        """测试仅包含 NormalMap 时正常匹配
+
+        法线也走有损 BC7：内置规则里只有 DiffuseMap 是 sRGB 例外，其余一律线性 bc7_unorm。
+        """
         props = types.SimpleNamespace(dds_use_custom_rules=False, dds_rules=[])
         texture_type, dds_format, _matched_by = dds_conversion.resolve_dds_target("cloth_NormalMap.png", props)
         self.assertEqual(texture_type, "NormalMap")
-        self.assertEqual(dds_format, "r8g8b8a8_unorm")
+        self.assertEqual(dds_format, "bc7_unorm")
+
+    def test_only_diffuse_map_keeps_srgb(self):
+        """颜色贴图（DiffuseMap）是唯一的 sRGB 例外，其余类型一律线性 bc7_unorm"""
+        props = types.SimpleNamespace(dds_use_custom_rules=False, dds_rules=[])
+        texture_type, dds_format, _matched_by = dds_conversion.resolve_dds_target("DiffuseMap_Body.png", props)
+        self.assertEqual(texture_type, "DiffuseMap")
+        self.assertEqual(dds_format, "bc7_unorm_srgb")
+        self.assertEqual(["--srgb-in"], dds_conversion._texconv_colorspace_flags(dds_format))
+
+        for name in (
+            "NormalMap_Body.png",
+            "LightMap_Body.png",
+            "MaterialMap_Body.png",
+            "RampMap_Body.png",
+            "HighLightMap_Body.png",
+            "WengineFx_Body.png",
+            "Glowmap_5_Body.png",
+            "FXMap_Body.png",
+            "TTLMap_Body.png",
+            "RoughnessMap_Body.png",
+            "ORMMap_Body.png",
+            "UnknownMask.png",
+        ):
+            with self.subTest(name=name):
+                self.assertEqual("bc7_unorm", dds_conversion.resolve_dds_target(name, props)[1])
 
     def test_default_rules_recognize_ttlmap(self):
         """测试 TTLMap 前缀与 FXMap 一样按遮罩格式识别（bc7_unorm）"""
@@ -375,7 +406,7 @@ class ConvertTextureToDDSTests(unittest.TestCase):
         self.target = os.path.join(self.temp_dir, "out", "Body_Material.dds")
         self.props = types.SimpleNamespace(dds_use_custom_rules=False, dds_rules=[])
 
-    def _run(self, capture=None, returncode=0):
+    def _run(self, capture=None, returncode=0, match_name=None):
         def fake_run(command, **_kwargs):
             if capture is not None:
                 capture.append(command)
@@ -391,7 +422,9 @@ class ConvertTextureToDDSTests(unittest.TestCase):
 
         with mock.patch.object(dds_conversion, "find_texconv", return_value="texconv.exe"), \
                 mock.patch.object(dds_conversion.subprocess, "run", side_effect=fake_run):
-            return dds_conversion.convert_texture_to_dds(self.source, self.target, self.props)
+            return dds_conversion.convert_texture_to_dds(
+                self.source, self.target, self.props, match_name=match_name
+            )
 
     def test_diffuse_map_uses_srgb_rule_and_writes_target(self):
         """DiffuseMap 按规则表走 bc7_unorm_srgb，并用 --srgb-in 保证颜色不变"""
@@ -414,8 +447,33 @@ class ConvertTextureToDDSTests(unittest.TestCase):
 
         self.assertTrue(ok, reason)
         command = commands[0]
-        self.assertEqual("r8g8b8a8_unorm", command[command.index("-f") + 1])
+        self.assertEqual("bc7_unorm", command[command.index("-f") + 1])
         self.assertIn("--ignore-srgb", command)
+
+    def test_match_name_overrides_source_filename(self):
+        """判定串换成材质名后，源 PNG 名里的关键词不再决定格式
+
+        源名是 NormalMap（线性），材质名是 DiffuseMap（sRGB）→ 以材质名为准。
+        """
+        self.source = os.path.join(self.temp_dir, "c209c22b-45087-0-NormalMap.png")
+        Path(self.source).write_bytes(b"png payload")
+        commands = []
+        ok, reason = self._run(capture=commands, match_name="DiffuseMap_Body")
+
+        self.assertTrue(ok, reason)
+        command = commands[0]
+        self.assertEqual("bc7_unorm_srgb", command[command.index("-f") + 1])
+        self.assertIn("--srgb-in", command)
+
+    def test_source_filename_still_decides_without_match_name(self):
+        """不传判定串时保持原口径：按源文件名判定（批量算子与其它导出节点走这条）"""
+        self.source = os.path.join(self.temp_dir, "c209c22b-45087-0-Body.png")
+        Path(self.source).write_bytes(b"png payload")
+        commands = []
+        ok, reason = self._run(capture=commands)
+
+        self.assertTrue(ok, reason)
+        self.assertEqual("bc7_unorm", commands[0][commands[0].index("-f") + 1])
 
     def test_source_file_is_untouched(self):
         """编辑期的源 PNG 必须原样保留，导出只是另外产出一份 DDS"""
@@ -455,7 +513,7 @@ class DDSConversionCacheTests(unittest.TestCase):
         self.target = os.path.join(self.temp_dir, "out", "Body_Material.dds")
         self.props = types.SimpleNamespace(dds_use_custom_rules=False, dds_rules=[])
 
-    def _run(self, force=False):
+    def _run(self, force=False, match_name=None):
         calls = []
 
         def fake_run(command, **_kwargs):
@@ -470,9 +528,16 @@ class DDSConversionCacheTests(unittest.TestCase):
         with mock.patch.object(dds_conversion, "find_texconv", return_value="texconv.exe"), \
                 mock.patch.object(dds_conversion.subprocess, "run", side_effect=fake_run):
             result = dds_conversion.convert_texture_to_dds_cached(
-                self.source, self.target, self.props, force=force
+                self.source, self.target, self.props, force=force, match_name=match_name
             )
         return result, calls
+
+    def test_match_name_is_forwarded_to_format_resolution(self):
+        """带缓存的入口把判定串透传下去：材质导出按材质名（而非源名）定格式"""
+        _result, calls = self._run(match_name="NormalMap_Body")
+
+        # 源名是 DiffuseMap（sRGB），材质名是 NormalMap（线性）→ 以材质名为准
+        self.assertEqual("bc7_unorm", calls[0][calls[0].index("-f") + 1])
 
     def test_same_target_is_converted_once_even_with_force(self):
         """核心：同一目标被反复请求时只跑一次 texconv，「覆盖现有资源」也不例外"""
