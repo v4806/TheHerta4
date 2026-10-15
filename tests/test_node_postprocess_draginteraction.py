@@ -1741,7 +1741,7 @@ class DragNodeEmitTests(unittest.TestCase):
         _, sections, _ = self._emit()
         self.assertEqual(
             sections["[ResourceDragJiggleTempVB0_abc123_43191_testns]"],
-            ["type = RWStructuredBuffer", "stride = 40", "array = 19039",
+            ["type = RWStructuredBuffer", "stride = 40", "array = 14078",
              "bind_flags = shader_resource unordered_access"],
         )
         self.assertNotIn("[ResourceDragJiggleShadowVB_abc123_43191_testns]", sections)
@@ -1754,6 +1754,22 @@ class DragNodeEmitTests(unittest.TestCase):
         self.assertIn("ResourceDragJiggleTempVB0_abc123_43191_testns = copy cs-u5", jig)
         self.assertNotIn("ShadowVB", jig)
         self.assertIn("Dispatch = 55, 1, 1", jig)  # ceil(14078/256)
+
+    def test_jiggle_temp_vb0_array_tracks_component_vertex_count(self):
+        # 回归（洛克茜 d5e1e7ff 实机爆炸）：array 曾写死 19039，而该部件真实顶点数
+        # 是 262153 ⇒ 变形 CS 只写前 19039 行，其余行在换绑成绘制 vb0 后被索引到、
+        # 读到 0 ⇒ 整片网格塌到原点。契约：array == 该部件 vertex_count，
+        # 且与该段 Dispatch 出自同一个数（同一部件不得有两个顶点数来源）。
+        node = _make_node(self.mod)
+        sections = _base_sections(vertex_count=262153)
+        comps = node._locate_components(sections, ["abc123"])
+        node._emit_sections(sections, comps, "testns")
+        self.assertEqual(comps[0]["vertex_count"], 262153)
+        vb0 = sections["[ResourceDragJiggleTempVB0_abc123_43191_testns]"]
+        self.assertIn("array = 262153", vb0)
+        self.assertNotIn("array = 19039", vb0)
+        jig = "\n".join(sections["[CustomShaderDragJiggleabc123_43191_testns]"])
+        self.assertIn("Dispatch = 1025, 1, 1", jig)  # ceil(262153/256)，与 array 同源
 
     def test_legacy_jiggle_vb0_sections_stripped_on_read(self):
         # 迁移：历代命名（TempVB0 空声明段 / ShadowVB 真声明段）在重读时都被剔除，

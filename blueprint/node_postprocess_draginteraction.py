@@ -4823,6 +4823,10 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         cn = comp["comp_name"]
         stem = comp["base_name"]
         res_dir = self._buffer_dir(sections, comp)
+        # 逐顶点缓冲的行数契约：一律取该部件自己的顶点数（VLR 的 override_vertex_count）。
+        # 缺省时退到与 dispatch 相同的 100000 假设：宁大勿小——偏大只是多占内存，
+        # 偏小会让真实索引到的顶点永远写不进去（见下方 TempVB0 注）。
+        _vc = int(comp.get("vertex_count", 0) or 0) or 100000
         comp_resources = {
             f"[ResourceDragDetect{cn}ObjectMap_{ns}]": [
                 "type = Buffer", "format = R32G32B32A32_FLOAT",
@@ -4835,17 +4839,21 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             f"[ResourceDragComponentZoneOut_{cn}_{ns}]": ["type = RWBuffer", "format = R32_FLOAT", "array = 1"],
             f"[ResourceDragJiggleState_{cn}_{ns}]": ["type = RWBuffer", "format = R32G32B32A32_FLOAT", "array = 10"],
             # TempVB0：位置缓冲的 UAV 别名（原地改写顶点位置后回绑 vb0）。
-        # 必须与 hlsl 同构：hlsl 是 `RWStructuredBuffer<VertexAttributes> rw_buffer : register(u5)`
-        # + `StructuredBuffer<VertexAttributes> base_buffer : register(t24)`，元素尺寸 = stride 40。
-        # 只声明 type（无 stride/array）会让 D3D 侧创建失败（日志指纹：
-        # Failed to substantiate custom Buffer [...dragjiggletempvb0_*]: 0x80070057 = E_INVALIDARG）；
-        # 写成 RWBuffer + format（16 B 元素）则会与结构化声明取址错位，等于没修。
-        f"[ResourceDragJiggleTempVB0_{cn}_{ns}]": [
-            "type = RWStructuredBuffer",
-            "stride = 40",
-            "array = 19039",
-            "bind_flags = shader_resource unordered_access",
-        ],
+            # 必须与 hlsl 同构：hlsl 是 `RWStructuredBuffer<VertexAttributes> rw_buffer : register(u5)`
+            # + `StructuredBuffer<VertexAttributes> base_buffer : register(t24)`，元素尺寸 = stride 40。
+            # 只声明 type（无 stride/array）会让 D3D 侧创建失败（日志指纹：
+            # Failed to substantiate custom Buffer [...dragjiggletempvb0_*]: 0x80070057 = E_INVALIDARG）；
+            # 写成 RWBuffer + format（16 B 元素）则会与结构化声明取址错位，等于没修。
+            # array 必须 == 该部件顶点数：hlsl 用 `rw_buffer.GetDimensions()` 取 vertexCount 当
+            # 可写边界（`if (i >= vertexCount) return;`），运行期又把本缓冲换绑成绘制 vb0。
+            # 写死偏小 ⇒ 越界顶点读 0 ⇒ 被索引到的顶点整片塌到原点（洛克茜 d5e1e7ff 实机：
+            # 曾写死 19039 而真实 262153，模式2 一开就爆炸，与碰撞/法线拖拽开关无关）。
+            f"[ResourceDragJiggleTempVB0_{cn}_{ns}]": [
+                "type = RWStructuredBuffer",
+                "stride = 40",
+                f"array = {_vc}",
+                "bind_flags = shader_resource unordered_access",
+            ],
         }
         comp_resources[f"[ResourceDragJiggleZoneIDs_{cn}_{ns}]"] = [
             "type = Buffer", "format = R32G32B32A32_UINT",
@@ -4918,7 +4926,6 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                     f"filename = {res_dir}/{stem}ColliderTriGridVerts.buf",
                 ]
                 # 沿腿轴滑动状态（逐顶点累积的轴向位移；用户 m05361 的「上下滑动控制丝袜长度」）
-                _vc = max(1, int(comp.get("vertex_count", 0) or 1))
                 # shader 按 i*2 索引（每顶点 2 个 float4：位移 + 上一帧轴向分量）
                 comp_resources[f"[ResourceDragJiggleSlideState_{cn}_{ns}]"] = [
                     "type = RWBuffer", "format = R32G32B32A32_FLOAT",
@@ -6235,7 +6242,7 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             "\t\tendif",
             f"\t\tvb0 = {temp_vb0}",
         ])
-        # 权重重映射的输出缓冲（vb2）：S3/S4 每帧把所有 19039 行都写一遍——受控行走锚点插值
+        # 权重重映射的输出缓冲（vb2）：S3/S4 每帧把所有顶点行（该部件 vertex_count 行）都写一遍——受控行走锚点插值
         # 权重，其余行走 SockSyncRow 自写恒等值（从 BlendTyped 读原权重），所以不存在
         # 「未初始化行被读到」的塌陷风险（t19 的 V4 已由 S3 的逐顶点写回闭合）。
         # 条件绑定：只在「路径滑移总闸开启」时把 vb2 指向 BlendOut，
