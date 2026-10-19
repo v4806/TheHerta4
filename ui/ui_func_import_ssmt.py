@@ -732,13 +732,79 @@ def ImprotFromWorkSpaceFull(self, context):
             if zzmi_merged_consumption:
                 self.report({'WARNING'}, f"ZZMI 骨骼合并预生成异常，已回退普通导入：{e}")
 
+    # HIMI 骨骼合并数据预生成：与 ZZMI/EFMI **同构**——生成侧与消费侧分离。
+    #
+    # 生成侧（本段）：无论「使用融合统一顶点组」是否开启，首次导入都必须把
+    # FrameAnalysis dump 里的骨骼合并数据完整反查并落盘到工作空间：
+    # VGMap/VGOffset/VGCount + SkeletonGroup/DeformDrawIndex/OriginalVertexCount +
+    # ModImpRuntime 的 palette（BoneMatrix）副本，外加角色级静态合并骨架
+    # （Config/HIMIMergedSkeleton.json + Config/<role_key>-MergedSkeleton.buf）。
+    # 因此复选框之后任何时候打开都不再需要提取文件。
+    #
+    # 消费侧（本段之外）：复选框决定本次导入/导出是否使用这份数据
+    # （common/ssmt_import_helper.py 的 merged_vgmap_enabled 与
+    #  common/submesh_model.py 的合并骨架预处理），关闭时导入结果与旧版一致。
+    #
+    # HIMI 与 ZZMI 的三点差别（照 HIMI骨骼合并计划书.md D05/D06/D10）：
+    # ① 无 cb1 对象变换 ⇒ SkeletonGroup 恒 0、不生成 ObjectCB1 三件套；
+    # ② 骨架是静态的 ⇒ 无逐帧 attach CS；
+    # ③ palette 是共享骨骼池 ⇒ 只对被引用的槽去重（见 common/himi_skeleton.py）。
+    #
+    # `getattr` 取 HIMI 逻辑名：部分测试/宿主只给 LogicName 挂了子集属性，
+    # 缺属性时按字面量 "HIMI" 比较，避免整条导入路径因属性缺失而崩。
+    _himi_logic_name = getattr(LogicName, "HIMI", "HIMI")
+    himi_merged_consumption = (
+        GlobalConfig.logic_name == _himi_logic_name
+        and GlobalProterties.import_merged_vgmap()
+    )
+    himi_merged_metadata_missing = False
+    if GlobalConfig.logic_name == _himi_logic_name:
+        try:
+            from ..common.himi_skeleton import HIMISkeletonMergeHelper as _HIMIMergeHelper
+            himi_merged_metadata_missing = bool(
+                _HIMIMergeHelper.missing_merged_metadata_exist(
+                    GlobalConfig.path_workspace_folder(),
+                    [target["import_key"] for target in import_targets],
+                )
+            )
+        except Exception:
+            himi_merged_metadata_missing = False
+    if himi_merged_consumption or himi_merged_metadata_missing:
+        merged_vgmap_ready = False
+        try:
+            from ..common.himi_skeleton import HIMISkeletonMergeHelper
+            import_keys = [target["import_key"] for target in import_targets]
+            ok, message = HIMISkeletonMergeHelper.ensure_skeleton_data(
+                workspace_root=GlobalConfig.path_workspace_folder(),
+                unique_str_list=import_keys,
+            )
+            print(f"[HIMI骨骼合并] {message}")
+            merged_vgmap_ready = bool(ok)
+            if ok:
+                if himi_merged_consumption:
+                    self.report({'INFO'}, message)
+            else:
+                print(f"[HIMI骨骼合并] 未生成骨骼数据：{message}")
+                if himi_merged_consumption:
+                    # 部分/全部子网格未生成合并骨架数据时会走普通导入路线，
+                    # 必须显式警告，避免用户误以为骨骼合并已完整生效。
+                    self.report({'WARNING'}, f"HIMI 骨骼合并未完整生成：{message}")
+        except Exception as e:
+            import traceback
+            print(f"[HIMI骨骼合并] 预生成失败（不阻断导入）: {e}")
+            traceback.print_exc()
+            if himi_merged_consumption:
+                self.report({'WARNING'}, f"HIMI 骨骼合并预生成异常，已回退普通导入：{e}")
+
     if merged_vgmap_ready is False and (
-        GlobalConfig.logic_name != LogicName.ZZMI or zzmi_merged_consumption
+        GlobalConfig.logic_name != LogicName.ZZMI
+        or zzmi_merged_consumption
+        or himi_merged_consumption
     ):
         # 失败后若继续保留复选框，当前对象虽按普通组导入，后续导出器却仍会
         # 按合并骨架生成运行时段，形成导入/导出模式分裂。显式关闭选项，确保
         # 本次普通导入与随后导出保持同一契约；用户修好来源后可再次手动开启。
-        # ZZMI 在复选框本就关闭时（本次只是修复性预生成）不需要这条回退。
+        # ZZMI/HIMI 在复选框本就关闭时（本次只是修复性预生成）不需要这条回退。
         GlobalProterties.set_import_merged_vgmap(False)
         self.report(
             {'WARNING'},
@@ -746,10 +812,12 @@ def ImprotFromWorkSpaceFull(self, context):
             "修复骨骼来源后可重新开启并再次导入",
         )
 
-    # 消费侧覆盖值：ZZMI 复选框关闭时，即使数据已预生成到工作空间，也必须走
+    # 消费侧覆盖值：HIMI/ZZMI 复选框关闭时，即使数据已预生成到工作空间，也必须走
     # 普通（局部）顶点组路线——传 None = 按全局选项决定，不改变旧版导入结果。
     merged_vgmap_import_override = merged_vgmap_ready
     if GlobalConfig.logic_name == LogicName.ZZMI and not zzmi_merged_consumption:
+        merged_vgmap_import_override = None
+    if GlobalConfig.logic_name == _himi_logic_name and not himi_merged_consumption:
         merged_vgmap_import_override = None
 
     foldername_gametypename_dict = {}
