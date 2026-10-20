@@ -1463,7 +1463,10 @@ def draw_node_header(self, context):
     GlobalConfig.read_from_main_json_ssmt4()
 
     layout = self.layout
+    # 后台导出开关：默认开启；取消勾选才走旧的同步导出。
+    # 与「导出」按钮放同一行：开关在左、按钮在右（不能单独 layout.prop，会占满整行）。
     row = layout.row(align=True)
+    row.prop(context.scene.global_properties, "background_export_enabled")
     row.operator("ssmt.generate_mod_blueprint", text="导出", icon='EXPORT')
 
 

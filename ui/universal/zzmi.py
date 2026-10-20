@@ -5516,8 +5516,45 @@ class ExportZZMI(ExportUnity):
         组名恒为骨骼 id，而索引不保证）。非数字组名跳过（不是骨骼）。
         占位小三角面对象（ZZMI_STUB，权重挂在已注册槽——json VGMap 首值）跳过——它是
         不可见标记，不是真实几何，不该触发跨组报警。
+
+        P1c 性能（输出与逐元素旧实现完全等价）：
+        - 每个对象的「组下标 → 数字组名」只构建一次；旧实现每个顶点组元素都要
+          `len(groups)` + `groups[i].name` + `str` + `isdigit`（cProfile：单函数
+          `builtins.len` 约 196 万次），内层循环现在只剩两次属性读 + 两次列表索引；
+        - 结果按 DrawIB 缓存：同一 DrawIB 在一轮导出里被多个阶段重复收集
+          （cProfile 45 次调用）。缓存条目带**结构签名**（对象名 / 顶点数 / 组数 /
+          组名元组），签名不一致即重算，因此顶点组被增删 / 改名 / 换对象后不会
+          拿到旧结果；`_export_impl` 每轮导出开头还会清空缓存；
+        - 数字组名的 `int()` 保持**懒解析**（第一次被权重>0 的顶点引用时才解析），
+          病态组名（`isdigit()` 为真但 `int()` 抛 ValueError，如 "\u00b2"）的异常
+          时机与旧实现一致。
         """
-        used: set[int] = set()
+        cache = getattr(self, "_zzmi_drawib_bone_refs_cache", None)
+        if cache is None:
+            cache = {}
+            try:
+                setattr(self, "_zzmi_drawib_bone_refs_cache", cache)
+            except (AttributeError, TypeError):
+                cache = None
+        if cache is not None:
+            entry = cache.get(draw_ib)
+            if entry is not None and entry[0] == self._drawib_bone_refs_signature(
+                draw_ib
+            ):
+                # 调用方会把返回值与别的集合做差集 / 迭代，返回副本以免改到缓存。
+                return set(entry[1])
+        used, signature = self._scan_drawib_bone_refs(draw_ib)
+        if cache is not None:
+            cache[draw_ib] = (signature, frozenset(used))
+        return used
+
+    def _iter_drawib_bone_ref_objects(self, draw_ib: str):
+        """遍历该 DrawIB 参与骨骼引用统计的 Blender 对象（跳过占位 / 取不到的）。
+
+        与旧 `_collect_drawib_referenced_bone_ids` 的对象筛选逐行同构：
+        `get_blender_obj_name()` 抛异常继续；名字为空继续；`bpy.data.objects.get`
+        取不到或带 `ZZMI_STUB` 继续。
+        """
         for drawib_model in self.drawib_model_list:
             if drawib_model.draw_ib != draw_ib:
                 continue
@@ -5530,22 +5567,76 @@ class ExportZZMI(ExportUnity):
                     obj = bpy.data.objects.get(obj_name) if obj_name else None
                     if obj is None or obj.get("ZZMI_STUB"):
                         continue
-                    mesh = getattr(obj, "data", None)
-                    vertices = getattr(mesh, "vertices", None)
-                    groups = getattr(obj, "vertex_groups", None)
-                    if vertices is None or groups is None:
+                    yield obj
+
+    def _drawib_bone_refs_signature(self, draw_ib: str) -> tuple:
+        """骨骼引用缓存的失效签名（结构层面：对象名 / 顶点数 / 组数 / 组名）。"""
+        signature = []
+        for obj in self._iter_drawib_bone_ref_objects(draw_ib):
+            mesh = getattr(obj, "data", None)
+            vertices = getattr(mesh, "vertices", None)
+            groups = getattr(obj, "vertex_groups", None)
+            obj_name = str(getattr(obj, "name", ""))
+            if vertices is None or groups is None:
+                signature.append((obj_name, None, None, None))
+                continue
+            signature.append(
+                (
+                    obj_name,
+                    len(vertices),
+                    len(groups),
+                    tuple(str(vertex_group.name) for vertex_group in groups),
+                )
+            )
+        return tuple(signature)
+
+    def _scan_drawib_bone_refs(self, draw_ib: str) -> tuple[set[int], tuple]:
+        """一次扫描：返回（引用的骨骼 id 集合, 本次扫描对应的结构签名）。
+
+        内层循环等价于旧实现的判定顺序：
+        `weight <= 0` 跳过 → `group >= len(groups)` 跳过 → 组名非纯数字跳过 →
+        计入 `int(组名)`。组名列表按 `vertex_groups` 的位置索引（与旧实现
+        `groups[group_elem.group]` 同一索引语义，含负索引回绕）。
+        """
+        used: set[int] = set()
+        used_add = used.add
+        signature = []
+        for obj in self._iter_drawib_bone_ref_objects(draw_ib):
+            mesh = getattr(obj, "data", None)
+            vertices = getattr(mesh, "vertices", None)
+            groups = getattr(obj, "vertex_groups", None)
+            obj_name = str(getattr(obj, "name", ""))
+            if vertices is None or groups is None:
+                signature.append((obj_name, None, None, None))
+                continue
+            group_count = len(groups)
+            group_names: list[str] = []
+            group_is_digit: list[bool] = []
+            for vertex_group in groups:
+                name = str(vertex_group.name)
+                group_names.append(name)
+                group_is_digit.append(name.isdigit())
+            signature.append(
+                (obj_name, len(vertices), group_count, tuple(group_names))
+            )
+            if not group_count:
+                continue
+            resolved: list[int | None] = [None] * group_count
+            for vertex in vertices:
+                for group_elem in vertex.groups:
+                    if group_elem.weight <= 0:
                         continue
-                    for vertex in vertices:
-                        for group_elem in vertex.groups:
-                            if group_elem.weight <= 0:
-                                continue
-                            if group_elem.group >= len(groups):
-                                continue
-                            name = str(groups[group_elem.group].name)
-                            if not name.isdigit():
-                                continue
-                            used.add(int(name))
-        return used
+                    group_index = group_elem.group
+                    if group_index >= group_count:
+                        continue
+                    if not group_is_digit[group_index]:
+                        continue
+                    bone_id = resolved[group_index]
+                    if bone_id is None:
+                        bone_id = int(group_names[group_index])
+                        resolved[group_index] = bone_id
+                    used_add(bone_id)
+        return used, tuple(signature)
 
     def _warn_cross_group_bone_references(self):
         """跨组骨骼引用的守卫（开关感知）。
@@ -7728,6 +7819,9 @@ class ExportZZMI(ExportUnity):
             self._cleanup_stub_objects()
 
     def _export_impl(self):
+        # 骨骼引用缓存按本次导出的几何状态重算（导出流程内顶点组只读；缓存条目
+        # 自身也带结构签名，见 `_collect_drawib_referenced_bone_ids`）。
+        self._zzmi_drawib_bone_refs_cache = {}
         # ZZMI 骨骼合并（B1 契约接线）：组件扫描 + 契约判定必须**先于任何写盘**。
         # 下面的 generate_buffer_files 是本次导出的第一个落盘点（Meshes/*.buf），
         # 契约 error 时不得留下半成品 Mod 产物（.buf / .ini / res/*.hlsl）。
@@ -7739,6 +7833,15 @@ class ExportZZMI(ExportUnity):
         self._enforce_merged_skeleton_contract()
 
         TimerUtils.start_stage("缓冲文件生成")
+        # 后台导出的状态栏细分文本：基础导出（写 .buf 资源）是本次导出里最长的
+        # 单段之一（实测约 17s），给一句更具体的名字。只改**显示**：report_stage
+        # 不推进步骤计数；同步导出 / 轻量宿主没有 stage 文件时静默。
+        try:
+            from ...blueprint import export_progress
+
+            export_progress.report_stage("基础导出：写入资源…")
+        except Exception:
+            pass
         self.generate_buffer_files(GlobalConfig.path_generatemod_buffer_folder())
         TimerUtils.end_stage("缓冲文件生成")
 
