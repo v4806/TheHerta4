@@ -1737,15 +1737,15 @@ void main(uint3 threadID : SV_DispatchThreadID)
     // 用户要求：在碰撞开启（CollisionSkinActive()）的情况下，松手后的回弹不得让顶点越过原始位置。
     // 机制：共享态/CNP 算出的位移是向量，欠阻尼时它会冲过零点、反向指向原位里侧（=回弹穿模）。
     //       这里以本次抓取面的法线为「向外」参考：位移在法线上的分量一旦为负
-    //       （顶点已经跑到原位后面），就把位移整体钉回零 = 停在原位。
-    //       共享态里那个反向位移会持续存在 ⇒ 本判据随后每帧继续成立，不会又飘回去。
+    //       （顶点已经跑到原位后面），就丢掉这个顶点的回弹位移 = 停在原位。
     //       只在松手后生效，拖拽期间不介入。
-    if (!mouseHeld && CollisionSkinActive())
-    {
-        float3 reboundOutN = SafeNormalize(nextNormal.xyz, capturedNormalWorld);
-        if (all(isfinite(reboundOutN)) && dot(nextCurrent.xyz, reboundOutN) < 0.0)
-            nextCurrent.xyz = float3(0.0, 0.0, 0.0);
-    }
+    // 【区域级隔离】不再把共享态 nextCurrent 清零：清零是组件级的，会把同一组件里没有
+    //       碰撞体的区域一起钉死在原位（表现为「没碰撞体也回弹卡住、不越界」）。
+    //       改为只置判据位，由逐顶点应用处的 l0n.w（导出侧按区域收窄的碰撞参与位，
+    //       无碰撞体的区域烘成 0）决定哪些顶点被钉——见 _write_collision_resources。
+    float3 reboundOutN = SafeNormalize(nextNormal.xyz, capturedNormalWorld);
+    bool reboundBlocked = !mouseHeld && CollisionSkinActive()
+        && all(isfinite(reboundOutN)) && dot(nextCurrent.xyz, reboundOutN) < 0.0;
     // Per-component resolved input/output evidence.  This is intentionally
     // tiny and contains no VB0 payload: it proves whether a shared snapshot
     // is valid in this component's local coordinate system.
@@ -1895,7 +1895,11 @@ void main(uint3 threadID : SV_DispatchThreadID)
 
     if (influence > 0.0)
     {
-        v.position += appliedOffset;
+        // 回弹钉原位只作用于「本顶点确实参与碰撞」的行：没有碰撞体的区域 l0n.w = 0，
+        // 弹簧照常越过原位来回晃（该 valid 位由导出侧按区域权重收窄）。
+        bool reboundPinned = reboundBlocked && ColliderVertexL0[i * 2u + 1u].w > 0.5;
+        if (!reboundPinned)
+            v.position += appliedOffset;
     }
     if (hasPathOffset)
     {

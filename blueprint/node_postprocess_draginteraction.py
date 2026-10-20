@@ -3489,6 +3489,62 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         except Exception:
             return None
 
+    def _collider_zone_ids(self):
+        """挂了碰撞体的区域 ID 集合（与 _collect_collider_objects 同一套过滤规则）。
+
+        节点级 collision_enabled 关闭 ⇒ 空集；区域级 override==2（强制关）跳过、
+        override==0/1 且 collider_objects 里确实解析出物体名才纳入。
+        """
+        if not getattr(self, "collision_enabled", False):
+            return set()
+        ids = set()
+        for zone_id, empty in self._collect_enabled_zone_entries():
+            settings = empty.ssmt_drag_zone
+            try:
+                override = int(getattr(settings, "collision_override", 0) or 0)
+            except (TypeError, ValueError):
+                override = 0
+            if override == 2 or not _collider_allowed_names(settings):
+                continue
+            ids.add(int(zone_id))
+        return ids
+
+    def _collision_zone_participation(self, mod_export_path, sections, comp,
+                                      source_vertex_count, runtime_vertex_count, vertex_base):
+        """(source_vertex_count,) bool：顶点是否被「挂了碰撞体的区域」影响。
+
+        _collect_collider_objects 是节点级聚合（任一区域的碰撞体 ⇒ 整组件烘一份网格），
+        所以「没挂碰撞体的区域」也会被同一张网格约束。这里读已烘的稀疏区域权重
+        （_write_jiggle_masks 先于本函数执行）把参与位收窄回区域级：只有自己的区域
+        带碰撞体的顶点，L0 的 valid 位才为 1，运行时 CollisionSolve 才会约束它。
+        权重文件缺失/长度对不上 ⇒ None（退回旧的全量参与行为，不阻断导出）。
+        """
+        zone_ids = self._collider_zone_ids()
+        if not zone_ids:
+            return np.zeros(int(source_vertex_count), dtype=bool)
+        out_dir = os.path.join(mod_export_path, self._buffer_dir(sections, comp))
+        stem = comp["base_name"]
+        ids_path = os.path.join(out_dir, f"{stem}JiggleZoneIDs.buf")
+        w_path = os.path.join(out_dir, f"{stem}JiggleZoneWeights.buf")
+        if not (os.path.isfile(ids_path) and os.path.isfile(w_path)):
+            return None
+        try:
+            ids = np.fromfile(ids_path, dtype=np.uint32).reshape(-1, SPARSE_ZONE_SLOTS)
+            weights = np.fromfile(w_path, dtype=np.float32).reshape(-1, SPARSE_ZONE_SLOTS)
+        except Exception:
+            return None
+        if len(ids) == int(runtime_vertex_count):
+            lo = int(vertex_base)
+            hi = lo + int(source_vertex_count)
+            ids = ids[lo:hi]
+            weights = weights[lo:hi]
+        if len(ids) != int(source_vertex_count) or len(weights) != len(ids):
+            return None
+        owned = np.zeros(ids.shape, dtype=bool)
+        for zone_id in zone_ids:
+            owned |= (ids == np.uint32(zone_id))
+        return np.any(owned & (weights > 1e-4), axis=1)
+
     def _write_collision_resources(self, mod_export_path, sections, comp, ns):
         """烘焙碰撞检测资源：ColliderPoints / ColliderVertexL0。
 
@@ -3534,6 +3590,20 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             )
             return False
 
+        # 【区域级隔离】节点级碰撞体聚合会让「没挂碰撞体的区域」也被同一份网格约束。
+        # 先按区域权重算出参与位：本组件没有任何顶点被带碰撞体的区域影响 ⇒ 不做碰撞
+        # （返回 False ⇒ 该组件走 x101 = 0 的 else 分支，既不绑 cs-t* 也不钉回弹）。
+        participation = self._collision_zone_participation(
+            mod_export_path, sections, comp,
+            source_vertex_count, vertex_count, vertex_base,
+        )
+        if participation is not None and not np.any(participation):
+            print(
+                f"[DragInteraction][WARNING] 碰撞烘焙：{comp['comp_name']} 的启用区域里没有任何一个"
+                "配了碰撞体，本组件不做碰撞约束（无碰撞体的区域可自由拖拽）"
+            )
+            return False
+
         normals = self._collider_vertex_normals(
             positions, triangles, collider_mask, source_vertex_count
         )
@@ -3574,6 +3644,10 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 f"{vertex_count} 对齐，碰撞 L0 将按全部基础顶点烘焙"
             )
             masked = None
+        # 【区域级隔离】只把参与位为真的顶点写成有效行（l0 valid = 1）；
+        # 无碰撞体区域的顶点保持 valid = 0 ⇒ CollisionSolve 的首行判据直接放行。
+        if participation is not None:
+            masked = participation if masked is None else (masked & participation)
         # 点云交错布局：每点 2×float4（位置 + 单位法线），法线按网格 count-sort 同一 order 重排
         reordered_normals = np.asarray(point_normals, dtype=np.float32)[grid["order"]]
         # L0 阈值必须用「到碰撞体三角形表面的真实最近点」算，不能用「到最近采样点的

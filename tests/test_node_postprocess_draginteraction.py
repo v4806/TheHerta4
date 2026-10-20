@@ -4943,6 +4943,61 @@ class DragCollisionTests(unittest.TestCase):
         settings = types.SimpleNamespace(collider_objects=[])
         self.assertIsNone(self.mod._collider_vertex_mask(settings, 6, None, None))
 
+    def test_collider_zone_ids_only_counts_zones_with_colliders(self):
+        """区域级隔离的入口判据：只有真配了碰撞体的区域进集合（节点级开关 + override）。"""
+        node = _make_node(self.mod, collision_enabled=True, zone_objects=[
+            self._collider_item(0, []),
+            self._collider_item(1, ["Thigh"]),
+            self._collider_item(2, ["Skirt"], override=2),
+        ])
+        self.assertEqual(node._collider_zone_ids(), {1})
+        off = _make_node(self.mod, collision_enabled=False,
+                         zone_objects=[self._collider_item(1, ["Thigh"])])
+        self.assertEqual(off._collider_zone_ids(), set())
+
+    def test_collision_zone_participation_narrows_to_collider_zones(self):
+        """没有碰撞体的区域的顶点参与位为 False ⇒ 运行时 CollisionSolve 直接放行。"""
+        node = _make_node(self.mod, collision_enabled=True, zone_objects=[
+            self._collider_item(0, []),
+            self._collider_item(1, ["Thigh"]),
+        ])
+        # 稀疏权重文件用桩替代（本机沙箱里临时目录不可用，不值得为测试造 FS）
+        ids_flat = np.array([0, 1, 0xFFFFFFFF, 0xFFFFFFFF,
+                             0, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
+                             0, 1, 0xFFFFFFFF, 0xFFFFFFFF], dtype=np.uint32)
+        w_flat = np.array([0.9, 0.1, 0.0, 0.0,
+                           1.0, 0.0, 0.0, 0.0,
+                           0.6, 0.0, 0.0, 0.0], dtype=np.float32)
+        comp = {"base_name": "stem", "base_resource": "Res"}
+        orig_isfile, orig_fromfile = os.path.isfile, np.fromfile
+        state = {"exists": True}
+        os.path.isfile = lambda p: state["exists"]
+        np.fromfile = lambda p, dtype=None, **kw: np.array(
+            ids_flat if "JiggleZoneIDs" in str(p) else w_flat, dtype=dtype)
+        try:
+            got = node._collision_zone_participation("unused", {}, comp, 3, 3, 0)
+            # 顶点0 命中有碰撞体的区域 1；顶点1 只属空碰撞体区域 0；顶点2 属区域1 但权重为 0
+            np.testing.assert_array_equal(got, np.array([True, False, False]))
+            # 权重文件缺失 ⇒ None（退回旧的全量参与行为，不阻断导出）
+            state["exists"] = False
+            self.assertIsNone(node._collision_zone_participation("unused", {}, comp, 3, 3, 0))
+        finally:
+            os.path.isfile, np.fromfile = orig_isfile, orig_fromfile
+
+        no_collider = _make_node(self.mod, collision_enabled=True,
+                                 zone_objects=[self._collider_item(0, [])])
+        got = no_collider._collision_zone_participation("unused", {}, {"base_name": "x"}, 4, 4, 0)
+        np.testing.assert_array_equal(got, np.zeros(4, dtype=bool))
+
+    def test_rebound_pin_is_per_vertex_not_global_state(self):
+        """回弹钉原位不得再清零共享态（清零会把同组件里没碰撞体的区域一起钉住）。"""
+        shader = (REPO_ROOT / "Toolset" / "drag_interaction" /
+                  "rzm_jiggle_interaction.hlsl").read_text(encoding="utf-8")
+        self.assertIn("bool reboundBlocked = !mouseHeld && CollisionSkinActive()", shader)
+        self.assertIn("bool reboundPinned = reboundBlocked && "
+                      "ColliderVertexL0[i * 2u + 1u].w > 0.5;", shader)
+        self.assertNotIn("nextCurrent.xyz = float3(0.0, 0.0, 0.0);", shader)
+
     def test_collect_collider_objects_respects_override_and_enabled(self):
         node = _make_node(self.mod, collision_enabled=True,
                           zone_objects=[self._collider_item(0, ["Thigh"], override=0)])
