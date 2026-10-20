@@ -6,18 +6,27 @@
 1. 记录当前阶段、当前节点与节点状态表（pending / running / done）；
 2. 原子写 ``stage.json``，写失败一律静默 —— 进度绝不能拖垮导出；
 3. 提供 ``elapsed()`` 给主进程显示本次后台导出已经跑了多久；
-4. 维护**步骤计数**（``begin_steps`` / ``complete_step``）：``stage.json`` 的
-   ``done`` / ``total`` 是"已完成步数 / 总步数"，总步数由主进程按
-   「顶层阶段数 + 后处理节点数 + 1(收尾)」预计算后写进 manifest。
+4. 维护**动态步骤计数**（``begin_steps`` / ``advance_stage`` / ``report_node`` /
+   ``finish_steps``）：``stage.json`` 的 ``done`` / ``total`` 是"已完成步数 /
+   总步数"。
 
-步骤模型（谁推进计数）：
+步骤模型（**每个不同名称的子步骤模块各算 1 步**）：
 
-- ``advance_stage(name)``：``TimerUtils.start_stage`` 的统一入口 —— 进入新阶段时
-  推进**上一个**阶段；第一个阶段不推进；同名阶段重入不推进；``Preprocess-*``
-  这类子阶段只更新显示名、不参与计步（它们属于某个顶层阶段内部，计步会撑爆
-  预计算的总步数）。
-- ``report_node(name, "done")``：节点完成时推进一步；``"running"`` 不推进。
-- ``finish_steps()``：收尾分支把计数补到 total（宁可在最后补满，也不早停在 99%）。
+- ``begin_steps(total)``：开始一次导出，``done=0``，``total`` 取传入值（可 0）。
+  传入值只是**初始估算**（主进程预算），之后会随实际出现的阶段动态增长。
+- ``advance_stage(name)``：``TimerUtils.start_stage`` 的统一入口 —— 进入与上一个
+  不同的阶段名时，先把**上一个阶段**记为完成（``done += 1``），再让
+  ``total = max(total, done + 1)``（当前阶段占 1 步）。同名阶段重入不计步；
+  同名阶段在整次导出里重复出现也只计一次（分段录制里 ``数据哈希预计算`` 等
+  子阶段会反复切换，不能重复累加）。
+- ``report_stage(name, ...)``：只更新状态栏**显示文本**（如"转换贴图 26/60"），
+  **不改 ``done`` / ``total``**；贴图张数这类深层内部进度只做文本提示。
+- ``report_node(name, "done")``：后处理节点完成时计 1 步，并按
+  ``total = max(total, done + 1)`` 扩张；同名节点只计一次。节点内部最后启动的
+  阶段在节点完成时一并记完成（阶段与节点各占 1 步，同名不重复计）。
+- ``finish_steps()``：收尾把 ``done`` 补到 ``total``（保证 100%）。
+
+百分比由主进程按 ``done / total`` 计算，并保证单调不回退。
 
 与 ``export_background._write_stage`` 的分工：那边写粗粒度阶段（第 N 轮 /
 直出导出 / 完成 / 失败），这边写细粒度阶段与节点。两边写同一份文件，所以本
@@ -42,8 +51,14 @@ _state = {
     "done": None,
     "total": None,
     "started_at": 0.0,
+    #: 计步用的稳定阶段名（最近一次 ``advance_stage`` 的名字；显示文本可能被
+    #: ``report_stage`` 改写成"转换贴图 3/60"，不能拿显示文本判断同名）
+    "stage_key": "",
     #: 当前阶段是否还没被"下一步"推进过（防止同一阶段被重复计步）
     "stage_pending": False,
+    #: 已经计入 done 的计步单元：``("stage", 阶段名)`` / ``("node", 节点键)``。
+    #: 同名阶段 / 节点在整次导出里只计一次（基础导出内部会反复切换同名子阶段）
+    "counted": set(),
     #: 当前正在执行的节点内部是否启动过阶段（该节点完成时要额外算一步阶段）
     "node_started_stage": False,
     #: 进入当前节点前的阶段显示名（节点结束时还原，避免细分文本漏到下一个节点）
@@ -51,11 +66,6 @@ _state = {
 }
 
 _stage_path = ""
-
-#: 参与步骤计数的阶段名前缀：只有直出/后台导出的**顶层阶段**计步。
-#: ``Preprocess-*``（前处理子阶段）在直出与普通模式里都属于某个顶层阶段内部，
-#: 计步会把计数撑过主进程预计算的 total，所以只更新显示名。
-_STEP_STAGE_PREFIXES = ("Direct-", "直出-")
 
 
 def set_stage_file(stage_path: str) -> None:
@@ -68,7 +78,9 @@ def set_stage_file(stage_path: str) -> None:
     _state["done"] = None
     _state["total"] = None
     _state["started_at"] = time.time()
+    _state["stage_key"] = ""
     _state["stage_pending"] = False
+    _state["counted"] = set()
     _state["node_started_stage"] = False
     _state["node_base_stage"] = ""
 
@@ -83,7 +95,9 @@ def clear_stage_file() -> None:
     _state["done"] = None
     _state["total"] = None
     _state["started_at"] = 0.0
+    _state["stage_key"] = ""
     _state["stage_pending"] = False
+    _state["counted"] = set()
     _state["node_started_stage"] = False
     _state["node_base_stage"] = ""
 
@@ -116,34 +130,63 @@ def _read_stage_field(name: str, default: str = "") -> str:
 
 
 def begin_steps(total) -> None:
-    """开始一次导出的步骤计数：``done=0``，``total`` 由主进程预计算（0 = 未知）。"""
+    """开始一次导出的步骤计数：``done=0``，``total`` 取传入值（可 0 = 未知）。
+
+    传入的 total 只是**初始估算**；之后 ``advance_stage`` / ``report_node`` 会
+    按实际出现的阶段数把它动态抬高（``total = max(total, done + 1)``）。
+    """
     _state["done"] = 0
     _state["total"] = max(0, _as_int(total, 0))
+    _state["stage_key"] = ""
+    _state["stage_pending"] = False
+    _state["counted"] = set()
+    _state["node_started_stage"] = False
     _write_stage_file()
+
+
+def _sync_total() -> None:
+    """当前阶段（或刚完成的一步之后的下一个阶段）也占 1 步：total 只增不减。"""
+    _state["total"] = max(step_total(), step_done() + 1)
+
+
+def _complete_stage(stage_name) -> bool:
+    """把阶段记为完成；同名阶段在整次导出里只计一次。返回是否真的推进了 done。"""
+    name = str(stage_name or "")
+    marker = ("stage", name)
+    if not name or marker in _state["counted"]:
+        return False
+    _state["counted"].add(marker)
+    _state["done"] = step_done() + 1
+    return True
+
+
+def _complete_node(key) -> bool:
+    """把节点记为完成；同名节点只计一次。返回是否真的推进了 done。"""
+    name = str(key or "")
+    marker = ("node", name)
+    if not name or marker in _state["counted"]:
+        return False
+    _state["counted"].add(marker)
+    _state["done"] = step_done() + 1
+    return True
 
 
 def complete_step() -> int:
-    """完成一步（已知 total 时封顶，未知时只递增）。返回当前 done。"""
-    current = _as_int(_state["done"], 0) if _state["done"] is not None else 0
-    total = _as_int(_state["total"], 0) if _state["total"] is not None else 0
-    done = current + 1
-    if total > 0:
-        done = min(done, total)
-    _state["done"] = done
+    """完成一个**无名**步骤（轮次 / 收尾等没有阶段名的推进）。返回当前 done。"""
+    _state["done"] = step_done() + 1
+    _sync_total()
     _write_stage_file()
-    return done
+    return step_done()
 
 
 def finish_steps() -> int:
-    """收尾：把步骤补满（total 已知时直接置为 total，否则至少算一步）。"""
-    total = _as_int(_state["total"], 0) if _state["total"] is not None else 0
-    if total > 0:
-        _state["done"] = total
-    else:
-        current = _as_int(_state["done"], 0) if _state["done"] is not None else 0
-        _state["done"] = current + 1
+    """收尾：``done = total``（保证 100%）；done 不会因此后退。"""
+    total = max(step_total(), step_done())
+    _state["total"] = total
+    _state["done"] = total
+    _state["stage_pending"] = False
     _write_stage_file()
-    return _state["done"]
+    return total
 
 
 def step_done() -> int:
@@ -152,59 +195,56 @@ def step_done() -> int:
 
 
 def step_total() -> int:
-    """总步骤数（0 表示主进程没提供，进度文本会省略分数）。"""
+    """总步骤数（0 表示还没开始 / 未知，进度文本会省略分数）。"""
     return max(0, _as_int(_state["total"], 0) if _state["total"] is not None else 0)
 
 
-def _should_count_stage(stage_name: str) -> bool:
-    """只有顶层导出阶段参与计步（``Preprocess-*`` 子阶段只更新显示名）。"""
-    name = str(stage_name or "")
-    return bool(name) and name.startswith(_STEP_STAGE_PREFIXES)
+def step_percent() -> int:
+    """``done / total`` 的百分比（整数 0~100；total<=0 按 0 处理）。"""
+    total = step_total()
+    if total <= 0:
+        return 0
+    return max(0, min(100, int(step_done() * 100 / total)))
 
 
 def advance_stage(stage: str) -> None:
-    """进入新阶段：推进上一个阶段（若有且可计步），再记录新阶段名。
+    """进入新阶段：把**上一个**阶段记为完成，再记录新阶段名。
 
-    - 第一个阶段不推进（它才刚开始）；
+    - 第一个阶段不推进（它才刚开始，但要占 1 步 → total 至少 1）；
     - 同名阶段重入不推进（直出节点循环里同一步可能多次 ``start_stage``）；
-    - 已经推进过的阶段不会再被推进（``stage_pending``），避免"节点完成后
-      下一次 ``start_stage`` 又把同一阶段算一遍"；
-    - ``Preprocess-*`` 等子阶段只更新显示名、不参与计步；
+    - 同名阶段在整次导出里重复出现也只计一次（基础导出内部会反复切换
+      ``数据哈希预计算`` / ``对象处理与合并`` 等子阶段，不能重复累加）；
+    - 显示文本与计步名分开：``report_stage`` 把文本改成"转换贴图 3/60"时，
+      计步名仍是最近一次 ``advance_stage`` 的名字；
     - 在某个节点内部启动的阶段会被标记，节点完成时由 ``report_node(done)``
-      额外补一步（该阶段与节点各算一步）。
+      补记这一阶段（该阶段与节点各算一步）。
     """
     name = str(stage or "")
     if not name:
         return
-    previous = str(_state.get("stage") or "")
-    if (
-        previous
-        and previous != name
-        and _state.get("stage_pending")
-        and _should_count_stage(previous)
-    ):
-        complete_step()  # 内部已经写文件
+    previous = str(_state.get("stage_key") or "")
+    if previous and previous != name and _state.get("stage_pending"):
+        _complete_stage(previous)
     if _state.get("node"):
         _state["node_started_stage"] = True
     if name != previous:
-        _state["stage"] = name
+        _state["stage_key"] = name
+    _state["stage"] = name
     _state["stage_pending"] = True
+    _sync_total()
     _write_stage_file()
 
 
 def report_stage(stage: str, done=None, total=None) -> None:
-    """更新当前阶段名（**不**推进步骤）；显式传入的 done/total 直接设定计数。
+    """更新状态栏**显示文本**（不推进步骤，也不改 done/total）。
 
-    ``TimerUtils.start_stage`` 的进度桥走 ``advance_stage``，步骤推进由
-    ``complete_step``（阶段切换 / 节点完成 / 收尾）控制。
+    贴图转换张数这类更深层的内部进度（"材质转资源pro：转换贴图 26/60"）只做
+    文本提示：百分比等这个子步骤整体走完（下一次 ``advance_stage`` / 节点完成）
+    才 +1。``done`` / ``total`` 参数仅为兼容旧调用保留，传入值会被忽略。
     """
     name = str(stage or "")
     if name:
         _state["stage"] = name
-    if done is not None:
-        _state["done"] = max(0, _as_int(done, 0))
-    if total is not None:
-        _state["total"] = max(0, _as_int(total, 0))
     _write_stage_file()
 
 
@@ -221,11 +261,11 @@ def report_node(name: str, status: str, count_step: bool = True) -> None:
     """更新单个节点状态并写 stage.json；节点首次完成时推进一步。
 
     若该节点执行期间自己启动过导出阶段（例如直出形态键 / 多文件节点），
-    完成时再补一步"阶段完成"，让 done 与主进程「阶段 + 节点」的预算对齐。
+    完成时把**节点内部最后启动的那个阶段**一并记为完成（该阶段与节点各算
+    1 步，同名不重复计）。
 
-    ``count_step=False`` 供"阶段级节点"使用：这些节点不参与主进程预计算的
-    步骤预算（预算只含顶层阶段 + 后处理节点 + 收尾），只用于节点高亮；
-    此时 ``done`` 不推进步骤，避免进度条提前跑满。
+    ``count_step=False`` 供"阶段级节点"使用：这些节点只用于节点高亮，
+    不参与步骤计数（``done`` / ``total`` 保持不变）。
     """
     key = str(name or "")
     if not key:
@@ -233,6 +273,9 @@ def report_node(name: str, status: str, count_step: bool = True) -> None:
     value = str(status or "")
     if not value:
         return
+    # 进度键可能是 ``树名/节点名``（嵌套蓝图节点也用同一张表）；节点内部的
+    # 细分文本前缀（``<节点名>：…``）只认节点名部分，避免带树名时匹配不上。
+    node_label = key.rsplit("/", 1)[-1] or key
 
     previous = _state["nodes"].get(key)
     _state["nodes"][key] = value
@@ -242,7 +285,7 @@ def report_node(name: str, status: str, count_step: bool = True) -> None:
         # 临时改写成细分文本（如"材质转资源pro：转换贴图 3/26"），节点完成时
         # 按这里记下的名字还原，避免细分文本漏到后面其它节点。
         base_stage = _read_stage_field("stage", "")
-        if base_stage and not base_stage.startswith(key + "："):
+        if base_stage and not base_stage.startswith(node_label + "："):
             _state["node_base_stage"] = base_stage
     elif _state["node"] == key:
         # 当前节点跑完了：清掉"当前节点"，避免主进程把已完成节点当成正在执行
@@ -251,18 +294,18 @@ def report_node(name: str, status: str, count_step: bool = True) -> None:
     if value == STATE_DONE and previous != STATE_DONE:
         # 恢复节点开始前的阶段显示名（只改显示，不动步骤计数）
         base_stage = str(_state.get("node_base_stage") or "")
-        if base_stage and str(_state.get("stage") or "").startswith(key + "："):
+        if base_stage and str(_state.get("stage") or "").startswith(node_label + "："):
             _state["stage"] = base_stage
         _state["node_base_stage"] = ""
         if count_step:
-            complete_step()  # 节点本身完成，内部已经写文件
-            if _state.get("node_started_stage"):
-                complete_step()  # 节点内部启动的那个阶段也完成
+            # 节点内部最后启动的那个阶段也走完了：先记该阶段，再记节点本身
+            if _state.get("node_started_stage") and _state.get("stage_pending"):
+                _complete_stage(str(_state.get("stage_key") or ""))
                 _state["stage_pending"] = False
-        else:
-            # 不推进步骤时仍要把 done 状态写进 stage.json（高亮数据在这里）
-            _write_stage_file()
+            _complete_node(key)
+            _sync_total()
         _state["node_started_stage"] = False
+        _write_stage_file()
     else:
         _write_stage_file()
 

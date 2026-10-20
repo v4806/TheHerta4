@@ -32,7 +32,7 @@ from ..blueprint.export_background import (
     build_quick_export_temp_tree,
     clear_active_session,
     clear_progress_header,
-    format_progress_bar,
+    format_percent_bar,
     get_active_session,
     push_progress_header,
     safe_object_name,
@@ -82,6 +82,68 @@ _BG_VIEW_NAV_EVENT_TYPES = frozenset({
 })
 #: 中键按下 / 松开期间需要放行的鼠标移动事件（中键拖动平移）。
 _BG_MOUSE_MOVE_EVENT_TYPES = frozenset({'MOUSEMOVE', 'INBETWEEN_MOUSEMOVE'})
+#: 嵌套蓝图节点与 SSMT 蓝图树类型：导出流程会递归展开
+#: ``SSMTNode_Blueprint_Nest.blueprint_name`` 指向的蓝图树，节点高亮也要跟进。
+_BG_NEST_NODE_IDNAME = "SSMTNode_Blueprint_Nest"
+_BG_SSMT_TREE_IDNAME = "SSMTBlueprintTreeType"
+_BG_NEST_SKIP_NAMES = frozenset({"", "NONE"})
+
+
+def _iter_nested_blueprint_trees(tree):
+    """某个蓝图树里 ``SSMTNode_Blueprint_Nest`` 引用到的嵌套蓝图树。
+
+    跳过静音节点、``NONE`` / 空名、不存在的树、非 SSMT 蓝图树（与 worker 的
+    ``direct_export._iter_nested_blueprint_trees`` 同口径）；异常静默。
+    """
+    for node in getattr(tree, "nodes", None) or ():
+        try:
+            if str(getattr(node, "bl_idname", "") or "") != _BG_NEST_NODE_IDNAME:
+                continue
+            if bool(getattr(node, "mute", False)):
+                continue
+            blueprint_name = str(getattr(node, "blueprint_name", "") or "").strip()
+            if blueprint_name in _BG_NEST_SKIP_NAMES:
+                continue
+            nested_tree = bpy.data.node_groups.get(blueprint_name)
+            if nested_tree is None:
+                continue
+            if str(getattr(nested_tree, "bl_idname", "") or "") != _BG_SSMT_TREE_IDNAME:
+                continue
+            yield nested_tree
+        except Exception:
+            continue
+
+
+def _iter_blueprint_trees(tree):
+    """主蓝图树 + 递归展开的嵌套蓝图树（先主树，再按引用顺序广度优先）。
+
+    ``visited`` 按对象 id 记已展开的树，循环引用（A 嵌 B、B 又嵌 A）不会死循环。
+    """
+    if tree is None:
+        return
+
+    visited = set()
+    pending = [tree]
+    while pending:
+        current = pending.pop(0)
+        if current is None or id(current) in visited:
+            continue
+        visited.add(id(current))
+        yield current
+        for nested_tree in _iter_nested_blueprint_trees(current):
+            if id(nested_tree) not in visited:
+                pending.append(nested_tree)
+
+
+def _blueprint_node_key(tree, node) -> str:
+    """节点进度键：``树名/节点名``；没有树名时退回纯节点名（旧格式兼容）。"""
+    node_name = str(getattr(node, "name", "") or "").strip()
+    if not node_name:
+        return ""
+    tree_name = str(getattr(tree, "name", "") or "").strip()
+    if not tree_name:
+        return node_name
+    return f"{tree_name}/{node_name}"
 
 
 #: 后台导出 modal 轮询的共用实现：Generate Mod 与快速局部导出共用同一套
@@ -208,48 +270,95 @@ class _BackgroundExportMixin:
         print(f"❌ {message}")
 
     @staticmethod
+    def _session_elapsed_label(session):
+        """成功收尾用的「用时 X.X 秒」；会话没有计时（或计时异常）时返回空串。
+
+        优先用会话自带的 ``elapsed_text()``，没有就退回 ``elapsed_seconds()`` 自己格式化；
+        任何异常都静默（计时失败不能让收尾文案崩掉）。
+        """
+        try:
+            elapsed_text = getattr(session, "elapsed_text", None)
+            if callable(elapsed_text):
+                label = str(elapsed_text() or "").strip()
+                if label:
+                    return label
+            elapsed_seconds = getattr(session, "elapsed_seconds", None)
+            if callable(elapsed_seconds):
+                return f"用时 {float(elapsed_seconds()):.1f} 秒"
+        except Exception:
+            return ""
+        return ""
+
+    @staticmethod
     def _completion_header(session):
-        """成功收尾的状态栏文本：``后台导出完成（N/N）``；没有步数时退化为纯文本。"""
+        """成功收尾的状态栏文本：
+        ``后台导出完成（N/N，用时 X.X 秒）``；没有步数时省略分数，
+        没有计时（旧会话 / 计时失败）时省略用时，退化为原本文案。
+        """
         try:
             done = int(getattr(session, "done_steps", 0) or 0)
             total = int(getattr(session, "total_steps", 0) or 0)
         except (TypeError, ValueError):
             done = 0
             total = 0
+        elapsed_label = SSMTGenerateModBlueprint._session_elapsed_label(session)
         if total > 0:
-            return f"后台导出完成（{max(0, min(done, total))}/{total}）"
+            detail = f"{max(0, min(done, total))}/{total}"
+            if elapsed_label:
+                detail = f"{detail}，{elapsed_label}"
+            return f"后台导出完成（{detail}）"
+        if elapsed_label:
+            return f"后台导出完成（{elapsed_label}）"
         return "后台导出完成"
 
-    def _update_progress_bar(self, context, session):
-        """把步骤进度同步到 ``window_manager`` 的原生进度条，并返回**文本进度条**。
+    @staticmethod
+    def _session_progress_percent(session):
+        """取主进程算好的整数百分比（0~100）；取不到时回退 ``done/total``。
 
-        文本条（``[████░░] 40%``）**总是**返回并拼到 header 上：Blender 原生
-        ``progress_*`` 只画在状态栏，弹出窗口/其它区域遮挡时看不到，header 里
-        带一条文本进度条才能保证用户随时看到「完成多少步」。
+        worker 的 total 会随阶段动态增长，原生进度条与文本条都只吃**百分比**，
+        刻度固定 0~100，避免 total 变化时刻度错位。没有 total 时返回 ``None``
+        （不显示进度条，状态栏只留纯文本）。
+        """
+        try:
+            value = getattr(session, "progress_percent", None)
+            if value is not None:
+                return max(0, min(100, int(value)))
+        except (TypeError, ValueError):
+            pass
+        try:
+            total = int(getattr(session, "total_steps", 0) or 0)
+            done = int(getattr(session, "done_steps", 0) or 0)
+        except (TypeError, ValueError):
+            return None
+        if total <= 0:
+            return None
+        return max(0, min(100, int(done * 100 / total)))
+
+    def _update_progress_bar(self, context, session):
+        """把主进程的百分比同步到 ``window_manager`` 原生进度条，并返回**文本进度条**。
+
+        原生条固定 ``progress_begin(0, 100)`` + ``progress_update(int(percent))``：
+        总步数是 worker 动态上报的（20+ 个阶段），用固定 0~100 刻度才不会在
+        total 变化时错位。文本条（``[████░░] 40%``）**总是**返回并拼到 header 上
+        （弹出窗口遮挡状态栏时也能看到进度）；``done/total`` 步数由
+        ``progress_text`` 单独显示。
 
         任何异常都静默：进度显示失败绝不能影响导出。
         """
-        total = 0
-        done = 0
-        try:
-            total = int(getattr(session, "total_steps", 0) or 0)
-            done = int(getattr(session, "done_steps", 0) or 0)
-        except (TypeError, ValueError):
-            total = 0
-            done = 0
-        if total <= 0:
+        percent = self._session_progress_percent(session)
+        if percent is None:
             return ""
 
         try:
             window_manager = getattr(context, "window_manager", None)
             if window_manager is None:
-                return format_progress_bar(done, total)
+                return format_percent_bar(percent)
 
             if not getattr(self, "_bg_progress_started", False):
                 begin = getattr(window_manager, "progress_begin", None)
                 if not callable(begin):
-                    return format_progress_bar(done, total)
-                begin(0, total)
+                    return format_percent_bar(percent)
+                begin(0, 100)
                 self._bg_progress_started = True
                 # 新一轮进度条：清掉上一轮的重绘节流记录。
                 self._bg_last_progress_state = None
@@ -257,25 +366,22 @@ class _BackgroundExportMixin:
             # 变化节流（用户实测：导出期间鼠标指针在「进度」与「繁忙」之间高频跳动）：
             # window_manager.progress_update() 每次都会刷新 GHOST 光标进度状态
             # （WM_cursor_progress），modal 每 0.2s 调一次就会让光标每 0.2s 重画一次。
-            # 这里只在 done（钳制到 [0, total]）或 total 真的变化时才调用；
-            # 文本进度条仍然每 tick 返回，显示不受影响。
-            value = max(0, min(done, total))
-            state = (value, total)
-            if getattr(self, "_bg_last_progress_state", None) == state:
-                return format_progress_bar(done, total)
+            # 这里只在百分比真的变化时才调用；文本进度条仍然每 tick 返回。
+            if getattr(self, "_bg_last_progress_state", None) == percent:
+                return format_percent_bar(percent)
 
             update = getattr(window_manager, "progress_update", None)
             if callable(update):
-                update(value)
-                self._bg_last_progress_state = state
-            return format_progress_bar(done, total)
+                update(percent)
+                self._bg_last_progress_state = percent
+            return format_percent_bar(percent)
         except Exception:
             self._bg_progress_started = False
             # 异常后下次成功的 tick 必须能重新 begin 并重新 update，
             # 所以节流记录一并清掉。
             self._bg_last_progress_state = None
             try:
-                return format_progress_bar(done, total)
+                return format_percent_bar(percent)
             except Exception:
                 return ""
 
@@ -297,8 +403,9 @@ class _BackgroundExportMixin:
     def _sync_node_highlight(self, session):
         """把后台导出的节点级进度画到蓝图上：未开始=蓝灰、执行中=黄、已完成=绿。
 
-        节点名可能含中文 / 重名，按 ``session.stage_nodes`` 的名字精确取；
-        第一次改色前记录原 ``use_custom_color`` / ``color``，收尾由
+        节点以 ``树名/节点名`` 为键（worker 按所属蓝图树上报，嵌套蓝图里的
+        节点也能上色）；不含 ``/`` 的旧键回退到 ``session.tree_name`` 主树 +
+        节点名。第一次改色前记录原 ``use_custom_color`` / ``color``，收尾由
         ``_restore_node_colors`` 原样恢复。任何异常都静默（进度不能影响导出）。
 
         写入节流（用户实测：打开节点编辑器时状态栏随机卡几秒~十几秒）：
@@ -308,9 +415,9 @@ class _BackgroundExportMixin:
         ``pending`` 节点在导出刚开始时一次性上色（可能几十个），之后 records
         里已记为 ``pending``，不再重复写入。
 
-        worker 只在后处理阶段把节点名写进 ``stage.json``；蓝图里参与导出的
+        worker 只在后处理阶段把节点键写进 ``stage.json``；蓝图里参与导出的
         前处理 / 蓝图解析 / 导出轮次节点由 ``_collect_participant_node_names``
-        在主进程补全，见 ``_participant_phase_status``。
+        在主进程补全（同样递归嵌套蓝图树），见 ``_participant_phase_status``。
         """
         if not _BG_NODE_HIGHLIGHT_ENABLED:
             return
@@ -322,12 +429,9 @@ class _BackgroundExportMixin:
             if lookup is None:
                 lookup = {}
                 self._bg_node_lookup = lookup
-            tree = lookup.get("__tree__")
+            tree = self._lookup_highlight_tree(lookup, tree_name)
             if tree is None:
-                tree = bpy.data.node_groups.get(tree_name) if tree_name else None
-                if tree is None:
-                    return
-                lookup["__tree__"] = tree
+                return
 
             records = getattr(self, "_bg_node_colors", None)
             if records is None:
@@ -338,26 +442,34 @@ class _BackgroundExportMixin:
             # （前处理 / 蓝图解析 / 导出轮次）由主进程按蓝图树补全状态，
             # 与后处理节点一起按 蓝灰 → 黄 → 绿 推进。
             nodes_state = worker_nodes
-            participants = lookup.get("__participants__")
+            participants = lookup.get("participants")
             if participants is None:
                 participants = self._collect_participant_node_names(tree)
-                lookup["__participants__"] = participants
+                lookup["participants"] = participants
             if participants:
                 phase_status = self._participant_phase_status(session, worker_nodes)
                 nodes_state = dict(worker_nodes)
-                for name in participants:
-                    nodes_state.setdefault(name, phase_status)
+                for key in participants:
+                    nodes_state.setdefault(key, phase_status)
 
             if not nodes_state:
                 return
 
-            # 只挑「状态真的变了」的节点（含首次出现的 pending 批量写）
-            changes = [
-                (name, status)
-                for name, status in nodes_state.items()
-                if status in _BG_NODE_STATUS_COLORS
-                and (records.get(name) or {}).get("status") != status
-            ]
+            # 键统一解析成 ``(树名, 节点名)``：新键带树名，旧 stage.json 的纯
+            # 节点名回退到主树。同一节点只留先出现的那份状态（worker 上报优先
+            # 于主进程推断的参与节点状态），避免同一节点被两种键重复改色。
+            changes = []
+            seen_keys = set()
+            for name, status in nodes_state.items():
+                key = self._split_node_key(name, tree_name)
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                if not key[1] or status not in _BG_NODE_STATUS_COLORS:
+                    continue
+                if (records.get(key) or {}).get("status") == status:
+                    continue
+                changes.append((key, status))
             if not changes:
                 return
 
@@ -367,14 +479,16 @@ class _BackgroundExportMixin:
                 return
             self._bg_last_highlight_time = now
 
-            for name, status in changes:
-                record = records.get(name)
-                node = lookup.get(name)
+            node_cache = lookup.setdefault("nodes", {})
+            for key, status in changes:
+                record = records.get(key)
+                node = node_cache.get(key)
                 if node is None:
-                    node = self._find_blueprint_node(tree, name)
+                    node_tree = self._lookup_highlight_tree(lookup, key[0]) or tree
+                    node = self._find_blueprint_node(node_tree, key[1])
                     if node is None:
                         continue
-                    lookup[name] = node
+                    node_cache[key] = node
 
                 if record is None:
                     record = {
@@ -383,7 +497,7 @@ class _BackgroundExportMixin:
                         "color": self._node_color_tuple(node),
                         "status": "",
                     }
-                    records[name] = record
+                    records[key] = record
                 record["status"] = status
 
                 color = _BG_NODE_STATUS_COLORS[status]
@@ -393,8 +507,40 @@ class _BackgroundExportMixin:
             pass
 
     @staticmethod
+    def _lookup_highlight_tree(lookup, tree_name):
+        """按树名取蓝图树并缓存（主树 / 嵌套树共用）；取不到返回 None。"""
+        name = str(tree_name or "")
+        if not name:
+            return None
+        trees = lookup.setdefault("trees", {})
+        if name in trees:
+            return trees[name]
+        try:
+            tree = bpy.data.node_groups.get(name)
+        except Exception:
+            tree = None
+        if tree is None:
+            return None
+        trees[name] = tree
+        return tree
+
+    @staticmethod
+    def _split_node_key(name, default_tree_name=""):
+        """解析 ``树名/节点名`` 进度键；不含 ``/`` 的旧键回退到主树。"""
+        text = str(name or "")
+        if "/" in text:
+            tree_part, node_part = text.split("/", 1)
+            if tree_part and node_part:
+                return (tree_part, node_part)
+        return (str(default_tree_name or ""), text)
+
+    @staticmethod
     def _find_blueprint_node(tree, name):
-        """按名字取蓝图节点：优先 ``nodes.get``（O(1)），否则线性兜底。"""
+        """在指定蓝图树里按名字取节点：优先 ``nodes.get``（O(1)），否则线性兜底。
+
+        ``tree`` 由进度键解析而来（主树或嵌套蓝图树），调用方按
+        ``(树名, 节点名)`` 缓存结果。
+        """
         collection = getattr(tree, "nodes", None)
         if collection is None:
             return None
@@ -412,42 +558,49 @@ class _BackgroundExportMixin:
 
     @staticmethod
     def _collect_participant_node_names(tree):
-        """蓝图里「参与导出」但 worker 不上报状态的节点名（前处理 / 解析 / 轮次）。
+        """蓝图里「参与导出」但 worker 不上报状态的节点键（前处理 / 解析 / 轮次）。
 
         worker 的 ``stage.json`` 只登记后处理节点，所以导出期间前处理等节点
-        一直没有颜色。这里在主进程按蓝图树补全：所有连到输出节点、且不是
-        后处理 / 输出 / 中转的节点都算参与导出。
+        一直没有颜色。这里在主进程按蓝图树补全：递归遍历主树 + 嵌套蓝图树
+        （``SSMTNode_Blueprint_Nest`` 引用的树），所有连到输出节点、且不是
+        后处理 / 输出 / 中转的节点都算参与导出；键格式 ``树名/节点名``，
+        不同蓝图树里的同名节点不会冲突。循环引用由 ``_iter_blueprint_trees``
+        的 visited 集合挡住。
 
         树结构在导出期间不变，结果由调用方缓存在 ``_bg_node_lookup`` 里只算一次。
         """
-        names = []
+        keys = []
+        seen_keys = set()
         try:
             checker = getattr(BlueprintExportHelper, "_is_node_connected_to_output", None)
         except Exception:
             checker = None
-        for node in getattr(tree, "nodes", None) or []:
-            try:
-                if bool(getattr(node, "mute", False)):
-                    continue
-                bl_idname = str(getattr(node, "bl_idname", "") or "")
-                if bl_idname.startswith("SSMTNode_PostProcess_"):
-                    continue
-                if bl_idname.startswith("SSMTNode_Result_"):
-                    continue
-                if bl_idname in ("NodeReroute", "NodeFrame"):
-                    continue
-                if callable(checker):
-                    try:
-                        if not checker(tree, node):
-                            continue
-                    except Exception:
+        for current_tree in _iter_blueprint_trees(tree):
+            for node in getattr(current_tree, "nodes", None) or []:
+                try:
+                    if bool(getattr(node, "mute", False)):
                         continue
-                name = str(getattr(node, "name", "") or "")
-                if name:
-                    names.append(name)
-            except Exception:
-                continue
-        return names
+                    bl_idname = str(getattr(node, "bl_idname", "") or "")
+                    if bl_idname.startswith("SSMTNode_PostProcess_"):
+                        continue
+                    if bl_idname.startswith("SSMTNode_Result_"):
+                        continue
+                    if bl_idname in ("NodeReroute", "NodeFrame"):
+                        continue
+                    if callable(checker):
+                        try:
+                            if not checker(current_tree, node):
+                                continue
+                        except Exception:
+                            continue
+                    key = _blueprint_node_key(current_tree, node)
+                    if not key or key in seen_keys:
+                        continue
+                    seen_keys.add(key)
+                    keys.append(key)
+                except Exception:
+                    continue
+        return keys
 
     @staticmethod
     def _participant_phase_status(session, worker_nodes):
@@ -641,6 +794,8 @@ class SSMTGenerateModBlueprint(_BackgroundExportMixin, bpy.types.Operator):
 
         self._bg_session = session
         self._bg_node_colors = {}
+        # 新一次导出：高亮缓存（树 / 节点 / 参与节点）必须跟着会话重建
+        self._bg_node_lookup = None
         self._bg_progress_started = False
         # 中键拖动平移状态：modal 只在中键按住期间放行鼠标移动。
         self._bg_view_nav = False
@@ -1307,6 +1462,8 @@ class SSMTQuickExportSelected(_BackgroundExportMixin, bpy.types.Operator):
 
         self._bg_session = session
         self._bg_node_colors = {}
+        # 新一次导出：高亮缓存（树 / 节点 / 参与节点）必须跟着会话重建
+        self._bg_node_lookup = None
         self._bg_progress_started = False
         # 中键拖动平移状态：modal 只在中键按住期间放行鼠标移动。
         self._bg_view_nav = False

@@ -893,6 +893,112 @@ class BackgroundSessionTests(_BackgroundTestBase):
 
 
 # ---------------------------------------------------------------------------
+# 3b. 总用时（start → 完成）
+# ---------------------------------------------------------------------------
+
+
+class ElapsedTimingTests(_BackgroundTestBase):
+    """后台导出总用时：start() 起算、elapsed_seconds() 单调增长、收尾文案带用时。"""
+
+    START = 100.0
+
+    def _header(self, session):
+        return ui_func_export.SSMTGenerateModBlueprint._completion_header(session)
+
+    def test_elapsed_seconds_zero_before_start(self):
+        """没有 start() 就不计时：秒数 0、用时文案为空，收尾退化为原文案。"""
+        session = self.make_session()
+
+        self.assertEqual(session.elapsed_seconds(), 0.0)
+        self.assertEqual(session.elapsed_text(), "")
+
+    def test_elapsed_seconds_positive_and_grows_after_start(self):
+        """start() 记下开始时刻；之后重复调用返回当前时长（桩时间让它一直增长）。"""
+        session = self.make_session()
+        # start() 读一次（100.0），之后每次读都在往后走
+        with mock.patch.object(
+            export_background.time,
+            "monotonic",
+            side_effect=[self.START, 138.6, 140.0, 140.0, 140.0],
+        ):
+            self.assertTrue(session.start())
+            first = session.elapsed_seconds()
+            second = session.elapsed_seconds()
+            third = session.elapsed_seconds()
+            label = session.elapsed_text()
+
+        self.assertGreater(first, 0.0)
+        self.assertAlmostEqual(first, 38.6)
+        self.assertGreater(second, first)
+        self.assertAlmostEqual(third, second)
+        self.assertEqual(label, "用时 40.0 秒")
+        session.cleanup()
+
+    def test_elapsed_text_keeps_one_decimal_and_seconds_over_60(self):
+        """保留 1 位小数；超过 60 秒也照常显示秒数，不换算成分钟。"""
+        session = self.make_session()
+        session.started_monotonic = self.START
+
+        with mock.patch.object(
+            export_background.time, "monotonic", side_effect=[225.34, 225.34]
+        ):
+            self.assertEqual(session.elapsed_text(), "用时 125.3 秒")
+            self.assertAlmostEqual(session.elapsed_seconds(), 125.34)
+
+    def test_completion_header_with_steps_includes_elapsed(self):
+        session = self.make_session()
+        session.done_steps = 21
+        session.total_steps = 21
+        session.started_monotonic = self.START
+
+        with mock.patch.object(export_background.time, "monotonic", return_value=138.6):
+            header = self._header(session)
+
+        self.assertEqual(header, "后台导出完成（21/21，用时 38.6 秒）")
+
+    def test_completion_header_without_steps_includes_elapsed(self):
+        session = self.make_session()
+        session.done_steps = 0
+        session.total_steps = 0
+        session.started_monotonic = self.START
+
+        with mock.patch.object(export_background.time, "monotonic", return_value=138.6):
+            header = self._header(session)
+
+        self.assertEqual(header, "后台导出完成（用时 38.6 秒）")
+
+    def test_completion_header_is_silent_when_elapsed_raises(self):
+        """计时相关异常不能影响收尾：文案退化为不带用时的原文案。"""
+        session = self.make_session()
+        session.done_steps = 2
+        session.total_steps = 2
+
+        def _boom():
+            raise RuntimeError("计时坏了")
+
+        session.elapsed_seconds = _boom
+        session.elapsed_text = _boom
+
+        self.assertEqual(self._header(session), "后台导出完成（2/2）")
+
+    def test_success_summary_includes_elapsed_once(self):
+        """成功摘要追加「用时 X 秒」；重复调用不会重复添加。"""
+        session = self.make_session()
+        session.result = {"status": "success", "rounds": 2, "warnings": ["缺失变量: $x"]}
+        session.started_monotonic = self.START
+
+        with mock.patch.object(export_background.time, "monotonic", return_value=138.6):
+            first = session.success_summary()
+            second = session.success_summary()
+
+        self.assertIn("后台导出完成，共 2 轮", first)
+        self.assertIn("自检警告", first)
+        self.assertIn("用时 38.6 秒", first)
+        self.assertEqual(first.count("用时"), 1)
+        self.assertEqual(second, first)
+
+
+# ---------------------------------------------------------------------------
 # 4. worker 全链路（fake ExportRoundExecutor / fake 蓝图模型）
 # ---------------------------------------------------------------------------
 
@@ -1310,8 +1416,16 @@ class _RecordingSession:
         # 收尾文本「后台导出完成（done/total）」用的步数（真实会话由 stage.json 提供）
         self.done_steps = 0
         self.total_steps = 2
+        # 收尾「用时 X.X 秒」用的计时（真实会话由 start() 记 monotonic）
+        self.elapsed_seconds_value = 38.6
         self.header_before_start = ""
         _RecordingSession.instances.append(self)
+
+    def elapsed_seconds(self):
+        return self.elapsed_seconds_value
+
+    def elapsed_text(self):
+        return f"用时 {self.elapsed_seconds_value:.1f} 秒"
 
     def start(self):
         self.started = True
@@ -1329,7 +1443,7 @@ class _RecordingSession:
         return "后台导出：准备 0/2"
 
     def success_summary(self):
-        return "后台导出完成，共 2 轮"
+        return "后台导出完成，共 2 轮，用时 38.6 秒"
 
     def error_summary(self):
         return "后台导出失败（日志: C:/tmp/worker.log）"
@@ -1570,10 +1684,25 @@ class OperatorInvokeTests(_BackgroundTestBase):
         session.poll_results = ["running", "success"]
         self.assertEqual(operator.modal(context, types.SimpleNamespace(type='TIMER')), {'RUNNING_MODAL'})
         self.assertEqual(operator.modal(context, types.SimpleNamespace(type='TIMER')), {'FINISHED'})
-        self.assertEqual(_FAKE_AREAS[0].header, "后台导出完成（0/2）")
+        self.assertEqual(_FAKE_AREAS[0].header, "后台导出完成（0/2，用时 38.6 秒）")
         self.assertEqual(len(_FAKE_WINDOW_MANAGER.removed_timers), 1)
         self.assertTrue(session.cleaned)
         self.assertEqual(operator.reports[-1][0], {'INFO'})
+
+    def test_success_report_includes_elapsed(self):
+        """成功收尾的 INFO 摘要带用时，且不会重复添加。"""
+        context, operator = self._start_background_operator()
+        session = _RecordingSession.instances[0]
+        session.poll_results = ["success"]
+
+        self.assertEqual(
+            operator.modal(context, types.SimpleNamespace(type='TIMER')), {'FINISHED'}
+        )
+
+        message = operator.reports[-1][1]
+        self.assertEqual(operator.reports[-1][0], {'INFO'})
+        self.assertIn("用时 38.6 秒", message)
+        self.assertEqual(message.count("用时"), 1)
 
     def test_modal_failure_updates_header_without_error_report(self):
         """失败收尾不再弹 Blender 原生 Report：header 留摘要，report 不出现 ERROR。"""
@@ -1837,7 +1966,7 @@ class OperatorInvokeTests(_BackgroundTestBase):
         self.assertEqual(result, {'RUNNING_MODAL'})
         self.assertEqual(
             _FAKE_WINDOW_MANAGER.progress_calls,
-            [("begin", 0, 5), ("update", 1)],
+            [("begin", 0, 100), ("update", 20)],
         )
 
         session.done_steps = 5
@@ -1846,7 +1975,7 @@ class OperatorInvokeTests(_BackgroundTestBase):
         self.assertEqual(result, {'FINISHED'})
         self.assertEqual(
             _FAKE_WINDOW_MANAGER.progress_calls,
-            [("begin", 0, 5), ("update", 1), ("update", 5), ("end",)],
+            [("begin", 0, 100), ("update", 20), ("update", 100), ("end",)],
         )
 
     def test_modal_progress_api_failure_falls_back_to_header_bar(self):
@@ -1887,7 +2016,7 @@ class OperatorInvokeTests(_BackgroundTestBase):
 
         self.assertEqual(
             _FAKE_WINDOW_MANAGER.progress_calls,
-            [("begin", 0, 5), ("update", 2)],
+            [("begin", 0, 100), ("update", 40)],
         )
 
     def test_modal_progress_update_fires_once_per_done_change(self):
@@ -1907,7 +2036,7 @@ class OperatorInvokeTests(_BackgroundTestBase):
 
         self.assertEqual(
             _FAKE_WINDOW_MANAGER.progress_calls,
-            [("begin", 0, 5), ("update", 1), ("update", 3), ("update", 5)],
+            [("begin", 0, 100), ("update", 20), ("update", 60), ("update", 100)],
         )
 
     def test_modal_progress_begin_called_only_once(self):
@@ -1926,7 +2055,7 @@ class OperatorInvokeTests(_BackgroundTestBase):
             self.assertEqual(result, {'RUNNING_MODAL'})
 
         begins = [call for call in _FAKE_WINDOW_MANAGER.progress_calls if call[0] == "begin"]
-        self.assertEqual(begins, [("begin", 0, 4)])
+        self.assertEqual(begins, [("begin", 0, 100)])
 
     def test_finish_background_export_ends_progress_bar(self):
         context = self._make_context()
@@ -1990,7 +2119,8 @@ class ProgressCenterTests(_BackgroundTestBase):
         stage = self._read(stage_path)
         self.assertEqual(stage["stage"], "直出-收集节点")
         self.assertEqual(stage["done"], 0)
-        self.assertEqual(stage["total"], 3)
+        # report_stage 只更新显示文本，不再改 done/total（显式传入也被忽略）
+        self.assertEqual(stage["total"], 0)
         self.assertEqual(stage["nodes"], {"节点A": "pending", "节点B": "pending"})
         self.assertEqual(stage["node"], "")
         self.assertGreaterEqual(stage["elapsed"], 0.0)
@@ -2070,16 +2200,28 @@ class ProgressCenterTests(_BackgroundTestBase):
 class _StageNode:
     """直出阶段节点上报测试用的最小节点。"""
 
-    def __init__(self, name, bl_idname, mute=False, connected_to_output=True):
+    def __init__(
+        self,
+        name,
+        bl_idname,
+        mute=False,
+        connected_to_output=True,
+        blueprint_name="",
+        id_data=None,
+    ):
         self.name = name
         self.bl_idname = bl_idname
         self.mute = mute
         self.connected_to_output = connected_to_output
+        self.blueprint_name = blueprint_name
+        self.id_data = id_data
 
 
 class _StageTree:
-    def __init__(self, nodes):
+    def __init__(self, nodes, name="", bl_idname=""):
         self.nodes = list(nodes)
+        self.name = name
+        self.bl_idname = bl_idname
 
 
 class DirectExportStageNodeProgressTests(_BackgroundTestBase):
@@ -2211,6 +2353,149 @@ class DirectExportStageNodeProgressTests(_BackgroundTestBase):
             )
 
 
+class DirectExportNestedTreeProgressTests(_BackgroundTestBase):
+    """worker 侧节点键 ``树名/节点名`` 与嵌套蓝图递归收集。"""
+
+    def _stage_path(self, name="direct_nested_stage.json"):
+        return os.path.join(self.temp_dir, name)
+
+    @staticmethod
+    def _read(path):
+        with open(path, "r", encoding="utf-8") as file:
+            return json.load(file)
+
+    def _set_stage(self):
+        stage_path = self._stage_path()
+        export_progress.set_stage_file(stage_path)
+        self.addCleanup(export_progress.clear_stage_file)
+        export_progress.begin_steps(5)
+        return stage_path
+
+    def _install_trees(self, *trees):
+        mapping = {tree.name: tree for tree in trees}
+        original_get = _FAKE_BPY.data.node_groups.get
+        _FAKE_BPY.data.node_groups.get = lambda name: mapping.get(name)
+        self.addCleanup(setattr, _FAKE_BPY.data.node_groups, "get", original_get)
+
+    def _nested_fixture(self):
+        """主蓝图 + 子蓝图 + 循环引用 + NONE/缺失/非 SSMT 引用。"""
+        nested_leaf = _StageNode("物体信息子", "SSMTNode_Object_Info")
+        back_to_main = _StageNode(
+            "回指主树", "SSMTNode_Blueprint_Nest", blueprint_name="主蓝图"
+        )
+        sub_tree = _StageTree(
+            [nested_leaf, back_to_main],
+            name="子蓝图",
+            bl_idname="SSMTBlueprintTreeType",
+        )
+        main_leaf = _StageNode("物体信息主", "SSMTNode_Object_Info")
+        nest_entry = _StageNode(
+            "嵌套入口", "SSMTNode_Blueprint_Nest", blueprint_name="子蓝图"
+        )
+        none_ref = _StageNode(
+            "空引用", "SSMTNode_Blueprint_Nest", blueprint_name="NONE"
+        )
+        missing_ref = _StageNode(
+            "缺失引用", "SSMTNode_Blueprint_Nest", blueprint_name="不存在的蓝图"
+        )
+        non_ssmt_ref = _StageNode(
+            "引用普通树", "SSMTNode_Blueprint_Nest", blueprint_name="普通节点树"
+        )
+        main_tree = _StageTree(
+            [main_leaf, nest_entry, none_ref, missing_ref, non_ssmt_ref],
+            name="主蓝图",
+            bl_idname="SSMTBlueprintTreeType",
+        )
+        non_ssmt_tree = _StageTree(
+            [_StageNode("非SSMT节点", "SSMTNode_Object_Info")],
+            name="普通节点树",
+            bl_idname="ShaderNodeTree",
+        )
+        self._install_trees(main_tree, sub_tree, non_ssmt_tree)
+        return main_tree, sub_tree
+
+    def test_stage_nodes_use_tree_prefixed_keys(self):
+        """主树与嵌套树里同 bl_idname 的节点上报为 ``树名/节点名``。"""
+        stage_path = self._set_stage()
+        main_tree, _sub_tree = self._nested_fixture()
+
+        direct_export_module._report_stage_nodes(
+            main_tree,
+            ("SSMTNode_Object_Info",),
+            export_progress.STATE_RUNNING,
+        )
+
+        stage = self._read(stage_path)
+        self.assertEqual(
+            stage["nodes"],
+            {"主蓝图/物体信息主": "running", "子蓝图/物体信息子": "running"},
+        )
+
+    def test_pending_batch_includes_nested_tree_nodes(self):
+        stage_path = self._set_stage()
+        main_tree, _sub_tree = self._nested_fixture()
+
+        direct_export_module._report_stage_nodes(
+            main_tree,
+            ("SSMTNode_Object_Info",),
+            export_progress.STATE_PENDING,
+        )
+
+        self.assertEqual(
+            self._read(stage_path)["nodes"],
+            {"主蓝图/物体信息主": "pending", "子蓝图/物体信息子": "pending"},
+        )
+
+    def test_participant_collection_walks_nested_trees_without_looping(self):
+        """主树 + 嵌套树节点都被收集；循环引用不死循环；NONE/缺失/非 SSMT 跳过。"""
+        main_tree, _sub_tree = self._nested_fixture()
+
+        keys = direct_export_module._collect_participant_node_names(main_tree)
+
+        # 主树在前，嵌套树随后；每个键只出现一次（循环引用不重复）
+        self.assertEqual(keys[:4], [
+            "主蓝图/物体信息主",
+            "主蓝图/嵌套入口",
+            "主蓝图/空引用",
+            "主蓝图/缺失引用",
+        ])
+        self.assertIn("子蓝图/物体信息子", keys)
+        self.assertIn("子蓝图/回指主树", keys)
+        self.assertEqual(len(keys), len(set(keys)))
+        self.assertNotIn("普通节点树/非SSMT节点", keys)
+
+    def test_iter_stage_node_names_skips_none_and_missing_references(self):
+        main_tree, _sub_tree = self._nested_fixture()
+
+        self.assertEqual(
+            direct_export_module._iter_stage_node_names(
+                main_tree, ("SSMTNode_Blueprint_Nest",)
+            ),
+            [
+                "主蓝图/嵌套入口",
+                "主蓝图/空引用",
+                "主蓝图/缺失引用",
+                "主蓝图/引用普通树",
+                "子蓝图/回指主树",
+            ],
+        )
+
+    def test_postprocess_node_key_uses_owning_tree(self):
+        stage_path = self._set_stage()
+        _main_tree, sub_tree = self._nested_fixture()
+        node = _StageNode(
+            "嵌套后处理", "SSMTNode_PostProcess_ShapeKey", id_data=sub_tree
+        )
+
+        direct_export_module._report_postprocess_node(
+            node, export_progress.STATE_RUNNING
+        )
+
+        stage = self._read(stage_path)
+        self.assertEqual(stage["nodes"], {"子蓝图/嵌套后处理": "running"})
+        self.assertEqual(stage["node"], "子蓝图/嵌套后处理")
+
+
 class StepProgressTests(_BackgroundTestBase):
     """步骤计数：``begin_steps`` / ``complete_step`` / ``report_node(done)`` / 进度桥。"""
 
@@ -2250,7 +2535,8 @@ class StepProgressTests(_BackgroundTestBase):
         export_progress.report_node("节点A", "done")
         self.assertEqual(self._read(stage_path)["done"], 2)
 
-    def test_complete_step_is_capped_at_total(self):
+    def test_complete_step_grows_total_dynamically(self):
+        """complete_step 每完成一步就保底 ``total = max(total, done + 1)``。"""
         stage_path = self._stage_path("step_cap.json")
         export_progress.set_stage_file(stage_path)
         self.addCleanup(export_progress.clear_stage_file)
@@ -2258,7 +2544,8 @@ class StepProgressTests(_BackgroundTestBase):
         export_progress.complete_step()
         export_progress.complete_step()
         export_progress.complete_step()
-        self.assertEqual(export_progress.step_done(), 2)
+        self.assertEqual(export_progress.step_done(), 3)
+        self.assertEqual(export_progress.step_total(), 4)  # 当前阶段仍占 1 步
 
     def test_finish_steps_fills_total(self):
         stage_path = self._stage_path("step_finish.json")
@@ -2271,7 +2558,7 @@ class StepProgressTests(_BackgroundTestBase):
         self.assertEqual((stage["done"], stage["total"]), (10, 10))
 
     def test_start_stage_advances_previous_stage_only(self):
-        """第一个阶段不推进；第二个阶段推进上一个；同名/子阶段不推进。"""
+        """第一个阶段不推进；第二个阶段推进上一个；同名阶段重入不推进。"""
         stage_path = self._stage_path("step_bridge.json")
         timer_utils = sys.modules[f"{PKG}.utils.timer_utils"].TimerUtils
         self.assertTrue(export_background.install_progress_bridge(stage_path))
@@ -2292,8 +2579,9 @@ class StepProgressTests(_BackgroundTestBase):
         self.assertEqual(export_progress.step_done(), 2)  # 推进 Direct-SetupState
         self.assertEqual(self._read(stage_path)["stage"], "Preprocess-CreateCopies")
 
+        # 每个不同名称的子阶段都算 1 步（Preprocess-* 也计步）
         timer_utils.start_stage("Direct-CollectObjects")
-        self.assertEqual(export_progress.step_done(), 2)  # 前一步是子阶段：不推进
+        self.assertEqual(export_progress.step_done(), 3)  # 推进 Preprocess-CreateCopies
         self.assertEqual(self._read(stage_path)["stage"], "Direct-CollectObjects")
 
     def test_progress_text_omits_score_and_pipe_when_absent(self):
@@ -2331,6 +2619,242 @@ class StepProgressTests(_BackgroundTestBase):
             export_background.format_progress_bar(5, 5), "[████████████████████] 100%"
         )
         self.assertEqual(export_background.format_progress_bar(3, 0), "")
+
+    def test_format_percent_bar(self):
+        self.assertEqual(export_background.format_percent_bar(0), "[░░░░░░░░░░░░░░░░░░░░] 0%")
+        self.assertEqual(export_background.format_percent_bar(40), "[████████░░░░░░░░░░░░] 40%")
+        self.assertEqual(export_background.format_percent_bar(100), "[████████████████████] 100%")
+        self.assertEqual(export_background.format_percent_bar(120), "[████████████████████] 100%")
+
+
+class DynamicStepProgressTests(_BackgroundTestBase):
+    """动态步数模型：**每个不同名称的子步骤模块各算 1 步**，同名不重复计。
+
+    阶段序列取自一次完整导出的实测录制（20+ 个不同名称的阶段）；贴图张数这类
+    更深层内部进度只显示文本，不推动百分比。
+    """
+
+    #: 实测录制到的真实阶段序列（顺序即实际出现顺序）
+    RECORDED_STAGES = (
+        "正在保存工程快照…",
+        "后台实例正在加载工程（约 10 秒）",
+        "加载工程",
+        "前处理-计算缓存哈希",
+        "前处理-清空形态键",
+        "前处理-采样直出形态键",
+        "前处理-应用形态键",
+        "前处理-恢复非镜像",
+        "直出-解析蓝图模型",
+        "直出-构建导出器",
+        "数据哈希预计算",
+        "对象处理与合并",
+        "Element数据解析",
+        "索引去重与Buffer构建",
+        "ShapeKey计算",
+        "基础导出：写入资源…",
+        "INI配置生成",
+        "直出-形态键生成（形态键配置）",
+        "形态键扩展配置",
+        "物体切换面板",
+        "完成",
+    )
+
+    def _stage_path(self, name="dynamic_step.json"):
+        return os.path.join(self.temp_dir, name)
+
+    @staticmethod
+    def _read(path):
+        with open(path, "r", encoding="utf-8") as file:
+            return json.load(file)
+
+    def _begin(self, total=0, name="dynamic_step.json"):
+        stage_path = self._stage_path(name)
+        export_progress.set_stage_file(stage_path)
+        self.addCleanup(export_progress.clear_stage_file)
+        export_progress.begin_steps(total)
+        return stage_path
+
+    def test_recorded_stage_sequence_monotonic_and_finishes_at_100(self):
+        """录制的真实阶段序列：每步 done/total 单调不减，收尾 done == total。"""
+        self._begin(13)  # 主进程旧预算只有 13 步，worker 会动态抬高
+
+        # 基础导出内部会反复切换同名子阶段：重复出现不能再计步
+        events = list(self.RECORDED_STAGES)
+        events.insert(12, "数据哈希预计算")
+        events.insert(13, "对象处理与合并")
+
+        observed = []
+        for name in events:
+            export_progress.advance_stage(name)
+            # 中间插入贴图张数这类文本进度：只显示，不改 done/total
+            if name == "INI配置生成":
+                before = (export_progress.step_done(), export_progress.step_total())
+                export_progress.report_stage("材质转资源pro：转换贴图 26/60")
+                self.assertEqual(
+                    (export_progress.step_done(), export_progress.step_total()), before
+                )
+            observed.append(
+                (
+                    export_progress.step_done(),
+                    export_progress.step_total(),
+                    export_progress.step_percent(),
+                )
+            )
+
+        for done, total, _percent in observed:
+            self.assertLessEqual(done, total)
+
+        percents = [item[2] for item in observed]
+        self.assertEqual(percents, sorted(percents), "百分比不能回退")
+
+        # 唯一阶段名数：每个不同名称各占 1 步，最后一个阶段还在进行中
+        unique_count = len(set(events))
+        self.assertEqual(export_progress.step_total(), max(13, unique_count))
+        self.assertEqual(export_progress.step_done(), unique_count - 1)
+        self.assertLess(export_progress.step_percent(), 100)
+
+        export_progress.finish_steps()
+        self.assertEqual(
+            (export_progress.step_done(), export_progress.step_total()),
+            (max(13, unique_count), max(13, unique_count)),
+        )
+        self.assertEqual(export_progress.step_percent(), 100)
+        stage = self._read(self._stage_path())
+        self.assertEqual(stage["done"], max(13, unique_count))
+        self.assertEqual(stage["total"], max(13, unique_count))
+
+    def test_report_stage_text_only_does_not_change_steps(self):
+        """贴图张数（report_stage）只更新文本，不推百分比；后续阶段仍正确计步。"""
+        stage_path = self._begin(0)
+        export_progress.advance_stage("基础导出：写入资源…")
+        before = (export_progress.step_done(), export_progress.step_total())
+
+        export_progress.report_node("材质转资源pro", "running")
+        for index in (1, 26, 60):
+            export_progress.report_stage(f"材质转资源pro：转换贴图 {index}/60")
+            self.assertEqual(
+                (export_progress.step_done(), export_progress.step_total()), before
+            )
+        self.assertEqual(
+            self._read(stage_path)["stage"], "材质转资源pro：转换贴图 60/60"
+        )
+
+        # 显示文本被改写成细分文本后，阶段切换仍按计步名判断（不把贴图文本当阶段）
+        export_progress.advance_stage("INI配置生成")
+        self.assertEqual(export_progress.step_done(), 1)
+        self.assertEqual(export_progress.step_total(), 2)
+
+    def test_same_stage_name_repeated_is_counted_once(self):
+        """同名阶段重复出现只计 1 步（基础导出的子阶段会反复切换）。"""
+        self._begin(0)
+        for name in (
+            "数据哈希预计算",
+            "对象处理与合并",
+            "数据哈希预计算",
+            "对象处理与合并",
+            "ShapeKey计算",
+        ):
+            export_progress.advance_stage(name)
+
+        self.assertEqual(export_progress.step_done(), 2)  # 前两个唯一名各 1 步
+        self.assertEqual(export_progress.step_total(), 3)  # 当前阶段也占 1 步
+        self.assertEqual(export_progress.step_percent(), 66)
+
+    def test_total_grows_dynamically_per_new_stage(self):
+        """begin_steps 的初始 total 可动态增长；总步数随新阶段 1:1 增长。"""
+        self._begin(0)
+        export_progress.advance_stage("阶段A")
+        self.assertEqual(
+            (export_progress.step_done(), export_progress.step_total()), (0, 1)
+        )
+
+        for name in ("阶段B", "阶段C", "阶段D", "阶段E", "阶段F"):
+            export_progress.advance_stage(name)
+        self.assertEqual(
+            (export_progress.step_done(), export_progress.step_total()), (5, 6)
+        )
+        self.assertEqual(export_progress.step_percent(), 83)
+
+        export_progress.finish_steps()
+        self.assertEqual(
+            (export_progress.step_done(), export_progress.step_total()), (6, 6)
+        )
+        self.assertEqual(export_progress.step_percent(), 100)
+
+    def test_node_done_counts_stage_and_node_once(self):
+        """节点内部启动的阶段与节点本身各算 1 步；重复上报 done 不再计步。"""
+        self._begin(0)
+        export_progress.advance_stage("后处理")
+        export_progress.report_nodes(["形态键节点"])
+        export_progress.report_node("形态键节点", "running")
+        export_progress.advance_stage("直出-形态键生成")
+        self.assertEqual(export_progress.step_done(), 1)  # 完成"后处理"
+
+        export_progress.report_node("形态键节点", "done")
+        self.assertEqual(export_progress.step_done(), 3)  # 阶段 + 节点各 1 步
+        self.assertEqual(export_progress.step_total(), 4)
+
+        export_progress.report_node("形态键节点", "done")
+        self.assertEqual(export_progress.step_done(), 3)  # 同名节点不重复计
+
+        export_progress.finish_steps()
+        self.assertEqual(export_progress.step_percent(), 100)
+
+    def test_refresh_stage_percent_monotonic_when_total_grows(self):
+        """主进程：total 动态变大时百分比不回退（取已显示最大值），最终 100%。"""
+        session = self.make_session(total_steps=5)
+        self.assertTrue(session.start())
+        _FakeProcess.instances[0].returncode = None
+
+        samples = (
+            (2, 5),
+            (3, 8),   # 原始百分比 37% < 40%：必须保持 40%
+            (5, 9),
+            (9, 9),
+        )
+        percents = []
+        for done, total in samples:
+            with open(session.stage_path, "w", encoding="utf-8") as file:
+                json.dump(
+                    {"stage": "基础导出", "done": done, "total": total, "message": ""},
+                    file,
+                    ensure_ascii=False,
+                )
+            self.assertEqual(session.poll(), "running")
+            self.assertEqual(session.total_steps, total)  # total 以 stage.json 为准
+            self.assertEqual(session.done_steps, done)
+            percents.append(session.progress_percent)
+
+        self.assertEqual(percents, [40, 40, 55, 100])
+        self.assertEqual(percents, sorted(percents))
+        self.assertEqual(session.progress_text(), "后台导出：9/9 基础导出")
+        session.cleanup()
+
+    def test_update_progress_bar_uses_session_percent(self):
+        """UI 用主进程的整数百分比驱动原生条（固定 0~100 刻度）与文本条。"""
+        session = self.make_session(total_steps=5)
+        self.assertTrue(session.start())
+        _FakeProcess.instances[0].returncode = None
+        with open(session.stage_path, "w", encoding="utf-8") as file:
+            json.dump(
+                {"stage": "基础导出", "done": 3, "total": 10, "message": ""},
+                file,
+                ensure_ascii=False,
+            )
+        self.assertEqual(session.poll(), "running")
+        self.assertEqual(session.progress_percent, 30)
+
+        operator = ui_func_export.SSMTGenerateModBlueprint()
+        text = operator._update_progress_bar(
+            types.SimpleNamespace(window_manager=_FAKE_WINDOW_MANAGER), session
+        )
+
+        self.assertEqual(
+            _FAKE_WINDOW_MANAGER.progress_calls,
+            [("begin", 0, 100), ("update", 30)],
+        )
+        self.assertIn("[██████░░░░░░░░░░░░░░] 30%", text)
+        session.cleanup()
 
 
 class NodeHighlightTests(_BackgroundTestBase):
@@ -2547,6 +3071,197 @@ class NodeHighlightTests(_BackgroundTestBase):
         self.assertEqual(result, {'RUNNING_MODAL'})
         self.assertEqual(calls, [session])
         self.assertEqual(_FAKE_AREAS[0].header, "后台导出：准备 0/2")
+
+
+class _FakeBlueprintTree:
+    """多蓝图树高亮测试用的最小蓝图树（可被 ``bpy.data.node_groups.get`` 取到）。"""
+
+    def __init__(self, name, nodes=(), bl_idname="SSMTBlueprintTreeType"):
+        self.name = name
+        self.bl_idname = bl_idname
+        self.nodes = _FakeNodeCollection(nodes)
+
+
+def _make_blueprint_node(name, bl_idname="", color=(0.5, 0.5, 0.5), **attrs):
+    node = _FakeProgressNode(name, color=color)
+    node.bl_idname = bl_idname
+    for key, value in attrs.items():
+        setattr(node, key, value)
+    return node
+
+
+class NestedBlueprintNodeHighlightTests(_BackgroundTestBase):
+    """主进程节点高亮：``树名/节点名`` 键、嵌套蓝图递归、原色恢复。"""
+
+    MAIN_TREE_NAME = "主蓝图"
+    NESTED_TREE_NAME = "子蓝图"
+
+    def setUp(self):
+        super().setUp()
+        self._highlight_enabled_backup = ui_func_export._BG_NODE_HIGHLIGHT_ENABLED
+        self._highlight_interval_backup = ui_func_export._BG_HIGHLIGHT_MIN_INTERVAL
+        ui_func_export._BG_NODE_HIGHLIGHT_ENABLED = True
+        ui_func_export._BG_HIGHLIGHT_MIN_INTERVAL = 0.0
+        self.addCleanup(
+            setattr,
+            ui_func_export,
+            "_BG_NODE_HIGHLIGHT_ENABLED",
+            self._highlight_enabled_backup,
+        )
+        self.addCleanup(
+            setattr,
+            ui_func_export,
+            "_BG_HIGHLIGHT_MIN_INTERVAL",
+            self._highlight_interval_backup,
+        )
+
+    @staticmethod
+    def _operator():
+        operator = ui_func_export.SSMTGenerateModBlueprint()
+        operator._bg_node_colors = {}
+        operator._bg_node_lookup = None
+        return operator
+
+    def _install_trees(self, *trees):
+        mapping = {tree.name: tree for tree in trees}
+        original_get = _FAKE_BPY.data.node_groups.get
+        _FAKE_BPY.data.node_groups.get = lambda name: mapping.get(name)
+        self.addCleanup(setattr, _FAKE_BPY.data.node_groups, "get", original_get)
+
+    def _fixture(self):
+        """主树 → 子蓝图 → 回指主树（循环）；另有 NONE / 缺失 / 非 SSMT 引用。"""
+        self.nested_leaf = _make_blueprint_node(
+            "嵌套物体信息", "SSMTNode_Object_Info", color=(0.11, 0.22, 0.33)
+        )
+        back_to_main = _make_blueprint_node(
+            "回指主树",
+            "SSMTNode_Blueprint_Nest",
+            blueprint_name=self.MAIN_TREE_NAME,
+        )
+        self.nested_tree = _FakeBlueprintTree(
+            self.NESTED_TREE_NAME, [self.nested_leaf, back_to_main]
+        )
+
+        self.main_leaf = _make_blueprint_node(
+            "主树物体信息", "SSMTNode_Object_Info", color=(0.4, 0.5, 0.6)
+        )
+        nest_entry = _make_blueprint_node(
+            "嵌套入口",
+            "SSMTNode_Blueprint_Nest",
+            blueprint_name=self.NESTED_TREE_NAME,
+        )
+        none_ref = _make_blueprint_node(
+            "空引用", "SSMTNode_Blueprint_Nest", blueprint_name="NONE"
+        )
+        missing_ref = _make_blueprint_node(
+            "缺失引用", "SSMTNode_Blueprint_Nest", blueprint_name="不存在的蓝图"
+        )
+        non_ssmt_ref = _make_blueprint_node(
+            "引用普通树", "SSMTNode_Blueprint_Nest", blueprint_name="普通节点树"
+        )
+        self.main_tree = _FakeBlueprintTree(
+            self.MAIN_TREE_NAME,
+            [self.main_leaf, nest_entry, none_ref, missing_ref, non_ssmt_ref],
+        )
+        non_ssmt_tree = _FakeBlueprintTree(
+            "普通节点树",
+            [_make_blueprint_node("非SSMT节点", "SSMTNode_Object_Info")],
+            bl_idname="ShaderNodeTree",
+        )
+        self._install_trees(self.main_tree, self.nested_tree, non_ssmt_tree)
+        return self.main_tree
+
+    def test_split_node_key_parses_tree_and_falls_back_to_main_tree(self):
+        split = ui_func_export.SSMTGenerateModBlueprint._split_node_key
+        self.assertEqual(split("树A/节点X", "主蓝图"), ("树A", "节点X"))
+        # 旧 stage.json 的纯节点名：回退到主树
+        self.assertEqual(split("节点X", "主蓝图"), ("主蓝图", "节点X"))
+        self.assertEqual(split("", "主蓝图"), ("主蓝图", ""))
+
+    def test_participant_collection_walks_nested_trees(self):
+        self._fixture()
+        keys = ui_func_export.SSMTGenerateModBlueprint._collect_participant_node_names(
+            self.main_tree
+        )
+
+        self.assertIn("主蓝图/主树物体信息", keys)
+        self.assertIn("子蓝图/嵌套物体信息", keys)
+        self.assertIn("子蓝图/回指主树", keys)
+        self.assertEqual(len(keys), len(set(keys)))  # 循环引用不重复
+        self.assertNotIn("普通节点树/非SSMT节点", keys)
+
+    def test_old_key_falls_back_to_main_tree(self):
+        self._fixture()
+        operator = self._operator()
+
+        operator._sync_node_highlight(
+            types.SimpleNamespace(
+                tree_name=self.MAIN_TREE_NAME,
+                stage="后处理",
+                stage_nodes={"主树物体信息": "running"},
+            )
+        )
+
+        self.assertEqual(tuple(self.main_leaf.color), (0.95, 0.72, 0.1))
+        # 嵌套树里的同名键节点不会被旧键误伤（参与节点推断为 done 绿）
+        self.assertEqual(tuple(self.nested_leaf.color), (0.22, 0.78, 0.3))
+
+    def test_nested_node_highlighted_by_tree_prefixed_key_and_restored(self):
+        self._fixture()
+        operator = self._operator()
+
+        operator._sync_node_highlight(
+            types.SimpleNamespace(
+                tree_name=self.MAIN_TREE_NAME,
+                stage="后处理",
+                stage_nodes={"子蓝图/嵌套物体信息": "running"},
+            )
+        )
+
+        self.assertTrue(self.nested_leaf.use_custom_color)
+        self.assertEqual(tuple(self.nested_leaf.color), (0.95, 0.72, 0.1))
+        # 主树里没有这个节点，不会被错上成黄（参与节点推断为 done 绿）
+        self.assertEqual(tuple(self.main_leaf.color), (0.22, 0.78, 0.3))
+
+        operator._restore_node_colors()
+
+        self.assertFalse(self.nested_leaf.use_custom_color)
+        self.assertEqual(tuple(self.nested_leaf.color), (0.11, 0.22, 0.33))
+
+    def test_nested_participants_follow_export_phases(self):
+        """嵌套树里的参与节点同样 蓝灰 → 黄 → 绿；后处理节点由 worker 上报。"""
+        self._fixture()
+        post = _make_blueprint_node(
+            "嵌套后处理", "SSMTNode_PostProcess_ShapeKey", color=(0.5, 0.5, 0.5)
+        )
+        self.nested_tree.nodes = _FakeNodeCollection([self.nested_leaf, post])
+        operator = self._operator()
+
+        def _sync(stage, stage_nodes):
+            operator._sync_node_highlight(
+                types.SimpleNamespace(
+                    tree_name=self.MAIN_TREE_NAME,
+                    stage=stage,
+                    stage_nodes=dict(stage_nodes),
+                )
+            )
+
+        _sync("加载工程", {})
+        self.assertEqual(tuple(self.nested_leaf.color), (0.45, 0.52, 0.68))
+        self.assertEqual(tuple(self.main_leaf.color), (0.45, 0.52, 0.68))
+        self.assertFalse(post.use_custom_color)
+
+        _sync("前处理", {})
+        self.assertEqual(tuple(self.nested_leaf.color), (0.95, 0.72, 0.1))
+
+        _sync("后处理", {"子蓝图/嵌套后处理": "running"})
+        self.assertEqual(tuple(self.nested_leaf.color), (0.22, 0.78, 0.3))
+        self.assertEqual(tuple(post.color), (0.95, 0.72, 0.1))
+
+        operator._restore_node_colors()
+        self.assertEqual(tuple(self.nested_leaf.color), (0.11, 0.22, 0.33))
+        self.assertEqual(tuple(self.main_leaf.color), (0.4, 0.5, 0.6))
+        self.assertEqual(tuple(post.color), (0.5, 0.5, 0.5))
 
 
 class ProgressBridgeTests(_BackgroundTestBase):

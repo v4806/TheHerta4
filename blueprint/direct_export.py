@@ -50,10 +50,82 @@ def _get_sync_root_tree(node, context=None):
     return getattr(node, "id_data", None)
 
 
+#: 节点进度键的分隔符：``树名/节点名``。导出会递归展开嵌套蓝图，不同蓝图
+#: 树里的同名节点必须能区分开，所以 worker 上报一律带所属树名。
+_NODE_KEY_SEPARATOR = "/"
+#: 嵌套蓝图节点与 SSMT 蓝图树类型：与导出流程 ``_collect_postprocess_nodes`` /
+#: ``model.py::_resolve_nested_blueprint_collect`` 同一套递归口径。
+_NODE_TYPE_BLUEPRINT_NEST = "SSMTNode_Blueprint_Nest"
+_BLUEPRINT_TREE_IDNAME = "SSMTBlueprintTreeType"
+_BLUEPRINT_NONE_NAME = "NONE"
+
+
+def _node_progress_key(tree, node) -> str:
+    """节点进度键：``树名/节点名``；没有树名时退回纯节点名（旧格式兼容）。"""
+    node_name = str(getattr(node, "name", "") or "").strip()
+    if not node_name:
+        return ""
+    tree_name = str(getattr(tree, "name", "") or "").strip()
+    if not tree_name:
+        return node_name
+    return f"{tree_name}{_NODE_KEY_SEPARATOR}{node_name}"
+
+
+def _iter_nested_blueprint_trees(tree):
+    """某个蓝图树里 ``SSMTNode_Blueprint_Nest`` 引用到的嵌套蓝图树。
+
+    跳过静音节点、``NONE`` / 空名、不存在的树、非 SSMT 蓝图树（与导出流程
+    ``model.py::_resolve_nested_blueprint_collect`` 同口径）；异常静默。
+    """
+    for node in getattr(tree, "nodes", None) or ():
+        try:
+            if str(getattr(node, "bl_idname", "") or "") != _NODE_TYPE_BLUEPRINT_NEST:
+                continue
+            if bool(getattr(node, "mute", False)):
+                continue
+            blueprint_name = str(getattr(node, "blueprint_name", "") or "").strip()
+            if not blueprint_name or blueprint_name == _BLUEPRINT_NONE_NAME:
+                continue
+            nested_tree = bpy.data.node_groups.get(blueprint_name)
+            if nested_tree is None:
+                continue
+            if str(getattr(nested_tree, "bl_idname", "") or "") != _BLUEPRINT_TREE_IDNAME:
+                continue
+            yield nested_tree
+        except Exception:
+            continue
+
+
+def _iter_blueprint_trees(tree):
+    """主蓝图树 + 递归展开的嵌套蓝图树（先主树，再按引用顺序广度优先）。
+
+    ``visited`` 按对象 id 记已展开的树，循环引用（A 嵌 B、B 又嵌 A）不会死循环。
+    """
+    if tree is None:
+        return
+
+    visited = set()
+    pending = [tree]
+    while pending:
+        current = pending.pop(0)
+        if current is None or id(current) in visited:
+            continue
+        visited.add(id(current))
+        yield current
+        for nested_tree in _iter_nested_blueprint_trees(current):
+            if id(nested_tree) not in visited:
+                pending.append(nested_tree)
+
+
 def _report_postprocess_node(node, status: str) -> None:
-    """后台导出时上报后处理节点进度；同步导出（没有进度文件）时静默。"""
+    """后台导出时上报后处理节点进度；同步导出（没有进度文件）时静默。
+
+    后处理节点可能来自嵌套蓝图，键用 ``node.id_data``（节点所属蓝图树）拿树名。
+    """
     try:
-        export_progress.report_node(str(getattr(node, "name", "") or ""), status)
+        key = _node_progress_key(getattr(node, "id_data", None), node)
+        if key:
+            export_progress.report_node(key, status)
     except Exception:
         pass
 
@@ -78,34 +150,39 @@ _RESULT_OUTPUT_NODE_IDNAMES = (
 
 
 def _iter_stage_node_names(tree, bl_idnames):
-    """按 ``bl_idname`` 从蓝图树里取节点名：跳过静音节点与空名，去重。"""
+    """按 ``bl_idname`` 从主树 + 递归嵌套树里取节点进度键。
+
+    键格式 ``树名/节点名``；跳过静音节点与空名，去重。
+    """
     if tree is None:
         return []
     desired = {str(value or "") for value in (bl_idnames or ()) if str(value or "")}
     if not desired:
         return []
 
-    names = []
-    seen_names = set()
-    for node in getattr(tree, "nodes", None) or ():
-        try:
-            if bool(getattr(node, "mute", False)):
+    keys = []
+    seen_keys = set()
+    for current_tree in _iter_blueprint_trees(tree):
+        for node in getattr(current_tree, "nodes", None) or ():
+            try:
+                if bool(getattr(node, "mute", False)):
+                    continue
+                if str(getattr(node, "bl_idname", "") or "") not in desired:
+                    continue
+                key = _node_progress_key(current_tree, node)
+                if not key or key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                keys.append(key)
+            except Exception:
                 continue
-            if str(getattr(node, "bl_idname", "") or "") not in desired:
-                continue
-            name = str(getattr(node, "name", "") or "").strip()
-            if not name or name in seen_names:
-                continue
-            seen_names.add(name)
-            names.append(name)
-        except Exception:
-            continue
-    return names
+    return keys
 
 
 def _collect_participant_node_names(tree):
-    """收集主进程会补全状态的非后处理节点名（与 ``ui_func_export`` 同口径）。
+    """收集主进程会补全状态的非后处理节点键（与 ``ui_func_export`` 同口径）。
 
+    与导出流程一致地递归遍历主树 + 嵌套蓝图树，键格式 ``树名/节点名``。
     主进程的 ``_participant_phase_status`` 在 ``stage.json`` 里出现任何节点后
     会把**没上报**的参与节点一律猜成 done。worker 先把它们登记为 pending，
     才能让主进程不再"整片"上色；状态由下面的阶段上报逐个推进。
@@ -118,33 +195,34 @@ def _collect_participant_node_names(tree):
     except Exception:
         checker = None
 
-    names = []
-    seen_names = set()
-    for node in getattr(tree, "nodes", None) or ():
-        try:
-            if bool(getattr(node, "mute", False)):
-                continue
-            bl_idname = str(getattr(node, "bl_idname", "") or "")
-            if bl_idname.startswith("SSMTNode_PostProcess_"):
-                continue
-            if bl_idname.startswith("SSMTNode_Result_"):
-                continue
-            if bl_idname in ("NodeReroute", "NodeFrame"):
-                continue
-            if callable(checker):
-                try:
-                    if not checker(tree, node):
-                        continue
-                except Exception:
+    keys = []
+    seen_keys = set()
+    for current_tree in _iter_blueprint_trees(tree):
+        for node in getattr(current_tree, "nodes", None) or ():
+            try:
+                if bool(getattr(node, "mute", False)):
                     continue
-            name = str(getattr(node, "name", "") or "").strip()
-            if not name or name in seen_names:
+                bl_idname = str(getattr(node, "bl_idname", "") or "")
+                if bl_idname.startswith("SSMTNode_PostProcess_"):
+                    continue
+                if bl_idname.startswith("SSMTNode_Result_"):
+                    continue
+                if bl_idname in ("NodeReroute", "NodeFrame"):
+                    continue
+                if callable(checker):
+                    try:
+                        if not checker(current_tree, node):
+                            continue
+                    except Exception:
+                        continue
+                key = _node_progress_key(current_tree, node)
+                if not key or key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                keys.append(key)
+            except Exception:
                 continue
-            seen_names.add(name)
-            names.append(name)
-        except Exception:
-            continue
-    return names
+    return keys
 
 
 def _report_participant_nodes(tree, status: str) -> None:
@@ -655,9 +733,11 @@ class DirectExportSession:
                 LOG.info("Direct ShapeKey: skipped standard slot export; generating direct resources from Meshes0000 and preprocess records")
 
             try:
-                export_progress.report_nodes(
-                    [str(getattr(node, "name", "") or "") for node in self.ordered_postprocess_nodes]
-                )
+                keys = [
+                    _node_progress_key(getattr(node, "id_data", None), node)
+                    for node in self.ordered_postprocess_nodes
+                ]
+                export_progress.report_nodes([key for key in keys if key])
             except Exception:
                 pass
 

@@ -986,6 +986,24 @@ def format_progress_bar(done, total, width: int = 20) -> str:
     return f"[{'█' * filled}{'░' * (cells - filled)}] {percent}%"
 
 
+def format_percent_bar(percent, width: int = 20) -> str:
+    """文本进度条（百分比驱动）：``[████░░] 40%``。
+
+    后台导出的总步数会随实际阶段动态增长，所以主进程只按**百分比**（整数
+    0~100）驱动原生进度条与这条文本条；文本里的 ``done/total`` 由
+    ``progress_text`` 单独显示。``percent`` 非法时返回空串。
+    """
+    try:
+        value = int(percent or 0)
+    except (TypeError, ValueError):
+        return ""
+    value = max(0, min(100, value))
+
+    cells = max(1, int(width or 20))
+    filled = max(0, min(cells, int(round(value / 100 * cells))))
+    return f"[{'█' * filled}{'░' * (cells - filled)}] {value}%"
+
+
 def _resolve_status_workspace(context=None):
     """取当前 workspace：优先用调用方传入的 context（modal 事件 context 最可靠）。
 
@@ -1175,12 +1193,18 @@ class BackgroundExportSession:
         self.log_path = ""
 
         self.process = None
+        #: start() 成功启动后台实例时的 monotonic 时刻；None = 尚未启动（不计时）
+        self.started_monotonic = None
         self.status = "idle"
         self.stage = ""
         self.stage_done = 0
         self.stage_total = 0
         #: 已完成步骤数（与 stage_done 同步；UI 进度条按 step 计数读它）
         self.done_steps = 0
+        #: 已显示百分比（整数 0~100，只增不减：worker 的 total 会动态增长）
+        self.progress_percent = 0
+        #: 已经显示过的最大百分比（total 变大时防止百分比回退）
+        self._max_percent = 0
         self.stage_message = ""
         self.stage_node = ""
         self.stage_nodes = {}
@@ -1244,6 +1268,8 @@ class BackgroundExportSession:
             self.stage = "加载工程"
             self.stage_done = 0
             self.done_steps = 0
+            self.progress_percent = 0
+            self._max_percent = 0
             # 步骤数以主进程预计算为准；未提供时退化成「轮次 + 收尾」
             self.stage_total = self.total_steps or (len(self.round_plans) + 1)
             self.stage_message = "后台实例正在加载工程（约 10 秒）…"
@@ -1257,6 +1283,11 @@ class BackgroundExportSession:
                 stdin=subprocess.DEVNULL,
             )
             self.status = "running"
+            # 本次导出总用时从「后台实例真正启动」起算；计时异常绝不能影响导出
+            try:
+                self.started_monotonic = time.monotonic()
+            except Exception:
+                self.started_monotonic = None
             # 防重入：登记活动会话，清理时（cleanup）再注销
             set_active_session(self)
             return True
@@ -1310,17 +1341,22 @@ class BackgroundExportSession:
             self.stage_done = int(stage.get("done") or 0)
         except (TypeError, ValueError):
             self.stage_done = 0
+        # total 以 worker 动态上报为准（阶段名一变就涨）；没上报时才沿用旧值 /
+        # 主进程预算（旧 worker / 早期 stage.json 没有 total）。
         try:
-            self.stage_total = int(stage.get("total") or 0)
+            stage_total = int(stage.get("total") or 0)
         except (TypeError, ValueError):
-            self.stage_total = 0
-        # 旧 worker / 早期 stage.json 可能没有 total：沿用主进程预计算的总步骤数
-        if self.stage_total <= 0:
+            stage_total = 0
+        if stage_total > 0:
+            self.stage_total = stage_total
+        elif self.stage_total <= 0:
             self.stage_total = self.total_steps
-        elif self.total_steps <= 0:
+        # 主进程的 total_steps 与 worker 的动态 total 保持同步（UI 文本 done/total）
+        if self.stage_total > 0:
             self.total_steps = self.stage_total
         self.done_steps = self.stage_done
         self.stage_message = str(stage.get("message") or "")
+        self._refresh_progress_percent()
 
         # 细粒度进度：``_write_stage`` 写的粗粒度快照没有子状态字段，
         # 这时保留上一次的值，避免节点高亮与"当前节点"在轮次切换时闪空。
@@ -1340,7 +1376,63 @@ class BackgroundExportSession:
         except (TypeError, ValueError):
             pass
 
+    def _refresh_progress_percent(self) -> None:
+        """按 ``done / total`` 算整数百分比（0~100），并保证**单调不回退**。
+
+        worker 的 total 是动态增长的（每出现一个新阶段就 ``total = max(total,
+        done + 1)``），所以不能用固定刻度；主进程只记「已经显示过的最大百分比」，
+        取 max 防止 total 变化时百分比往回跳（total<=0 时按 0 处理）。
+        """
+        try:
+            total = max(0, int(self.stage_total or 0))
+            done = max(0, int(self.stage_done or 0))
+        except (TypeError, ValueError):
+            return  # 进度显示失败绝不能影响导出轮询
+        percent = int(done * 100 / total) if total > 0 else 0
+        percent = max(0, min(100, percent))
+        if percent < self._max_percent:
+            percent = self._max_percent
+        self._max_percent = percent
+        self.progress_percent = percent
+
     # -- 展示 ---------------------------------------------------------------
+
+    def elapsed_seconds(self) -> float:
+        """从 ``start()`` 成功启动后台实例到**现在**的秒数；重复调用返回当前时长。
+
+        未启动、或计时出现任何异常时返回 ``0.0``：计时只用于文案，绝不能影响导出。
+        """
+        try:
+            started = self.started_monotonic
+            if started is None:
+                return 0.0
+            return max(0.0, float(time.monotonic() - started))
+        except Exception:
+            return 0.0
+
+    def elapsed_text(self) -> str:
+        """统一格式的用时文案 ``用时 38.6 秒``（保留 1 位小数，超 60 秒也照常显示秒）。
+
+        计时不可用时返回空串，调用方据此退化为不带用时的原文案。
+        """
+        try:
+            if self.started_monotonic is None:
+                return ""
+            return f"用时 {self.elapsed_seconds():.1f} 秒"
+        except Exception:
+            return ""
+
+    def _append_elapsed(self, message: str) -> str:
+        """把用时幂等追加到摘要末尾；``message`` 已含「用时」时不重复添加。"""
+        try:
+            if "用时" in message:
+                return message
+            label = self.elapsed_text()
+            if not label:
+                return message
+            return f"{message}，{label}"
+        except Exception:
+            return message
 
     def progress_text(self) -> str:
         """状态栏短文本，例如 ``后台导出：3/7 后处理-创建副本｜形态键基态``。
@@ -1373,7 +1465,8 @@ class BackgroundExportSession:
             head = " | ".join(warnings[:3])
             suffix = f"；另有 {len(warnings) - 3} 条" if len(warnings) > 3 else ""
             message += f"；自检警告: {head}{suffix}"
-        return message
+        # 成功摘要末尾追加本次总用时（原有文案保持不变）
+        return self._append_elapsed(message)
 
     def error_summary(self) -> str:
         message = self.error or "后台导出失败"
