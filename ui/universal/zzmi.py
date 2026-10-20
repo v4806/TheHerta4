@@ -6991,6 +6991,21 @@ class ExportZZMI(ExportUnity):
                 section.append("cs = ./res/zzmi_merged_skeleton_attach.hlsl")
                 section.append("x1 = 0")
                 section.append(f"y1 = {vg_count}")
+                # 新鲜度守卫（2026-10-20，丽娜槽 97 漂移根因）：跨部件骨骼矩阵
+                # 去重后同一个 canonical 槽位会被**多个部件**写，而每个部件的
+                # palette 只在**它自己的 deform 段**捕获。某部件本帧没画（例如
+                # 只剩 3 个顶点的子网格被裁掉）时它的 palette 停在上一帧，此时
+                # 再跑它的 attach 就会用**上一帧矩阵**盖掉本帧刚写好的共享槽位
+                # ⇒ 该骨骼（本例头/发 4046 个顶点全压在槽 97）运动时滞后漂移。
+                # y2 = 1 启用守卫，z2 = 该 (部件, 槽) 的本帧到达计数（seen）：
+                # 计数 0 ⇒ 本帧没捕获 ⇒ CS 直接返回，槽里保留**当帧**值，绝不
+                # 把新值降级成旧值。y2 缺省 0 = 关闭守卫（未升级的段逐字节不变）。
+                # 用第 2 组参数而不是 z1/w1：第 1 组已被 y1=骨骼数与蒙皮 CS 的
+                # z1/w1 占用。
+                section.append("y2 = 1")
+                section.append(
+                    f"z2 = {self._merged_seen_var(component_id, slot)}"
+                )
                 section.append(
                     f"cs-t0 = ref {self._merged_palette_name(component['draw_ib'], slot)}"
                 )
@@ -7083,6 +7098,13 @@ class ExportZZMI(ExportUnity):
                     )
                     section.append("x1 = 0")
                     section.append(f"y1 = {vg_count}")
+                    # 与同组 attach 同一守卫（见同组发射点的长注释）：
+                    # 跨组件的 palette 同样只在**它自己**的 deform 段捕获，
+                    # 本帧没画时读到的是上一帧姿态 ⇒ 不许它盖掉本帧值。
+                    section.append("y2 = 1")
+                    section.append(
+                        f"z2 = {self._merged_seen_var(int(cross_component_id), slot)}"
+                    )
                     section.append(
                         "cs-t0 = ref "
                         + self._merged_palette_name(cross_component["draw_ib"], slot)

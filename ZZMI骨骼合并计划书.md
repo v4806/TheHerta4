@@ -500,6 +500,8 @@ VGMap 也不改变导入结果**；复选框开启时仍传预生成结果（失
 8. 复选框关闭：导入与导出行为均与现状完全一致（无 VGMap 读写、无 ModImpRuntime 写入、BLENDINDICES 走 `g.group` 原路径、无 Merged Skeleton 段）。
 9. 单测全绿 + Blender headless e2e [PASS]。
 
+10. **palette 新鲜度守卫（2026-10-20，丽娜共享槽 97「运动时飘」根因）**：每个 `CustomShaderZZMIMergedSkeletonAttach*` 段（同组 `Attach_` 与跨组 `AttachX_` 两类，均 `cs = ./res/zzmi_merged_skeleton_attach.hlsl`）必须带 `y2 = 1`（启用守卫）与 `z2 = $zz_ms_seen_<部件><槽>`（该 (部件, 槽) 的本帧到达计数，与 `_merged_seen_arrived_condition` 同一口径）；CS 在**任何资源读取之前**执行 `if (ZZ_ATTACH_GUARD > 0.5f && ZZ_ATTACH_SEEN < 0.5f) return;`（`IniParams[2].y` / `IniParams[2].z`）。原因：跨部件按骨骼矩阵 bitwise 去重会让**同一个 canonical 槽位被多个部件写**，而每个部件的 palette 只在**它自己的 deform 段**捕获；某个部件本帧没画（实测：只剩 3 个顶点的子网格被裁掉）时它的 palette 停在上一帧，于是每个 deform 段都跑的**无条件** `run` 会用上一帧矩阵盖掉本帧刚写好的共享槽位 ⇒ 共享骨稳定滞后一帧（实测：头/发 4046 个顶点全压在共享槽 97 上，运动时最明显）。守卫只做一件事：**绝不把当帧值降级成旧值**（计数为 0 时跳过写入与「写一份同样的旧值」在内容上等价，但当另有部件本帧写过该槽时，跳过保住了当帧那份）。因此 `run` 仍可保持顶层无条件执行——本规则**不松动**「`run` 绝不进 if」；`w1` 缺省 0 = 关闭守卫，未升级的段逐字节不变。第 1 组参数（`z1`/`w1`）归蒙皮 CS 的每行 float 数/前缀行数，attach 段**不得占用**（`tests/test_zzmi_merged_skeleton_ini.py::test_every_attach_section_carries_freshness_guard` 守着这条）。
+
 ---
 
 ## 9. 存档与交接（2026-10-11）
@@ -515,6 +517,7 @@ VGMap 也不改变导入结果**；复选框开启时仍传预生成结果（失
 | 顺序无关守卫（F3） | `_append_merged_absorbed_replay` / `_append_merged_cross_group_replays` / `_merged_cross_host_group_map` | 守卫等「全部供骨件当帧到达」才闭合 |
 | 蒙皮 CS 重发布（F3-CS） | `Toolset/zzmi_merged_skin.hlsl` + `_append_merged_skin_publish_block` | 绕开 IA 布局限制、幂等写 SO |
 | **按来源拆分绘制（⑬，当前主线）** | `_merged_source_index_runs` / `_merged_split_group_plan` / `_merged_split_representative` / `_append_merged_render_split_draws` / `_merged_index_unique_str` / `_merged_split_mesh_comment` | 按顶点组把合并 IB 切段、每段**放回该来源自己的渲染段**画、统一继承合并物体的 `; [mesh:]` 标注 |
+| **palette 新鲜度守卫（2026-10-20）** | `Toolset/zzmi_merged_skeleton_attach.hlsl` + `ui/universal/zzmi.py` 的两处 attach 发射点（同组 / 跨组） | attach 拒绝陈旧 palette（`y2`/`z2`）⇒ 共享 canonical 槽位不再被上一帧矩阵覆盖（丽娜槽 97 漂移根因） |
 | 已否决并移除 | — | F4 / F5 / F7（在渲染段重算跨组校准并写回顶点流）全部实测否决、代码已删；校准 attach 改回直拷 |
 
 测试（cwd `E:\代码\TheHerta4`，解释器 `C:\Python311\python.exe -m pytest`）：

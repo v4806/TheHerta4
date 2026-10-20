@@ -692,6 +692,55 @@ class ZZSIMergedSkeletonIniTests(unittest.TestCase):
         self.assertNotIn("ResourceZZMergedSkeleton", present_text)
         self.assertNotIn("= null", present_text)
 
+    def test_every_attach_section_carries_freshness_guard(self):
+        """每个 attach 段都必须带「本帧是否捕获过这份 palette」守卫（2026-10-20）。
+
+        根因（丽娜槽 97 运动时漂移，实机复现）：跨部件按骨骼矩阵 bitwise 去重后，
+        同一个 canonical 槽位会被**多个部件**写，而每个部件的 palette 只在**它自己
+        的 deform 段**捕获。某部件本帧没画（实测：只剩 3 个顶点的子网格被裁掉）
+        时它的 palette 停在上一帧，attach 又每个段都无条件跑一遍 ⇒ 用上一帧矩阵
+        盖掉本帧刚写好的共享槽位。修法是让 attach CS 自己拒绝陈旧输入：
+        `y2 = 1` 启用守卫、`z2 = $zz_ms_seen_<部件><槽>` 传本帧到达计数
+        （与 `_merged_seen_arrived_condition` 同一口径）。
+        """
+        submesh_a = _FakeSubmesh("LOD0.a23aa8a3-42759-0", 0, 105)
+        submesh_b = _FakeSubmesh("LOD0.b20f90ea-19182-0", 105, 51)
+        exporter = _make_exporter(
+            [_FakeDrawIBModel("a23aa8a3", [submesh_a]), _FakeDrawIBModel("b20f90ea", [submesh_b])],
+            merged_vgmap=True,
+        )
+        exporter.merged_skeleton_components, exporter.merged_skeleton_component_id_dict = (
+            exporter._collect_merged_skeleton_components()
+        )
+        builder = _FakeIniBuilder()
+        exporter.add_merged_skeleton_sections(builder)
+        text = "\n".join(_all_builder_lines(builder))
+
+        for cid in (0, 1):
+            for slot in (1, 2):
+                block = text.split(
+                    f"[CustomShaderZZMIMergedSkeletonAttach_C{cid}_s{slot}]", 1
+                )[1].split("\n[", 1)[0]
+                self.assertIn("y2 = 1", block, f"C{cid}_s{slot} 缺守卫开关")
+                self.assertIn(
+                    f"z2 = $zz_ms_seen_{cid}{slot}", block, f"C{cid}_s{slot} 守卫计数错槽"
+                )
+                # 第 1 组参数被 y1=骨骼数与蒙皮 CS 的 z1/w1 占用，attach 不许碰
+                self.assertNotIn("z1 = ", block)
+                self.assertNotIn("w1 = ", block)
+
+        # 陈旧 palette 的读取必须在 CS 里被拒（run 仍是顶层无条件，
+        # 计划书 §8「run 绝不进 if」不变）
+        shader = (REPO_ROOT / "Toolset" / "zzmi_merged_skeleton_attach.hlsl").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("#define ZZ_ATTACH_SEEN IniParams[2].z", shader)
+        self.assertIn("#define ZZ_ATTACH_GUARD IniParams[2].y", shader)
+        self.assertIn("ZZ_ATTACH_GUARD > 0.5f && ZZ_ATTACH_SEEN < 0.5f", shader)
+        # 守卫必须排在任何资源读取之前（陈旧 palette 连长度都可能不对）
+        guard_at = shader.index("ZZ_ATTACH_GUARD > 0.5f && ZZ_ATTACH_SEEN < 0.5f")
+        self.assertLess(guard_at, shader.index("src_palette.GetDimensions"))
+
     def test_merged_skeleton_resource_is_typed_rwbuffer(self):
         """合并骨架资源必须是 typed RWBuffer + 显式 bind_flags（2026-09-22 跨显卡修复）。
 
