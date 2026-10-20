@@ -148,6 +148,33 @@ def _blueprint_node_key(tree, node) -> str:
     return f"{tree_name}/{node_name}"
 
 
+#: 状态栏后台导出进度文本的固定前缀（由 ``session.progress_text()`` 生成）。
+_BG_PROGRESS_PREFIX = "后台导出："
+
+
+def compose_background_progress_text(text: str, progress_bar: str) -> str:
+    """把文本进度条插到「后台导出：」前缀之后、步骤文本之前。
+
+    ``session.progress_text()`` 产出 ``后台导出：13/32 前处理-恢复非镜像｜树/节点``，
+    ``_update_progress_bar()`` 产出 ``[██████░░] 40%``。状态栏布局要求进度条在
+    前缀之后、步骤文本之前：:
+
+        后台导出：[██████░░] 40% 13/32 前处理-恢复非镜像｜树/节点
+
+    进度条为空（准备 / 加载工程 / 完成等没有百分比的阶段）时原样返回 ``text``；
+    ``text`` 不是标准进度文案（如「后台导出完成」）时也不插入，避免拼出怪文本。
+    """
+    if not progress_bar:
+        return text
+    text = str(text or "")
+    if not text.startswith(_BG_PROGRESS_PREFIX):
+        return text
+    step_text = text[len(_BG_PROGRESS_PREFIX):].strip()
+    if not step_text:
+        return f"{_BG_PROGRESS_PREFIX}{progress_bar}"
+    return f"{_BG_PROGRESS_PREFIX}{progress_bar} {step_text}"
+
+
 #: 后台导出 modal 轮询的共用实现：Generate Mod 与快速局部导出共用同一套
 #: 进度显示 / 节点高亮 / 三种收尾，避免两处复制。
 class _BackgroundExportMixin:
@@ -190,9 +217,8 @@ class _BackgroundExportMixin:
         self._sync_node_highlight(session)
         text = session.progress_text()
         progress_bar = self._update_progress_bar(context, session)
-        if progress_bar:
-            text = f"{text} {progress_bar}"
-        push_progress_header(text, context)
+        # 布局：后台导出：[██░░] 40% 13/32 阶段｜节点 —— 进度条插在前缀之后、步骤文本之前。
+        push_progress_header(compose_background_progress_text(text, progress_bar), context)
 
         if status == "running":
             return {'RUNNING_MODAL'}

@@ -1864,7 +1864,11 @@ class OperatorInvokeTests(_BackgroundTestBase):
 
         self.assertEqual(result, {'RUNNING_MODAL'})
         self.assertEqual(polls, [1])
-        self.assertIn("后台导出：准备 0/2", _FAKE_AREAS[0].header)
+        # 进度条非空时插在「后台导出：」之后、步骤文本之前
+        self.assertEqual(
+            _FAKE_AREAS[0].header,
+            "后台导出：[░░░░░░░░░░░░░░░░░░░░] 0% 准备 0/2",
+        )
 
     def test_modal_escape_clears_view_nav_state(self):
         """收尾（含 ESC 取消）要清掉中键拖动状态，避免下一轮误放行移动事件。"""
@@ -2019,6 +2023,45 @@ class OperatorInvokeTests(_BackgroundTestBase):
             _FAKE_WINDOW_MANAGER.progress_calls,
             [("begin", 0, 100), ("update", 20), ("update", 100), ("end",)],
         )
+
+    def test_modal_places_progress_bar_before_step_text(self):
+        """状态栏布局：``后台导出：`` + 进度条 + 空格 + ``done/total 阶段｜节点``。"""
+        self.scene_properties.background_export_enabled = True
+        context = self._make_context()
+        operator = self._make_operator(context)
+        operator.invoke(context, None)
+        session = _RecordingSession.instances[0]
+        session.total_steps = 32
+        session.done_steps = 13
+        session.progress_text = lambda: (
+            "后台导出：13/32 前处理-恢复非镜像｜蕾米埃尔-NF/物体信息.013"
+        )
+        session.poll_results = ["running"]
+
+        result = operator.modal(context, types.SimpleNamespace(type='TIMER'))
+
+        self.assertEqual(result, {'RUNNING_MODAL'})
+        self.assertEqual(
+            _FAKE_AREAS[0].header,
+            "后台导出：[████████░░░░░░░░░░░░] 40% 13/32 前处理-恢复非镜像｜"
+            "蕾米埃尔-NF/物体信息.013",
+        )
+
+    def test_modal_keeps_text_when_progress_bar_empty(self):
+        """进度条为空（准备 / 加载 / 完成等阶段）时状态栏文本保持原样。"""
+        self.scene_properties.background_export_enabled = True
+        context = self._make_context()
+        operator = self._make_operator(context)
+        operator.invoke(context, None)
+        session = _RecordingSession.instances[0]
+        session.progress_text = lambda: "后台导出完成（31/31，用时 27.7 秒）"
+        operator._update_progress_bar = lambda _context, _session: ""
+        session.poll_results = ["running"]
+
+        result = operator.modal(context, types.SimpleNamespace(type='TIMER'))
+
+        self.assertEqual(result, {'RUNNING_MODAL'})
+        self.assertEqual(_FAKE_AREAS[0].header, "后台导出完成（31/31，用时 27.7 秒）")
 
     def test_modal_progress_api_failure_falls_back_to_header_bar(self):
         """progress_* 抛异常时静默，并在 header 上退回文本进度条。"""
@@ -2667,6 +2710,20 @@ class StepProgressTests(_BackgroundTestBase):
         self.assertEqual(export_background.format_percent_bar(40), "[████████░░░░░░░░░░░░] 40%")
         self.assertEqual(export_background.format_percent_bar(100), "[████████████████████] 100%")
         self.assertEqual(export_background.format_percent_bar(120), "[████████████████████] 100%")
+
+    def test_compose_background_progress_text_layout(self):
+        """进度条插在「后台导出：」之后、步骤文本之前；为空时原样返回文本。"""
+        compose = ui_func_export.compose_background_progress_text
+        self.assertEqual(
+            compose("后台导出：13/32 前处理-恢复非镜像｜树/节点", "[████████░░░░░░░░░░░░] 40%"),
+            "后台导出：[████████░░░░░░░░░░░░] 40% 13/32 前处理-恢复非镜像｜树/节点",
+        )
+        self.assertEqual(compose("后台导出：准备 0/2", ""), "后台导出：准备 0/2")
+        # 非标准进度文案（完成 / 取消 / 失败）不插入进度条，避免拼出重复前缀
+        self.assertEqual(
+            compose("后台导出完成（31/31，用时 27.7 秒）", "[████████████████████] 100%"),
+            "后台导出完成（31/31，用时 27.7 秒）",
+        )
 
 
 class FixedStepProgressTests(_BackgroundTestBase):
