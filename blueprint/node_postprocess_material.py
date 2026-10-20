@@ -8,7 +8,11 @@ import shutil
 
 from ..common.global_config import GlobalConfig
 from ..common.logic_name import LogicName
-from ..toolkit.tt_dds_conversion import convert_texture_to_dds
+from ..toolkit.tt_dds_conversion import (
+    convert_texture_to_dds,
+    existing_dds_matches_format,
+    resolve_texture_dds_format,
+)
 from . import fx_namespace
 from .node_postprocess_base import SSMTNode_PostProcess_Base
 
@@ -1338,6 +1342,46 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
                 return node.image
         return None
 
+    # -- 后台导出细分进度：贴图复制 / 转 DDS --------------------------------
+    #
+    # 材质转资源pro 的 texconv 转换是耗时大头（实测 26 张 ≈13~20s），期间原来
+    # 状态栏停在"材质转资源pro"一动不动，用户会以为卡死。这里按"每张已处理贴图"
+    # 上报一次细粒度文本。只影响**显示**：``export_progress`` 没有 stage 文件时
+    # （同步导出 / 主线程）静默返回，不改导出流程与产物。
+
+    def _reset_texture_progress(self) -> None:
+        """一次导出开始时清零贴图计数。"""
+        self._tex_progress_done = 0
+        self._tex_progress_total = 0
+
+    def _plan_texture_progress(self, count) -> None:
+        """登记本批次预计处理的贴图数（只累加；用于显示 ``i/total`` 的 total）。"""
+        try:
+            planned = int(getattr(self, "_tex_progress_total", 0) or 0)
+            self._tex_progress_total = planned + max(0, int(count or 0))
+        except (TypeError, ValueError):
+            pass
+
+    def _report_texture_progress(self) -> None:
+        """每张进入复制的贴图前上报一次；任何异常都吞掉，绝不影响导出。
+
+        ``export_progress`` 按需导入：轻量 fake 宿主（单测）没有这个子模块，
+        同步导出 / 主线程也没有 stage 文件 —— 两种情况都保持静默。
+        """
+        try:
+            from . import export_progress
+
+            done = int(getattr(self, "_tex_progress_done", 0) or 0) + 1
+            self._tex_progress_done = done
+            total = max(int(getattr(self, "_tex_progress_total", 0) or 0), done)
+            self._tex_progress_total = total
+            # 前缀用节点名（默认就叫「材质转资源pro」）：节点完成时进度中台会按
+            # "<节点名>：" 前缀清掉这段细分文本，避免漏到下一个节点。
+            label = str(getattr(self, "name", "") or "").strip() or "材质转资源pro"
+            export_progress.report_stage(f"{label}：转换贴图 {done}/{total}")
+        except Exception:
+            pass
+
     def copy_texture_file(self, texture_image, target_folder, material, forced_filename=None):
         if not texture_image or not texture_image.filepath:
             return None
@@ -1356,17 +1400,38 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
             if file_extension.lower() != ".dds" and getattr(self, "export_textures_as_dds", False):
                 converted_name = f"{stem}.dds"
                 converted_path = os.path.join(target_folder, converted_name)
-                if os.path.exists(converted_path) and not self.material_to_resource_override:
-                    return converted_name
+                # 导出侧已知贴图类型（材质名本身就是 DiffuseMap_xxx 这类命名），
+                # 拿它当兜底提示：编辑期源图名可能只有 Diffuse 而没有 DiffuseMap
+                # （实测 VivianGemADiffuse.png），只按源文件名匹配会落到线性默认规则。
+                name_hints = [getattr(material, "name", ""), stem]
+                # 材质名前缀就是贴图类型（DiffuseMap / MaterialMap / ...），导出侧
+                # 必须用它决定 DDS 格式，不能再让源文件名带偏。
+                texture_type = str(getattr(material, "name", "") or "").strip().split("_")[0]
+                # 「已存在 DDS」不能盲信：必须与当前规则期望的格式一致才跳过，
+                # 否则规则改对后旧线性 DDS 会被永远沿用。
+                if os.path.exists(converted_path):
+                    expected_format = resolve_texture_dds_format(
+                        source_path,
+                        bpy.context.scene.texture_tools_props,
+                        texture_type=texture_type,
+                        name_hints=name_hints,
+                    )
+                    if existing_dds_matches_format(converted_path, expected_format) and (
+                        not self.material_to_resource_override or forced_filename == converted_name
+                    ):
+                        return converted_name
                 # 同一轮导出内这张图已经转过：forced_filename 是本次导出里同一材质
                 # （同一 stem）上一次调用返回的 .dds 名，且文件确实存在。此时再调一次
                 # texconv 重转同一张图，结果与上一次完全相同，纯属重复劳动 ——
                 # 实测「身体」那套 5 张贴图各被重转 14 次，一次导出 82 次转换里 70 次
                 # 是这种重复（占整次导出 ~70% 的墙钟时间）。
                 # 「覆盖现有资源」的语义不受影响：本轮第一次该覆盖的仍然覆盖了。
-                if forced_filename == converted_name and os.path.exists(converted_path):
-                    return converted_name
-                ok, reason = convert_texture_to_dds(source_path, converted_path)
+                ok, reason = convert_texture_to_dds(
+                    source_path,
+                    converted_path,
+                    texture_type=texture_type,
+                    name_hints=name_hints,
+                )
                 if ok:
                     return converted_name
                 # 转换失败不中断导出：退回原样复制。文件名也必须用回源扩展名 ——
@@ -1436,6 +1501,9 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
                                 swap_key_prefix, next_swap_key_num, used_swap_keys,
                                 resource_name_provider=None):
         generated_lines = []
+        # 细分进度：本批次要处理 len(matching_materials) 张贴图（下面每张都会进
+        # ``create_resource_entry`` 上报一次），先累加进显示用的 total。
+        self._plan_texture_progress(len(matching_materials or []))
         # 发光亮度写在当前逻辑对应的 FX 命名空间变量上：
         # RabbitFX/NTEMIFX 是大写 $…\brightness 同名字段，HI3FX 同样叫 brightness
         # （但它是 IniParams row230.w，语义一致）。
@@ -1500,6 +1568,9 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
 
     def create_resource_entry(self, material, param_name, texture_folder, all_sections, resource_name_override=None):
         global _material_resource_cache
+
+        # 细分进度：每张材质贴图开始复制/转 DDS 前先刷新状态栏文本。
+        self._report_texture_progress()
 
         texture_image = self.get_texture_from_material(material)
         if not texture_image: return None
@@ -2666,6 +2737,9 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
             return
 
         _LOG.info("🔧 材质转资源节点开始执行")
+
+        # 每次导出重新计贴图进度（多个材质转资源节点各自从 1 开始，文本自带节点前缀）
+        self._reset_texture_progress()
 
         total_found = 0
         total_matched = 0

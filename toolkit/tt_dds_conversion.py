@@ -1,7 +1,9 @@
+import hashlib
 import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import tempfile
 
@@ -28,7 +30,7 @@ DDS_DEFAULT_RULES = [
     {
         "texture_type": "MaterialMap",
         "pattern": r"(?i)(?:^|[_\-. ])MaterialMap(?:[_\-. ]|$)",
-        "format": "bc7_unorm",
+        "format": "bc7_unorm_srgb",
     },
     {
         "texture_type": "RampMap",
@@ -73,6 +75,43 @@ DDS_DEFAULT_RULES = [
 ]
 
 _SUPPORTED_SOURCE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tga", ".bmp", ".tif", ".tiff"}
+
+# 目标格式名 -> DX10 头里偏移 128 的 DXGI 格式号（大小写不敏感比较）
+_DDS_DXGI_FORMAT_IDS = {
+    "bc7_unorm": 98,
+    "bc7_unorm_srgb": 99,
+    "bc6h_uf16": 95,
+    "bc6h_sf16": 96,
+    "bc1_unorm": 71,
+    "bc1_unorm_srgb": 72,
+    "bc2_unorm": 74,
+    "bc2_unorm_srgb": 75,
+    "bc3_unorm": 77,
+    "bc3_unorm_srgb": 78,
+    "bc4_unorm": 80,
+    "bc5_unorm": 83,
+    "r8g8b8a8_unorm": 28,
+    "r8g8b8a8_unorm_srgb": 29,
+    "b8g8r8a8_unorm": 87,
+    "b8g8r8a8_unorm_srgb": 91,
+}
+
+# legacy 头（FOURCC 在偏移 84）-> 等价的非 sRGB 格式名。
+# legacy FOURCC 没有 sRGB 变体，所以它们永远匹配不上任何 _srgb 目标。
+_DDS_LEGACY_FOURCC_FORMATS = {
+    b"DXT1": "bc1_unorm",
+    b"DXT2": "bc2_unorm",
+    b"DXT3": "bc2_unorm",
+    b"DXT4": "bc3_unorm",
+    b"DXT5": "bc3_unorm",
+    b"ATI1": "bc4_unorm",
+    b"BC4U": "bc4_unorm",
+    b"ATI2": "bc5_unorm",
+    b"BC5U": "bc5_unorm",
+}
+
+# DDS magic(4) + DDS_HEADER(124) + DX10 扩展头(20)
+_DDS_FULL_HEADER_SIZE = 148
 
 
 def find_texconv():
@@ -214,7 +253,28 @@ def _restore_image_display_state(image, snapshot, dds_format: str) -> None:
             pass
 
 
-def resolve_dds_target(filename: str, props) -> tuple[str, str, str]:
+_TEXTURE_TYPE_SPLIT_RE = re.compile(r"[_.\-\s]+")
+
+
+def _first_texture_type_token(texture_type: str) -> str:
+    """取类型名的首个 token（按 ``_`` ``.`` ``-`` 空格切分），无有效 token 返回空串。"""
+    for token in _TEXTURE_TYPE_SPLIT_RE.split(str(texture_type or "").strip()):
+        if token:
+            return token
+    return ""
+
+
+def format_for_texture_type(texture_type: str, props) -> str:
+    """把材质类型 / 材质名前缀解析成 DDS 格式；未命中返回空串由调用方回退。
+
+    输入可以是 ``DiffuseMap``、``MaterialMap``、``diffusemap_xxx``、
+    ``DiffuseMap_VivianGemADiffuse`` 等：取首个 token 判定，大小写不敏感。
+    解析顺序：自定义规则（pattern 命中完整类型名）→ 默认规则的 ``texture_type``。
+    """
+    raw = str(texture_type or "").strip()
+    if not raw:
+        return ""
+
     if getattr(props, "dds_use_custom_rules", False):
         for rule in getattr(props, "dds_rules", []) or []:
             if not getattr(rule, "enabled", True):
@@ -223,7 +283,41 @@ def resolve_dds_target(filename: str, props) -> tuple[str, str, str]:
             if not pattern:
                 continue
             try:
-                if _pattern_matches(pattern, filename):
+                if _pattern_matches(pattern, raw):
+                    rule_format = str(getattr(rule, "format", "") or "").strip()
+                    if rule_format:
+                        return rule_format
+            except re.error:
+                continue
+
+    key = _first_texture_type_token(raw).lower()
+    if not key:
+        return ""
+    for rule in DDS_DEFAULT_RULES:
+        if str(rule.get("texture_type", "") or "").strip().lower() == key:
+            return str(rule.get("format", "") or "")
+    return ""
+
+
+def _resolve_single_name(name: str, props):
+    """按单个候选名匹配规则；未命中返回 None。
+
+    自定义规则优先、默认规则取最早 match 位置 —— 与原 ``resolve_dds_target``
+    的匹配语义完全一致，只是抽出来供「源文件名 / hints」逐个重试。
+    """
+    candidate = str(name or "").strip()
+    if not candidate:
+        return None
+
+    if getattr(props, "dds_use_custom_rules", False):
+        for rule in getattr(props, "dds_rules", []) or []:
+            if not getattr(rule, "enabled", True):
+                continue
+            pattern = str(getattr(rule, "pattern", "") or "").strip()
+            if not pattern:
+                continue
+            try:
+                if _pattern_matches(pattern, candidate):
                     rule_format = str(getattr(rule, "format", "") or "").strip()
                     # 自定义规则完全由用户说了算：pattern 只负责识别名称，
                     # format 决定输出格式，不再从文件名推断类型做色彩空间干预
@@ -231,7 +325,7 @@ def resolve_dds_target(filename: str, props) -> tuple[str, str, str]:
             except re.error:
                 continue
 
-    targets = _get_match_targets(filename)
+    targets = _get_match_targets(candidate)
     best_rule = None
     best_start = float("inf")
     for rule in DDS_DEFAULT_RULES:
@@ -249,17 +343,350 @@ def resolve_dds_target(filename: str, props) -> tuple[str, str, str]:
 
     if best_rule is not None:
         return best_rule["texture_type"], best_rule["format"], best_rule["texture_type"]
+    return None
+
+
+def resolve_dds_target(filename: str, props, name_hints=()) -> tuple[str, str, str]:
+    """按「源文件名 → name_hints」的顺序推断 DDS 目标格式。
+
+    源文件名匹配保持原有语义；源文件名**一个规则都没命中**时，才依次用
+    ``name_hints``（材质名 / 贴图槽类型标签 / 输出文件名 stem 等）重试，
+    第一个命中的候选名直接返回。全不命中仍回退 ``default/bc7_unorm``。
+
+    为什么要 hints：Mod 导出时输出名已被改成材质资源名，编辑期的源 PNG 可能
+    只含 ``Diffuse`` 而不含 ``DiffuseMap``（实测 ``VivianGemADiffuse.png``），
+    只按源文件名匹配就会落到线性默认规则。
+    """
+    hit = _resolve_single_name(filename, props)
+    if hit is not None:
+        return hit
+
+    for hint in name_hints or ():
+        hit = _resolve_single_name(hint, props)
+        if hit is not None:
+            return hit
 
     return "default", "bc7_unorm", "Default"
 
 
-def convert_texture_to_dds(source_path: str, target_path: str, props=None) -> tuple[bool, str]:
+def resolve_texture_dds_format(
+    source_path: str,
+    props,
+    texture_type: str = "",
+    name_hints=(),
+    format_override: str = "",
+) -> str:
+    """单文件转换的最终输出格式。
+
+    优先级：``format_override``（非空）→ ``format_for_texture_type(texture_type)``
+    → ``resolve_dds_target(源文件名, name_hints)`` 的最后兜底。导出侧有材质类型
+    信息时必须传 ``texture_type``，不能再让源文件名决定格式（实测
+    ``VivianGemADiffuse.png`` 不含 ``DiffuseMap`` 关键字会落到线性默认规则）。
+    """
+    override = str(format_override or "").strip()
+    if override:
+        return override
+
+    if props is None:
+        try:
+            props = bpy.context.scene.texture_tools_props
+        except Exception:
+            props = None
+
+    type_format = format_for_texture_type(texture_type, props)
+    if type_format:
+        return type_format
+
+    dds_format = resolve_dds_target(
+        os.path.basename(str(source_path or "")), props, name_hints=name_hints
+    )[1]
+    return str(dds_format or "bc7_unorm")
+
+
+def _read_dds_header(path: str):
+    """读 DDS 文件前 148 字节；不存在 / 不是 DDS / 头太短都返回 None。"""
+    try:
+        with open(path, "rb") as handle:
+            header = handle.read(_DDS_FULL_HEADER_SIZE)
+    except OSError:
+        return None
+    if len(header) < 128 or header[:4] != b"DDS ":
+        return None
+    return header
+
+
+def dds_header_dxgi_format(path: str):
+    """DX10 头返回偏移 128 的 DXGI 格式号；legacy FOURCC 头返回 None。"""
+    header = _read_dds_header(path)
+    if header is None or len(header) < _DDS_FULL_HEADER_SIZE:
+        return None
+    if header[84:88] != b"DX10":
+        return None
+    return struct.unpack_from("<I", header, 128)[0]
+
+
+def existing_dds_matches_format(path: str, dds_format: str) -> bool:
+    """判断磁盘上已有的 DDS 是否已经是 ``dds_format`` 指定的格式。
+
+    只读 148 字节文件头，不 import ``common/dds_pixel.py``（那个模块面向完整
+    data 解码、且有循环 import 风险）。
+
+    「存在即跳过」会让规则变更（例如 MaterialMap 从 ``bc7_unorm`` 改成
+    ``bc7_unorm_srgb``）对旧文件失效，所以复用前必须先验头。任何不确定的
+    情况（文件不存在 / 头读不到 / 格式未知）都返回 False —— 重转是安全默认。
+    """
+    expected = str(dds_format or "").strip().lower()
+    if not expected or not os.path.isfile(path):
+        return False
+
+    header = _read_dds_header(path)
+    if header is None:
+        return False
+
+    fourcc = bytes(header[84:88])
+    if fourcc == b"DX10":
+        if len(header) < _DDS_FULL_HEADER_SIZE:
+            return False
+        actual = struct.unpack_from("<I", header, 128)[0]
+        return _DDS_DXGI_FORMAT_IDS.get(expected) == actual
+
+    # legacy FOURCC 头没有 sRGB 变体：任何 _srgb 目标都判不一致。
+    if expected.endswith("_srgb"):
+        return False
+    legacy_format = _DDS_LEGACY_FOURCC_FORMATS.get(fourcc)
+    return legacy_format is not None and legacy_format == expected
+
+
+# ---------------------------------------------------------------------------
+# DDS 转换结果缓存
+# ---------------------------------------------------------------------------
+# 为什么缓存：一次 Mod 导出要给二十多张贴图各跑一次 texconv（4K BC7 编码累计 ~13s），
+# 而同一张源图在两次导出之间通常没有任何变化。缓存键只用「源路径 + size + mtime_ns +
+# 目标格式 + 色彩空间标志 + texconv 标识」，**刻意不读源文件内容**（源图常 20MB 以上，
+# 每次全量哈希反而会把省下来的时间吃回去），源图一改 size/mtime 就自动失效。
+# 缓存放在用户本地（%LOCALAPPDATA%），不写插件目录、不写用户工程目录。
+
+_DDS_CACHE_SCHEMA = "v1"
+_DDS_CACHE_ENV = "HERTA_DDS_CACHE"
+_DDS_CACHE_MAX_BYTES = 2 * 1024 * 1024 * 1024
+_DDS_CACHE_TRIM_RATIO = 0.8
+_DDS_CACHE_SUFFIX = ".dds"
+_DDS_CACHE_OFF_VALUES = frozenset({"0", "false", "no", "off"})
+_DDS_CACHE_KEY_LEN = 32
+
+
+def dds_cache_enabled() -> bool:
+    """``HERTA_DDS_CACHE=0``（false/no/off 同义）关闭缓存，默认开启。"""
+    value = str(os.environ.get(_DDS_CACHE_ENV, "") or "").strip().lower()
+    return value not in _DDS_CACHE_OFF_VALUES
+
+
+def dds_cache_dir() -> str:
+    """缓存目录：Windows 用 ``%LOCALAPPDATA%\\TheHerta4\\dds_cache``，其它平台 ``~/.cache``。
+
+    只算路径、**不建目录** —— 「查缓存」不该为了算路径就在磁盘上留痕，目录由写入侧
+    ``os.makedirs(exist_ok=True)`` 创建。
+    """
+    if os.name == "nt":
+        local_appdata = str(os.environ.get("LOCALAPPDATA", "") or "").strip()
+        if not local_appdata:
+            local_appdata = os.path.join(os.path.expanduser("~"), "AppData", "Local")
+        return os.path.join(local_appdata, "TheHerta4", "dds_cache")
+    return os.path.join(os.path.expanduser("~"), ".cache", "TheHerta4", "dds_cache")
+
+
+def _dds_texconv_identity(texconv_executable) -> str:
+    """把 texconv 的「路径 + size + mtime」并进键：换版本后旧缓存自动失效。"""
+    path = str(texconv_executable or "")
+    if not path:
+        return ""
+    try:
+        stat = os.stat(path)
+    except OSError:
+        # 相对路径（测试桩）原样入键，不做 abspath —— 否则会随 cwd 漂移。
+        return path if not os.path.isabs(path) else os.path.normcase(path)
+    return f"{os.path.normcase(os.path.abspath(path))}|{stat.st_size}|{stat.st_mtime_ns}"
+
+
+def dds_cache_key(
+    source_path: str,
+    dds_format: str,
+    colorspace_flags=(),
+    texconv_executable: str = "",
+    source_stat=None,
+) -> str:
+    """算缓存键（sha256 前 32 位）。源文件 stat 由调用方传入可避免重复 stat。"""
+    source_abs = os.path.normcase(os.path.abspath(str(source_path or "")))
+    stat = source_stat if source_stat is not None else os.stat(source_abs)
+    payload = "\n".join(
+        (
+            _DDS_CACHE_SCHEMA,
+            source_abs,
+            str(stat.st_size),
+            str(stat.st_mtime_ns),
+            str(dds_format or "").strip().lower(),
+            ",".join(str(flag) for flag in (colorspace_flags or ())),
+            _dds_texconv_identity(texconv_executable),
+        )
+    )
+    return hashlib.sha256(payload.encode("utf-8", "surrogatepass")).hexdigest()[:_DDS_CACHE_KEY_LEN]
+
+
+def _dds_cache_entry_is_usable(path: str, dds_format: str) -> bool:
+    """缓存条目是否可用：必须是**完整且格式对得上**的 DDS。
+
+    texconv 的输出必然是带完整头的 DDS（≥148 字节）。文件缺失 / 被截断 / magic 不对 /
+    DXGI 格式号与目标不符都当「损坏」，回退重新转换（不在这里删文件，避免和并发导出抢写；
+    下次写入会用 ``os.replace`` 原子覆盖）。未知格式名只校验 DDS 头，不阻断缓存。
+    """
+    try:
+        if os.path.getsize(path) < _DDS_FULL_HEADER_SIZE:
+            return False
+    except OSError:
+        return False
+    if str(dds_format or "").strip().lower() in _DDS_DXGI_FORMAT_IDS:
+        return existing_dds_matches_format(path, dds_format)
+    return _read_dds_header(path) is not None
+
+
+def resolve_dds_cache_entry(
+    source_path: str,
+    dds_format: str,
+    colorspace_flags=(),
+    texconv_executable: str = "",
+    source_stat=None,
+):
+    """查缓存，命中返回缓存文件绝对路径；关闭 / 未命中 / 损坏 / 源文件不可读都返回 None。"""
+    if not dds_cache_enabled():
+        return None
+    try:
+        key = dds_cache_key(
+            source_path,
+            dds_format,
+            colorspace_flags=colorspace_flags,
+            texconv_executable=texconv_executable,
+            source_stat=source_stat,
+        )
+    except OSError:
+        return None
+    entry = os.path.join(dds_cache_dir(), key + _DDS_CACHE_SUFFIX)
+    if not _dds_cache_entry_is_usable(entry, dds_format):
+        return None
+    return entry
+
+
+def store_dds_cache(
+    source_path: str,
+    dds_format: str,
+    colorspace_flags=(),
+    texconv_executable: str = "",
+    produced_path: str = "",
+    source_stat=None,
+):
+    """把一次成功的转换产物写进缓存，返回缓存路径；关闭 / 产物不合格 / 写失败返回 None。
+
+    写失败只打印、不抛：缓存是纯加速层，任何异常都不得影响导出产物。
+    """
+    if not dds_cache_enabled():
+        return None
+    # 只缓存「看起来是完整 DDS」的产物：短文件 / 头不对说明转换异常，缓存它只会把坏
+    # 产物传播到下一轮；顺带也让单元测试的假产物不落进用户的真实缓存目录。
+    if not _dds_cache_entry_is_usable(produced_path, dds_format):
+        return None
+    try:
+        key = dds_cache_key(
+            source_path,
+            dds_format,
+            colorspace_flags=colorspace_flags,
+            texconv_executable=texconv_executable,
+            source_stat=source_stat,
+        )
+        cache_dir = dds_cache_dir()
+        os.makedirs(cache_dir, exist_ok=True)
+        entry = os.path.join(cache_dir, key + _DDS_CACHE_SUFFIX)
+        # 先写临时文件再 os.replace：并发导出最多重复一次转换，不会读到半截缓存。
+        staging = entry + f".{os.getpid()}.tmp"
+        shutil.copy2(produced_path, staging)
+        os.replace(staging, entry)
+    except Exception as exc:
+        print(f"[DDS缓存] 写入失败（忽略，不影响导出）: {exc}")
+        return None
+    trim_dds_cache(cache_dir, keep_path=entry)
+    return entry
+
+
+def trim_dds_cache(cache_dir: str = "", max_bytes=None, keep_path: str = "") -> None:
+    """缓存超上限时按文件 mtime 从旧到新删除，直到总量低于上限的 80%。
+
+    留 20% 缓冲是有意的：每次写入都贴着上限删一个文件既频繁又难读日志。
+    ``keep_path``（刚写入的那一个）不参与删除；若只剩它也仍然超限，就停手并保留它。
+    """
+    directory = cache_dir or dds_cache_dir()
+    limit = int(_DDS_CACHE_MAX_BYTES if max_bytes is None else max_bytes)
+    if limit <= 0:
+        return
+    entries = []
+    total = 0
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return
+    for name in names:
+        if not name.endswith(_DDS_CACHE_SUFFIX):
+            continue
+        path = os.path.join(directory, name)
+        try:
+            stat = os.stat(path)
+        except OSError:
+            continue
+        entries.append((stat.st_mtime_ns, stat.st_size, path))
+        total += stat.st_size
+    if total <= limit:
+        return
+
+    target_total = int(limit * _DDS_CACHE_TRIM_RATIO)
+    keep_normcase = os.path.normcase(keep_path) if keep_path else ""
+    removed = 0
+    freed = 0
+    for _mtime, size, path in sorted(entries):
+        if total <= target_total:
+            break
+        if keep_normcase and os.path.normcase(path) == keep_normcase:
+            continue
+        try:
+            os.remove(path)
+        except OSError:
+            continue
+        total -= size
+        removed += 1
+        freed += size
+    if removed:
+        print(
+            f"[DDS缓存] 超出上限 {limit // (1024 * 1024)}MB，清理 {removed} 个旧缓存"
+            f"（释放 {freed // (1024 * 1024)}MB，剩余 {total // (1024 * 1024)}MB）"
+        )
+
+
+def convert_texture_to_dds(
+    source_path: str,
+    target_path: str,
+    props=None,
+    texture_type: str = "",
+    name_hints=(),
+    format_override: str = "",
+) -> tuple[bool, str]:
     """把单张贴图转成 DDS 写到 ``target_path``，供 Mod 导出流程复用。
 
-    口径与「批量转换为 .dds」算子完全一致：输出格式由现有规则表
-    （:func:`resolve_dds_target`）从**源文件名**推断，色彩空间标志由
-    :func:`_texconv_colorspace_flags` 按该格式选择 —— 这正是为「PNG 这类不带色彩空间
-    信息的输入」设计的（sRGB 输出用 ``--srgb-in`` 达成恒等，线性输出用 ``--ignore-srgb``）。
+    输出格式由 :func:`resolve_texture_dds_format` 决定：显式 ``format_override``
+    优先，否则按「源文件名 → name_hints」推断；色彩空间标志由
+    :func:`_texconv_colorspace_flags` 按该格式选择 —— 这正是为「PNG 这类不带
+    色彩空间信息的输入」设计的（sRGB 输出用 ``--srgb-in`` 达成恒等，线性输出
+    用 ``--ignore-srgb``）。
+
+    结果按「源路径 + size + mtime + 目标格式 + 色彩空间标志 + texconv 标识」缓存
+    （见 :func:`resolve_dds_cache_entry` / :func:`store_dds_cache`）：同一张源图第二次
+    导出直接 ``copy2`` 缓存产物，不再启动 texconv；``HERTA_DDS_CACHE=0`` 可整体关闭。
+    缓存只是加速层 —— 未命中、损坏、写失败一律回落到原来的转换流程。
 
     **不改动源文件**，返回 ``(True, "")`` 或 ``(False, 失败原因)``。
     """
@@ -270,10 +697,43 @@ def convert_texture_to_dds(source_path: str, target_path: str, props=None) -> tu
     if props is None:
         props = bpy.context.scene.texture_tools_props
 
-    dds_format = resolve_dds_target(os.path.basename(source_path), props)[1] or "bc7_unorm"
+    dds_format = resolve_texture_dds_format(
+        source_path,
+        props,
+        texture_type=texture_type,
+        name_hints=name_hints,
+        format_override=format_override,
+    )
+
+    # 源文件 stat 只取一次：键和写入都用它，避免 22MB 源图被反复 stat。
+    try:
+        source_stat = os.stat(source_path)
+    except OSError:
+        source_stat = None
+
+    colorspace_flags = _texconv_colorspace_flags(dds_format)
+    cached = resolve_dds_cache_entry(
+        source_path,
+        dds_format,
+        colorspace_flags=colorspace_flags,
+        texconv_executable=texconv_executable,
+        source_stat=source_stat,
+    )
+    if cached:
+        try:
+            target_dir = os.path.dirname(target_path)
+            if target_dir:
+                os.makedirs(target_dir, exist_ok=True)
+            shutil.copy2(cached, target_path)
+        except Exception as exc:
+            # 缓存命中但复制失败（磁盘满 / 目标被占用）：回退重新转换，别让导出中断。
+            print(f"[DDS缓存] 命中但复制失败，回退重新转换: {exc}")
+        else:
+            print(f"[DDS缓存] 命中 {os.path.basename(str(target_path))}")
+            return True, ""
 
     command = [texconv_executable, "-f", dds_format]
-    command.extend(_texconv_colorspace_flags(dds_format))
+    command.extend(colorspace_flags)
 
     # 先转到临时目录再搬过去：texconv 的输出名固定是「源文件名词干 + .dds」，而导出侧
     # 要的目标名通常取材质资源名，两者不同；直接 -o 目标目录会写出一个多余的错误文件名。
@@ -307,6 +767,17 @@ def convert_texture_to_dds(source_path: str, target_path: str, props=None) -> tu
             shutil.move(produced, target_path)
         except Exception as exc:
             return False, f"写出目标文件失败: {exc}"
+
+    # 转换成功后把「刚刚写出的这一份」复制进缓存：缓存内容就是首次转换的字节，
+    # 之后命中时原样 copy2 出去（texconv 确定性，与重新转换结果一致）。
+    store_dds_cache(
+        source_path,
+        dds_format,
+        colorspace_flags=colorspace_flags,
+        texconv_executable=texconv_executable,
+        produced_path=target_path,
+        source_stat=source_stat,
+    )
 
     return True, ""
 
@@ -522,6 +993,7 @@ class TT_OT_test_dds_rule(bpy.types.Operator):
             "FXMap_Body.dds",
             "RoughnessMap_Body.png",
             "UnknownMask.png",
+            "VivianGemADiffuse.png",
         ]
 
         result_lines = ["DDS规则测试结果:"]
