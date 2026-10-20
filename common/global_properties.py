@@ -147,7 +147,7 @@ class GlobalProterties(bpy.types.PropertyGroup):
     ) # type: ignore
 
     background_export_enabled: bpy.props.BoolProperty(
-        name="后台导出（不阻塞界面）",
+        name="后台导出",
         description=(
             "默认开启：生成 Mod 会先保存一份工程副本，再交给独立的干净 Blender 后台实例"
             "执行完整导出（各轮次 + 后处理），主界面不阻塞，状态栏显示进度，按 ESC 可取消；"

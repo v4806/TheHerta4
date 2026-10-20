@@ -1413,7 +1413,7 @@ class BackgroundToggleTests(_BackgroundTestBase):
             "background_export_enabled"
         ]
         self.assertIs(declaration["default"], True)
-        self.assertEqual(declaration["name"], "后台导出（不阻塞界面）")
+        self.assertEqual(declaration["name"], "后台导出")
 
         # 读取入口按场景属性返回真假
         self.scene_properties.background_export_enabled = False
