@@ -122,7 +122,12 @@ def _fake_property(**kwargs):
 
 
 _FAKE_BPY = types.ModuleType("bpy")
-_FAKE_BPY.types = types.SimpleNamespace(Operator=_FakeOperatorBase, PropertyGroup=object)
+_FAKE_BPY.types = types.SimpleNamespace(
+    Operator=_FakeOperatorBase,
+    PropertyGroup=object,
+    # 真实 direct_export.py 的函数返回注解会求值 bpy.types.Node
+    Node=object,
+)
 _FAKE_BPY.props = types.SimpleNamespace(
     StringProperty=_fake_property,
     EnumProperty=_fake_property,
@@ -425,6 +430,43 @@ export_background = _load_real_module(
 # 真实模块：导出算子（它会 import 上面两个真实模块）
 ui_func_export = _load_real_module(
     f"{PKG}.ui.ui_func_export", Path("ui") / "ui_func_export.py"
+)
+
+# 真实模块：直出导出（只测阶段节点上报辅助函数）。
+# direct_export.py 会 import 各游戏导出器与直出子模块，这里按需补最小桩。
+for _package_name in (f"{PKG}.ui.universal", f"{PKG}.ui.wwmi"):
+    _package = _install_module(_package_name)
+    _package.__path__ = []
+for _module_name, _class_name in (
+    ("efmi", "ExportEFMI"),
+    ("gimi", "ExportGIMI"),
+    ("himi", "ExportHIMI"),
+    ("identityv", "ExportIdentityV"),
+    ("snowbreak", "ExportSnowBreak"),
+    ("srmi", "ExportSRMI"),
+    ("unity", "ExportUnity"),
+    ("yysls", "ExportYYSLS"),
+    ("zzmi", "ExportZZMI"),
+):
+    _install_module(
+        f"{PKG}.ui.universal.{_module_name}",
+        **{_class_name: type(_class_name, (), {})},
+    )
+_install_module(
+    f"{PKG}.ui.wwmi.wwmi_export",
+    ExportWWMI=type("ExportWWMI", (), {}),
+)
+_install_module(
+    f"{PKG}.blueprint.direct_export_multifile",
+    DirectMultiFileGenerator=type("DirectMultiFileGenerator", (), {}),
+)
+_install_module(
+    f"{PKG}.blueprint.direct_export_shapekey",
+    DirectShapeKeyGenerator=type("DirectShapeKeyGenerator", (), {}),
+)
+direct_export_module = _load_real_module(
+    f"{PKG}.blueprint.direct_export_node_progress",
+    Path("blueprint") / "direct_export.py",
 )
 
 
@@ -1377,6 +1419,17 @@ class OperatorInvokeTests(_BackgroundTestBase):
     def _make_mesh(self, name, pointer=1):
         return types.SimpleNamespace(type="MESH", name=name, as_pointer=lambda: pointer)
 
+    def _start_background_operator(self):
+        """起一个真正走到 modal 的后台导出操作符（Generate 入口）。"""
+        self.scene_properties.background_export_enabled = True
+        context = self._make_context()
+        operator = self._make_operator(context)
+        operator.execute = lambda _context: (_ for _ in ()).throw(
+            AssertionError("后台导出不应走同步 execute")
+        )
+        self.assertEqual(operator.invoke(context, None), {'RUNNING_MODAL'})
+        return context, operator
+
     def test_invoke_with_toggle_off_runs_original_execute(self):
         self.scene_properties.background_export_enabled = False
         operator = self._make_operator(None)
@@ -1418,6 +1471,7 @@ class OperatorInvokeTests(_BackgroundTestBase):
         self.assertEqual(len(_RecordingSession.instances), 1)
         session = _RecordingSession.instances[0]
         self.assertTrue(session.started)
+        self.assertFalse(operator._bg_view_nav)
         self.assertTrue(session.kwargs["quick_export"])
         self.assertEqual(session.kwargs["object_names"], ["M1"])
         # 快速导出步骤口径：轮次 1 + 后处理节点 0 + 收尾 1
@@ -1425,6 +1479,32 @@ class OperatorInvokeTests(_BackgroundTestBase):
         self.assertEqual(session.kwargs["round_plans"][0]["buffer_folder_name"], "Meshes")
         self.assertEqual(_FAKE_WINDOW_MANAGER.timers[0]["interval"], 0.2)
         self.assertEqual(_FAKE_WINDOW_MANAGER.modal_handlers, [operator])
+
+    def test_quick_modal_uses_same_navigation_dispatch(self):
+        """快速局部导出与 Generate 共用同一套事件分派：普通移动吞掉、中键拖动放行。"""
+        self.scene_properties.background_export_enabled = True
+        context = self._make_context([self._make_mesh("M1")])
+        operator = self._make_quick_operator()
+        operator.execute = lambda _context: (_ for _ in ()).throw(
+            AssertionError("后台导出不应走同步 execute")
+        )
+
+        self.assertEqual(operator.invoke(context, None), {'RUNNING_MODAL'})
+        self.assertFalse(operator._bg_view_nav)
+        self.assertEqual(
+            operator.modal(context, types.SimpleNamespace(type='MOUSEMOVE', value='NOTHING')),
+            {'RUNNING_MODAL'},
+        )
+        self.assertEqual(
+            operator.modal(context, types.SimpleNamespace(type='MIDDLEMOUSE', value='PRESS')),
+            {'PASS_THROUGH'},
+        )
+        self.assertTrue(operator._bg_view_nav)
+        self.assertEqual(
+            operator.modal(context, types.SimpleNamespace(type='MIDDLEMOUSE', value='RELEASE')),
+            {'PASS_THROUGH'},
+        )
+        self.assertFalse(operator._bg_view_nav)
 
     def test_invoke_is_blocked_while_background_session_active(self):
         """防重入：已有活动会话时两个导出入口都返回 CANCELLED，且不新建会话。"""
@@ -1473,6 +1553,7 @@ class OperatorInvokeTests(_BackgroundTestBase):
         self.assertEqual(len(_RecordingSession.instances), 1)
         session = _RecordingSession.instances[0]
         self.assertTrue(session.started)
+        self.assertFalse(operator._bg_view_nav)
         self.assertEqual(session.kwargs["tree_name"], "测试蓝图")
         self.assertEqual(session.kwargs["output_dir"], _FakeGlobalConfig.output_dir)
         self.assertEqual(session.kwargs["round_plans"][0]["buffer_folder_name"], "Meshes")
@@ -1528,34 +1609,124 @@ class OperatorInvokeTests(_BackgroundTestBase):
             any(level & {'WARNING', 'ERROR'} for level, _message in operator.reports)
         )
 
-    def test_modal_passes_through_non_timer_events(self):
-        """导出期间界面仍可操作：鼠标 / 键盘等非 TIMER 事件放行，不吞掉平移缩放。"""
-        self.scene_properties.background_export_enabled = True
-        context = self._make_context()
-        operator = self._make_operator(context)
-        operator.invoke(context, None)
+    def test_modal_mouse_move_without_middle_button_is_swallowed(self):
+        """未按中键时 MOUSEMOVE 被吞掉：放行会让 UI 层重设光标（进度光标被覆盖的根因）。"""
+        context, operator = self._start_background_operator()
         session = _RecordingSession.instances[0]
         polls = []
         session.poll = lambda: polls.append(1) or "running"
-        _FAKE_AREAS[0].header = "<unset>"
+        header_after_start = _FAKE_AREAS[0].header
 
-        for event_type in ('MIDDLEMOUSE', 'WHEELUPMOUSE', 'MOUSEMOVE', 'LEFTMOUSE', 'RET'):
+        for event_type in ('MOUSEMOVE', 'INBETWEEN_MOUSEMOVE'):
             with self.subTest(event_type=event_type):
                 self.assertEqual(
-                    operator.modal(context, types.SimpleNamespace(type=event_type)),
-                    {'PASS_THROUGH'},
+                    operator.modal(
+                        context, types.SimpleNamespace(type=event_type, value='NOTHING')
+                    ),
+                    {'RUNNING_MODAL'},
                 )
 
         # 非 TIMER 事件不轮询 stage.json、也不写状态栏（进度仍按 0.2s TIMER 刷新）
         self.assertEqual(polls, [])
-        self.assertEqual(_FAKE_AREAS[0].header, "<unset>")
+        self.assertEqual(_FAKE_AREAS[0].header, header_after_start)
 
-        # ESC 不走 PASS_THROUGH，仍是取消收尾
+    def test_modal_other_events_are_swallowed(self):
+        """键盘 / 左右键等非导航事件一律 RUNNING_MODAL，免得界面重设光标。"""
+        context, operator = self._start_background_operator()
+
+        for event_type in ('LEFTMOUSE', 'RIGHTMOUSE', 'RET', 'A', 'SPACE'):
+            with self.subTest(event_type=event_type):
+                self.assertEqual(
+                    operator.modal(
+                        context, types.SimpleNamespace(type=event_type, value='PRESS')
+                    ),
+                    {'RUNNING_MODAL'},
+                )
+
+    def test_modal_middle_mouse_drag_passes_through_and_tracks_state(self):
+        """中键按下 → 拖动中的移动放行 → 松开清状态；松开后移动重新被吞掉。"""
+        context, operator = self._start_background_operator()
+        self.assertFalse(operator._bg_view_nav)
+
+        self.assertEqual(
+            operator.modal(context, types.SimpleNamespace(type='MIDDLEMOUSE', value='PRESS')),
+            {'PASS_THROUGH'},
+        )
+        self.assertTrue(operator._bg_view_nav)
+
+        for event_type in ('MOUSEMOVE', 'INBETWEEN_MOUSEMOVE'):
+            with self.subTest(event_type=event_type):
+                self.assertEqual(
+                    operator.modal(
+                        context, types.SimpleNamespace(type=event_type, value='NOTHING')
+                    ),
+                    {'PASS_THROUGH'},
+                )
+
+        self.assertEqual(
+            operator.modal(context, types.SimpleNamespace(type='MIDDLEMOUSE', value='RELEASE')),
+            {'PASS_THROUGH'},
+        )
+        self.assertFalse(operator._bg_view_nav)
+
+        self.assertEqual(
+            operator.modal(context, types.SimpleNamespace(type='MOUSEMOVE', value='NOTHING')),
+            {'RUNNING_MODAL'},
+        )
+
+    def test_modal_wheel_and_trackpad_events_pass_through(self):
+        """滚轮 / 触控板 / 旋转事件直接放行，且不改变拖动状态。"""
+        context, operator = self._start_background_operator()
+
+        for event_type in (
+            'WHEELUPMOUSE',
+            'WHEELDOWNMOUSE',
+            'TRACKPADPAN',
+            'TRACKPADZOOM',
+            'MOUSEROTATE',
+            'MOUSEPAN',
+        ):
+            with self.subTest(event_type=event_type):
+                self.assertEqual(
+                    operator.modal(
+                        context, types.SimpleNamespace(type=event_type, value='PRESS')
+                    ),
+                    {'PASS_THROUGH'},
+                )
+
+        self.assertFalse(operator._bg_view_nav)
+
+    def test_modal_timer_still_polls_after_navigation_events(self):
+        """导航事件放行后，TIMER 仍走轮询刷新状态栏并返回 RUNNING_MODAL。"""
+        context, operator = self._start_background_operator()
+        session = _RecordingSession.instances[0]
+        session.total_steps = 2
+        polls = []
+        original_poll = session.poll
+        session.poll = lambda: polls.append(1) or original_poll()
+
+        operator.modal(context, types.SimpleNamespace(type='WHEELUPMOUSE', value='PRESS'))
+        operator.modal(context, types.SimpleNamespace(type='MOUSEMOVE', value='NOTHING'))
+
+        result = operator.modal(context, types.SimpleNamespace(type='TIMER'))
+
+        self.assertEqual(result, {'RUNNING_MODAL'})
+        self.assertEqual(polls, [1])
+        self.assertIn("后台导出：准备 0/2", _FAKE_AREAS[0].header)
+
+    def test_modal_escape_clears_view_nav_state(self):
+        """收尾（含 ESC 取消）要清掉中键拖动状态，避免下一轮误放行移动事件。"""
+        context, operator = self._start_background_operator()
+        operator.modal(context, types.SimpleNamespace(type='MIDDLEMOUSE', value='PRESS'))
+        self.assertTrue(operator._bg_view_nav)
+
         self.assertEqual(
             operator.modal(context, types.SimpleNamespace(type='ESC')), {'CANCELLED'}
         )
-        self.assertTrue(session.cancelled)
-        self.assertTrue(session.cleaned)
+
+        self.assertFalse(operator._bg_view_nav)
+        self.assertTrue(_RecordingSession.instances[0].cancelled)
+        self.assertTrue(_RecordingSession.instances[0].cleaned)
         self.assertEqual(_FAKE_AREAS[0].header, "后台导出已取消")
 
     def test_finish_restores_node_colors_for_all_outcomes(self):
@@ -1697,6 +1868,66 @@ class OperatorInvokeTests(_BackgroundTestBase):
         self.assertIn("[█████", _FAKE_AREAS[0].header)
         self.assertIn("25%", _FAKE_AREAS[0].header)
 
+    def test_modal_progress_update_throttled_when_done_unchanged(self):
+        """done 不变时不再调 progress_update（指针在「进度/繁忙」间高频跳动的根因）。"""
+        self.scene_properties.background_export_enabled = True
+        context = self._make_context()
+        operator = self._make_operator(context)
+        operator.invoke(context, None)
+        session = _RecordingSession.instances[0]
+        session.total_steps = 5
+        session.done_steps = 2
+        session.poll_results = ["running"]
+
+        for _ in range(3):
+            result = operator.modal(context, types.SimpleNamespace(type='TIMER'))
+            self.assertEqual(result, {'RUNNING_MODAL'})
+            # 文本进度条仍每 tick 刷新（节流只针对原生 progress_update）
+            self.assertIn("[████████░░░░░░░░░░░░] 40%", _FAKE_AREAS[0].header)
+
+        self.assertEqual(
+            _FAKE_WINDOW_MANAGER.progress_calls,
+            [("begin", 0, 5), ("update", 2)],
+        )
+
+    def test_modal_progress_update_fires_once_per_done_change(self):
+        """done 每次变化只调一次 progress_update；重复的 done 被跳过。"""
+        self.scene_properties.background_export_enabled = True
+        context = self._make_context()
+        operator = self._make_operator(context)
+        operator.invoke(context, None)
+        session = _RecordingSession.instances[0]
+        session.total_steps = 5
+        session.poll_results = ["running"]
+
+        for done in (1, 1, 3, 3, 5, 5):
+            session.done_steps = done
+            result = operator.modal(context, types.SimpleNamespace(type='TIMER'))
+            self.assertEqual(result, {'RUNNING_MODAL'})
+
+        self.assertEqual(
+            _FAKE_WINDOW_MANAGER.progress_calls,
+            [("begin", 0, 5), ("update", 1), ("update", 3), ("update", 5)],
+        )
+
+    def test_modal_progress_begin_called_only_once(self):
+        """progress_begin 只在第一次 tick 调一次，之后无论 done 怎么变都不再 begin。"""
+        self.scene_properties.background_export_enabled = True
+        context = self._make_context()
+        operator = self._make_operator(context)
+        operator.invoke(context, None)
+        session = _RecordingSession.instances[0]
+        session.total_steps = 4
+        session.poll_results = ["running"]
+
+        for done in (0, 1, 2, 3, 4):
+            session.done_steps = done
+            result = operator.modal(context, types.SimpleNamespace(type='TIMER'))
+            self.assertEqual(result, {'RUNNING_MODAL'})
+
+        begins = [call for call in _FAKE_WINDOW_MANAGER.progress_calls if call[0] == "begin"]
+        self.assertEqual(begins, [("begin", 0, 4)])
+
     def test_finish_background_export_ends_progress_bar(self):
         context = self._make_context()
         for outcome in ("success", "cancel", "error"):
@@ -1834,6 +2065,150 @@ class ProgressCenterTests(_BackgroundTestBase):
         export_progress.report_stage("无目录")
         export_progress.report_nodes(["节点A"])
         export_progress.report_node("节点A", "done")  # 不抛异常即通过
+
+
+class _StageNode:
+    """直出阶段节点上报测试用的最小节点。"""
+
+    def __init__(self, name, bl_idname, mute=False, connected_to_output=True):
+        self.name = name
+        self.bl_idname = bl_idname
+        self.mute = mute
+        self.connected_to_output = connected_to_output
+
+
+class _StageTree:
+    def __init__(self, nodes):
+        self.nodes = list(nodes)
+
+
+class DirectExportStageNodeProgressTests(_BackgroundTestBase):
+    """``direct_export.py`` 的阶段节点上报：按 bl_idname 批量、跳静音/空名、静默。"""
+
+    def _stage_path(self, name="direct_stage_nodes.json"):
+        return os.path.join(self.temp_dir, name)
+
+    @staticmethod
+    def _read(path):
+        with open(path, "r", encoding="utf-8") as file:
+            return json.load(file)
+
+    def _set_stage(self):
+        stage_path = self._stage_path()
+        export_progress.set_stage_file(stage_path)
+        self.addCleanup(export_progress.clear_stage_file)
+        export_progress.begin_steps(5)
+        return stage_path
+
+    @staticmethod
+    def _tree():
+        return _StageTree(
+            [
+                _StageNode("物体信息A", "SSMTNode_Object_Info"),
+                _StageNode("物体信息B", "SSMTNode_Object_Info"),
+                _StageNode("顶点组处理", "SSMTNode_VertexGroupProcess"),
+                _StageNode("静音物体信息", "SSMTNode_Object_Info", mute=True),
+                _StageNode("", "SSMTNode_Object_Info"),
+                _StageNode("无关节点", "SSMTNode_DataType"),
+            ]
+        )
+
+    def test_reports_matching_nodes_by_bl_idname(self):
+        stage_path = self._set_stage()
+        direct_export_module._report_stage_nodes(
+            self._tree(),
+            ("SSMTNode_Object_Info", "SSMTNode_VertexGroupProcess"),
+            export_progress.STATE_RUNNING,
+        )
+
+        stage = self._read(stage_path)
+        self.assertEqual(
+            stage["nodes"],
+            {
+                "物体信息A": "running",
+                "物体信息B": "running",
+                "顶点组处理": "running",
+            },
+        )
+        self.assertEqual(stage["node"], "顶点组处理")
+
+        direct_export_module._report_stage_nodes(
+            self._tree(),
+            ("SSMTNode_Object_Info", "SSMTNode_VertexGroupProcess"),
+            export_progress.STATE_DONE,
+        )
+        stage = self._read(stage_path)
+        self.assertEqual(
+            stage["nodes"],
+            {
+                "物体信息A": "done",
+                "物体信息B": "done",
+                "顶点组处理": "done",
+            },
+        )
+        # 阶段节点只驱动高亮，不占用主进程预计算的步骤数
+        self.assertEqual((stage["done"], stage["total"]), (0, 5))
+
+    def test_pending_batch_registers_only_matching_nodes(self):
+        stage_path = self._set_stage()
+        direct_export_module._report_stage_nodes(
+            self._tree(),
+            ("SSMTNode_Object_Info", "SSMTNode_Result_Output"),
+            export_progress.STATE_PENDING,
+        )
+
+        stage = self._read(stage_path)
+        self.assertEqual(
+            stage["nodes"],
+            {"物体信息A": "pending", "物体信息B": "pending"},
+        )
+        self.assertEqual(stage["node"], "")
+
+    def test_participant_collection_matches_main_process_filter(self):
+        tree = _StageTree(
+            [
+                _StageNode("物体信息A", "SSMTNode_Object_Info"),
+                _StageNode("物体组", "SSMTNode_Object_Group"),
+                _StageNode("后处理节点", "SSMTNode_PostProcess_ShapeKey"),
+                _StageNode("输出节点", "SSMTNode_Result_Output"),
+                _StageNode("中转", "NodeReroute"),
+                _StageNode("静音物体信息", "SSMTNode_Object_Info", mute=True),
+                _StageNode("断开物体组", "SSMTNode_Object_Group", connected_to_output=False),
+                _StageNode("", "SSMTNode_Object_Info"),
+            ]
+        )
+
+        self.assertEqual(
+            direct_export_module._collect_participant_node_names(tree),
+            ["物体信息A", "物体组"],
+        )
+
+    def test_report_failures_are_silent(self):
+        direct_export_module._report_stage_nodes(
+            _StageTree([_StageNode("物体信息A", "SSMTNode_Object_Info")]),
+            ("SSMTNode_Object_Info",),
+            export_progress.STATE_RUNNING,
+        )
+
+        class _ExplodingTree:
+            @property
+            def nodes(self):
+                raise RuntimeError("nodes unavailable")
+
+        direct_export_module._report_stage_nodes(
+            _ExplodingTree(),
+            ("SSMTNode_Object_Info",),
+            export_progress.STATE_RUNNING,
+        )
+
+        with mock.patch.object(
+            export_progress, "report_node", side_effect=RuntimeError("progress broken")
+        ):
+            direct_export_module._report_stage_nodes(
+                _StageTree([_StageNode("物体信息A", "SSMTNode_Object_Info")]),
+                ("SSMTNode_Object_Info",),
+                export_progress.STATE_RUNNING,
+            )
 
 
 class StepProgressTests(_BackgroundTestBase):

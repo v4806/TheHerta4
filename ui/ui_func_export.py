@@ -70,6 +70,18 @@ _BG_HIGHLIGHT_MIN_INTERVAL = 0.0
 #: 阶段名仍停在这些值 = 参与导出的节点还没真正开始干活（读作 pending）。
 #: worker 启动后主进程先把阶段标成「加载工程」，直到它写出第一个 stage.json。
 _BG_PARTICIPANT_IDLE_STAGES = ("", "加载工程")
+#: 视图导航事件（滚轮 / 触控板 / 旋转）：导出期间必须放行给界面，
+#: 否则蓝图视图的缩放 / 平移会被 modal 吞掉。
+_BG_VIEW_NAV_EVENT_TYPES = frozenset({
+    'WHEELUPMOUSE',
+    'WHEELDOWNMOUSE',
+    'TRACKPADPAN',
+    'TRACKPADZOOM',
+    'MOUSEROTATE',
+    'MOUSEPAN',
+})
+#: 中键按下 / 松开期间需要放行的鼠标移动事件（中键拖动平移）。
+_BG_MOUSE_MOVE_EVENT_TYPES = frozenset({'MOUSEMOVE', 'INBETWEEN_MOUSEMOVE'})
 
 
 #: 后台导出 modal 轮询的共用实现：Generate Mod 与快速局部导出共用同一套
@@ -80,12 +92,25 @@ class _BackgroundExportMixin:
     def modal(self, context, event):
         """后台导出轮询：每 0.2s 读一次 stage.json / result.json 并刷新状态栏。
 
-        **只处理 TIMER / ESC**：其余事件一律 ``PASS_THROUGH`` 交回界面，导出期间
-        仍可平移 / 缩放节点编辑器（中键拖动、滚轮等）—— 早期的实现把鼠标事件
-        全部吞在 modal 里，导致后台导出时蓝图视图完全不能操作。
+        事件分派（**只放行视图导航事件**）：
+
+        * ``ESC`` → 取消导出；
+        * ``TIMER`` → 轮询进度、写状态栏 / 进度条、同步节点高亮，返回
+          ``RUNNING_MODAL``；
+        * ``MIDDLEMOUSE`` / 滚轮 / 触控板 → ``PASS_THROUGH``（中键按下期间记
+          ``_bg_view_nav``，松开时清掉），导出期间仍可平移 / 缩放节点编辑器；
+        * ``MOUSEMOVE`` / ``INBETWEEN_MOUSEMOVE`` → 仅中键拖动中 ``PASS_THROUGH``；
+        * 其余非 TIMER 事件一律 ``RUNNING_MODAL``（吞掉）。
+
+        为什么不能把所有非 TIMER 事件都放行：Blender 的进度光标由
+        ``wm_cursor_number_impl`` 设置后会把 ``win->cursor`` 清零，之后任何
+        UI 层的 ``WM_cursor_set``（鼠标 hover 改光标等）都会把进度光标覆盖成
+        普通 / 繁忙指针，下一次 ``progress_update`` 又设回进度 —— 每次鼠标事件
+        切换一次，表现为指针在百分比与繁忙指针之间高频跳动。
         """
         session = getattr(self, "_bg_session", None)
         if session is None:
+            self._bg_view_nav = False
             self._stop_background_timer(context)
             clear_progress_header(context)
             return {'CANCELLED'}
@@ -94,9 +119,8 @@ class _BackgroundExportMixin:
             self._finish_background_export(context, session, "cancel")
             return {'CANCELLED'}
 
-        # 非 TIMER 事件放行：事件继续传给界面（鼠标中键平移、滚轮缩放等）。
         if event.type != 'TIMER':
-            return {'PASS_THROUGH'}
+            return self._modal_navigation_result(event)
 
         status = session.poll()
         self._sync_node_highlight(session)
@@ -120,6 +144,34 @@ class _BackgroundExportMixin:
         self._finish_background_export(context, session, "error")
         return {'CANCELLED'}
 
+    def _modal_navigation_result(self, event):
+        """非 TIMER 事件分派：只放行视图导航，其余吞掉以保住进度光标。
+
+        * ``MIDDLEMOUSE``：按下记 ``_bg_view_nav=True``、松开清掉，均 ``PASS_THROUGH``；
+        * 滚轮 / 触控板 / 旋转：``PASS_THROUGH``；
+        * ``MOUSEMOVE`` / ``INBETWEEN_MOUSEMOVE``：仅中键拖动中放行；
+        * 其它（键盘、左右键、其它鼠标键）：``RUNNING_MODAL``，不让界面重设光标。
+        """
+        event_type = event.type
+
+        if event_type == 'MIDDLEMOUSE':
+            value = getattr(event, "value", "")
+            if value == 'PRESS':
+                self._bg_view_nav = True
+            elif value == 'RELEASE':
+                self._bg_view_nav = False
+            return {'PASS_THROUGH'}
+
+        if event_type in _BG_VIEW_NAV_EVENT_TYPES:
+            return {'PASS_THROUGH'}
+
+        if event_type in _BG_MOUSE_MOVE_EVENT_TYPES:
+            if getattr(self, "_bg_view_nav", False):
+                return {'PASS_THROUGH'}
+            return {'RUNNING_MODAL'}
+
+        return {'RUNNING_MODAL'}
+
     def _finish_background_export(self, context, session, outcome):
         """收尾：恢复节点颜色、结束进度条、停 timer、按结果更新 header 并清理。
 
@@ -127,6 +179,7 @@ class _BackgroundExportMixin:
         Blender 原生 Report 弹窗会挡住界面，改为把摘要留在 header（保留到用户操作）
         并 ``print`` 到控制台（含 worker.log 路径）。成功仍用 INFO（INFO 不弹窗）。
         """
+        self._bg_view_nav = False
         self._end_progress_bar(context)
         self._restore_node_colors()
         self._stop_background_timer(context)
@@ -198,13 +251,29 @@ class _BackgroundExportMixin:
                     return format_progress_bar(done, total)
                 begin(0, total)
                 self._bg_progress_started = True
+                # 新一轮进度条：清掉上一轮的重绘节流记录。
+                self._bg_last_progress_state = None
+
+            # 变化节流（用户实测：导出期间鼠标指针在「进度」与「繁忙」之间高频跳动）：
+            # window_manager.progress_update() 每次都会刷新 GHOST 光标进度状态
+            # （WM_cursor_progress），modal 每 0.2s 调一次就会让光标每 0.2s 重画一次。
+            # 这里只在 done（钳制到 [0, total]）或 total 真的变化时才调用；
+            # 文本进度条仍然每 tick 返回，显示不受影响。
+            value = max(0, min(done, total))
+            state = (value, total)
+            if getattr(self, "_bg_last_progress_state", None) == state:
+                return format_progress_bar(done, total)
 
             update = getattr(window_manager, "progress_update", None)
             if callable(update):
-                update(max(0, min(done, total)))
+                update(value)
+                self._bg_last_progress_state = state
             return format_progress_bar(done, total)
         except Exception:
             self._bg_progress_started = False
+            # 异常后下次成功的 tick 必须能重新 begin 并重新 update，
+            # 所以节流记录一并清掉。
+            self._bg_last_progress_state = None
             try:
                 return format_progress_bar(done, total)
             except Exception:
@@ -214,6 +283,7 @@ class _BackgroundExportMixin:
         """结束原生进度条（success / cancel / error 三个收尾分支都会走到）；重复调用安全。"""
         started = bool(getattr(self, "_bg_progress_started", False))
         self._bg_progress_started = False
+        self._bg_last_progress_state = None
         if not started:
             return
         try:
@@ -572,6 +642,8 @@ class SSMTGenerateModBlueprint(_BackgroundExportMixin, bpy.types.Operator):
         self._bg_session = session
         self._bg_node_colors = {}
         self._bg_progress_started = False
+        # 中键拖动平移状态：modal 只在中键按住期间放行鼠标移动。
+        self._bg_view_nav = False
         self._bg_timer = context.window_manager.event_timer_add(0.2, window=context.window)
         context.window_manager.modal_handler_add(self)
         # 快照已保存：接下来后台实例要先加载 480MB 工程（约 10 秒）才写出第一个
@@ -1236,6 +1308,8 @@ class SSMTQuickExportSelected(_BackgroundExportMixin, bpy.types.Operator):
         self._bg_session = session
         self._bg_node_colors = {}
         self._bg_progress_started = False
+        # 中键拖动平移状态：modal 只在中键按住期间放行鼠标移动。
+        self._bg_view_nav = False
         self._bg_timer = context.window_manager.event_timer_add(0.2, window=context.window)
         context.window_manager.modal_handler_add(self)
         # 快照已保存：后台实例要先加载工程快照（约 10 秒）才写出 stage.json。

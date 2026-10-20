@@ -217,11 +217,15 @@ def report_nodes(names) -> None:
     _write_stage_file()
 
 
-def report_node(name: str, status: str) -> None:
+def report_node(name: str, status: str, count_step: bool = True) -> None:
     """更新单个节点状态并写 stage.json；节点首次完成时推进一步。
 
     若该节点执行期间自己启动过导出阶段（例如直出形态键 / 多文件节点），
     完成时再补一步"阶段完成"，让 done 与主进程「阶段 + 节点」的预算对齐。
+
+    ``count_step=False`` 供"阶段级节点"使用：这些节点不参与主进程预计算的
+    步骤预算（预算只含顶层阶段 + 后处理节点 + 收尾），只用于节点高亮；
+    此时 ``done`` 不推进步骤，避免进度条提前跑满。
     """
     key = str(name or "")
     if not key:
@@ -250,10 +254,14 @@ def report_node(name: str, status: str) -> None:
         if base_stage and str(_state.get("stage") or "").startswith(key + "："):
             _state["stage"] = base_stage
         _state["node_base_stage"] = ""
-        complete_step()  # 节点本身完成，内部已经写文件
-        if _state.get("node_started_stage"):
-            complete_step()  # 节点内部启动的那个阶段也完成
-            _state["stage_pending"] = False
+        if count_step:
+            complete_step()  # 节点本身完成，内部已经写文件
+            if _state.get("node_started_stage"):
+                complete_step()  # 节点内部启动的那个阶段也完成
+                _state["stage_pending"] = False
+        else:
+            # 不推进步骤时仍要把 done 状态写进 stage.json（高亮数据在这里）
+            _write_stage_file()
         _state["node_started_stage"] = False
     else:
         _write_stage_file()
