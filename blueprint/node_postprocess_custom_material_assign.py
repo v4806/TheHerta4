@@ -51,6 +51,15 @@ _RESOURCE_SECTION_RE = re.compile(r"^\[Resource[-_]", re.IGNORECASE)
 #: ini 中的部件锚点注释 ``; [mesh:物体名]``（可带 ``[vertex_count:N]``）。
 _MESH_COMMENT_RE = re.compile(r"\[mesh:([^\]]+)\]", re.IGNORECASE)
 
+#: IB 键（``8位hex-数字-数字``，如 ``6ef3d666-888-0``）。
+#: 导出 ini 的 mesh 注释常只带 IB 键（``LOD0.6ef3d666-888-0``），而 Blender
+#: 物体名后面还挂着部件名（``LOD0.6ef3d666-888-0.武器翅膀花纹贴片``），精确
+#: 名查找对不上，只能靠 IB 键把两者关联起来。前后边界避免把更长的 hex 串
+#: 当成 IB 前缀截断匹配。
+_IB_KEY_RE = re.compile(
+    r"(?<![0-9a-fA-F])([0-9a-fA-F]{8})-(\d+)-(\d+)(?!\d)"
+)
+
 #: 探测「该部件读不读得到材质」时依次尝试的贴图类型。
 #: 与材质转资源的前缀体系一致；只要有一种命中就认为材质可用。
 _MATERIAL_PROBE_TYPES = (
@@ -110,6 +119,33 @@ def _is_slot_style_param(param) -> bool:
     """
     text = str(param or "").strip().lower()
     return text == "this" or text.startswith("ps-t")
+
+
+def _collect_conditional_block_indexes(lines) -> set:
+    r"""返回落在 ``if`` … ``endif`` 条件块内的行号集合。
+
+    条件块里的赋值是**运行期按条件择一**的，最典型的就是材质切换组：同一个参数
+    （如 ``Resource\RabbitFX\Glowmap``）在 ``if $swapkey15151 == 0`` / ``== 1``
+    各写一条。这类行绝不能按「该网格绘制点之前最后一次赋值生效」判成孤儿 ——
+    一判就会把除末档以外的每一档都改写成 ``= null``，表现为切换档位「空白」。
+
+    2026-10-12 实测（``SSMT BluePrint`` 产物）：档 0 的
+    ``Resource\RabbitFX\Glowmap = ref Resource_GlowMap_Gmsktwcnsg`` 被置成
+    ``= null``，只剩档 1 的 ``Resource_GlowMap_Gmsktwcnsg.001`` 生效。
+    """
+    inside = set()
+    depth = 0
+    for index, line in enumerate(lines):
+        stripped = str(line).strip().lower()
+        if stripped == "if" or stripped.startswith("if ") or stripped.startswith("if("):
+            depth += 1
+            continue
+        if stripped.startswith("endif"):
+            depth = max(0, depth - 1)
+            continue
+        if depth > 0:
+            inside.add(index)
+    return inside
 
 
 def _iter_ini_lines(sections):
@@ -769,6 +805,29 @@ class SSMT_OT_CustomMaterialAssignAddTarget(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class SSMT_OT_CustomMaterialAssignClearTargets(bpy.types.Operator):
+    bl_idname = "ssmt.custom_material_assign_clear_targets"
+    bl_label = "清空部件"
+    bl_description = "清空部件输入框，只保留 1 个空项"
+    bl_options = {"REGISTER", "UNDO", "INTERNAL"}
+
+    node_name: bpy.props.StringProperty()
+
+    def execute(self, context):
+        node = _find_node(context, self.node_name)
+        if not node:
+            return {"CANCELLED"}
+        removed = len(node.target_items)
+        # 部件马上要被清掉，预览过的材质必须先还原：分组条目没了就没人再能写回原材质。
+        _restore_all_preview(node)
+        _restore_preview_material_shading(node, context)
+        node.target_items.clear()
+        node.target_items.add()
+        node.active_target_index = 0
+        self.report({"INFO"}, f"已清空部件输入框（原有 {removed} 项，保留 1 个空项）")
+        return {"FINISHED"}
+
+
 class SSMT_OT_CustomMaterialAssignRemoveTarget(bpy.types.Operator):
     bl_idname = "ssmt.custom_material_assign_remove_target"
     bl_label = "移除目标部件"
@@ -956,20 +1015,18 @@ def _draw_picking_header(self, context):
         )
 
 
-_SWITCH_PREFIX_SET = {
-    name.casefold()
-    for name in MATERIAL_DETECT_PRESETS
-} | {
-    "diffusemap",
-    "normalmap",
-    "lightmap",
-    "materialmap",
-    "glowmap",
-    "fxmap",
-    "ttlmap",
-    "rampmap",
-    "highlightmap",
-    "stockingmap",
+#: 明确不参与贴图切换的材质前缀。
+#:
+#: 渲染/预览用的自造材质首段不是贴图类型名（``IMGPV_<网格名>``，见
+#: ``common/marked_texture_material.py`` 的 RENDER_MATERIAL_PREFIX），必须排除。
+#:
+#: 除此之外**不再限制类型**：原实现用 ``MATERIAL_DETECT_PRESETS`` 加几个硬编码
+#: 类型做白名单，把 BodyMaskMap 这类真实贴图类型挡在外面 —— 它们即使在同一部件上
+#: 有多套材质也成不了切换组。生成侧本来就不限类型
+#: （``extract_texture_type_from_resource`` / ``find_matching_materials`` 都只是按
+#: 前缀字符串匹配），所以白名单只会漏掉本该支持的贴图。
+_SWITCH_PREFIX_EXCLUDE = {
+    "imgpv",
 }
 
 
@@ -984,7 +1041,11 @@ def _parse_switch_var_base(node):
 
 
 def _collect_switch_prefix_groups(obj):
-    """按材质前缀收集同一部件的多套材质。"""
+    """按材质前缀收集同一部件的多套材质。
+
+    不限贴图类型（只排除 ``_SWITCH_PREFIX_EXCLUDE`` 里的自造材质）：材质转资源的
+    生成侧按前缀字符串匹配，任何前缀的多套材质都能生成切换行，所以这里也照此口径。
+    """
     groups = OrderedDict()
     if obj is None or getattr(obj, "type", "") != "MESH":
         return groups
@@ -997,7 +1058,7 @@ def _collect_switch_prefix_groups(obj):
         if len(parts) < 2:
             continue
         prefix = parts[0].strip()
-        if not prefix or prefix.casefold() not in _SWITCH_PREFIX_SET:
+        if not prefix or prefix.casefold() in _SWITCH_PREFIX_EXCLUDE:
             continue
         names = groups.setdefault(prefix.casefold(), [])
         if name not in names:
@@ -1970,6 +2031,34 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
                 names.add(obj.name)
         return names
 
+    @staticmethod
+    def _ib_key_from_name(name):
+        """从名字里提取 IB 键（``8位hex-数字-数字``，小写）；提取不到返回 ``None``。
+
+        允许名字带 ``LOD0.`` 前缀、``.部件名`` 后缀与 ``_copy`` 之类的尾巴：
+        导出 ini 的 mesh 注释通常只有 IB 键，而 Blender 物体名还带着部件名，
+        两边要靠这个键对齐。匹配不到时返回 ``None``（调用方按归属不明处理）。
+        """
+        match = _IB_KEY_RE.search(str(name or ""))
+        if not match:
+            return None
+        return "{}-{}-{}".format(
+            match.group(1), match.group(2), match.group(3)
+        ).lower()
+
+    def _target_ib_set(self):
+        """目标部件物体名里的 IB 键集合（小写）。
+
+        同一个 IB 可能带多个部件（只指定其中一部分），所以集合里出现的 IB
+        在名字查不到物体时按「可能含目标部件」保守处理。
+        """
+        keys = set()
+        for name in self._target_object_set():
+            key = self._ib_key_from_name(name)
+            if key:
+                keys.add(key)
+        return keys
+
     def _is_primary_switch_group(self, group, collection):
         variable = str(getattr(group, "switch_variable", "") or "").strip()
         if not variable:
@@ -2745,6 +2834,10 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
             "ssmt.custom_material_assign_add_target", text="添加", icon="ADD"
         )
         add.node_name = self.name
+        clear_targets = header.operator(
+            "ssmt.custom_material_assign_clear_targets", text="清空", icon="TRASH"
+        )
+        clear_targets.node_name = self.name
 
         grouped = OrderedDict()
         for index, item in enumerate(self.target_items):
@@ -2796,12 +2889,23 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
             matching = [entries for entries in merged_groups.values() if entries[0][0] == index]
             if matching:
                 for entries in matching:
-                    box = rows.box()
                     first_group = entries[0][2]
-                    box.label(text=f"部件指定组（{first_group.state_count} 档）", icon="LINKED")
+                    group_box = rows.box()
+                    # 组头：明确写出「这一组有几个部件共用同一个切换变量」。
+                    # 以前这里只写「部件指定组（N 档）」，成员行又和独立部件长得一样，
+                    # 滚到中段就完全看不出它们是一组（数据其实早已合并成同一个 $swapkey）。
+                    group_box.label(
+                        text=f"贴图切换组（{len(entries)} 个部件共用同一个切换）",
+                        icon="LINKED",
+                    )
+                    draw_switch_controls(group_box, first_group)
+                    members_box = group_box.box()
+                    members_box.label(
+                        text=f"组内共用此切换的部件（{len(entries)} 个）",
+                        icon="GROUP",
+                    )
                     for member_index, member_item, _group in entries:
-                        draw_target_row(box, member_index, member_item, f"部件 {member_index + 1}")
-                    draw_switch_controls(box, first_group)
+                        draw_target_row(members_box, member_index, member_item, f"部件 {member_index + 1}")
                 continue
             box = rows.box()
             draw_target_row(box, index, item, f"部件 {index + 1}")
@@ -2928,17 +3032,41 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
     # 清除未指定部件的游戏贴图（勾选 clear_non_target_textures 时启用）
     # ------------------------------------------------------------------ #
 
-    def _mesh_name_verdict(self, mesh_name, mesh_verdict_cache):
-        """``[mesh:...]`` 名 -> ``target`` / ``non_target`` / ``unknown``。"""
+    def _mesh_name_verdict(self, mesh_name, mesh_verdict_cache, target_ibs=None):
+        """``[mesh:...]`` 名 -> ``target`` / ``non_target`` / ``unknown``。
+
+        精确名找得到物体时按目标列表判定，和原来一致。**找不到物体时**改用
+        IB 键回退：导出 ini 的 mesh 注释常只有 IB 键（``LOD0.6ef3d666-888-0``），
+        而物体名后面带部件名（``LOD0.6ef3d666-888-0.武器翅膀花纹贴片``），精确
+        查找必然落空——若不做回退，整段都会被当成「归属不明」保护起来，未指定
+        部件的贴图永远清不掉。
+
+        * IB 键在目标集合里 -> ``target``：同一个 IB 可能还有别的目标部件
+          （名字没在这条注释里出现），保守按目标保留。
+        * IB 键存在但不在集合里 -> ``non_target``：本段确实没有目标部件。
+        * 连 IB 键都提取不到 -> ``unknown``：保持原来的保守语义，原样保留。
+
+        ``target_ibs`` 可由调用方预算一次传进来（``_clear_non_target_textures``
+        会传）；不传时内部用 ``_target_ib_set()`` 现算，方便测试直接调用。
+        """
         verdict = mesh_verdict_cache.get(mesh_name)
         if verdict is None:
             obj = self.find_object_by_mesh_name(mesh_name, object_filter=None)
-            if obj is None:
-                verdict = "unknown"
-            elif self._is_custom_target(obj):
-                verdict = "target"
+            if obj is not None:
+                if self._is_custom_target(obj):
+                    verdict = "target"
+                else:
+                    verdict = "non_target"
             else:
-                verdict = "non_target"
+                if target_ibs is None:
+                    target_ibs = self._target_ib_set()
+                ib_key = self._ib_key_from_name(mesh_name)
+                if ib_key is None:
+                    verdict = "unknown"
+                elif ib_key in target_ibs:
+                    verdict = "target"
+                else:
+                    verdict = "non_target"
             mesh_verdict_cache[mesh_name] = verdict
         return verdict
 
@@ -3077,6 +3205,8 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
         target_names = self._target_object_set()
         if not target_names:
             return 0
+        # 名字查不到物体时的 IB 回退集合（每个文件/段共用一份，避免重复计算）。
+        target_ibs = self._target_ib_set()
 
         ini_files = sorted(glob.glob(os.path.join(mod_export_path, "*.ini")))
         if not ini_files:
@@ -3124,7 +3254,9 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
                 mesh_verdicts = []
                 boundary = None
                 for mesh_name, bindings, draw_pos in mesh_bindings:
-                    verdict = self._mesh_name_verdict(mesh_name, mesh_verdict_cache)
+                    verdict = self._mesh_name_verdict(
+                        mesh_name, mesh_verdict_cache, target_ibs
+                    )
                     if verdict == "target":
                         target_obj = self.find_object_by_mesh_name(mesh_name, object_filter=None)
                         if target_obj is not None and not self._target_has_readable_material(
@@ -3138,8 +3270,9 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
                     mesh_verdicts.append((verdict, bindings, draw_pos))
                     if verdict not in ("non_target", "missing_material"):
                         # target：目标部件正在使用；unknown：名字对不上任何导出
-                        # 物体，归属不明。两者都必须原样保留，并构成 MOD 覆盖的
-                        # 边界——只有排在它们之前的绘制才拿得到游戏原生贴图。
+                        # 物体、也提取不到 IB 键，归属不明。两者都必须原样保留，
+                        # 并构成 MOD 覆盖的边界——只有排在它们之前的绘制才拿得到
+                        # 游戏原生贴图。
                         protected_lines.update(bindings.values())
                         if boundary is None or draw_pos < boundary:
                             boundary = draw_pos
@@ -3160,11 +3293,15 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
                 # 导出给第一个子网格写、而该段每个网格又都有自己的绑定时的那
                 # 一份段级默认值）。置空它们不影响任何绘制，却能解除对
                 # Resource 定义段的引用，让贴图真正可回收。
+                # 例外：``if`` … ``endif`` 条件块内的赋值按运行期条件择一
+                # （材质切换组同一参数在多个分支各写一条），不是孤儿，必须原样
+                # 保留 —— 否则除末档以外的档位会被整批置成 ``= null``。
                 used_indexes = {
                     index for _, bindings, _ in mesh_verdicts for index in bindings.values()
                 }
+                conditional_indexes = _collect_conditional_block_indexes(lines)
                 for index, line in enumerate(lines):
-                    if index in used_indexes:
+                    if index in used_indexes or index in conditional_indexes:
                         continue
                     match = _TEXTURE_BINDING_RE.match(str(line))
                     if match:
@@ -3388,6 +3525,7 @@ classes = (
     SSMT_OT_CustomMaterialDetect,
     SSMT_OT_CustomMaterialDetectClear,
     SSMT_OT_CustomMaterialAssignAddTarget,
+    SSMT_OT_CustomMaterialAssignClearTargets,
     SSMT_OT_CustomMaterialAssignAddSelected,
     SSMT_OT_CustomMaterialAssignScanObjects,
     SSMT_OT_CustomMaterialAssignRemoveTarget,
