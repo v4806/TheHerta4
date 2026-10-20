@@ -143,6 +143,7 @@ _install_module(
     clear_active_session=lambda _session=None: None,
     clear_progress_header=lambda: None,
     format_progress_bar=lambda *_args, **_kwargs: "",
+    format_percent_bar=lambda *_args, **_kwargs: "",
     get_active_session=lambda: None,
     push_progress_header=lambda _text: None,
     safe_object_name=lambda obj: str(getattr(obj, "name", "") or ""),

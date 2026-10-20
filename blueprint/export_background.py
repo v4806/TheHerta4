@@ -33,6 +33,7 @@ from ..utils.log_utils import LOG
 from ..utils.shapekey_utils import ShapeKeyUtils
 from . import export_progress
 from .export_parallel import ExportRoundExecutor
+from .export_step_plan import build_step_plan
 from .preprocess_parallel import ParallelPreprocessCoordinator
 
 
@@ -122,16 +123,27 @@ def _write_json(file_path: str, payload) -> None:
 
 
 def _write_stage(stage_path: str, stage: str, done: int, total: int, message: str = "") -> None:
-    """写当前阶段快照：``{"stage": ..., "done": n, "total": N, "message": ...}``。"""
-    _write_json(
-        stage_path,
-        {
-            "stage": str(stage),
-            "done": int(done),
-            "total": int(total),
-            "message": str(message or ""),
-        },
-    )
+    """写当前阶段快照：``{"stage": ..., "done": n, "total": N, "message": ...}``。
+
+    已有的固定步骤清单（``plan`` / ``plan_total``，由 ``export_progress`` 写入）
+    原样保留 —— 粗粒度阶段快照不能把调试用的清单冲掉。
+    """
+    payload = {
+        "stage": str(stage),
+        "done": int(done),
+        "total": int(total),
+        "message": str(message or ""),
+    }
+    try:
+        existing = _read_json(stage_path)
+        if isinstance(existing, dict) and existing.get("plan"):
+            payload["plan"] = list(existing.get("plan") or [])
+            payload["plan_total"] = int(
+                existing.get("plan_total") or len(payload["plan"])
+            )
+    except Exception:
+        pass
+    _write_json(stage_path, payload)
 
 
 # ---------------------------------------------------------------------------
@@ -434,8 +446,9 @@ def build_manifest(
     不使用 ``round_plans``。
     ``quick_export`` 为真时 worker 按 ``object_names`` 在快照里重建临时蓝图树，
     走单轮导出 + 后处理（快速局部导出的后台分支）。
-    ``total_steps`` 是进度条的**总步骤数**（阶段 + 后处理节点 + 收尾），worker
-    用它调 ``export_progress.begin_steps``，不自己重新推断。
+    ``total_steps`` 是进度条的**总步骤数**（阶段 + 后处理节点 + 收尾）。worker
+    会优先用 ``export_step_plan.build_step_plan`` 在同一棵蓝图树上重算固定清单；
+    只有清单算不出来时才用这个字段兜底（旧清单 / 拿不到树的场景）。
     """
     stage_path = os.path.join(session_dir, STAGE_FILE_NAME)
     result_path = os.path.join(session_dir, RESULT_FILE_NAME)
@@ -695,9 +708,10 @@ def _disable_nested_parallel() -> None:
 def _run_worker(manifest_path: str) -> None:
     """在干净实例里跑完整导出：全部轮次串行 → 后处理 → 写 result.json / log。
 
-    进度条按**步骤数**显示：总步数由主进程预计算写进 manifest（阶段 + 后处理
-    节点 + 收尾），worker 用 ``export_progress.begin_steps`` 建立计数，阶段切换 /
-    节点完成 / 收尾分别推进一步。
+    进度条按**步骤数**显示：worker 在导出开始前用
+    ``export_step_plan.build_step_plan`` 一次算出完整步骤清单（与主进程预估
+    同一个函数），``total = len(清单)`` 整次导出固定不变；阶段切换 / 节点完成
+    逐项推进 ``done``，收尾 ``finish_steps()`` 补满。
     """
     manifest = _read_json(manifest_path) or {}
 
@@ -707,7 +721,7 @@ def _run_worker(manifest_path: str) -> None:
     round_plans = list(manifest.get("round_plans") or [])
     quick_export = bool(manifest.get("quick_export"))
     object_names = [str(name) for name in (manifest.get("object_names") or []) if str(name)]
-    # 步骤数以 manifest 为准；旧清单没有该字段时退化成「轮次 + 收尾」
+    # 步骤数以清单为准；清单算不出来时才退回 manifest 里的预算
     total_steps = max(0, int(manifest.get("total_steps") or 0))
     if total_steps <= 0 and round_plans:
         total_steps = len(round_plans) + 1
@@ -739,18 +753,33 @@ def _run_worker(manifest_path: str) -> None:
             if not objects:
                 raise RuntimeError("后台快速局部导出未找到选中的网格物体")
             tree = build_quick_export_temp_tree(objects)
-            # 步骤口径：轮次 1 + 后处理节点 0（临时树不含后处理节点）+ 收尾 1
-            total_steps = 1 + 0 + 1
         else:
             tree_name = str(manifest.get("tree_name") or "")
             tree = bpy.data.node_groups.get(tree_name)
             if tree is None:
                 raise RuntimeError(f"未找到蓝图树: {tree_name}")
 
+        # 步骤清单在**导出开始前一次算好**（与主进程预估同一个函数）：之后
+        # total = len(清单) 固定不变，阶段/节点按清单推进，不再动态加步数。
+        try:
+            step_plan = build_step_plan(
+                tree,
+                direct_export=bool(manifest.get("direct_export")),
+                has_shapekey_export=bool(manifest.get("has_shapekey_export")),
+                max_shapekey_slot=int(manifest.get("max_shapekey_slot") or 0),
+                has_multi_file_export=bool(manifest.get("has_multi_file_export")),
+                round_plans=round_plans,
+                quick_export=quick_export,
+            )
+        except Exception:
+            step_plan = []
+        if step_plan:
+            total_steps = len(step_plan)
+
         # 进度桥：之后所有 TimerUtils 阶段与后处理节点都会写进 stage.json
         install_progress_bridge(stage_path)
         # 步骤计数必须在 install（set_stage_file 会重置状态）之后初始化
-        export_progress.begin_steps(total_steps)
+        export_progress.begin_steps(total_steps, plan=step_plan)
 
         _write_stage(
             stage_path,
@@ -805,7 +834,8 @@ def _run_worker(manifest_path: str) -> None:
             buffer_sizes.append(int(round_result.get("buffer_size") or 0))
             result["rounds"] = 1
             result["buffer_sizes"] = list(buffer_sizes)
-            export_progress.complete_step()
+            # 按计划清单推进（单轮 1 步）
+            export_progress.complete_step("快速局部导出")
 
             _write_stage(
                 stage_path,
@@ -848,9 +878,9 @@ def _run_worker(manifest_path: str) -> None:
             )
         else:
             for index, round_plan in enumerate(round_plans, start=1):
-                # 第 2 轮开始时，第 1 轮才算完成；每轮只推进一步
+                # 第 2 轮开始时，第 1 轮才算完成；每轮只推进一步（按计划清单名字）
                 if index > 1:
-                    export_progress.complete_step()
+                    export_progress.complete_step(f"第 {index - 1} 轮")
 
                 _write_stage(
                     stage_path,
@@ -880,7 +910,8 @@ def _run_worker(manifest_path: str) -> None:
                 )
 
             if round_plans:
-                export_progress.complete_step()  # 最后一轮完成
+                # 最后一轮完成（按计划清单名字推进）
+                export_progress.complete_step(f"第 {len(round_plans)} 轮")
 
             _write_stage(
                 stage_path,
@@ -1179,7 +1210,7 @@ class BackgroundExportSession:
         self.blender_executable = str(blender_executable or "")
         self.addon_name = str(addon_name or "")
         self.session_dir = str(session_dir or "")
-        #: 主进程预计算的总步骤数（阶段 + 后处理节点 + 收尾）；0 = 未知
+        #: 主进程预计算的总步骤数（与 worker 用同一个计划函数，导出期间固定）
         self.total_steps = max(0, int(total_steps or 0))
         #: 快速局部导出：worker 按 object_names 在快照里重定位网格并重建临时树
         self.quick_export = bool(quick_export)
@@ -1201,7 +1232,7 @@ class BackgroundExportSession:
         self.stage_total = 0
         #: 已完成步骤数（与 stage_done 同步；UI 进度条按 step 计数读它）
         self.done_steps = 0
-        #: 已显示百分比（整数 0~100，只增不减：worker 的 total 会动态增长）
+        #: 已显示百分比（整数 0~100；total 在导出开始时已固定，单调保护留给旧 worker）
         self.progress_percent = 0
         #: 已经显示过的最大百分比（total 变大时防止百分比回退）
         self._max_percent = 0
@@ -1270,7 +1301,7 @@ class BackgroundExportSession:
             self.done_steps = 0
             self.progress_percent = 0
             self._max_percent = 0
-            # 步骤数以主进程预计算为准；未提供时退化成「轮次 + 收尾」
+            # 步骤数以主进程预计算（同一计划函数）为准；未提供时退化成「轮次 + 收尾」
             self.stage_total = self.total_steps or (len(self.round_plans) + 1)
             self.stage_message = "后台实例正在加载工程（约 10 秒）…"
 
@@ -1341,8 +1372,8 @@ class BackgroundExportSession:
             self.stage_done = int(stage.get("done") or 0)
         except (TypeError, ValueError):
             self.stage_done = 0
-        # total 以 worker 动态上报为准（阶段名一变就涨）；没上报时才沿用旧值 /
-        # 主进程预算（旧 worker / 早期 stage.json 没有 total）。
+        # total 在导出开始时由计划清单固定；这里仍读 stage.json 的 total，
+        # 兼容旧 worker（会动态增长）与早期没有 total 的快照。
         try:
             stage_total = int(stage.get("total") or 0)
         except (TypeError, ValueError):
@@ -1351,7 +1382,7 @@ class BackgroundExportSession:
             self.stage_total = stage_total
         elif self.stage_total <= 0:
             self.stage_total = self.total_steps
-        # 主进程的 total_steps 与 worker 的动态 total 保持同步（UI 文本 done/total）
+        # 主进程的 total_steps 与 stage.json 的 total 同步（UI 文本 done/total）
         if self.stage_total > 0:
             self.total_steps = self.stage_total
         self.done_steps = self.stage_done
@@ -1379,9 +1410,9 @@ class BackgroundExportSession:
     def _refresh_progress_percent(self) -> None:
         """按 ``done / total`` 算整数百分比（0~100），并保证**单调不回退**。
 
-        worker 的 total 是动态增长的（每出现一个新阶段就 ``total = max(total,
-        done + 1)``），所以不能用固定刻度；主进程只记「已经显示过的最大百分比」，
-        取 max 防止 total 变化时百分比往回跳（total<=0 时按 0 处理）。
+        worker 的 total 在导出开始时已由计划清单固定，正常情况下刻度恒定；
+        主进程仍记「已经显示过的最大百分比」兜底旧 worker / total 变化时的回跳
+        （total<=0 时按 0 处理）。
         """
         try:
             total = max(0, int(self.stage_total or 0))

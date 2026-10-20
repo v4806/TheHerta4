@@ -17,14 +17,16 @@ from ..common.config_table_backup import (
 
 from ..blueprint.model import BluePrintModel
 from ..blueprint.direct_export import (
-    collect_direct_multifile_nodes,
-    collect_direct_shapekey_nodes,
     execute_direct_export,
     has_direct_export_mode,
 )
 from ..blueprint.export_helper import BlueprintExportHelper
 from ..blueprint.preprocess import PreProcessHelper
 from ..blueprint.export_parallel import ExportRoundExecutor, ParallelExportCoordinator, ParallelExportError
+try:  # 共享步骤计划：拿不到时（精简加载 / 测试桩）退回旧预算
+    from ..blueprint.export_step_plan import build_step_plan
+except Exception:  # pragma: no cover
+    build_step_plan = None
 from ..blueprint.export_background import (
     BACKGROUND_BUSY_MESSAGE,
     BackgroundExportSession,
@@ -832,7 +834,14 @@ class SSMTGenerateModBlueprint(_BackgroundExportMixin, bpy.types.Operator):
         )
 
         direct_export = has_direct_export_mode(tree)
-        total_steps = self._estimate_background_total_steps(tree, export_plan, direct_export)
+        total_steps = self._estimate_background_total_steps(
+            tree,
+            export_plan,
+            direct_export,
+            has_shapekey_export=has_shapekey_export,
+            max_shapekey_slot=max_shapekey_slot,
+            has_multi_file_export=has_multi_file_export,
+        )
 
         return BackgroundExportSession(
             tree_name=tree.name,
@@ -848,53 +857,74 @@ class SSMTGenerateModBlueprint(_BackgroundExportMixin, bpy.types.Operator):
             total_steps=total_steps,
         )
 
-    #: 直出流程里固定执行的顶层阶段数：
-    #: Direct-CollectNodes / SetupState / CollectObjects / Preprocess /
-    #: BlueprintModel / BuildExporter / BaseExport
-    _DIRECT_BASE_STAGE_COUNT = 7
-    #: 传统形态键后处理节点的 bl_idname（非直出模式时还要额外跑附加轮次）
-    _SHAPEKEY_POSTPROCESS_IDNAME = "SSMTNode_PostProcess_ShapeKey"
-
-    def _estimate_background_total_steps(self, tree, export_plan, direct_export) -> int:
+    def _estimate_background_total_steps(
+        self,
+        tree,
+        export_plan,
+        direct_export,
+        has_shapekey_export=None,
+        max_shapekey_slot=None,
+        has_multi_file_export=None,
+    ) -> int:
         """预计算后台导出的总步骤数（进度条的分母）。
 
-        只算真正会被执行的步骤，worker 侧按同一份口径计步：
+        与 worker 用**同一个** ``export_step_plan.build_step_plan``：清单在导出
+        开始时一次算好，``total = len(清单)`` 全程固定不变，所以「加载工程」阶段
+        显示的分母就是最终分母。
 
-        - 直出模式：顶层阶段数 + 后处理节点数 + 1(收尾)；
-          阶段清单 = 7 个基础阶段 + （有直出形态键节点时）形态键生成
-          + （有多文件节点时）生成多文件资源 + （需要传统形态键附加轮次时）附加轮次；
-        - 普通模式：轮次数 + 后处理节点数 + 1(收尾)。
+        ``has_shapekey_export`` / ``max_shapekey_slot`` / ``has_multi_file_export``
+        由 ``_create_background_session`` 传入（与写进 manifest 的值完全一致）；
+        单独调用时按蓝图树重新推断。
 
-        任何异常都退化为「至少 1 步」，绝不让进度计算阻断导出启动。
+        任何异常都退化为旧口径预算，绝不让进度计算阻断导出启动。
         """
         try:
             postprocess_nodes = self._collect_background_postprocess_nodes(tree)
         except Exception:
             postprocess_nodes = []
 
+        if has_shapekey_export is None:
+            try:
+                has_shapekey_export = bool(
+                    BlueprintExportHelper.has_shapekey_postprocess_node(tree)
+                )
+            except Exception:
+                has_shapekey_export = False
+        if max_shapekey_slot is None:
+            max_shapekey_slot = 0
+            if has_shapekey_export:
+                try:
+                    max_shapekey_slot = int(
+                        BlueprintExportHelper.calculate_max_shapekey_slot_count(tree) or 0
+                    )
+                except Exception:
+                    max_shapekey_slot = 0
+            if max_shapekey_slot <= 0:
+                has_shapekey_export = False
+        if has_multi_file_export is None:
+            try:
+                has_multi_file_export = bool(
+                    BlueprintExportHelper.has_multi_file_export_nodes()
+                )
+            except Exception:
+                has_multi_file_export = False
+
         try:
-            if not direct_export:
-                return len(export_plan or []) + len(postprocess_nodes) + 1
-
-            try:
-                direct_shapekey_nodes = list(collect_direct_shapekey_nodes(tree) or [])
-            except Exception:
-                direct_shapekey_nodes = []
-            try:
-                direct_multifile_nodes = list(collect_direct_multifile_nodes(tree) or [])
-            except Exception:
-                direct_multifile_nodes = []
-
-            stage_count = self._DIRECT_BASE_STAGE_COUNT
-            if direct_shapekey_nodes:
-                stage_count += 1  # 直出-形态键生成
-            if direct_multifile_nodes:
-                stage_count += 1  # 直出-生成多文件资源
-            if direct_shapekey_nodes and self._needs_standard_shapekey_rounds(postprocess_nodes):
-                stage_count += 1  # 直出-形态键附加轮次
-            return stage_count + len(postprocess_nodes) + 1
+            if callable(build_step_plan):
+                step_plan = build_step_plan(
+                    tree,
+                    direct_export=bool(direct_export),
+                    has_shapekey_export=bool(has_shapekey_export),
+                    max_shapekey_slot=int(max_shapekey_slot or 0),
+                    has_multi_file_export=bool(has_multi_file_export),
+                    round_plans=export_plan,
+                    postprocess_nodes=postprocess_nodes,
+                )
+                if step_plan:
+                    return len(step_plan)
         except Exception:
-            return max(1, len(export_plan or []) + len(postprocess_nodes) + 1)
+            pass
+        return max(1, len(export_plan or []) + len(postprocess_nodes) + 1)
 
     @staticmethod
     def _collect_background_postprocess_nodes(tree) -> list:
@@ -903,19 +933,6 @@ class SSMTGenerateModBlueprint(_BackgroundExportMixin, bpy.types.Operator):
             return list(BlueprintExportHelper._collect_postprocess_nodes(tree) or [])
         except Exception:
             return []
-
-    @classmethod
-    def _needs_standard_shapekey_rounds(cls, postprocess_nodes) -> bool:
-        """是否存在未启用直出的形态键后处理节点（决定是否补跑传统附加轮次）。"""
-        try:
-            for node in postprocess_nodes or []:
-                if getattr(node, "bl_idname", "") != cls._SHAPEKEY_POSTPROCESS_IDNAME:
-                    continue
-                if not getattr(node, "direct_export_mode", False):
-                    return True
-        except Exception:
-            pass
-        return False
 
     def _invoke_with_output_blueprint(self, context, event):
         tree = self._resolve_target_tree(context)
@@ -1483,8 +1500,17 @@ class SSMTQuickExportSelected(_BackgroundExportMixin, bpy.types.Operator):
         object_names = [name for name in object_names if name]
 
         # 临时蓝图树只有 Object Info / Group / Output，不含后处理节点；
-        # 步骤口径：轮次 1 + 后处理节点 0 + 收尾 1
-        total_steps = 1 + 0 + 1
+        # 步骤口径与 worker 用同一个计划函数：单轮 1 + 后处理节点 0 + 收尾 1。
+        try:
+            quick_plan = build_step_plan(
+                None,
+                direct_export=False,
+                round_plans=[dict(QUICK_EXPORT_ROUND_PLAN)],
+                quick_export=True,
+            )
+            total_steps = len(quick_plan) if quick_plan else 2
+        except Exception:
+            total_steps = 2
 
         return BackgroundExportSession(
             tree_name="",

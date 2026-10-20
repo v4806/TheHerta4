@@ -13,6 +13,7 @@ from .direct_export_multifile import DirectMultiFileGenerator
 from .direct_export_shapekey import DirectShapeKeyGenerator
 from .export_helper import BlueprintExportHelper
 from .export_parallel import ExportRoundExecutor
+from .export_step_plan import build_step_plan
 from .model import BluePrintModel
 from .preprocess import PreProcessHelper
 from .preprocess_parallel import ParallelPreprocessCoordinator
@@ -585,6 +586,16 @@ class DirectExportSession:
         return False
 
     def run(self):
+        # 步骤清单在导出开始前一次算好：后台导出已由 ``_run_worker`` 用同一个
+        # 计划函数建好（ensure_plan 不会覆盖）；同步直出（没有后台会话清单）时
+        # 在这里自建，保证 total 从第一步起就是最终值、全程不变。
+        try:
+            export_progress.ensure_plan(
+                build_step_plan(self.tree, direct_export=True)
+            )
+        except Exception:
+            pass
+
         TimerUtils.start_stage("Direct-CollectNodes")
         # 先把主进程关注的参与节点统一登记为 pending；主进程对"没上报"的
         # 参与节点会整体猜成 done，逐个上报前必须先占住这些名字。

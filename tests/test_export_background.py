@@ -423,6 +423,10 @@ global_properties_module = _load_real_module(
 export_progress = _load_real_module(
     f"{PKG}.blueprint.export_progress", Path("blueprint") / "export_progress.py"
 )
+# 真实模块：固定步骤计划（export_background / ui_func_export / direct_export 共用）
+export_step_plan = _load_real_module(
+    f"{PKG}.blueprint.export_step_plan", Path("blueprint") / "export_step_plan.py"
+)
 # 真实模块：后台导出
 export_background = _load_real_module(
     f"{PKG}.blueprint.export_background", Path("blueprint") / "export_background.py"
@@ -1116,8 +1120,8 @@ class WorkerTests(_BackgroundTestBase):
         self.assertEqual(result["status"], "error")
         self.assertIn("未找到蓝图树", result["error"])
 
-    def test_worker_direct_export_uses_manifest_total_steps(self):
-        """直出模式：total_steps 以 manifest 为准，阶段/节点完成逐步推进，收尾补满。"""
+    def test_worker_direct_export_builds_fixed_plan_total(self):
+        """直出模式：worker 用计划函数算固定清单，total 全程不变，收尾补满。"""
         session_dir = os.path.join(self.temp_dir, "worker_direct")
         os.makedirs(session_dir)
         manifest = export_background.build_manifest(
@@ -1128,11 +1132,24 @@ class WorkerTests(_BackgroundTestBase):
             round_plans=[],
             logic_name="EFMI",
             direct_export=True,
-            total_steps=12,
+            total_steps=12,  # 旧预算：worker 以计划清单为准，不再用它
         )
+        tree = types.SimpleNamespace(name="测试蓝图")
         _FAKE_BPY.data.node_groups.get = (
-            lambda name: types.SimpleNamespace(name=name) if name == "测试蓝图" else None
+            lambda name: tree if name == "测试蓝图" else None
         )
+
+        # worker 会为这棵树算出的计划清单（同一函数）
+        expected_plan = export_step_plan.build_step_plan(
+            tree,
+            direct_export=True,
+            has_shapekey_export=False,
+            max_shapekey_slot=0,
+            has_multi_file_export=False,
+            round_plans=[],
+            postprocess_nodes=[],
+        )
+        self.assertTrue(expected_plan)
 
         direct_module = sys.modules[f"{PKG}.blueprint.direct_export"]
         original_direct = direct_module.execute_direct_export
@@ -1146,6 +1163,7 @@ class WorkerTests(_BackgroundTestBase):
             observed.append(export_progress.step_done())
             export_progress.report_node("形态键节点", "done")
             observed.append(export_progress.step_done())
+            observed.append(export_progress.step_total())
 
         direct_module.execute_direct_export = _fake_direct
         self.addCleanup(setattr, direct_module, "execute_direct_export", original_direct)
@@ -1156,12 +1174,17 @@ class WorkerTests(_BackgroundTestBase):
             result = json.load(file)
         self.assertEqual(result["status"], "success")
         self.assertEqual(result["rounds"], 1)
-        self.assertEqual(observed, [0, 1, 2])
+        # 测试桩 TimerUtils 只把 Direct-Preprocess 翻成中文，这两个英文阶段名都在
+        # 计划清单之外 → 只更新文本、不计步；total 始终是清单长度
+        self.assertEqual(observed[:3], [0, 0, 0])
+        self.assertEqual(observed[3], len(expected_plan))
 
         with open(manifest["stage_path"], "r", encoding="utf-8") as file:
             stage = json.load(file)
         self.assertEqual(stage["stage"], "完成")
-        self.assertEqual((stage["done"], stage["total"]), (12, 12))
+        self.assertEqual((stage["done"], stage["total"]), (len(expected_plan), len(expected_plan)))
+        self.assertEqual(stage["plan_total"], len(expected_plan))
+        self.assertEqual(stage["plan"], expected_plan)
 
     def test_worker_quick_export_rebuilds_tree_and_runs_single_round(self):
         """quick_export：按 object_names 取 MESH → 临时树 → 单轮导出 + 后处理。"""
@@ -1887,67 +1910,86 @@ class OperatorInvokeTests(_BackgroundTestBase):
     # -- 总步骤预计算 -------------------------------------------------------
 
     def test_background_session_total_steps_common_mode(self):
-        """普通模式：轮次数 + 后处理节点数 + 1(收尾)。"""
-        _FakeBlueprintExportHelper.postprocess_nodes = [object(), object()]
+        """普通模式：轮次数 + 后处理节点数 + 1(收尾)，与计划函数口径一致。"""
+        nodes = [
+            types.SimpleNamespace(name="节点A"),
+            types.SimpleNamespace(name="节点B"),
+        ]
+        _FakeBlueprintExportHelper.postprocess_nodes = nodes
         operator = self._make_operator(None)
 
         session = operator._create_background_session(_FakeExportTree())
 
+        expected = export_step_plan.build_step_plan(
+            _FakeExportTree(),
+            direct_export=False,
+            round_plans=session.kwargs["round_plans"],
+            postprocess_nodes=nodes,
+        )
         self.assertFalse(session.kwargs["direct_export"])
-        self.assertEqual(session.kwargs["total_steps"], 1 + 2 + 1)
+        self.assertEqual(session.kwargs["total_steps"], len(expected))
+        self.assertEqual(len(expected), 1 + 2 + 1)
 
     def test_background_session_total_steps_direct_mode(self):
-        """直出模式：7 个基础阶段 + 形态键生成 + 后处理节点 + 收尾。"""
-        ui_func_export.has_direct_export_mode = lambda _tree: True
-        original_shapekey = ui_func_export.collect_direct_shapekey_nodes
-        original_multifile = ui_func_export.collect_direct_multifile_nodes
-        ui_func_export.collect_direct_shapekey_nodes = lambda _tree: [object()]
-        ui_func_export.collect_direct_multifile_nodes = lambda _tree: []
-        self.addCleanup(
-            setattr, ui_func_export, "collect_direct_shapekey_nodes", original_shapekey
-        )
-        self.addCleanup(
-            setattr, ui_func_export, "collect_direct_multifile_nodes", original_multifile
-        )
-        _FakeBlueprintExportHelper.postprocess_nodes = [
+        """直出模式：主进程用与 worker 同一个计划函数算 total。"""
+        nodes = [
             types.SimpleNamespace(
-                bl_idname="SSMTNode_PostProcess_ShapeKey", direct_export_mode=True
+                name="形态键配置",
+                bl_idname="SSMTNode_PostProcess_ShapeKey",
+                direct_export_mode=True,
             ),
             types.SimpleNamespace(
-                bl_idname="SSMTNode_PostProcess_MultiFile", direct_export_mode=True
+                name="多文件配置",
+                bl_idname="SSMTNode_PostProcess_MultiFile",
+                direct_export_mode=True,
             ),
         ]
+        _FakeBlueprintExportHelper.postprocess_nodes = nodes
+        ui_func_export.has_direct_export_mode = lambda _tree: True
         operator = self._make_operator(None)
 
         session = operator._create_background_session(_FakeExportTree())
 
+        expected = export_step_plan.build_step_plan(
+            _FakeExportTree(),
+            direct_export=True,
+            has_shapekey_export=False,
+            max_shapekey_slot=0,
+            has_multi_file_export=False,
+            round_plans=[],
+            postprocess_nodes=nodes,
+        )
         self.assertTrue(session.kwargs["direct_export"])
-        # 7 基础 + 形态键生成 1 + 多文件生成 0 + 附加轮次 0 + 2 节点 + 收尾 1
-        self.assertEqual(session.kwargs["total_steps"], 7 + 1 + 2 + 1)
+        self.assertEqual(session.kwargs["total_steps"], len(expected))
+        # 直出形态键生成 / 多文件生成各 1 步；节点直出，不需要传统附加轮次
+        self.assertIn("直出-形态键生成", expected)
+        self.assertIn("直出-生成多文件资源", expected)
+        self.assertNotIn("直出-形态键附加轮次", expected)
+        # 7 顶层 + 8 前处理 + 2 直出形态键前处理 + 8 基础导出 + 2 节点 + 2 生成 + 收尾
+        self.assertEqual(len(expected), 7 + 8 + 2 + 8 + 2 + 2 + 1)
 
     def test_estimate_total_steps_includes_standard_shapekey_round_stage(self):
         """有未启用直出的形态键后处理节点时，直出还要补跑传统附加轮次（多 1 步）。"""
-        original_shapekey = ui_func_export.collect_direct_shapekey_nodes
-        original_multifile = ui_func_export.collect_direct_multifile_nodes
-        ui_func_export.collect_direct_shapekey_nodes = lambda _tree: [object()]
-        ui_func_export.collect_direct_multifile_nodes = lambda _tree: []
-        self.addCleanup(
-            setattr, ui_func_export, "collect_direct_shapekey_nodes", original_shapekey
-        )
-        self.addCleanup(
-            setattr, ui_func_export, "collect_direct_multifile_nodes", original_multifile
-        )
-        _FakeBlueprintExportHelper.postprocess_nodes = [
+        nodes = [
             types.SimpleNamespace(
-                bl_idname="SSMTNode_PostProcess_ShapeKey", direct_export_mode=False
+                name="形态键配置",
+                bl_idname="SSMTNode_PostProcess_ShapeKey",
+                direct_export_mode=False,
             )
         ]
+        _FakeBlueprintExportHelper.postprocess_nodes = nodes
         operator = self._make_operator(None)
 
         total = operator._estimate_background_total_steps(_FakeExportTree(), [], True)
 
-        # 7 基础 + 形态键生成 1 + 附加轮次 1 + 节点 1 + 收尾 1
-        self.assertEqual(total, 7 + 1 + 1 + 1 + 1)
+        expected = export_step_plan.build_step_plan(
+            _FakeExportTree(),
+            direct_export=True,
+            postprocess_nodes=nodes,
+        )
+        self.assertEqual(total, len(expected))
+        self.assertIn("直出-形态键附加轮次", expected)
+        self.assertNotIn("直出-形态键生成", expected)
 
     # -- 步骤进度条（window_manager.progress_*） ---------------------------
 
@@ -2535,17 +2577,17 @@ class StepProgressTests(_BackgroundTestBase):
         export_progress.report_node("节点A", "done")
         self.assertEqual(self._read(stage_path)["done"], 2)
 
-    def test_complete_step_grows_total_dynamically(self):
-        """complete_step 每完成一步就保底 ``total = max(total, done + 1)``。"""
+    def test_complete_step_keeps_total_fixed(self):
+        """旧预算模式（没有计划清单）：complete_step 推 done，但 total 不再增长。"""
         stage_path = self._stage_path("step_cap.json")
         export_progress.set_stage_file(stage_path)
         self.addCleanup(export_progress.clear_stage_file)
         export_progress.begin_steps(2)
         export_progress.complete_step()
         export_progress.complete_step()
-        export_progress.complete_step()
-        self.assertEqual(export_progress.step_done(), 3)
-        self.assertEqual(export_progress.step_total(), 4)  # 当前阶段仍占 1 步
+        export_progress.complete_step()  # 预算用满后不再推进
+        self.assertEqual(export_progress.step_done(), 2)
+        self.assertEqual(export_progress.step_total(), 2)
 
     def test_finish_steps_fills_total(self):
         stage_path = self._stage_path("step_finish.json")
@@ -2627,17 +2669,16 @@ class StepProgressTests(_BackgroundTestBase):
         self.assertEqual(export_background.format_percent_bar(120), "[████████████████████] 100%")
 
 
-class DynamicStepProgressTests(_BackgroundTestBase):
-    """动态步数模型：**每个不同名称的子步骤模块各算 1 步**，同名不重复计。
+class FixedStepProgressTests(_BackgroundTestBase):
+    """固定步数模型：**导出开始时一次算好清单，total 全程不变**。
 
-    阶段序列取自一次完整导出的实测录制（20+ 个不同名称的阶段）；贴图张数这类
-    更深层内部进度只显示文本，不推动百分比。
+    计步只认计划清单里、且整次导出没计过的名字；同名子阶段重复出现只计一次；
+    清单之外的阶段只更新文本；贴图张数这类更深层内部进度也只显示文本。
+    ``finish_steps`` 把 done 补满到 total（100%）。
     """
 
-    #: 实测录制到的真实阶段序列（顺序即实际出现顺序）
+    #: 实测录制到的阶段序列（顺序即实际出现顺序）；用于模拟执行序列
     RECORDED_STAGES = (
-        "正在保存工程快照…",
-        "后台实例正在加载工程（约 10 秒）",
         "加载工程",
         "前处理-计算缓存哈希",
         "前处理-清空形态键",
@@ -2653,7 +2694,7 @@ class DynamicStepProgressTests(_BackgroundTestBase):
         "ShapeKey计算",
         "基础导出：写入资源…",
         "INI配置生成",
-        "直出-形态键生成（形态键配置）",
+        "直出-形态键生成",
         "形态键扩展配置",
         "物体切换面板",
         "完成",
@@ -2667,66 +2708,172 @@ class DynamicStepProgressTests(_BackgroundTestBase):
         with open(path, "r", encoding="utf-8") as file:
             return json.load(file)
 
-    def _begin(self, total=0, name="dynamic_step.json"):
+    def _begin(self, total=0, name="dynamic_step.json", plan=None):
         stage_path = self._stage_path(name)
         export_progress.set_stage_file(stage_path)
         self.addCleanup(export_progress.clear_stage_file)
-        export_progress.begin_steps(total)
+        export_progress.begin_steps(total, plan=plan)
         return stage_path
 
-    def test_recorded_stage_sequence_monotonic_and_finishes_at_100(self):
-        """录制的真实阶段序列：每步 done/total 单调不减，收尾 done == total。"""
-        self._begin(13)  # 主进程旧预算只有 13 步，worker 会动态抬高
+    @staticmethod
+    def _make_tree(nodes=()):
+        """直出计划测试用的最小蓝图树 + 后处理节点。"""
+        tree = types.SimpleNamespace(name="测试蓝图")
+        for node in nodes:
+            node.id_data = tree
+        return tree
 
-        # 基础导出内部会反复切换同名子阶段：重复出现不能再计步
+    @staticmethod
+    def _make_node(name, bl_idname, direct_export_mode=True):
+        return types.SimpleNamespace(
+            name=name,
+            bl_idname=bl_idname,
+            direct_export_mode=direct_export_mode,
+        )
+
+    def _recorded_plan(self):
+        """实测阶段的计划清单：直出 + 形态键 + 4 个后处理节点（共 31 步）。"""
+        nodes = [
+            self._make_node("材质转资源pro", "SSMTNode_PostProcess_CustomMaterialAssign"),
+            self._make_node("形态键配置", "SSMTNode_PostProcess_ShapeKey"),
+            self._make_node("形态键扩展配置", "SSMTNode_PostProcess_ShapeKeyExt"),
+            self._make_node("物体切换面板", "SSMTNode_PostProcess_ObjectSwap"),
+        ]
+        tree = self._make_tree(nodes)
+        return export_step_plan.build_step_plan(
+            tree,
+            direct_export=True,
+            has_shapekey_export=True,
+            max_shapekey_slot=1,
+            has_multi_file_export=False,
+            postprocess_nodes=nodes,
+        )
+
+    def test_direct_plan_lists_every_step_once_and_totals_31(self):
+        """计划函数返回有序无重复清单：7 顶层 + 10 前处理 + 8 基础导出 + 4 节点 + 生成/收尾。"""
+        plan = self._recorded_plan()
+
+        self.assertEqual(len(plan), 31)
+        self.assertEqual(len(set(plan)), len(plan))
+        # 顶层 / 前处理 / 基础导出内部 / 节点 / 直出生成 / 收尾 都在清单里
+        for name in (
+            "直出-收集节点",
+            "直出-执行前处理",
+            "前处理-采样直出形态键",
+            "ShapeKey计算",
+            "缓冲文件生成",
+            "INI配置生成",
+            "测试蓝图/材质转资源pro",
+            "测试蓝图/形态键配置",
+            "直出-形态键生成",
+            "收尾",
+        ):
+            self.assertIn(name, plan)
+        # 每个后处理节点只算 1 步
+        self.assertEqual(
+            sum(1 for key in plan if key.startswith("测试蓝图/")), 4
+        )
+
+    def test_plan_matches_simulated_execution_and_finishes_at_100(self):
+        """按实测阶段序列模拟执行：每步 done/total 单调不减，total 恒定，收尾 100%。"""
+        plan = self._recorded_plan()
+        stage_path = self._begin(0, plan=plan)
+
         events = list(self.RECORDED_STAGES)
-        events.insert(12, "数据哈希预计算")
-        events.insert(13, "对象处理与合并")
+        # 基础导出内部会反复切换同名子阶段：重复出现不能再计步
+        events.insert(9, "数据哈希预计算")
+        events.insert(10, "对象处理与合并")
 
+        node_steps = [key for key in plan if key.startswith("测试蓝图/")]
         observed = []
+        totals = []
         for name in events:
             export_progress.advance_stage(name)
-            # 中间插入贴图张数这类文本进度：只显示，不改 done/total
+            # 计划外阶段（录制里没有的）也不涨 total
             if name == "INI配置生成":
+                export_progress.advance_stage("计划外阶段")
                 before = (export_progress.step_done(), export_progress.step_total())
                 export_progress.report_stage("材质转资源pro：转换贴图 26/60")
                 self.assertEqual(
                     (export_progress.step_done(), export_progress.step_total()), before
                 )
-            observed.append(
-                (
-                    export_progress.step_done(),
-                    export_progress.step_total(),
-                    export_progress.step_percent(),
-                )
-            )
+            observed.append(export_progress.step_done())
+            totals.append(export_progress.step_total())
 
-        for done, total, _percent in observed:
-            self.assertLessEqual(done, total)
+        # 后处理节点逐个完成（每个节点 1 步）
+        for key in node_steps:
+            export_progress.report_node(key, "running")
+            export_progress.report_node(key, "done")
+            observed.append(export_progress.step_done())
+            totals.append(export_progress.step_total())
 
-        percents = [item[2] for item in observed]
-        self.assertEqual(percents, sorted(percents), "百分比不能回退")
+        self.assertTrue(all(total == len(plan) for total in totals), "total 必须全程不变")
+        self.assertEqual(observed, sorted(observed), "done 不能回退")
+        self.assertLessEqual(max(observed), len(plan))
 
-        # 唯一阶段名数：每个不同名称各占 1 步，最后一个阶段还在进行中
-        unique_count = len(set(events))
-        self.assertEqual(export_progress.step_total(), max(13, unique_count))
-        self.assertEqual(export_progress.step_done(), unique_count - 1)
+        # 收尾补满：done == len(plan) == total，百分比 100
+        export_progress.finish_steps()
+        self.assertEqual(
+            (export_progress.step_done(), export_progress.step_total()),
+            (len(plan), len(plan)),
+        )
+        self.assertEqual(export_progress.step_percent(), 100)
+        stage = self._read(stage_path)
+        self.assertEqual((stage["done"], stage["total"]), (len(plan), len(plan)))
+        self.assertEqual(stage["plan"], plan)
+
+    def test_out_of_plan_stage_does_not_change_done_or_total(self):
+        """清单之外的阶段：只更新文本，done / total 都不变。"""
+        plan = ["阶段A", "阶段B", "收尾"]
+        stage_path = self._begin(len(plan), plan=plan)
+
+        export_progress.advance_stage("阶段A")
+        self.assertEqual(export_progress.step_done(), 0)
+        export_progress.advance_stage("清单外阶段")  # 完成阶段A
+        self.assertEqual(export_progress.step_done(), 1)
+        before = (export_progress.step_done(), export_progress.step_total())
+
+        export_progress.advance_stage("另一个清单外阶段")
+        self.assertEqual(
+            (export_progress.step_done(), export_progress.step_total()), before
+        )
+        self.assertEqual(export_progress.step_total(), len(plan))
+        self.assertEqual(self._read(stage_path)["stage"], "另一个清单外阶段")
+
+    def test_worker_total_stays_fixed_across_advance_stage(self):
+        """worker 的 total 在整次导出中保持不变（多次 advance_stage + 节点完成）。"""
+        plan = ["阶段A", "阶段B", "节点X", "收尾"]
+        self._begin(0, plan=plan)
+
+        for name in ("阶段A", "阶段B", "阶段A", "阶段C", "阶段D"):
+            export_progress.advance_stage(name)
+            self.assertEqual(export_progress.step_total(), len(plan))
+        export_progress.report_node("节点X", "running")
+        self.assertEqual(export_progress.step_total(), len(plan))
+        export_progress.report_node("节点X", "done")
+        self.assertEqual(export_progress.step_total(), len(plan))
+
+    def test_finish_steps_fills_plan_and_reaches_100(self):
+        """收尾把 done 补到 total；total 保持不变，百分比到 100。"""
+        plan = ["阶段A", "阶段B", "阶段C", "收尾"]
+        self._begin(0, plan=plan)
+        export_progress.advance_stage("阶段A")
+        export_progress.advance_stage("阶段B")
+        self.assertEqual(export_progress.step_done(), 1)
         self.assertLess(export_progress.step_percent(), 100)
 
         export_progress.finish_steps()
         self.assertEqual(
             (export_progress.step_done(), export_progress.step_total()),
-            (max(13, unique_count), max(13, unique_count)),
+            (len(plan), len(plan)),
         )
         self.assertEqual(export_progress.step_percent(), 100)
-        stage = self._read(self._stage_path())
-        self.assertEqual(stage["done"], max(13, unique_count))
-        self.assertEqual(stage["total"], max(13, unique_count))
 
     def test_report_stage_text_only_does_not_change_steps(self):
         """贴图张数（report_stage）只更新文本，不推百分比；后续阶段仍正确计步。"""
-        stage_path = self._begin(0)
-        export_progress.advance_stage("基础导出：写入资源…")
+        plan = ["缓冲文件生成", "INI配置生成", "收尾"]
+        stage_path = self._begin(len(plan), plan=plan)
+        export_progress.advance_stage("缓冲文件生成")
         before = (export_progress.step_done(), export_progress.step_total())
 
         export_progress.report_node("材质转资源pro", "running")
@@ -2742,11 +2889,12 @@ class DynamicStepProgressTests(_BackgroundTestBase):
         # 显示文本被改写成细分文本后，阶段切换仍按计步名判断（不把贴图文本当阶段）
         export_progress.advance_stage("INI配置生成")
         self.assertEqual(export_progress.step_done(), 1)
-        self.assertEqual(export_progress.step_total(), 2)
+        self.assertEqual(export_progress.step_total(), len(plan))
 
     def test_same_stage_name_repeated_is_counted_once(self):
         """同名阶段重复出现只计 1 步（基础导出的子阶段会反复切换）。"""
-        self._begin(0)
+        plan = ["数据哈希预计算", "对象处理与合并", "ShapeKey计算", "收尾"]
+        self._begin(len(plan), plan=plan)
         for name in (
             "数据哈希预计算",
             "对象处理与合并",
@@ -2757,33 +2905,35 @@ class DynamicStepProgressTests(_BackgroundTestBase):
             export_progress.advance_stage(name)
 
         self.assertEqual(export_progress.step_done(), 2)  # 前两个唯一名各 1 步
-        self.assertEqual(export_progress.step_total(), 3)  # 当前阶段也占 1 步
-        self.assertEqual(export_progress.step_percent(), 66)
+        self.assertEqual(export_progress.step_total(), len(plan))  # total 固定
+        self.assertEqual(export_progress.step_percent(), 50)
 
-    def test_total_grows_dynamically_per_new_stage(self):
-        """begin_steps 的初始 total 可动态增长；总步数随新阶段 1:1 增长。"""
-        self._begin(0)
+    def test_total_stays_fixed_when_new_stage_appears(self):
+        """出现新阶段时 total 不变（旧实现会 total = max(total, done+1)）。"""
+        plan = ["阶段A", "阶段B", "收尾"]
+        self._begin(len(plan), plan=plan)
         export_progress.advance_stage("阶段A")
         self.assertEqual(
-            (export_progress.step_done(), export_progress.step_total()), (0, 1)
+            (export_progress.step_done(), export_progress.step_total()), (0, len(plan))
         )
 
         for name in ("阶段B", "阶段C", "阶段D", "阶段E", "阶段F"):
             export_progress.advance_stage(name)
-        self.assertEqual(
-            (export_progress.step_done(), export_progress.step_total()), (5, 6)
-        )
-        self.assertEqual(export_progress.step_percent(), 83)
+            self.assertEqual(export_progress.step_total(), len(plan))
+        # 清单内只完成了 阶段A / 阶段B 两步
+        self.assertEqual(export_progress.step_done(), 2)
 
         export_progress.finish_steps()
         self.assertEqual(
-            (export_progress.step_done(), export_progress.step_total()), (6, 6)
+            (export_progress.step_done(), export_progress.step_total()),
+            (len(plan), len(plan)),
         )
         self.assertEqual(export_progress.step_percent(), 100)
 
     def test_node_done_counts_stage_and_node_once(self):
-        """节点内部启动的阶段与节点本身各算 1 步；重复上报 done 不再计步。"""
-        self._begin(0)
+        """节点内部启动的计划阶段与节点本身各算 1 步；重复上报 done 不再计步。"""
+        plan = ["后处理", "直出-形态键生成", "形态键节点", "收尾"]
+        self._begin(len(plan), plan=plan)
         export_progress.advance_stage("后处理")
         export_progress.report_nodes(["形态键节点"])
         export_progress.report_node("形态键节点", "running")
@@ -2792,7 +2942,7 @@ class DynamicStepProgressTests(_BackgroundTestBase):
 
         export_progress.report_node("形态键节点", "done")
         self.assertEqual(export_progress.step_done(), 3)  # 阶段 + 节点各 1 步
-        self.assertEqual(export_progress.step_total(), 4)
+        self.assertEqual(export_progress.step_total(), len(plan))
 
         export_progress.report_node("形态键节点", "done")
         self.assertEqual(export_progress.step_done(), 3)  # 同名节点不重复计

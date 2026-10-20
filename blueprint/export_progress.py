@@ -6,27 +6,28 @@
 1. 记录当前阶段、当前节点与节点状态表（pending / running / done）；
 2. 原子写 ``stage.json``，写失败一律静默 —— 进度绝不能拖垮导出；
 3. 提供 ``elapsed()`` 给主进程显示本次后台导出已经跑了多久；
-4. 维护**动态步骤计数**（``begin_steps`` / ``advance_stage`` / ``report_node`` /
+4. 维护**固定步骤计数**（``begin_steps`` / ``advance_stage`` / ``report_node`` /
    ``finish_steps``）：``stage.json`` 的 ``done`` / ``total`` 是"已完成步数 /
    总步数"。
 
-步骤模型（**每个不同名称的子步骤模块各算 1 步**）：
+步骤模型（**清单在导出开始时一次算好，整次导出不变**）：
 
-- ``begin_steps(total)``：开始一次导出，``done=0``，``total`` 取传入值（可 0）。
-  传入值只是**初始估算**（主进程预算），之后会随实际出现的阶段动态增长。
+- ``begin_steps(total, plan=None)``：开始一次导出，``done=0``，``total`` 取
+  ``len(plan)``（没给清单时才用传入预算 ``total``）。``plan`` 由
+  ``blueprint/export_step_plan.py::build_step_plan`` 一次算出，**之后不再增长**。
 - ``advance_stage(name)``：``TimerUtils.start_stage`` 的统一入口 —— 进入与上一个
-  不同的阶段名时，先把**上一个阶段**记为完成（``done += 1``），再让
-  ``total = max(total, done + 1)``（当前阶段占 1 步）。同名阶段重入不计步；
-  同名阶段在整次导出里重复出现也只计一次（分段录制里 ``数据哈希预计算`` 等
-  子阶段会反复切换，不能重复累加）。
+  不同的阶段名时，先把**上一个阶段**记为完成（``done += 1``），但**只在它属于
+  计划清单、且整次导出里还没计过时**才推进；清单之外的阶段只更新状态栏文本，
+  不计步、也不改 ``total``。同名阶段重入 / 重复出现也只计一次（基础导出内部
+  会反复切换 ``数据哈希预计算`` 等子阶段，不能重复累加）。
 - ``report_stage(name, ...)``：只更新状态栏**显示文本**（如"转换贴图 26/60"），
   **不改 ``done`` / ``total``**；贴图张数这类深层内部进度只做文本提示。
-- ``report_node(name, "done")``：后处理节点完成时计 1 步，并按
-  ``total = max(total, done + 1)`` 扩张；同名节点只计一次。节点内部最后启动的
-  阶段在节点完成时一并记完成（阶段与节点各占 1 步，同名不重复计）。
-- ``finish_steps()``：收尾把 ``done`` 补到 ``total``（保证 100%）。
+- ``report_node(name, "done")``：后处理节点完成时计 1 步（每节点只算 1 步）；
+  计划内、且同名节点没计过时才推进。节点内部最后启动的阶段若在计划里，节点
+  完成时一并记完成（该阶段与节点各 1 步，同名不重复计）。
+- ``finish_steps()``：收尾把 ``done`` 补到 ``total``（保证 100%）；``total`` 不变。
 
-百分比由主进程按 ``done / total`` 计算，并保证单调不回退。
+百分比由主进程按 ``done / total`` 计算，并保留单调不回退（兜底旧 worker）。
 
 与 ``export_background._write_stage`` 的分工：那边写粗粒度阶段（第 N 轮 /
 直出导出 / 完成 / 失败），这边写细粒度阶段与节点。两边写同一份文件，所以本
@@ -56,10 +57,13 @@ _state = {
     "stage_key": "",
     #: 当前阶段是否还没被"下一步"推进过（防止同一阶段被重复计步）
     "stage_pending": False,
-    #: 已经计入 done 的计步单元：``("stage", 阶段名)`` / ``("node", 节点键)``。
-    #: 同名阶段 / 节点在整次导出里只计一次（基础导出内部会反复切换同名子阶段）
+    #: 已经计入 done 的计步单元：``("step", 名称)``。同名阶段 / 节点在整次导出里
+    #: 只计一次（基础导出内部会反复切换同名子阶段）
     "counted": set(),
-    #: 当前正在执行的节点内部是否启动过阶段（该节点完成时要额外算一步阶段）
+    #: 导出开始时一次算好的固定步骤清单（有序）与查找集合；空 = 旧预算模式
+    "plan": [],
+    "plan_set": set(),
+    #: 当前正在执行的节点内部是否启动过阶段（该节点完成时要一并记该阶段）
     "node_started_stage": False,
     #: 进入当前节点前的阶段显示名（节点结束时还原，避免细分文本漏到下一个节点）
     "node_base_stage": "",
@@ -81,6 +85,8 @@ def set_stage_file(stage_path: str) -> None:
     _state["stage_key"] = ""
     _state["stage_pending"] = False
     _state["counted"] = set()
+    _state["plan"] = []
+    _state["plan_set"] = set()
     _state["node_started_stage"] = False
     _state["node_base_stage"] = ""
 
@@ -98,6 +104,8 @@ def clear_stage_file() -> None:
     _state["stage_key"] = ""
     _state["stage_pending"] = False
     _state["counted"] = set()
+    _state["plan"] = []
+    _state["plan_set"] = set()
     _state["node_started_stage"] = False
     _state["node_base_stage"] = ""
 
@@ -129,14 +137,26 @@ def _read_stage_field(name: str, default: str = "") -> str:
     return str(payload.get(name) or default)
 
 
-def begin_steps(total) -> None:
-    """开始一次导出的步骤计数：``done=0``，``total`` 取传入值（可 0 = 未知）。
+def begin_steps(total, plan=None) -> None:
+    """开始一次导出的步骤计数：``done=0``，``total`` 固定为计划清单长度。
 
-    传入的 total 只是**初始估算**；之后 ``advance_stage`` / ``report_node`` 会
-    按实际出现的阶段数把它动态抬高（``total = max(total, done + 1)``）。
+    ``plan`` 由 ``export_step_plan.build_step_plan`` 在导出开始时**一次算好**；
+    传入清单时 ``total = len(plan)``，整次导出不再变化。没给清单时才退回
+    ``total`` 传入值（旧预算 / 兼容旧调用方）。
     """
+    plan_list = []
+    seen = set()
+    for key in plan or []:
+        text = str(key or "")
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        plan_list.append(text)
+
+    _state["plan"] = plan_list
+    _state["plan_set"] = set(plan_list)
     _state["done"] = 0
-    _state["total"] = max(0, _as_int(total, 0))
+    _state["total"] = len(plan_list) if plan_list else max(0, _as_int(total, 0))
     _state["stage_key"] = ""
     _state["stage_pending"] = False
     _state["counted"] = set()
@@ -144,49 +164,67 @@ def begin_steps(total) -> None:
     _write_stage_file()
 
 
-def _sync_total() -> None:
-    """当前阶段（或刚完成的一步之后的下一个阶段）也占 1 步：total 只增不减。"""
-    _state["total"] = max(step_total(), step_done() + 1)
+def ensure_plan(plan) -> bool:
+    """计划清单还没建立时用 ``plan`` 建立；返回是否真的建立了。
+
+    供 ``direct_export`` 在同步直出（没有后台会话清单）时自建计划；后台导出
+    已经由 ``_run_worker`` 建好清单时不会被覆盖。
+    """
+    if _state["plan"]:
+        return False
+    keys = [str(key or "") for key in plan or [] if str(key or "")]
+    if not keys:
+        return False
+    begin_steps(len(keys), plan=keys)
+    return True
 
 
-def _complete_stage(stage_name) -> bool:
-    """把阶段记为完成；同名阶段在整次导出里只计一次。返回是否真的推进了 done。"""
-    name = str(stage_name or "")
-    marker = ("stage", name)
-    if not name or marker in _state["counted"]:
+def _complete_step(name) -> bool:
+    """把计划清单里的一步记为完成；清单外 / 同名重复一律不计。返回是否推进。"""
+    text = str(name or "")
+    if not text:
+        return False
+    marker = ("step", text)
+    if marker in _state["counted"]:
+        return False
+    plan_set = _state["plan_set"]
+    if plan_set and text not in plan_set:
+        return False
+    total = step_total()
+    # 没有分母（还没 begin_steps）或计划已满：不推进，避免 done/total 失真
+    if total <= 0 or step_done() >= total:
         return False
     _state["counted"].add(marker)
     _state["done"] = step_done() + 1
     return True
 
 
-def _complete_node(key) -> bool:
-    """把节点记为完成；同名节点只计一次。返回是否真的推进了 done。"""
+def complete_step(key: str = "") -> int:
+    """完成计划清单里的一步（``key`` = 清单里的名字）。返回当前 done。
+
+    旧调用方（没有计划清单、只传预算）可以不带 ``key``：按剩余预算推进 1 步。
+    有计划清单时无名步骤不推进 —— 避免清单外的动作偷偷涨百分比。
+    """
     name = str(key or "")
-    marker = ("node", name)
-    if not name or marker in _state["counted"]:
-        return False
-    _state["counted"].add(marker)
-    _state["done"] = step_done() + 1
-    return True
-
-
-def complete_step() -> int:
-    """完成一个**无名**步骤（轮次 / 收尾等没有阶段名的推进）。返回当前 done。"""
-    _state["done"] = step_done() + 1
-    _sync_total()
+    if name:
+        _complete_step(name)
+    elif not _state["plan"]:
+        _complete_step(f"__unnamed_{step_done() + 1}__")
     _write_stage_file()
     return step_done()
 
 
 def finish_steps() -> int:
-    """收尾：``done = total``（保证 100%）；done 不会因此后退。"""
-    total = max(step_total(), step_done())
+    """收尾：把 ``done`` 补到 ``total``（保证 100%）；``total`` 不变。"""
+    total = step_total()
+    if not _state["plan"]:
+        # 旧预算模式没有计划清单：done 超出预算时只能抬 total（不再增长不适用）
+        total = max(total, step_done())
     _state["total"] = total
-    _state["done"] = total
+    _state["done"] = max(total, step_done())
     _state["stage_pending"] = False
     _write_stage_file()
-    return total
+    return _state["done"]
 
 
 def step_done() -> int:
@@ -210,10 +248,12 @@ def step_percent() -> int:
 def advance_stage(stage: str) -> None:
     """进入新阶段：把**上一个**阶段记为完成，再记录新阶段名。
 
-    - 第一个阶段不推进（它才刚开始，但要占 1 步 → total 至少 1）；
+    - 第一个阶段不推进（它才刚开始，完成与否等下一个阶段出现才知道）；
     - 同名阶段重入不推进（直出节点循环里同一步可能多次 ``start_stage``）；
     - 同名阶段在整次导出里重复出现也只计一次（基础导出内部会反复切换
       ``数据哈希预计算`` / ``对象处理与合并`` 等子阶段，不能重复累加）；
+    - **只有计划清单内、且没计过的阶段才 ``done += 1``；清单之外的阶段只更新
+      状态栏文本，不计步、也不改 ``total``**（``total`` 导出开始时已定死）；
     - 显示文本与计步名分开：``report_stage`` 把文本改成"转换贴图 3/60"时，
       计步名仍是最近一次 ``advance_stage`` 的名字；
     - 在某个节点内部启动的阶段会被标记，节点完成时由 ``report_node(done)``
@@ -224,14 +264,13 @@ def advance_stage(stage: str) -> None:
         return
     previous = str(_state.get("stage_key") or "")
     if previous and previous != name and _state.get("stage_pending"):
-        _complete_stage(previous)
+        _complete_step(previous)
     if _state.get("node"):
         _state["node_started_stage"] = True
     if name != previous:
         _state["stage_key"] = name
     _state["stage"] = name
     _state["stage_pending"] = True
-    _sync_total()
     _write_stage_file()
 
 
@@ -260,9 +299,12 @@ def report_nodes(names) -> None:
 def report_node(name: str, status: str, count_step: bool = True) -> None:
     """更新单个节点状态并写 stage.json；节点首次完成时推进一步。
 
+    **每个后处理节点在整次导出里只算 1 步**（计划清单里每个节点一项、同名
+    只计一次）；清单之外的节点只更新高亮，不计步、不改 ``total``。
+
     若该节点执行期间自己启动过导出阶段（例如直出形态键 / 多文件节点），
     完成时把**节点内部最后启动的那个阶段**一并记为完成（该阶段与节点各算
-    1 步，同名不重复计）。
+    1 步，同名不重复计、且同样要求它在计划清单内）。
 
     ``count_step=False`` 供"阶段级节点"使用：这些节点只用于节点高亮，
     不参与步骤计数（``done`` / ``total`` 保持不变）。
@@ -300,10 +342,11 @@ def report_node(name: str, status: str, count_step: bool = True) -> None:
         if count_step:
             # 节点内部最后启动的那个阶段也走完了：先记该阶段，再记节点本身
             if _state.get("node_started_stage") and _state.get("stage_pending"):
-                _complete_stage(str(_state.get("stage_key") or ""))
+                _complete_step(str(_state.get("stage_key") or ""))
                 _state["stage_pending"] = False
-            _complete_node(key)
-            _sync_total()
+            # 直出模式节点键是 ``树名/节点名``，普通模式是纯节点名：两种都试
+            if not _complete_step(key):
+                _complete_step(node_label)
         _state["node_started_stage"] = False
         _write_stage_file()
     else:
@@ -329,6 +372,7 @@ def get_state() -> dict:
         "nodes": dict(_state["nodes"]),
         "done": _state["done"],
         "total": _state["total"],
+        "plan": list(_state["plan"]),
         "elapsed": elapsed(),
     }
 
@@ -368,6 +412,10 @@ def _write_stage_file() -> None:
 
         payload["node"] = str(_state["node"] or "")
         payload["nodes"] = {str(key): str(value) for key, value in _state["nodes"].items()}
+        # 固定步骤清单（调试用）：导出开始时一次算好，整次导出不变
+        if _state["plan"]:
+            payload["plan"] = list(_state["plan"])
+            payload["plan_total"] = len(_state["plan"])
         payload["elapsed"] = round(elapsed(), 3)
         payload["started_at"] = float(_state["started_at"] or 0.0)
 
