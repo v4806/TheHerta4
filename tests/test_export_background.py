@@ -373,6 +373,11 @@ class _FakeBlueprintExportHelper:
         return False
 
     @staticmethod
+    def _is_node_connected_to_output(_tree, node):
+        """参与导出节点判定（真实插件的私有静态方法）：测试里用属性控制。"""
+        return bool(getattr(node, "connected_to_output", True))
+
+    @staticmethod
     def collect_shapekey_objects(*_args, **_kwargs):
         return []
 
@@ -1523,6 +1528,36 @@ class OperatorInvokeTests(_BackgroundTestBase):
             any(level & {'WARNING', 'ERROR'} for level, _message in operator.reports)
         )
 
+    def test_modal_passes_through_non_timer_events(self):
+        """导出期间界面仍可操作：鼠标 / 键盘等非 TIMER 事件放行，不吞掉平移缩放。"""
+        self.scene_properties.background_export_enabled = True
+        context = self._make_context()
+        operator = self._make_operator(context)
+        operator.invoke(context, None)
+        session = _RecordingSession.instances[0]
+        polls = []
+        session.poll = lambda: polls.append(1) or "running"
+        _FAKE_AREAS[0].header = "<unset>"
+
+        for event_type in ('MIDDLEMOUSE', 'WHEELUPMOUSE', 'MOUSEMOVE', 'LEFTMOUSE', 'RET'):
+            with self.subTest(event_type=event_type):
+                self.assertEqual(
+                    operator.modal(context, types.SimpleNamespace(type=event_type)),
+                    {'PASS_THROUGH'},
+                )
+
+        # 非 TIMER 事件不轮询 stage.json、也不写状态栏（进度仍按 0.2s TIMER 刷新）
+        self.assertEqual(polls, [])
+        self.assertEqual(_FAKE_AREAS[0].header, "<unset>")
+
+        # ESC 不走 PASS_THROUGH，仍是取消收尾
+        self.assertEqual(
+            operator.modal(context, types.SimpleNamespace(type='ESC')), {'CANCELLED'}
+        )
+        self.assertTrue(session.cancelled)
+        self.assertTrue(session.cleaned)
+        self.assertEqual(_FAKE_AREAS[0].header, "后台导出已取消")
+
     def test_finish_restores_node_colors_for_all_outcomes(self):
         """success / cancel / error 三个收尾分支都要恢复节点原色并清空状态。"""
         context = self._make_context()
@@ -1996,7 +2031,7 @@ class NodeHighlightTests(_BackgroundTestBase):
         operator._restore_node_colors()
         self.assertEqual(tuple(node.color), (0.1, 0.2, 0.3, 1.0))
 
-    def test_unknown_node_and_pending_status_are_ignored(self):
+    def test_unknown_node_and_unknown_status_are_ignored(self):
         node = _FakeProgressNode("已知节点", color=(0.3, 0.3, 0.3))
         self._install_tree(node)
         operator = self._operator()
@@ -2004,12 +2039,116 @@ class NodeHighlightTests(_BackgroundTestBase):
         operator._sync_node_highlight(
             types.SimpleNamespace(
                 tree_name=self.TREE_NAME,
-                stage_nodes={"已知节点": "pending", "不存在节点": "running"},
+                stage_nodes={"已知节点": "unknown-status", "不存在节点": "running"},
             )
         )
 
         self.assertFalse(node.use_custom_color)
         self.assertEqual(tuple(node.color), (0.3, 0.3, 0.3))
+
+    def test_pending_nodes_highlighted_once_then_not_rewritten(self):
+        """导出开始后所有 pending 节点一次性上蓝灰；后续 tick 不重复写同一批。"""
+        nodes = [
+            _FakeProgressNode("节点A", color=(0.11, 0.12, 0.13)),
+            _FakeProgressNode("节点B", color=(0.21, 0.22, 0.23)),
+            _FakeProgressNode("节点C", color=(0.31, 0.32, 0.33)),
+        ]
+        self._install_tree(*nodes)
+        operator = self._operator()
+        stage_nodes = {"节点A": "pending", "节点B": "pending", "节点C": "pending"}
+
+        operator._sync_node_highlight(
+            types.SimpleNamespace(tree_name=self.TREE_NAME, stage_nodes=dict(stage_nodes))
+        )
+
+        for node in nodes:
+            self.assertTrue(node.use_custom_color)
+            self.assertEqual(tuple(node.color), (0.45, 0.52, 0.68))
+
+        # 状态没变 → 第二次 tick 不重写（把颜色改成哨兵值，重写会变回蓝灰）
+        for node in nodes:
+            node.color = (0.9, 0.9, 0.9)
+        operator._sync_node_highlight(
+            types.SimpleNamespace(tree_name=self.TREE_NAME, stage_nodes=dict(stage_nodes))
+        )
+        for node in nodes:
+            self.assertEqual(tuple(node.color), (0.9, 0.9, 0.9))
+
+        # pending 的原色也要由收尾恢复
+        operator._restore_node_colors()
+        self.assertFalse(nodes[0].use_custom_color)
+        self.assertEqual(tuple(nodes[0].color), (0.11, 0.12, 0.13))
+        self.assertEqual(tuple(nodes[1].color), (0.21, 0.22, 0.23))
+        self.assertEqual(tuple(nodes[2].color), (0.31, 0.32, 0.33))
+
+    def test_status_transition_pending_running_done(self):
+        """pending → running → done：每次状态变化换色，原色仍是最开始那一份。"""
+        node = _FakeProgressNode("状态节点", color=(0.1, 0.2, 0.3))
+        self._install_tree(node)
+        operator = self._operator()
+
+        def _sync(status):
+            operator._sync_node_highlight(
+                types.SimpleNamespace(
+                    tree_name=self.TREE_NAME, stage_nodes={"状态节点": status}
+                )
+            )
+
+        _sync("pending")
+        self.assertEqual(tuple(node.color), (0.45, 0.52, 0.68))
+        _sync("running")
+        self.assertEqual(tuple(node.color), (0.95, 0.72, 0.1))
+        _sync("done")
+        self.assertEqual(tuple(node.color), (0.22, 0.78, 0.3))
+
+        operator._restore_node_colors()
+        self.assertEqual(tuple(node.color), (0.1, 0.2, 0.3))
+
+    def test_participants_highlighted_through_export_phases(self):
+        """前处理 / 解析节点：加载=蓝灰 → 阶段开始=黄 → 后处理开始=绿。"""
+        info = _FakeProgressNode("物体信息", color=(0.05, 0.1, 0.15))
+        info.bl_idname = "SSMTNode_Object_Info"
+        group = _FakeProgressNode("物体组", color=(0.2, 0.25, 0.3))
+        group.bl_idname = "SSMTNode_Object_Group"
+        post = _FakeProgressNode("后处理节点", color=(0.4, 0.4, 0.4))
+        post.bl_idname = "SSMTNode_PostProcess_ShapeKey"
+        output = _FakeProgressNode("Mod输出", color=(0.5, 0.5, 0.5))
+        output.bl_idname = "SSMTNode_Result_Output"
+        self._install_tree(info, group, post, output)
+        operator = self._operator()
+
+        def _sync(stage, stage_nodes):
+            operator._sync_node_highlight(
+                types.SimpleNamespace(
+                    tree_name=self.TREE_NAME, stage=stage, stage_nodes=dict(stage_nodes)
+                )
+            )
+
+        # 加载工程：参与导出的节点先上 pending 蓝灰；后处理节点等 worker 上报
+        _sync("加载工程", {})
+        self.assertEqual(tuple(info.color), (0.45, 0.52, 0.68))
+        self.assertEqual(tuple(group.color), (0.45, 0.52, 0.68))
+        self.assertFalse(post.use_custom_color)
+        # 输出节点不算「参与导出的工作节点」
+        self.assertFalse(output.use_custom_color)
+
+        # 前处理 / 蓝图解析 / 导出轮次阶段：黄
+        _sync("前处理", {})
+        self.assertEqual(tuple(info.color), (0.95, 0.72, 0.1))
+        self.assertEqual(tuple(group.color), (0.95, 0.72, 0.1))
+
+        # worker 开始上报后处理节点 = 前处理等阶段已结束：绿
+        _sync("后处理", {"后处理节点": "running"})
+        self.assertEqual(tuple(info.color), (0.22, 0.78, 0.3))
+        self.assertEqual(tuple(group.color), (0.22, 0.78, 0.3))
+        self.assertEqual(tuple(post.color), (0.95, 0.72, 0.1))
+
+        # 收尾恢复原色（参与导出节点也一起恢复）
+        operator._restore_node_colors()
+        self.assertEqual(tuple(info.color), (0.05, 0.1, 0.15))
+        self.assertEqual(tuple(group.color), (0.2, 0.25, 0.3))
+        self.assertEqual(tuple(post.color), (0.4, 0.4, 0.4))
+        self.assertFalse(output.use_custom_color)
 
     def test_modal_syncs_highlight_on_every_tick(self):
         self._install_tree()

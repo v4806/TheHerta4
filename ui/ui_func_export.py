@@ -52,13 +52,24 @@ def _raise_for_unknown_logic_name() -> None:
 
 #: 后台导出时蓝图节点的进度配色（RGB；Blender 5.x 的 node.color 是 3 分量，
 #: 旧版本是 4 分量，赋值时按节点现有维度补齐 —— 见 ``_node_color_for``）
+_BG_NODE_PENDING_COLOR = (0.45, 0.52, 0.68)
 _BG_NODE_RUNNING_COLOR = (0.95, 0.72, 0.1)
 _BG_NODE_DONE_COLOR = (0.22, 0.78, 0.3)
+#: 节点状态 → 高亮颜色：尚未开始=蓝灰、正在执行=黄、已完成=绿。
+#: 只认这三种状态，其它状态（未来的新增值）一律忽略。
+_BG_NODE_STATUS_COLORS = {
+    "pending": _BG_NODE_PENDING_COLOR,
+    "running": _BG_NODE_RUNNING_COLOR,
+    "done": _BG_NODE_DONE_COLOR,
+}
 # 节点颜色高亮（用户要求恢复）：写 node.color 会触发节点编辑器重绘，这里只在
 # 节点状态真的变化时写一次（见 _sync_node_highlight 的 records 状态判断）。
 _BG_NODE_HIGHLIGHT_ENABLED = True
 # 不限流（恢复 B 方案之前的节奏）；需要时可调大来限制节点编辑器重绘频率。
 _BG_HIGHLIGHT_MIN_INTERVAL = 0.0
+#: 阶段名仍停在这些值 = 参与导出的节点还没真正开始干活（读作 pending）。
+#: worker 启动后主进程先把阶段标成「加载工程」，直到它写出第一个 stage.json。
+_BG_PARTICIPANT_IDLE_STAGES = ("", "加载工程")
 
 
 #: 后台导出 modal 轮询的共用实现：Generate Mod 与快速局部导出共用同一套
@@ -67,7 +78,12 @@ class _BackgroundExportMixin:
     """后台导出 modal：轮询进度、节点高亮、原生进度条与收尾分支。"""
 
     def modal(self, context, event):
-        """后台导出轮询：每 0.5s 读一次 stage.json / result.json 并刷新状态栏。"""
+        """后台导出轮询：每 0.2s 读一次 stage.json / result.json 并刷新状态栏。
+
+        **只处理 TIMER / ESC**：其余事件一律 ``PASS_THROUGH`` 交回界面，导出期间
+        仍可平移 / 缩放节点编辑器（中键拖动、滚轮等）—— 早期的实现把鼠标事件
+        全部吞在 modal 里，导致后台导出时蓝图视图完全不能操作。
+        """
         session = getattr(self, "_bg_session", None)
         if session is None:
             self._stop_background_timer(context)
@@ -77,6 +93,10 @@ class _BackgroundExportMixin:
         if event.type == 'ESC':
             self._finish_background_export(context, session, "cancel")
             return {'CANCELLED'}
+
+        # 非 TIMER 事件放行：事件继续传给界面（鼠标中键平移、滚轮缩放等）。
+        if event.type != 'TIMER':
+            return {'PASS_THROUGH'}
 
         status = session.poll()
         self._sync_node_highlight(session)
@@ -205,7 +225,7 @@ class _BackgroundExportMixin:
             pass
 
     def _sync_node_highlight(self, session):
-        """把后台导出的节点级进度画到蓝图上：正在执行=黄、已完成=绿。
+        """把后台导出的节点级进度画到蓝图上：未开始=蓝灰、执行中=黄、已完成=绿。
 
         节点名可能含中文 / 重名，按 ``session.stage_nodes`` 的名字精确取；
         第一次改色前记录原 ``use_custom_color`` / ``color``，收尾由
@@ -215,13 +235,17 @@ class _BackgroundExportMixin:
         节点颜色写入会触发节点编辑器整体重绘，节点树大时一次重绘很慢。这里
         只处理「状态真的变了」的节点，并且最多每 ``_BG_HIGHLIGHT_MIN_INTERVAL``
         秒同步一次（未到时间的变更留到下一次 0.2s 轮询再写）。
+        ``pending`` 节点在导出刚开始时一次性上色（可能几十个），之后 records
+        里已记为 ``pending``，不再重复写入。
+
+        worker 只在后处理阶段把节点名写进 ``stage.json``；蓝图里参与导出的
+        前处理 / 蓝图解析 / 导出轮次节点由 ``_collect_participant_node_names``
+        在主进程补全，见 ``_participant_phase_status``。
         """
         if not _BG_NODE_HIGHLIGHT_ENABLED:
             return
         try:
-            nodes_state = dict(getattr(session, "stage_nodes", None) or {})
-            if not nodes_state:
-                return
+            worker_nodes = dict(getattr(session, "stage_nodes", None) or {})
 
             tree_name = str(getattr(session, "tree_name", "") or "")
             lookup = getattr(self, "_bg_node_lookup", None)
@@ -240,13 +264,31 @@ class _BackgroundExportMixin:
                 records = {}
                 self._bg_node_colors = records
 
-            pending = [
+            # worker 的 stage.json 只登记后处理节点；参与导出的其它节点
+            # （前处理 / 蓝图解析 / 导出轮次）由主进程按蓝图树补全状态，
+            # 与后处理节点一起按 蓝灰 → 黄 → 绿 推进。
+            nodes_state = worker_nodes
+            participants = lookup.get("__participants__")
+            if participants is None:
+                participants = self._collect_participant_node_names(tree)
+                lookup["__participants__"] = participants
+            if participants:
+                phase_status = self._participant_phase_status(session, worker_nodes)
+                nodes_state = dict(worker_nodes)
+                for name in participants:
+                    nodes_state.setdefault(name, phase_status)
+
+            if not nodes_state:
+                return
+
+            # 只挑「状态真的变了」的节点（含首次出现的 pending 批量写）
+            changes = [
                 (name, status)
                 for name, status in nodes_state.items()
-                if status in ("running", "done")
+                if status in _BG_NODE_STATUS_COLORS
                 and (records.get(name) or {}).get("status") != status
             ]
-            if not pending:
+            if not changes:
                 return
 
             now = time.monotonic()
@@ -255,7 +297,7 @@ class _BackgroundExportMixin:
                 return
             self._bg_last_highlight_time = now
 
-            for name, status in pending:
+            for name, status in changes:
                 record = records.get(name)
                 node = lookup.get(name)
                 if node is None:
@@ -274,9 +316,7 @@ class _BackgroundExportMixin:
                     records[name] = record
                 record["status"] = status
 
-                color = (
-                    _BG_NODE_RUNNING_COLOR if status == "running" else _BG_NODE_DONE_COLOR
-                )
+                color = _BG_NODE_STATUS_COLORS[status]
                 node.use_custom_color = True
                 node.color = self._node_color_for(node, color)
         except Exception:
@@ -299,6 +339,60 @@ class _BackgroundExportMixin:
             if str(getattr(candidate, "name", "") or "") == name:
                 return candidate
         return None
+
+    @staticmethod
+    def _collect_participant_node_names(tree):
+        """蓝图里「参与导出」但 worker 不上报状态的节点名（前处理 / 解析 / 轮次）。
+
+        worker 的 ``stage.json`` 只登记后处理节点，所以导出期间前处理等节点
+        一直没有颜色。这里在主进程按蓝图树补全：所有连到输出节点、且不是
+        后处理 / 输出 / 中转的节点都算参与导出。
+
+        树结构在导出期间不变，结果由调用方缓存在 ``_bg_node_lookup`` 里只算一次。
+        """
+        names = []
+        try:
+            checker = getattr(BlueprintExportHelper, "_is_node_connected_to_output", None)
+        except Exception:
+            checker = None
+        for node in getattr(tree, "nodes", None) or []:
+            try:
+                if bool(getattr(node, "mute", False)):
+                    continue
+                bl_idname = str(getattr(node, "bl_idname", "") or "")
+                if bl_idname.startswith("SSMTNode_PostProcess_"):
+                    continue
+                if bl_idname.startswith("SSMTNode_Result_"):
+                    continue
+                if bl_idname in ("NodeReroute", "NodeFrame"):
+                    continue
+                if callable(checker):
+                    try:
+                        if not checker(tree, node):
+                            continue
+                    except Exception:
+                        continue
+                name = str(getattr(node, "name", "") or "")
+                if name:
+                    names.append(name)
+            except Exception:
+                continue
+        return names
+
+    @staticmethod
+    def _participant_phase_status(session, worker_nodes):
+        """参与导出节点（前处理 / 蓝图解析 / 导出轮次）的推算状态。
+
+        worker 只在**后处理阶段**才开始往 ``stage.json`` 写节点状态，因此
+        ``stage_nodes`` 非空即代表「前处理等阶段已结束」→ ``done``；
+        阶段名还停在加载工程 / 为空时还没开工 → ``pending``；其余阶段 → ``running``。
+        """
+        if worker_nodes:
+            return "done"
+        stage = str(getattr(session, "stage", "") or "")
+        if stage in _BG_PARTICIPANT_IDLE_STAGES:
+            return "pending"
+        return "running"
 
     @staticmethod
     def _node_color_tuple(node):
