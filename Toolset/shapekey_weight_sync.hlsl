@@ -26,6 +26,15 @@
 
 #define SHAPEKEY_WEIGHT_SYNC_BASE 100
 
+// 权重硬边界：只挡 inf/NaN 和彻底失控的数值，不是「形态键合理范围」。
+// ini 里写 $Freq_xxx = 1.6 / -0.4 必须原样通过这里 —— 旧代码在这里 clamp 到
+// 0..1，是 >1 与负值失效的主因。
+// ⚠ 必须与 common/shapekey_weight_range.py 的 SHAPEKEY_WEIGHT_MIN/MAX 以及
+//   其余 4 个 drag_interaction*.hlsl 里的同名 define 一致
+//   （tests/test_shapekey_weight_range_contract.py 核对）。
+#define SHAPEKEY_WEIGHT_MIN (-4.0)
+#define SHAPEKEY_WEIGHT_MAX (4.0)
+
 RWBuffer<float> ShapeKeyWeight : register(u0);
 Texture1D<float4> IniParams : register(t120);
 
@@ -40,5 +49,12 @@ void main(uint3 threadID : SV_DispatchThreadID)
         return;
     }
     // 动态分量索引（[i & 3]）与 rzm_shapekey_var_sync.hlsl 的既有写法一致。
-    ShapeKeyWeight[i] = clamp(IniParams[SHAPEKEY_WEIGHT_SYNC_BASE + (i >> 2)][i & 3], 0.0, 1.0);
+    float raw = IniParams[SHAPEKEY_WEIGHT_SYNC_BASE + (i >> 2)][i & 3];
+    // 未初始化的槽位可能读到 NaN；NaN 会被下面的 clamp 原样透传进权重缓冲，
+    // 一并按 0 处理。
+    if (isnan(raw))
+    {
+        raw = 0.0;
+    }
+    ShapeKeyWeight[i] = clamp(raw, SHAPEKEY_WEIGHT_MIN, SHAPEKEY_WEIGHT_MAX);
 }

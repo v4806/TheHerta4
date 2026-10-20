@@ -63,6 +63,20 @@ _install_module(
 )
 
 _module_path = Path(__file__).resolve().parents[1] / "blueprint" / "node_postprocess_shapekey_ext.py"
+
+
+def _load_real_common_module(alias):
+    """把仓库里真实的 common/<name>.py 挂到假包前缀下（节点模块用相对导入取它）。"""
+    file_path = Path(__file__).resolve().parents[1] / "common" / f"{alias.rsplit('.', 1)[-1]}.py"
+    spec = importlib.util.spec_from_file_location(alias, file_path)
+    loaded = importlib.util.module_from_spec(spec)
+    sys.modules[alias] = loaded
+    spec.loader.exec_module(loaded)
+    return loaded
+
+
+_load_real_common_module(f"{PKG}.common.shapekey_weight_range")
+
 _spec = importlib.util.spec_from_file_location(
     f"{PKG}.blueprint.node_postprocess_shapekey_ext", _module_path
 )

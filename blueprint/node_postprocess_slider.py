@@ -6,6 +6,12 @@ import shutil
 from collections import OrderedDict
 
 from .node_postprocess_base import SSMTNode_PostProcess_Base
+from ..common.shapekey_weight_range import (
+    SLIDER_WINDOW_MIN,
+    SLIDER_WINDOW_MAX,
+    normalize_window,
+    weight_from_param_expr,
+)
 
 
 class SSMTNode_PostProcess_SliderPanel(SSMTNode_PostProcess_Base):
@@ -145,6 +151,14 @@ class SSMTNode_PostProcess_SliderPanel(SSMTNode_PostProcess_Base):
 
         sorted_freq_params = sorted(list(freq_params))
         num_sliders = len(sorted_freq_params)
+
+        # 形态键强度行程：旧版滑条节点没有 weight_min/weight_max 属性，取默认 0~1，
+        # 生成结果与放开 clamp 之前逐字节一致。新工程请用带行程设置的
+        # node_postprocess_shapekey_ext.py —— 那里能配 0 以下 / 1 以上的行程。
+        window_min, window_max = normalize_window(
+            getattr(self, "weight_min", SLIDER_WINDOW_MIN),
+            getattr(self, "weight_max", SLIDER_WINDOW_MAX),
+        )
 
         if num_sliders == 0:
             print("在INI文件的[Constants]块中未找到任何形态键强度参数 (如 global $Freq_...)")
@@ -346,9 +360,10 @@ class SSMTNode_PostProcess_SliderPanel(SSMTNode_PostProcess_Base):
         present_logic.append("\n    ; --- 7. 计算映射参数并链接到形态键强度 ---")
 
         for i in range(1, num_sliders + 1):
+            param_var = "$param" + str(i)
             present_logic.extend([
                 f"    $param{i} = ($rel_x{i} - $min_rel_x{i}) / $range_x{i}",
-                f"    {sorted_freq_params[i-1]} = $param{i}"
+                f"    {sorted_freq_params[i-1]} = {weight_from_param_expr(param_var, window_min, window_max)}"
             ])
 
         present_logic.extend([

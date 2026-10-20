@@ -8,6 +8,16 @@ import uuid
 from collections import OrderedDict
 
 from .node_postprocess_base import SSMTNode_PostProcess_Base
+from ..common.shapekey_weight_range import (
+    SHAPEKEY_WEIGHT_MIN,
+    SHAPEKEY_WEIGHT_MAX,
+    SLIDER_WINDOW_MIN,
+    SLIDER_WINDOW_MAX,
+    is_identity_window,
+    normalize_window,
+    param_from_weight_expr,
+    weight_from_param_expr,
+)
 
 try:
     from PIL import Image, ImageDraw, ImageFont
@@ -826,6 +836,30 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
         name="创建累积备份",
         description="每次生成/刷新时是否自动备份 mod ini 文件（避免误操作丢失数据）",
         default=True,
+    )
+    weight_min: bpy.props.FloatProperty(
+        name="滑块下限",
+        description=(
+            "滑块面板能把形态键强度推到的最小值。默认 0（= 放开前的行为）。"
+            f"设成负数即可让滑块把权重推到 0 以下（反向变化）；硬边界 {SHAPEKEY_WEIGHT_MIN:g}，"
+            "超出这个硬边界的值请直接改 ini 里的 $Freq_xxx（shader 会放行到硬边界）"
+        ),
+        default=SLIDER_WINDOW_MIN,
+        min=SHAPEKEY_WEIGHT_MIN,
+        max=SHAPEKEY_WEIGHT_MAX,
+        precision=3,
+    )
+    weight_max: bpy.props.FloatProperty(
+        name="滑块上限",
+        description=(
+            "滑块面板能把形态键强度推到的最大值。默认 1（= 放开前的行为）。"
+            "设成大于 1 即可让滑块把权重推到 1 以上；"
+            f"硬边界 {SHAPEKEY_WEIGHT_MAX:g}，超出这个硬边界的值请直接改 ini 里的 $Freq_xxx"
+        ),
+        default=SLIDER_WINDOW_MAX,
+        min=SHAPEKEY_WEIGHT_MIN,
+        max=SHAPEKEY_WEIGHT_MAX,
+        precision=3,
     )
     help_key: bpy.props.StringProperty(
         name="显示/隐藏面板",
@@ -2178,6 +2212,36 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
         if num_sliders == 0:
             return False
 
+        # 形态键强度行程（滑块能推到的区间）。默认 0~1，与放开 clamp 前的产物一致：
+        # 生成端在窗口就是 0~1 时保留旧写法（`$Freq_x = $paramN`），所以老工程
+        # 重新导出逐字节不变。真正的权重不受这个窗口限制 —— ini 里写 1.6 / -0.4
+        # 会原样送到 shader 的硬边界（±4）里。
+        window_min, window_max = normalize_window(
+            getattr(self, "weight_min", SLIDER_WINDOW_MIN),
+            getattr(self, "weight_max", SLIDER_WINDOW_MAX),
+        )
+        window_is_identity = is_identity_window(window_min, window_max)
+
+        def append_rel_x_clamp(index, indent):
+            """权重可能落在窗口外：把显示用的 $rel_x 夹回面板，权重本身不动。"""
+            if window_is_identity:
+                return
+            pad = " " * indent
+            present_additions.append(f"{pad}if $rel_x{index} < $min_rel_x{index}")
+            present_additions.append(f"{pad}    $rel_x{index} = $min_rel_x{index}")
+            present_additions.append(f"{pad}endif")
+            present_additions.append(f"{pad}if $rel_x{index} > $max_rel_x{index}")
+            present_additions.append(f"{pad}    $rel_x{index} = $max_rel_x{index}")
+            present_additions.append(f"{pad}endif")
+
+        def param_from_freq(freq_var):
+            """`$paramN = ...` 的右侧：权重 -> 窗口内位置。"""
+            return param_from_weight_expr(freq_var, window_min, window_max)
+
+        def freq_from_param(index):
+            """`$Freq_x = ...` 的右侧：窗口内位置 -> 权重。"""
+            return weight_from_param_expr(f"$param{index}", window_min, window_max)
+
         slot_icon_map = self._scan_slot_icons(sections)
 
         try:
@@ -2420,17 +2484,18 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
                     present_additions.append(f"        if ($auto_play_enabled_group{gid} == 1)")
                     present_additions.append(f"            $param{i} = ($speed_percent_group{gid} - $speed_percent_min_group{gid}) / ($speed_percent_max_group{gid} - $speed_percent_min_group{gid})")
                     present_additions.append(f"        else")
-                    present_additions.append(f"            $param{i} = {sorted_freq_params[i-1]}")
+                    present_additions.append(f"            $param{i} = {param_from_freq(sorted_freq_params[i-1])}")
                     present_additions.append(f"        endif")
                 else:
-                    present_additions.append(f"        $param{i} = {sorted_freq_params[i-1]}")
+                    present_additions.append(f"        $param{i} = {param_from_freq(sorted_freq_params[i-1])}")
             else:
                 present_additions.append(f"        if ($auto_play_enabled == 1)")
                 present_additions.append(f"            $param{i} = ($step_frames - $step_frames_min) / ($step_frames_max - $step_frames_min)")
                 present_additions.append(f"        else")
-                present_additions.append(f"            $param{i} = {sorted_freq_params[i-1]}")
+                present_additions.append(f"            $param{i} = {param_from_freq(sorted_freq_params[i-1])}")
                 present_additions.append(f"        endif")
             present_additions.append(f"        $rel_x{i} = $min_rel_x{i} + $param{i} * $range_x{i}")
+            append_rel_x_clamp(i, 8)
             present_additions.append("    endif")
 
         present_additions.append("\n    ; --- 4. 计算滑块和按钮位置 ---")
@@ -2538,6 +2603,12 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
         present_additions.append("        $dragged_slider = $is_dragging - 1")
         present_additions.append("    endif")
 
+        if not window_is_identity:
+            present_additions.append(
+                f"    ; 形态键强度行程 {window_min:g} ~ {window_max:g}"
+                f"（shader 硬边界 {SHAPEKEY_WEIGHT_MIN:g} ~ {SHAPEKEY_WEIGHT_MAX:g}）"
+            )
+
         if multi_group_mode:
             for i in range(1, num_sliders + 1):
                 gid = slider_to_group.get(i - 1)
@@ -2547,20 +2618,21 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
                     present_additions.append(f"        if ($auto_play_enabled_group{gid} == 1)")
                     present_additions.append(f"            $speed_percent_group{gid} = $speed_percent_min_group{gid} + $param{i} * ($speed_percent_max_group{gid} - $speed_percent_min_group{gid})")
                     present_additions.append(f"        else")
-                    present_additions.append(f"            {sorted_freq_params[i-1]} = $param{i}")
+                    present_additions.append(f"            {sorted_freq_params[i-1]} = {freq_from_param(i)}")
                     present_additions.append(f"        endif")
                 else:
-                    present_additions.append(f"        {sorted_freq_params[i-1]} = $param{i}")
+                    present_additions.append(f"        {sorted_freq_params[i-1]} = {freq_from_param(i)}")
                 present_additions.append(f"    else")
                 if gid is not None and gid in group_ids:
                     present_additions.append(f"        if ($auto_play_enabled_group{gid} == 1)")
                     present_additions.append(f"            $param{i} = ($speed_percent_group{gid} - $speed_percent_min_group{gid}) / ($speed_percent_max_group{gid} - $speed_percent_min_group{gid})")
                     present_additions.append(f"        else")
-                    present_additions.append(f"            $param{i} = {sorted_freq_params[i-1]}")
+                    present_additions.append(f"            $param{i} = {param_from_freq(sorted_freq_params[i-1])}")
                     present_additions.append(f"        endif")
                 else:
-                    present_additions.append(f"        $param{i} = {sorted_freq_params[i-1]}")
+                    present_additions.append(f"        $param{i} = {param_from_freq(sorted_freq_params[i-1])}")
                 present_additions.append(f"        $rel_x{i} = $min_rel_x{i} + $param{i} * $range_x{i}")
+                append_rel_x_clamp(i, 8)
                 present_additions.append(f"    endif")
         else:
             for i in range(1, num_sliders + 1):
@@ -2569,15 +2641,16 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
                 present_additions.append(f"        if ($auto_play_enabled == 1)")
                 present_additions.append(f"            $step_frames = $step_frames_min + $param{i} * ($step_frames_max - $step_frames_min)")
                 present_additions.append(f"        else")
-                present_additions.append(f"            {sorted_freq_params[i-1]} = $param{i}")
+                present_additions.append(f"            {sorted_freq_params[i-1]} = {freq_from_param(i)}")
                 present_additions.append(f"        endif")
                 present_additions.append(f"    else")
                 present_additions.append(f"        if ($auto_play_enabled == 1)")
                 present_additions.append(f"            $param{i} = ($step_frames - $step_frames_min) / ($step_frames_max - $step_frames_min)")
                 present_additions.append(f"        else")
-                present_additions.append(f"            $param{i} = {sorted_freq_params[i-1]}")
+                present_additions.append(f"            $param{i} = {param_from_freq(sorted_freq_params[i-1])}")
                 present_additions.append(f"        endif")
                 present_additions.append(f"        $rel_x{i} = $min_rel_x{i} + $param{i} * $range_x{i}")
+                append_rel_x_clamp(i, 8)
                 present_additions.append(f"    endif")
 
         present_additions.append("\n    ; --- 9. 执行渲染 (按层级) ---")
@@ -2785,6 +2858,30 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
         box = layout.box()
         box.label(text="滑块面板-自定义", icon='GRIP')
         box.prop(self, "create_cumulative_backup")
+
+        # 形态键强度行程：默认 0~1（与放开 clamp 前的行为一致）。
+        # 改宽之后滑块就能把权重推到 1 以上 / 0 以下；超出窗口的键值仍然合法
+        # （shader 侧硬边界 ±4），只是滑块会停在端点。
+        box = layout.box()
+        box.label(text="形态键强度行程", icon='ARROW_LEFTRIGHT')
+        col = box.column(align=True)
+        col.prop(self, "weight_min", text="下限")
+        col.prop(self, "weight_max", text="上限")
+        window_min, window_max = normalize_window(
+            getattr(self, "weight_min", SLIDER_WINDOW_MIN),
+            getattr(self, "weight_max", SLIDER_WINDOW_MAX),
+        )
+        if is_identity_window(window_min, window_max):
+            box.label(
+                text=f"默认 0 ~ 1；shader 硬边界 {SHAPEKEY_WEIGHT_MIN:g} ~ {SHAPEKEY_WEIGHT_MAX:g}",
+                icon='INFO',
+            )
+        else:
+            box.label(
+                text=(f"当前 {window_min:g} ~ {window_max:g}；"
+                      f"硬边界 {SHAPEKEY_WEIGHT_MIN:g} ~ {SHAPEKEY_WEIGHT_MAX:g}"),
+                icon='INFO',
+            )
 
         box = layout.box()
         box.label(text="快捷键设置", icon='KEYINGSET')

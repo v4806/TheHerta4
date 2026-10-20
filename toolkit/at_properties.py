@@ -144,13 +144,13 @@ class ATP_Properties(bpy.types.PropertyGroup):
         name="最小值",
         default=0.0,
         update=update_shape_key_value_range,
-        description="列表内所有形态键的最小值（默认 0）",
+        description="列表内所有形态键的最小值（默认 0）。可以设成负数，比如 -0.5",
     )
     sk_value_max: bpy.props.FloatProperty(
         name="最大值",
         default=1.0,
         update=update_shape_key_value_range,
-        description="列表内所有形态键的最大值（默认 1）",
+        description="列表内所有形态键的最大值（默认 1）。可以设成 1.5 以上；Blender 的 slider 硬限是 ±10",
     )
     sk_add_new_name: bpy.props.StringProperty(name="形态键名称", default="NewKey", description="要批量添加或删除的形态键的名称")
     sk_set_active_name: bpy.props.StringProperty(name="活动形态键名称", default="", description="要设置为活动项的形态键名称")
