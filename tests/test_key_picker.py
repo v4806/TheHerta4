@@ -53,6 +53,20 @@ _install_module(
     ),
 )
 
+def _load_real_common_module(alias):
+    """把仓库里真实的 common/<name>.py 挂到假包前缀下（节点模块用相对导入取它）。"""
+    file_path = Path(__file__).resolve().parents[1] / "common" / f"{alias.rsplit('.', 1)[-1]}.py"
+    spec = importlib.util.spec_from_file_location(alias, file_path)
+    loaded = importlib.util.module_from_spec(spec)
+    sys.modules[alias] = loaded
+    spec.loader.exec_module(loaded)
+    return loaded
+
+
+# 节点模块顶层会 from ..common.shapekey_weight_range import ...（形态键权重放开
+# 0..1 那笔加的），假包必须把这个真实模块挂上，否则收集期直接 ModuleNotFoundError。
+_load_real_common_module(f"{PKG}.common.shapekey_weight_range")
+
 _module_path = Path(__file__).resolve().parents[1] / "blueprint" / "node_postprocess_shapekey_ext.py"
 _spec = importlib.util.spec_from_file_location(
     f"{PKG}.blueprint.node_postprocess_shapekey_ext", _module_path
