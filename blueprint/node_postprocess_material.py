@@ -1338,7 +1338,48 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
                 return node.image
         return None
 
-    def copy_texture_file(self, texture_image, target_folder, material, forced_filename=None):
+    # -- 后台导出细分进度：贴图复制 / 转 DDS --------------------------------
+    #
+    # 材质转资源pro 的 texconv 转换是耗时大头（实测 26 张 ≈13~20s），期间原来
+    # 状态栏停在"材质转资源pro"一动不动，用户会以为卡死。这里按"每张已处理贴图"
+    # 上报一次细粒度文本。只影响**显示**：``export_progress`` 没有 stage 文件时
+    # （同步导出 / 主线程）静默返回，不改导出流程与产物。
+
+    def _reset_texture_progress(self) -> None:
+        """一次导出开始时清零贴图计数。"""
+        self._tex_progress_done = 0
+        self._tex_progress_total = 0
+
+    def _plan_texture_progress(self, count) -> None:
+        """登记本批次预计处理的贴图数（只累加；用于显示 ``i/total`` 的 total）。"""
+        try:
+            planned = int(getattr(self, "_tex_progress_total", 0) or 0)
+            self._tex_progress_total = planned + max(0, int(count or 0))
+        except (TypeError, ValueError):
+            pass
+
+    def _report_texture_progress(self) -> None:
+        """每张进入复制的贴图前上报一次；任何异常都吞掉，绝不影响导出。
+
+        ``export_progress`` 按需导入：轻量 fake 宿主（单测）没有这个子模块，
+        同步导出 / 主线程也没有 stage 文件 —— 两种情况都保持静默。
+        """
+        try:
+            from . import export_progress
+
+            done = int(getattr(self, "_tex_progress_done", 0) or 0) + 1
+            self._tex_progress_done = done
+            total = max(int(getattr(self, "_tex_progress_total", 0) or 0), done)
+            self._tex_progress_total = total
+            # 前缀用节点名（默认就叫「材质转资源pro」）：节点完成时进度中台会按
+            # "<节点名>：" 前缀清掉这段细分文本，避免漏到下一个节点。
+            label = str(getattr(self, "name", "") or "").strip() or "材质转资源pro"
+            export_progress.report_stage(f"{label}：转换贴图 {done}/{total}")
+        except Exception:
+            pass
+
+    def copy_texture_file(self, texture_image, target_folder, material, forced_filename=None,
+                          workspace_source_path=None):
         if not texture_image or not texture_image.filepath:
             return None
         try:
@@ -1356,18 +1397,18 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
             if file_extension.lower() != ".dds" and getattr(self, "export_textures_as_dds", False):
                 converted_name = f"{stem}.dds"
                 converted_path = os.path.join(target_folder, converted_name)
-                # 「覆盖现有资源」只表示愿意重新生成，不代表每次引用都重来一遍：带缓存的
-                # 转换入口保证同一目标在一次导出里只跑一次 texconv。同一个材质被多个物体
-                # 引用是常态（实测一份 ini 里同一张 LightMap 被引用 282 次），没有这层保护
-                # 就会转 282 次、每次约 4 秒。
-                # 格式按**材质资源名**判定（stem 就是材质名，也是写出去的 .dds 文件名词干），
-                # 不看源 PNG 名：导出侧的名字才是用户在 Blender 里按贴图类型命名的
-                # （DiffuseMap_/NormalMap_…），源贴图则常是带哈希前缀或原始名的中间文件。
+                # 格式来源优先级：工作空间里这张材质的原贴图 DDS 头 → 材质类型规则 → 源文件名。
+                # 引擎读的就是原贴图那份字节（BC5 是双通道格式），照抄它的格式才不会读错。
+                texture_type = str(getattr(material, "name", "") or "").strip().split("_")[0]
                 ok, reason = convert_texture_to_dds_cached(
                     source_path,
                     converted_path,
+                    props=bpy.context.scene.texture_tools_props,
                     force=bool(self.material_to_resource_override),
                     match_name=stem,
+                    texture_type=texture_type,
+                    name_hints=(getattr(material, "name", ""), stem),
+                    workspace_source_path=workspace_source_path or "",
                 )
                 if ok:
                     return converted_name
@@ -1432,16 +1473,44 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
                 definition = f"global persist {key} = 0"
                 constants_lines.append(definition)
 
+    def _workspace_source_paths_for_materials(self, obj):
+        """材质名 → 工作空间里该材质原贴图的路径。
+
+        导出格式必须照抄原贴图的 DDS 头（引擎按原通道读，BC5 就是双通道），这条映射就是
+        在导出期找到那份原贴图的唯一桥梁：节点从 modimp_texture_slots 里拿到 source_path。
+        拿不到（节点不是从工作空间导入、或槽位缺 source_path）就返回空表，格式回落到规则表。
+        """
+        mapping = {}
+        if obj is None:
+            return mapping
+        try:
+            slots = self._collect_modimp_texture_slots(obj)
+        except Exception:
+            return mapping
+        for slot_info in slots.values():
+            source_path = str(slot_info.get("source_path", "") or "").strip()
+            if not source_path:
+                continue
+            for material in self._find_workspace_slot_materials(obj, slot_info):
+                mapping.setdefault(str(getattr(material, "name", "") or ""), source_path)
+        return mapping
+
+
     def generate_material_lines(self, matching_materials, param_name, texture_type, obj,
                                 texture_folder, all_sections,
                                 object_to_diffuse_swapkey, material_group_to_swapkey,
                                 swap_key_prefix, next_swap_key_num, used_swap_keys,
                                 resource_name_provider=None):
         generated_lines = []
+        # 细分进度：本批次要处理 len(matching_materials) 张贴图（下面每张都会进
+        # ``create_resource_entry`` 上报一次），先累加进显示用的 total。
+        self._plan_texture_progress(len(matching_materials or []))
         # 发光亮度写在当前逻辑对应的 FX 命名空间变量上：
         # RabbitFX/NTEMIFX 是大写 $…\brightness 同名字段，HI3FX 同样叫 brightness
         # （但它是 IniParams row230.w，语义一致）。
         brightness_param_name = fx_namespace.current_profile().param("brightness")
+        # 材质名 → 工作空间里该材质原贴图的路径：导出格式照抄这份原贴图的 DDS 头。
+        workspace_source_by_material = self._workspace_source_paths_for_materials(obj)
 
         if len(matching_materials) == 1:
             material = matching_materials[0]
@@ -1457,6 +1526,7 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
                 texture_folder,
                 all_sections,
                 resource_name_override=resource_name,
+                workspace_source_path=workspace_source_by_material.get(str(getattr(material, "name", "") or "")),
             )
             if new_line:
                 generated_lines.append(new_line)
@@ -1487,6 +1557,7 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
                     texture_folder,
                     all_sections,
                     resource_name_override=resource_name,
+                    workspace_source_path=workspace_source_by_material.get(str(getattr(material, "name", "") or "")),
                 )
                 if new_line:
                     generated_lines.append(f"if {current_swap_variable} == {index}")
@@ -1500,8 +1571,12 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
 
         return generated_lines, next_swap_key_num
 
-    def create_resource_entry(self, material, param_name, texture_folder, all_sections, resource_name_override=None):
+    def create_resource_entry(self, material, param_name, texture_folder, all_sections,
+                              resource_name_override=None, workspace_source_path=None):
         global _material_resource_cache
+
+        # 细分进度：每张材质贴图开始复制/转 DDS 前先刷新状态栏文本。
+        self._report_texture_progress()
 
         texture_image = self.get_texture_from_material(material)
         if not texture_image: return None
@@ -1522,9 +1597,12 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
                 texture_folder,
                 material,
                 forced_filename=cached_entry.get("filename"),
+                workspace_source_path=workspace_source_path,
             )
         else:
-            copied_filename = self.copy_texture_file(texture_image, texture_folder, material)
+            copied_filename = self.copy_texture_file(
+                texture_image, texture_folder, material, workspace_source_path=workspace_source_path
+            )
             resource_name = resource_name_override or f"Resource_{self._material_resource_stem(material)}"
             if copied_filename:
                 _material_resource_cache[cache_key] = {
@@ -2681,6 +2759,9 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
             return
 
         _LOG.info("🔧 材质转资源节点开始执行")
+
+        # 每次导出重新计贴图进度（多个材质转资源节点各自从 1 开始，文本自带节点前缀）
+        self._reset_texture_progress()
 
         total_found = 0
         total_matched = 0

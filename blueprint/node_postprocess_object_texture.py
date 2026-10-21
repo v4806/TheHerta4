@@ -517,7 +517,13 @@ def _apply_object_texture_replacements(ini_text, object_name, mesh_match, group,
         if getattr(group, "export_as_dds", False) and os.path.splitext(dest_name)[1].lower() != ".dds":
             converted_name = os.path.splitext(dest_name)[0] + ".dds"
             converted_path = os.path.join(texture_dir, converted_name)
-            ok, reason = convert_texture_to_dds_cached(source_path, converted_path)
+            # 槽位后缀是导出侧已知的贴图类型，只在读不到原贴图 DDS 头时作为规则兜底。
+            ok, reason = convert_texture_to_dds_cached(
+                source_path,
+                converted_path,
+                texture_type=suffix,
+                name_hints=[suffix],
+            )
             if ok and os.path.exists(converted_path):
                 converted = True
             else:

@@ -41,6 +41,9 @@ _fake_bpy = types.SimpleNamespace(
     ),
     data=types.SimpleNamespace(objects={}),
     path=types.SimpleNamespace(abspath=lambda value: value),
+    context=types.SimpleNamespace(
+        scene=types.SimpleNamespace(texture_tools_props=types.SimpleNamespace()),
+    ),
     utils=types.SimpleNamespace(
         register_class=lambda _cls: None, unregister_class=lambda _cls: None
     ),
@@ -71,6 +74,17 @@ _install_module(
     f"{PKG}.toolkit.tt_dds_conversion",
     convert_texture_to_dds_cached=lambda *_args, **_kwargs: (True, ""),
 )
+
+# 细分进度上报桩：真实实现在 blueprint/export_progress.py（无 stage 文件时静默），
+# 这里换成记录列表，便于断言「转换贴图 i/total」文本。
+_PROGRESS_REPORTS = []
+
+
+def _record_progress_stage(text=None, *_args, **_kwargs):
+    _PROGRESS_REPORTS.append(text)
+
+
+_install_module(f"{PKG}.blueprint.export_progress", report_stage=_record_progress_stage)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -130,13 +144,16 @@ class ExportTextureAsDDSTests(unittest.TestCase):
         return node
 
     def test_png_source_is_converted_to_dds(self):
-        """核心：开关开启时 PNG 源转成 DDS 写进 Mod，返回 .dds 文件名"""
-        source = self._make_source("c209c22b-45087-0-DiffuseMap.png")
+        """核心：开关开启时 PNG 源转成 DDS 写进 Mod，返回 .dds 文件名。
+
+        同时锁定导出侧接线：材质资源名与类型名必须传给转换入口，这样源图名不含
+        类型关键字时也能按材质名得到正确规则。"""
+        source = self._make_source("VivianGemADiffuse.png")
         node = self._make_node()
         calls = []
 
-        def fake_convert(source_path, target_path, props=None, force=False, match_name=None):
-            calls.append((source_path, target_path))
+        def fake_convert(source_path, target_path, **kwargs):
+            calls.append((source_path, target_path, kwargs))
             with open(target_path, "wb") as handle:
                 handle.write(b"DDS payload")
             return True, ""
@@ -147,7 +164,14 @@ class ExportTextureAsDDSTests(unittest.TestCase):
             result = node.copy_texture_file(_FakeImage(source), self.target_dir, _FakeMaterial())
 
         self.assertEqual("Body_Material.dds", result)
-        self.assertEqual([(source, os.path.join(self.target_dir, "Body_Material.dds"))], calls)
+        self.assertEqual(1, len(calls))
+        source_path, target_path, kwargs = calls[0]
+        self.assertEqual(source, source_path)
+        self.assertEqual(os.path.join(self.target_dir, "Body_Material.dds"), target_path)
+        self.assertEqual("Body_Material", kwargs.get("match_name"))
+        self.assertEqual("Body", kwargs.get("texture_type"))
+        self.assertEqual(("Body_Material", "Body_Material"), kwargs.get("name_hints"))
+        self.assertEqual("", kwargs.get("workspace_source_path"))
         # 源 PNG 必须原样保留：编辑期还要继续用它
         self.assertTrue(os.path.exists(source))
 
@@ -258,7 +282,8 @@ class ExportTextureAsDDSTests(unittest.TestCase):
         """
         source = self._make_source("c209c22b-45087-0-DiffuseMap.png")
         os.makedirs(self.target_dir, exist_ok=True)
-        with open(os.path.join(self.target_dir, "Body_Material.dds"), "wb") as handle:
+        target = os.path.join(self.target_dir, "Body_Material.dds")
+        with open(target, "wb") as handle:
             handle.write(b"already converted")
         node = self._make_node()
 
@@ -334,7 +359,7 @@ class PSBindingExportAsDDSTests(unittest.TestCase):
         source = self._make_source("body-DiffuseMap.png")
         node = self._make_node()
 
-        def fake_convert(source_path, target_path, props=None, force=False):
+        def fake_convert(source_path, target_path, props=None, force=False, **_kwargs):
             with open(target_path, "wb") as handle:
                 handle.write(b"DDS payload")
             return True, ""
@@ -390,7 +415,7 @@ class DiffuseSwitchExportAsDDSTests(unittest.TestCase):
     def test_png_is_converted_to_dds(self):
         source = self._make_source("alt-DiffuseMap.png")
 
-        def fake_convert(source_path, target_path, props=None, force=False):
+        def fake_convert(source_path, target_path, props=None, force=False, **_kwargs):
             with open(target_path, "wb") as handle:
                 handle.write(b"DDS payload")
             return True, ""
@@ -483,7 +508,7 @@ class ObjectTextureExportAsDDSTests(unittest.TestCase):
     def test_png_slot_is_converted_to_dds(self):
         source = self._make_source("body-DiffuseMap.png")
 
-        def fake_convert(source_path, target_path, props=None, force=False):
+        def fake_convert(source_path, target_path, props=None, force=False, **_kwargs):
             with open(target_path, "wb") as handle:
                 handle.write(b"DDS payload")
             return True, ""
@@ -520,6 +545,53 @@ class ObjectTextureExportAsDDSTests(unittest.TestCase):
 
         self.assertGreater(modified, 0)
         self.assertIn("filename = Textures/body-DiffuseMap.png", text)
+
+
+class TextureProgressReportTests(unittest.TestCase):
+    """材质转资源pro 贴图转换的细分进度文本（后台导出状态栏 i/total）。"""
+
+    _METHODS = ("_reset_texture_progress", "_plan_texture_progress", "_report_texture_progress")
+
+    def setUp(self):
+        _PROGRESS_REPORTS.clear()
+        base = node_postprocess_material.SSMTNode_PostProcess_MaterialBase
+        self.node = types.SimpleNamespace()
+        for name in self._METHODS:
+            setattr(self.node, name, types.MethodType(getattr(base, name), self.node))
+
+    def test_each_texture_reports_increment(self):
+        self.node._reset_texture_progress()
+        self.node._plan_texture_progress(2)
+
+        self.node._report_texture_progress()
+        self.node._report_texture_progress()
+
+        self.assertEqual(
+            _PROGRESS_REPORTS,
+            ["材质转资源pro：转换贴图 1/2", "材质转资源pro：转换贴图 2/2"],
+        )
+
+    def test_total_never_smaller_than_done(self):
+        """没有批次预算（直接调 create_resource_entry）时也不能出现 i>total。"""
+        self.node._reset_texture_progress()
+
+        self.node._report_texture_progress()
+
+        self.assertEqual(_PROGRESS_REPORTS, ["材质转资源pro：转换贴图 1/1"])
+
+    def test_reset_restarts_counter_for_next_export(self):
+        self.node._reset_texture_progress()
+        self.node._plan_texture_progress(1)
+        self.node._report_texture_progress()
+
+        self.node._reset_texture_progress()
+        self.node._plan_texture_progress(1)
+        self.node._report_texture_progress()
+
+        self.assertEqual(
+            _PROGRESS_REPORTS,
+            ["材质转资源pro：转换贴图 1/1", "材质转资源pro：转换贴图 1/1"],
+        )
 
 
 if __name__ == "__main__":

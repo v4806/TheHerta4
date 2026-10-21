@@ -2,6 +2,7 @@ import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import tempfile
 
@@ -23,7 +24,7 @@ DDS_DEFAULT_RULES = [
     {
         "texture_type": "NormalMap",
         "pattern": r"(?i)(?:^|[_\-. ])NormalMap(?:[_\-. ]|$)",
-        "format": "bc7_unorm",
+        "format": "r8g8b8a8_unorm",
     },
     {
         "texture_type": "LightMap",
@@ -33,17 +34,17 @@ DDS_DEFAULT_RULES = [
     {
         "texture_type": "MaterialMap",
         "pattern": r"(?i)(?:^|[_\-. ])MaterialMap(?:[_\-. ]|$)",
-        "format": "bc7_unorm",
+        "format": "bc7_unorm_srgb",
     },
     {
         "texture_type": "RampMap",
         "pattern": r"(?i)(?:^|[_\-. ])RampMap(?:[_\-. ]|$)",
-        "format": "bc7_unorm",
+        "format": "bc7_unorm_srgb",
     },
     {
         "texture_type": "HighLightMap",
         "pattern": r"(?i)(?:^|[_\-. ])HighLightMap(?:[_\-. ]|$)",
-        "format": "bc7_unorm",
+        "format": "bc7_unorm_srgb",
     },
     {
         "texture_type": "WengineFX",
@@ -53,7 +54,7 @@ DDS_DEFAULT_RULES = [
     {
         "texture_type": "Glowmap",
         "pattern": r"(?i)(?:^|[_\-. ])Glowmap(?:[_\-. ]|$)",
-        "format": "bc7_unorm",
+        "format": "bc7_unorm_srgb",
     },
     {
         "texture_type": "FXMap",
@@ -78,6 +79,51 @@ DDS_DEFAULT_RULES = [
 ]
 
 _SUPPORTED_SOURCE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tga", ".bmp", ".tif", ".tiff"}
+
+# 目标格式名 -> DX10 头里偏移 128 的 DXGI 格式号（大小写不敏感比较）
+_DDS_DXGI_FORMAT_IDS = {
+    "bc7_unorm": 98,
+    "bc7_unorm_srgb": 99,
+    "bc6h_uf16": 95,
+    "bc6h_sf16": 96,
+    "bc1_unorm": 71,
+    "bc1_unorm_srgb": 72,
+    "bc2_unorm": 74,
+    "bc2_unorm_srgb": 75,
+    "bc3_unorm": 77,
+    "bc3_unorm_srgb": 78,
+    "bc4_unorm": 80,
+    "bc4_snorm": 81,
+    "bc5_unorm": 83,
+    "bc5_snorm": 85,
+    "r8_unorm": 61,
+    "r8g8_unorm": 49,
+    "r8g8b8a8_typeless": 27,
+    "r16_unorm": 56,
+    "r16_float": 54,
+    "r16g16b16a16_float": 10,
+    "r8g8b8a8_unorm": 28,
+    "r8g8b8a8_unorm_srgb": 29,
+    "b8g8r8a8_unorm": 87,
+    "b8g8r8a8_unorm_srgb": 91,
+}
+
+# legacy 头（FOURCC 在偏移 84）-> 等价的非 sRGB 格式名。
+# legacy FOURCC 没有 sRGB 变体，所以它们永远匹配不上任何 _srgb 目标。
+_DDS_LEGACY_FOURCC_FORMATS = {
+    b"DXT1": "bc1_unorm",
+    b"DXT2": "bc2_unorm",
+    b"DXT3": "bc2_unorm",
+    b"DXT4": "bc3_unorm",
+    b"DXT5": "bc3_unorm",
+    b"ATI1": "bc4_unorm",
+    b"BC4U": "bc4_unorm",
+    b"ATI2": "bc5_unorm",
+    b"BC5U": "bc5_unorm",
+}
+
+# DDS magic(4) + DDS_HEADER(124) + DX10 扩展头(20)
+_DDS_FULL_HEADER_SIZE = 148
 
 
 def find_texconv():
@@ -219,12 +265,28 @@ def _restore_image_display_state(image, snapshot, dds_format: str) -> None:
             pass
 
 
-def resolve_dds_target(filename: str, props) -> tuple[str, str, str]:
-    """名称 → ``(类型, 格式, 命中规则)``：先自定义规则（列表顺序首条命中），再内置规则
-    （取匹配位置最靠左的那条），都不中则是 ``("default", "bc7_unorm", "Default")``。
+_TEXTURE_TYPE_SPLIT_RE = re.compile(r"[_.\-\s]+")
 
-    参数名沿用 ``filename``，但判定串由调用方决定：导出侧传材质资源名，批量算子传文件名。
+
+def _first_texture_type_token(texture_type: str) -> str:
+    """取类型名的首个 token（按 ``_`` ``.`` ``-`` 空格切分），无有效 token 返回空串。"""
+    for token in _TEXTURE_TYPE_SPLIT_RE.split(str(texture_type or "").strip()):
+        if token:
+            return token
+    return ""
+
+
+def format_for_texture_type(texture_type: str, props) -> str:
+    """把材质类型 / 材质名前缀解析成 DDS 格式；未命中返回空串由调用方回退。
+
+    输入可以是 ``DiffuseMap``、``MaterialMap``、``diffusemap_xxx``、
+    ``DiffuseMap_VivianGemADiffuse`` 等：取首个 token 判定，大小写不敏感。
+    解析顺序：自定义规则（pattern 命中完整类型名）→ 默认规则的 ``texture_type``。
     """
+    raw = str(texture_type or "").strip()
+    if not raw:
+        return ""
+
     if getattr(props, "dds_use_custom_rules", False):
         for rule in getattr(props, "dds_rules", []) or []:
             if not getattr(rule, "enabled", True):
@@ -233,7 +295,41 @@ def resolve_dds_target(filename: str, props) -> tuple[str, str, str]:
             if not pattern:
                 continue
             try:
-                if _pattern_matches(pattern, filename):
+                if _pattern_matches(pattern, raw):
+                    rule_format = str(getattr(rule, "format", "") or "").strip()
+                    if rule_format:
+                        return rule_format
+            except re.error:
+                continue
+
+    key = _first_texture_type_token(raw).lower()
+    if not key:
+        return ""
+    for rule in DDS_DEFAULT_RULES:
+        if str(rule.get("texture_type", "") or "").strip().lower() == key:
+            return str(rule.get("format", "") or "")
+    return ""
+
+
+def _resolve_single_name(name: str, props):
+    """按单个候选名匹配规则；未命中返回 None。
+
+    自定义规则优先、默认规则取最早 match 位置 —— 与原 ``resolve_dds_target``
+    的匹配语义完全一致，只是抽出来供「源文件名 / hints」逐个重试。
+    """
+    candidate = str(name or "").strip()
+    if not candidate:
+        return None
+
+    if getattr(props, "dds_use_custom_rules", False):
+        for rule in getattr(props, "dds_rules", []) or []:
+            if not getattr(rule, "enabled", True):
+                continue
+            pattern = str(getattr(rule, "pattern", "") or "").strip()
+            if not pattern:
+                continue
+            try:
+                if _pattern_matches(pattern, candidate):
                     rule_format = str(getattr(rule, "format", "") or "").strip()
                     # 自定义规则完全由用户说了算：pattern 只负责识别名称，
                     # format 决定输出格式，不再从文件名推断类型做色彩空间干预
@@ -241,7 +337,7 @@ def resolve_dds_target(filename: str, props) -> tuple[str, str, str]:
             except re.error:
                 continue
 
-    targets = _get_match_targets(filename)
+    targets = _get_match_targets(candidate)
     best_rule = None
     best_start = float("inf")
     for rule in DDS_DEFAULT_RULES:
@@ -259,8 +355,157 @@ def resolve_dds_target(filename: str, props) -> tuple[str, str, str]:
 
     if best_rule is not None:
         return best_rule["texture_type"], best_rule["format"], best_rule["texture_type"]
+    return None
+
+
+def resolve_dds_target(filename: str, props, name_hints=()) -> tuple[str, str, str]:
+    """按「源文件名 → name_hints」的顺序推断 DDS 目标格式。
+
+    源文件名匹配保持原有语义；源文件名**一个规则都没命中**时，才依次用
+    ``name_hints``（材质名 / 贴图槽类型标签 / 输出文件名 stem 等）重试，
+    第一个命中的候选名直接返回。全不命中仍回退 ``default/bc7_unorm``。
+
+    为什么要 hints：Mod 导出时输出名已被改成材质资源名，编辑期的源 PNG 可能
+    只含 ``Diffuse`` 而不含 ``DiffuseMap``（实测 ``VivianGemADiffuse.png``），
+    只按源文件名匹配就会落到线性默认规则。
+    """
+    hit = _resolve_single_name(filename, props)
+    if hit is not None:
+        return hit
+
+    for hint in name_hints or ():
+        hit = _resolve_single_name(hint, props)
+        if hit is not None:
+            return hit
 
     return "default", "bc7_unorm", "Default"
+
+
+def resolve_texture_dds_format(
+    source_path: str,
+    props,
+    texture_type: str = "",
+    name_hints=(),
+    format_override: str = "",
+    workspace_source_path: str = "",
+    match_name: str | None = None,
+) -> str:
+    """单文件转换的最终输出格式。
+
+    优先级：显式 ``format_override`` → 工作空间原贴图的 DDS 头 → 材质类型规则
+    （:func:`format_for_texture_type`）→ :func:`resolve_dds_target`（源文件名 + hints）。
+
+    为什么把「原贴图的头」放在规则表前面：引擎读的是工作空间里那份 DDS，BC5 是双通道
+    格式，换成 BC7 写进去引擎照样只读两个通道 —— 多出来的通道白占显存，还可能因为
+    格式不匹配读错。所以能读到原贴图就照抄它的格式，规则表只在这张图不在工作空间里
+    （源不是 DDS、也定位不到原贴图）时兜底。
+    """
+    override = str(format_override or "").strip()
+    if override:
+        return override
+
+    for candidate in (workspace_source_path, source_path):
+        detected = read_dds_header_format(str(candidate or ""))
+        if detected:
+            return detected
+
+    if props is None:
+        try:
+            props = bpy.context.scene.texture_tools_props
+        except Exception:
+            props = None
+
+    type_format = format_for_texture_type(texture_type, props)
+    if type_format:
+        return type_format
+
+    # 材质资源名（导出侧真正的命名依据）优先于源文件名：源图常是带哈希前缀的中间文件。
+    if match_name:
+        matched_type, matched_format, _matched_by = resolve_dds_target(str(match_name), props)
+        if str(matched_type) != "default":
+            return str(matched_format or "bc7_unorm")
+
+    dds_format = resolve_dds_target(
+        os.path.basename(str(source_path or "")), props, name_hints=name_hints
+    )[1]
+    return str(dds_format or "bc7_unorm")
+
+
+def _read_dds_header(path: str):
+    """读 DDS 文件前 148 字节；不存在 / 不是 DDS / 头太短都返回 None。"""
+    try:
+        with open(path, "rb") as handle:
+            header = handle.read(_DDS_FULL_HEADER_SIZE)
+    except OSError:
+        return None
+    if len(header) < 128 or header[:4] != b"DDS ":
+        return None
+    return header
+
+
+def dds_header_dxgi_format(path: str):
+    """DX10 头返回偏移 128 的 DXGI 格式号；legacy FOURCC 头返回 None。"""
+    header = _read_dds_header(path)
+    if header is None or len(header) < _DDS_FULL_HEADER_SIZE:
+        return None
+    if header[84:88] != b"DX10":
+        return None
+    return struct.unpack_from("<I", header, 128)[0]
+
+
+def _dxgi_format_name(dxgi_id: int) -> str:
+    """DXGI 格式号 -> texconv 格式名；表外返回空串。"""
+    for name, value in _DDS_DXGI_FORMAT_IDS.items():
+        if value == dxgi_id:
+            return name
+    return ""
+
+
+def read_dds_header_format(path: str) -> str:
+    """读 DDS 头得出 texconv 认可的格式名；读不到 / 格式不在表里返回空串。
+
+    这是「输出格式必须与工作空间原贴图一致」的唯一权威来源：工作空间里那份 DDS
+    就是游戏引擎实际加载的字节，它的头就是答案。两张表（DX10 / legacy FOURCC）
+    覆盖工作空间里出现的格式；表外格式返回空串，交给规则表兜底。
+    """
+    header = _read_dds_header(path)
+    if header is None:
+        return ""
+    fourcc = bytes(header[84:88])
+    if fourcc != b"DX10":
+        return _DDS_LEGACY_FOURCC_FORMATS.get(fourcc, "")
+    if len(header) < _DDS_FULL_HEADER_SIZE:
+        return ""
+    name = _dxgi_format_name(struct.unpack_from("<I", header, 128)[0])
+    if name.endswith("_typeless"):
+        # typeless 只是「内存布局未声明语义」：物理布局与 UNORM 完全相同，按 UNORM 输出。
+        name = name[: -len("_typeless")] + "_unorm"
+    return name
+
+
+def existing_dds_matches_format(path: str, dds_format: str):
+    """判断磁盘上已有的 DDS 是否已经是 ``dds_format`` 指定的格式。
+
+    只读 148 字节文件头，不 import ``common/dds_pixel.py``（那个模块面向完整
+    data 解码、且有循环 import 风险）。
+
+    三态返回：``True`` 一致、``False`` 明确不一致、``None`` 无法判断（表外格式）。
+    文件不存在 / 头读不到一律 ``False``。「存在即跳过」会让格式变化对旧产物失效
+    （规则被改、工作空间原贴图换了格式），所以复用前必须先验头。
+    """
+    expected = str(dds_format or "").strip().lower()
+    if not expected or not os.path.isfile(path):
+        return False
+
+    header = _read_dds_header(path)
+    if header is None:
+        return False
+
+    actual = read_dds_header_format(path)
+    if not actual:
+        # 表外格式读不出名字：判成不一致会让每次导出都重转一遍，所以答「不知道」。
+        return None
+    return actual == expected
 
 
 # 进程内转换缓存：key = 规范化后的目标绝对路径，value = 转出它时的源文件指纹。
@@ -287,32 +532,53 @@ def _source_signature(source_path: str):
     return (os.path.normcase(os.path.abspath(source_path)), stat.st_mtime_ns, stat.st_size)
 
 
-def _target_is_current(target_path: str, signature) -> bool:
-    """目标文件是否已经是这份源文件的最新转换结果。
+def _target_is_current(target_path: str, signature, expected_format: str = "") -> bool:
+    """目标文件是否已经是这份源文件、这个格式的最新产物。
 
-    按 mtime 比较（等价于 make 的时间戳规则）：转换产物总是比它的源文件新。这样源
-    贴图被重新编辑后会自动重转，而没动过的贴图直接复用磁盘上那一份。
+    只看 mtime（make 的时间戳规则）不足以复用：源图没变但期望格式变了（规则表被改，
+    或工作空间原贴图换了格式）时，磁盘上那份旧格式的产物会被永久沿用。给了
+    ``expected_format`` 就再验一次 DDS 头；头里格式无法识别（``None``）时按 mtime 放行。
     """
     try:
         target_stat = os.stat(target_path)
     except OSError:
         return False
-    return target_stat.st_mtime_ns >= signature[1]
+    if target_stat.st_mtime_ns < signature[1]:
+        return False
+    if expected_format:
+        return existing_dds_matches_format(target_path, expected_format) is not False
+    return True
+
+
+def _verbatim_copy_source(source_path: str, workspace_source_path: str, dds_format: str) -> str:
+    """找出格式正好等于 ``dds_format`` 的原贴图：texconv 写不出该格式时原样复制它。"""
+    expected = str(dds_format or "").strip().lower()
+    if not expected:
+        return ""
+    for candidate in (workspace_source_path, source_path):
+        candidate = str(candidate or "")
+        if candidate and os.path.isfile(candidate):
+            if str(read_dds_header_format(candidate)).strip().lower() == expected:
+                return candidate
+    return ""
 
 
 def convert_texture_to_dds(
     source_path: str,
     target_path: str,
     props=None,
+    texture_type: str = "",
+    name_hints=(),
+    format_override: str = "",
+    workspace_source_path: str = "",
     match_name: str | None = None,
 ) -> tuple[bool, str]:
     """把单张贴图转成 DDS 写到 ``target_path``，供 Mod 导出流程复用。
 
-    输出格式由现有规则表（:func:`resolve_dds_target`）推断，判定串取 ``match_name``：
-    「材质转资源」导出传**材质资源名**（就是目标 ``.dds`` 的文件名词干），为 ``None`` 时
-    退回源文件名（「批量转换为 .dds」算子与其它导出节点沿用原口径）。色彩空间标志由
-    :func:`_texconv_colorspace_flags` 按该格式选择 —— 这正是为「PNG 这类不带色彩空间
-    信息的输入」设计的（sRGB 输出用 ``--srgb-in`` 达成恒等，线性输出用 ``--ignore-srgb``）。
+    输出格式由 :func:`resolve_texture_dds_format` 决定：能读到工作空间原贴图就照抄它的
+    格式，读不到才退回规则表。texconv 写不出该格式时**不换格式重编码**，而是把原贴图
+    原样复制过去（返回 ``copied-verbatim:<格式>``）—— 换格式会让引擎按错误的
+    通道数 / 色彩空间读贴图，比不转换更糟。
 
     **不改动源文件**，返回 ``(True, "")`` 或 ``(False, 失败原因)``。
     """
@@ -323,11 +589,21 @@ def convert_texture_to_dds(
     if props is None:
         props = bpy.context.scene.texture_tools_props
 
-    match_target = match_name or os.path.basename(source_path)
-    dds_format = resolve_dds_target(match_target, props)[1] or "bc7_unorm"
+    hints = tuple(name_hints or ())
+
+    dds_format = resolve_texture_dds_format(
+        source_path,
+        props,
+        texture_type=texture_type,
+        name_hints=hints,
+        format_override=format_override,
+        workspace_source_path=workspace_source_path,
+        match_name=match_name,
+    )
+    colorspace_flags = _texconv_colorspace_flags(dds_format)
 
     command = [texconv_executable, "-f", dds_format]
-    command.extend(_texconv_colorspace_flags(dds_format))
+    command.extend(colorspace_flags)
 
     # 先转到临时目录再搬过去：texconv 的输出名固定是「源文件名词干 + .dds」，而导出侧
     # 要的目标名通常取材质资源名，两者不同；直接 -o 目标目录会写出一个多余的错误文件名。
@@ -353,6 +629,17 @@ def convert_texture_to_dds(
 
         if process.returncode != 0:
             detail = (process.stderr or process.stdout or "").strip()
+            verbatim = _verbatim_copy_source(source_path, workspace_source_path, dds_format)
+            if verbatim:
+                print(
+                    f"[DDS转换] texconv 写不出 {dds_format}，原样复制原贴图 "
+                    f"{os.path.basename(verbatim)}（保持工作空间原格式）"
+                )
+                try:
+                    shutil.copy2(verbatim, target_path)
+                except Exception as exc:
+                    return False, f"原样复制原贴图失败: {exc}"
+                return True, f"copied-verbatim:{dds_format}"
             return False, detail or f"texconv 退出码 {process.returncode}"
 
         produced = os.path.join(
@@ -377,36 +664,62 @@ def convert_texture_to_dds_cached(
     props=None,
     force: bool = False,
     match_name: str | None = None,
+    texture_type: str = "",
+    name_hints=(),
+    format_override: str = "",
+    workspace_source_path: str = "",
 ) -> tuple[bool, str]:
     """带缓存的 :func:`convert_texture_to_dds`：同一目标在一次导出内只真正转一次。
 
-    ``match_name`` 是「按哪个名字判定格式」，原样透传下去；缓存键仍只用目标路径 ——
-    判定串由目标名派生，同一次导出里同一个目标的格式不会变。
+    缓存值是「源文件指纹 + 期望格式」—— 格式也算进去，这样规则变了或原贴图换了格式以后，
+    磁盘上那份旧格式的产物不会被当成最新结果复用。
 
     ``force=True`` 对应节点上的「覆盖现有资源」：表示愿意重新生成，但仅限本次导出的
     第一次 —— 同一张贴图被 N 个物体引用时不会再各转一遍。缓存每次导出开始时清空，
-    所以下次导出仍会重新生成。
+    所以下次导出仍会重新生成。复用磁盘已有产物时同样返回 ``(True, "")``：调用方只
+    关心「目标就绪」。
 
-    复用磁盘已有产物时同样返回 ``(True, "")``：调用方只关心「目标就绪」，不关心它是
-    这一轮转出来的还是上一轮留下的。
+    ``match_name`` 沿用旧签名：材质资源名先查规则，命中就定格式（导出侧真正的命名依据）。
     """
     signature = _source_signature(source_path)
     if signature is None:
         return False, f"源文件不存在: {source_path}"
 
+    hints = tuple(name_hints or ())
+
+    expected_format = resolve_texture_dds_format(
+        source_path,
+        props,
+        texture_type=texture_type,
+        name_hints=hints,
+        format_override=format_override,
+        workspace_source_path=workspace_source_path,
+        match_name=match_name,
+    )
+
     cache_key = os.path.normcase(os.path.abspath(target_path))
+    cache_value = (signature, expected_format)
     # 命中缓存也要确认产物还在：同一次导出里目标目录可能被清掉（缓存只记「这一轮转过了」，
     # 不负责保管文件），缺了这个判断就会对着不存在的目标返回成功。
-    if _dds_conversion_cache.get(cache_key) == signature and os.path.exists(target_path):
+    if _dds_conversion_cache.get(cache_key) == cache_value and os.path.exists(target_path):
         return True, ""
 
-    if not force and _target_is_current(target_path, signature):
-        _dds_conversion_cache[cache_key] = signature
+    if not force and _target_is_current(target_path, signature, expected_format):
+        _dds_conversion_cache[cache_key] = cache_value
         return True, ""
 
-    ok, reason = convert_texture_to_dds(source_path, target_path, props, match_name)
+    ok, reason = convert_texture_to_dds(
+        source_path,
+        target_path,
+        props,
+        texture_type=texture_type,
+        name_hints=hints,
+        format_override=format_override,
+        workspace_source_path=workspace_source_path,
+        match_name=match_name,
+    )
     if ok:
-        _dds_conversion_cache[cache_key] = signature
+        _dds_conversion_cache[cache_key] = cache_value
     return ok, reason
 
 
@@ -621,6 +934,7 @@ class TT_OT_test_dds_rule(bpy.types.Operator):
             "FXMap_Body.dds",
             "RoughnessMap_Body.png",
             "UnknownMask.png",
+            "VivianGemADiffuse.png",
         ]
 
         result_lines = ["DDS规则测试结果:"]
