@@ -1018,7 +1018,7 @@ def format_progress_bar(done, total, width: int = 20) -> str:
     cells = max(1, int(width or 20))
     filled = max(0, min(cells, int(round(done_value / total_value * cells))))
     percent = int(done_value / total_value * 100)
-    return f"[{'█' * filled}{'░' * (cells - filled)}] {percent}%"
+    return f"▏{'█' * filled}{'─' * (cells - filled)}▕ {percent}%"
 
 
 def format_percent_bar(percent, width: int = 20) -> str:
@@ -1036,7 +1036,7 @@ def format_percent_bar(percent, width: int = 20) -> str:
 
     cells = max(1, int(width or 20))
     filled = max(0, min(cells, int(round(value / 100 * cells))))
-    return f"[{'█' * filled}{'░' * (cells - filled)}] {value}%"
+    return f"▏{'█' * filled}{'─' * (cells - filled)}▕ {value}%"
 
 
 def _resolve_status_workspace(context=None):
