@@ -79,6 +79,8 @@ class _FakeWindowManager:
         self.timers = []
         self.removed_timers = []
         self.modal_handlers = []
+        # invoke_props_dialog 调用记录（旧配置表「覆盖 / 保留」确认框）
+        self.dialogs = []
         # 原生进度条调用记录（后台导出的步骤进度条）
         self.progress_calls = []
         self.progress_fail = False
@@ -93,6 +95,10 @@ class _FakeWindowManager:
 
     def modal_handler_add(self, operator):
         self.modal_handlers.append(operator)
+
+    def invoke_props_dialog(self, operator, width=0):
+        self.dialogs.append((operator, width))
+        return {'RUNNING_MODAL'}
 
     def progress_begin(self, min_value, max_value):
         if self.progress_fail:
@@ -547,6 +553,7 @@ class _BackgroundTestBase(unittest.TestCase):
         _FAKE_WINDOW_MANAGER.timers = []
         _FAKE_WINDOW_MANAGER.removed_timers = []
         _FAKE_WINDOW_MANAGER.modal_handlers = []
+        _FAKE_WINDOW_MANAGER.dialogs = []
         _FAKE_WINDOW_MANAGER.progress_calls = []
         _FAKE_WINDOW_MANAGER.progress_fail = False
         _FakeBlueprintExportHelper.postprocess_nodes = []
@@ -678,6 +685,39 @@ class ManifestTests(_BackgroundTestBase):
         self.assertEqual(manifest["object_names"], ["M1", "M2"])
         self.assertEqual(manifest["total_steps"], 2)
 
+    def test_build_manifest_records_preprocess_cache_dir(self):
+        """主进程算好的前处理缓存目录必须进清单，worker 才有得用。"""
+        session_dir = os.path.join(self.temp_dir, "manifest_cache")
+        os.makedirs(session_dir)
+        cache_dir = os.path.join(self.temp_dir, ".ssmt_preprocess_cache")
+
+        manifest = export_background.build_manifest(
+            session_dir=session_dir,
+            snapshot_path=os.path.join(session_dir, "snapshot.blend"),
+            tree_name="测试蓝图",
+            output_dir=os.path.join(self.temp_dir, "out_cache"),
+            round_plans=[{"round_index": 1, "buffer_folder_name": "Meshes"}],
+            preprocess_cache_dir=cache_dir,
+        )
+
+        self.assertEqual(manifest["preprocess_cache_dir"], cache_dir)
+        with open(manifest["manifest_path"], "r", encoding="utf-8") as file:
+            self.assertEqual(json.load(file)["preprocess_cache_dir"], cache_dir)
+
+    def test_build_manifest_defaults_preprocess_cache_dir_to_empty(self):
+        session_dir = os.path.join(self.temp_dir, "manifest_cache_default")
+        os.makedirs(session_dir)
+
+        manifest = export_background.build_manifest(
+            session_dir=session_dir,
+            snapshot_path=os.path.join(session_dir, "snapshot.blend"),
+            tree_name="测试蓝图",
+            output_dir=os.path.join(self.temp_dir, "out_cache_default"),
+            round_plans=[{"round_index": 1, "buffer_folder_name": "Meshes"}],
+        )
+
+        self.assertEqual(manifest["preprocess_cache_dir"], "")
+
     def test_parse_manifest_argument(self):
         argv = ["blender", "--background", "--", "--manifest", "C:/tmp/m.json"]
         self.assertEqual(export_background._parse_manifest_argument(argv), "C:/tmp/m.json")
@@ -748,6 +788,32 @@ class BackgroundSessionTests(_BackgroundTestBase):
         self.assertEqual(manifest["output_dir"], os.path.join(self.temp_dir, "out"))
 
         session.cleanup()
+
+    def test_start_passes_preprocess_cache_dir_into_manifest(self):
+        """主进程算好的缓存目录随清单传给 worker（否则 worker 用快照旁的空目录）。"""
+        cache_dir = os.path.join(self.temp_dir, ".ssmt_preprocess_cache")
+        original = export_background._default_preprocess_cache_dir
+        export_background._default_preprocess_cache_dir = lambda: cache_dir
+        self.addCleanup(setattr, export_background, "_default_preprocess_cache_dir", original)
+        session = self.make_session()
+
+        self.assertTrue(session.start())
+
+        self.assertEqual(session.preprocess_cache_dir, cache_dir)
+        self.assertEqual(session.manifest["preprocess_cache_dir"], cache_dir)
+
+    def test_explicit_preprocess_cache_dir_wins_over_default(self):
+        explicit = os.path.join(self.temp_dir, "explicit_cache")
+        original = export_background._default_preprocess_cache_dir
+        export_background._default_preprocess_cache_dir = lambda: (_ for _ in ()).throw(
+            AssertionError("显式给了缓存目录就不该再推默认值")
+        )
+        self.addCleanup(setattr, export_background, "_default_preprocess_cache_dir", original)
+        session = self.make_session(preprocess_cache_dir=explicit)
+
+        self.assertTrue(session.start())
+
+        self.assertEqual(session.manifest["preprocess_cache_dir"], explicit)
 
     def test_start_returns_false_when_popen_fails(self):
         _FakeProcess.raise_on_start = OSError("no blender")
@@ -1278,8 +1344,8 @@ class WorkerTests(_BackgroundTestBase):
         self.assertEqual(result["status"], "error")
         self.assertIn("未找到选中的网格物体", result["error"])
 
-    def test_worker_backs_up_config_tables_and_records_ini_warnings(self):
-        """普通模式：导出前备份旧配置表，成功后把 INI 自检告警写进 result。"""
+    def test_worker_skips_config_table_backup_and_records_ini_warnings(self):
+        """普通模式：旧配置表备份已移到主进程启动前，worker 不再碰它，只记录 INI 告警。"""
         session_dir = os.path.join(self.temp_dir, "worker_backup")
         os.makedirs(session_dir)
         output_dir = os.path.join(self.temp_dir, "out_backup")
@@ -1328,13 +1394,10 @@ class WorkerTests(_BackgroundTestBase):
             result = json.load(file)
         self.assertEqual(result["status"], "success")
         self.assertEqual(result["warnings"], ["缺失变量: $x"])
-        self.assertEqual(
-            calls,
-            [
-                ("find", output_dir),
-                ("backup", output_dir, [os.path.join(output_dir, "角色.ini")]),
-            ],
-        )
+        # 备份职责已上移主进程（与同步导出一致）：worker 连查找都不该做，
+        # 否则会二次搬动主进程刚备份好的旧配置表。
+        self.assertEqual(calls, [])
+        self.assertFalse(hasattr(export_background, "_backup_config_tables_in_worker"))
 
     def test_worker_direct_export_skips_config_backup_and_ini_check(self):
         """直出模式与同步直出一致：不搬配置表备份、不做 INI 自检。"""
@@ -1399,6 +1462,49 @@ class WorkerTests(_BackgroundTestBase):
         self.assertEqual(_FakeGlobalConfig.workspacename, "覆盖角色")
         self.assertEqual(_FakeGlobalConfig.path_generate_mod_folder(), output_dir)
         self.assertTrue(os.path.isdir(output_dir))
+
+    def test_apply_manifest_environment_overrides_preprocess_cache_dir(self):
+        """worker 的 bpy.data.filepath 指向临时快照，缓存目录必须按清单覆盖回主进程的值。"""
+        cache_dir = os.path.join(self.temp_dir, ".ssmt_preprocess_cache")
+        applied = []
+        cache_module = _install_module(
+            f"{PKG}.blueprint.preprocess_cache",
+            PreProcessCache=types.SimpleNamespace(
+                set_override_cache_dir=applied.append,
+            ),
+        )
+        self.addCleanup(sys.modules.pop, cache_module.__name__, None)
+
+        export_background._apply_manifest_environment(
+            {
+                "logic_name": "EFMI",
+                "workspace_name": "覆盖角色",
+                "output_dir": os.path.join(self.temp_dir, "override_out_cache"),
+                "preprocess_cache_dir": cache_dir,
+            }
+        )
+
+        self.assertEqual(applied, [cache_dir])
+
+    def test_apply_manifest_environment_keeps_cache_dir_when_absent(self):
+        applied = []
+        cache_module = _install_module(
+            f"{PKG}.blueprint.preprocess_cache",
+            PreProcessCache=types.SimpleNamespace(
+                set_override_cache_dir=applied.append,
+            ),
+        )
+        self.addCleanup(sys.modules.pop, cache_module.__name__, None)
+
+        export_background._apply_manifest_environment(
+            {
+                "logic_name": "EFMI",
+                "workspace_name": "覆盖角色",
+                "output_dir": os.path.join(self.temp_dir, "override_out_no_cache"),
+            }
+        )
+
+        self.assertEqual(applied, [])
 
 
 # ---------------------------------------------------------------------------
@@ -1566,6 +1672,97 @@ class OperatorInvokeTests(_BackgroundTestBase):
         )
         self.assertEqual(operator.invoke(context, None), {'RUNNING_MODAL'})
         return context, operator
+
+    def _patch_old_config_tables(self, ini_paths, backed_up):
+        """让输出目录"看起来有旧配置表"，并记录备份调用（真实备份逻辑另有测试）。"""
+        original_find = ui_func_export.find_config_table_files
+        original_backup = ui_func_export.backup_config_tables
+        original_has_postprocess = ui_func_export.SSMTGenerateModBlueprint._has_postprocess_nodes
+        ui_func_export.find_config_table_files = lambda _path: list(ini_paths)
+        ui_func_export.backup_config_tables = (
+            lambda path, paths: backed_up.append((path, list(paths)))
+            or [("/old.ini", "/new.ini")]
+        )
+        ui_func_export.SSMTGenerateModBlueprint._has_postprocess_nodes = (
+            lambda self, _tree: True
+        )
+        self.addCleanup(setattr, ui_func_export, "find_config_table_files", original_find)
+        self.addCleanup(setattr, ui_func_export, "backup_config_tables", original_backup)
+        self.addCleanup(
+            setattr,
+            ui_func_export.SSMTGenerateModBlueprint,
+            "_has_postprocess_nodes",
+            original_has_postprocess,
+        )
+
+    def test_background_invoke_asks_before_overwriting_old_config_tables(self):
+        """后台导出与同步导出一样先问「覆盖 / 保留」：确认前不备份、不起会话。"""
+        self.scene_properties.background_export_enabled = True
+        context = self._make_context()
+        operator = self._make_operator(context)
+        output_dir = _FakeGlobalConfig.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        ini_path = os.path.join(output_dir, "角色.ini")
+        backed_up = []
+        self._patch_old_config_tables([ini_path], backed_up)
+
+        result = operator.invoke(context, None)
+
+        self.assertEqual(result, {'RUNNING_MODAL'})
+        self.assertEqual(len(_FAKE_WINDOW_MANAGER.dialogs), 1)
+        self.assertEqual(_FAKE_WINDOW_MANAGER.dialogs[0][1], 460)
+        self.assertEqual(backed_up, [])
+        self.assertEqual(_RecordingSession.instances, [])
+
+    def test_background_confirm_backs_up_then_starts_session(self):
+        """弹窗点确定（execute）后先备份旧配置表，再起后台会话。"""
+        self.scene_properties.background_export_enabled = True
+        context = self._make_context()
+        operator = self._make_operator(context)
+        output_dir = _FakeGlobalConfig.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        ini_path = os.path.join(output_dir, "角色.ini")
+        backed_up = []
+        self._patch_old_config_tables([ini_path], backed_up)
+        operator.invoke(context, None)
+        operator.overwrite_config = "YES"
+
+        result = operator.execute(context)
+
+        self.assertEqual(result, {'RUNNING_MODAL'})
+        self.assertEqual(backed_up, [(output_dir, [ini_path])])
+        self.assertEqual(len(_RecordingSession.instances), 1)
+        self.assertFalse(operator._restore_config_tables_after_export)
+
+    def test_background_finish_restores_old_config_tables_when_user_keeps_them(self):
+        """选了「否」：后台导出收尾把备份的旧配置表覆盖回原位，且只做一次。"""
+        self.scene_properties.background_export_enabled = True
+        context = self._make_context()
+        operator = self._make_operator(context)
+        output_dir = _FakeGlobalConfig.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        ini_path = os.path.join(output_dir, "角色.ini")
+        backed_up = []
+        self._patch_old_config_tables([ini_path], backed_up)
+        operator.invoke(context, None)
+        operator.overwrite_config = "NO"
+        operator.execute(context)
+        self.assertTrue(operator._restore_config_tables_after_export)
+
+        restored = []
+        original_restore = ui_func_export.restore_config_tables
+        ui_func_export.restore_config_tables = lambda entries: restored.append(list(entries))
+        self.addCleanup(setattr, ui_func_export, "restore_config_tables", original_restore)
+        session = _RecordingSession.instances[0]
+        session.poll_results = ["success"]
+
+        self.assertEqual(
+            operator.modal(context, types.SimpleNamespace(type='TIMER')), {'FINISHED'}
+        )
+
+        self.assertEqual(restored, [[("/old.ini", "/new.ini")]])
+        self.assertFalse(operator._restore_config_tables_after_export)
+        self.addCleanup(setattr, ui_func_export, "restore_config_tables", original_restore)
 
     def test_invoke_with_toggle_off_runs_original_execute(self):
         self.scene_properties.background_export_enabled = False

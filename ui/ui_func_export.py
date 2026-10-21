@@ -274,6 +274,10 @@ class _BackgroundExportMixin:
         self._restore_node_colors()
         self._stop_background_timer(context)
         clear_active_session(session)
+        # 只有 Generate Mod 装了配置表备份流程；快速导出的算子没有这套钩子
+        restore_if_needed = getattr(self, "_restore_config_tables_if_needed", None)
+        if restore_if_needed is not None:
+            restore_if_needed()
 
         if outcome == "cancel":
             session.cancel()
@@ -778,6 +782,7 @@ class SSMTGenerateModBlueprint(_BackgroundExportMixin, bpy.types.Operator):
         把这个指针还原，不能让它停在弹窗 / 后台启动阶段。
         """
         previous_output_tree_name = GlobalConfig.get_output_blueprint_tree_name()
+        self._pending_background_export = False
         try:
             if GlobalProterties.is_background_export_enabled():
                 # 防重入：已有后台导出在跑时不再起第二个后台实例
@@ -803,9 +808,19 @@ class SSMTGenerateModBlueprint(_BackgroundExportMixin, bpy.types.Operator):
             self.report({'WARNING'}, "NTEMI 导出不支持后台导出，已回落到同步导出")
             return self._invoke_with_output_blueprint(context, event)
 
-        # 立即反馈：``session.start()`` 里要先把工程存成 480MB 快照（数秒）再起
-        # 子进程，这段时间主进程没有任何进度文本 —— 先写状态栏，避免"点了导出
-        # 十几秒没反应"。
+        # 旧配置表：与同步导出同一套「覆盖 / 保留」确认弹窗。后台导出以前整段跳过，
+        # 既不追问也不备份，旧配置表会被新产物直接盖掉。确认结果由 execute() 接着跑。
+        dialog_result = self._invoke_config_table_dialog(context, tree)
+        if dialog_result is not None:
+            self._pending_background_export = True
+            return dialog_result
+
+        return self._start_background_export(context, tree)
+
+    def _start_background_export(self, context, tree):
+        """存快照 → 起后台实例 → 挂 modal 轮询；确认弹窗与直接启动共用这一段。"""
+        # 立即反馈：会话启动里要先把工程存成 480MB 快照（数秒）再起子进程，
+        # 这段时间主进程没有任何进度文本 —— 先写状态栏，避免"点了导出十几秒没反应"。
         push_progress_header("后台导出：正在保存工程快照…", context)
         try:
             session = self._create_background_session(tree)
@@ -839,6 +854,57 @@ class SSMTGenerateModBlueprint(_BackgroundExportMixin, bpy.types.Operator):
         LOG.info(f"   工程快照: {session.snapshot_path}")
         LOG.info(f"   后台日志: {session.log_path}")
         return {'RUNNING_MODAL'}
+
+    def _invoke_config_table_dialog(self, context, tree):
+        """导出目录里有旧配置表时弹确认框；返回 None 表示不需要确认。
+
+        同步导出与后台导出共用：两条链路都必须先问「覆盖 / 保留」再动旧配置表。
+        """
+        if not self._has_postprocess_nodes(tree):
+            return None
+
+        mod_export_path = GlobalConfig.path_generate_mod_folder()
+        if not mod_export_path or not os.path.exists(mod_export_path):
+            return None
+
+        config_table_paths = find_config_table_files(mod_export_path)
+        if not config_table_paths:
+            return None
+
+        self._export_path = mod_export_path
+        self._config_table_paths = config_table_paths
+        self._backup_pending = True
+        return context.window_manager.invoke_props_dialog(self, width=460)
+
+    def _backup_config_tables_before_export(self):
+        """确认后把旧配置表改名并移入备份目录（同步 / 后台共用同一实现）。"""
+        self._backup_entries = []
+        if not getattr(self, "_backup_pending", False):
+            return
+
+        mod_export_path = GlobalConfig.path_generate_mod_folder()
+        self._backup_entries = backup_config_tables(
+            mod_export_path,
+            getattr(self, "_config_table_paths", []) or [],
+        )
+        self._backup_pending = False
+        if self._backup_entries:
+            backup_root = os.path.dirname(self._backup_entries[0][1])
+            if self.overwrite_config == 'YES':
+                LOG.info(f"💾 旧配置表已备份至: {backup_root}，导出后将生成新的配置表")
+            else:
+                LOG.info(f"💾 旧配置表已备份至: {backup_root}，导出完成后将恢复旧配置表")
+
+    def _restore_config_tables_if_needed(self):
+        """后台导出收尾：用户选「否」时把备份的旧配置表覆盖回原位。"""
+        if not getattr(self, "_restore_config_tables_after_export", False):
+            return
+        self._restore_config_tables_after_export = False
+        try:
+            restore_config_tables(getattr(self, "_backup_entries", []) or [])
+            LOG.info("💾 已恢复导出前的旧配置表（后台导出选择「否」）")
+        except Exception as error:
+            LOG.warning(f"恢复旧配置表失败: {error}")
 
     def _create_background_session(self, tree):
         """按当前蓝图准备会话参数（与同步导出同一套轮次计划计算）。"""
@@ -965,17 +1031,9 @@ class SSMTGenerateModBlueprint(_BackgroundExportMixin, bpy.types.Operator):
         if not tree:
             return self.execute(context)
 
-        has_postprocess = self._has_postprocess_nodes(tree)
-
-        if has_postprocess:
-            mod_export_path = GlobalConfig.path_generate_mod_folder()
-            if mod_export_path and os.path.exists(mod_export_path):
-                config_table_paths = find_config_table_files(mod_export_path)
-                if config_table_paths:
-                    self._export_path = mod_export_path
-                    self._config_table_paths = config_table_paths
-                    self._backup_pending = True
-                    return context.window_manager.invoke_props_dialog(self, width=460)
+        dialog_result = self._invoke_config_table_dialog(context, tree)
+        if dialog_result is not None:
+            return dialog_result
 
         return self.execute(context)
 
@@ -1028,9 +1086,25 @@ class SSMTGenerateModBlueprint(_BackgroundExportMixin, bpy.types.Operator):
         """
         previous_output_tree_name = GlobalConfig.get_output_blueprint_tree_name()
         try:
+            if getattr(self, "_pending_background_export", False):
+                self._pending_background_export = False
+                return self._execute_background_export_after_dialog(context)
             return self._execute_export(context)
         finally:
             GlobalConfig.restore_output_blueprint_tree(previous_output_tree_name)
+
+    def _execute_background_export_after_dialog(self, context):
+        """确认弹窗点「OK」后接着启动后台实例：旧配置表在导出开始之前就先备份。"""
+        tree = self._resolve_target_tree(context)
+        if not tree:
+            self.report({'ERROR'}, "未找到当前蓝图，请在蓝图编辑器中点击 Generate Mod")
+            return {'CANCELLED'}
+
+        self._backup_config_tables_before_export()
+        self._restore_config_tables_after_export = bool(
+            self._backup_entries and str(getattr(self, "overwrite_config", "YES")) == "NO"
+        )
+        return self._start_background_export(context, tree)
 
     def _execute_export(self, context):
         GlobalConfig.read_from_main_json_ssmt4()
@@ -1058,20 +1132,7 @@ class SSMTGenerateModBlueprint(_BackgroundExportMixin, bpy.types.Operator):
             return {'CANCELLED'}
 
         # 配置表备份：弹窗确认后，将旧配置表改名并移动至备份目录
-        self._backup_entries = []
-        if getattr(self, "_backup_pending", False):
-            mod_export_path = GlobalConfig.path_generate_mod_folder()
-            self._backup_entries = backup_config_tables(
-                mod_export_path,
-                getattr(self, "_config_table_paths", []) or [],
-            )
-            self._backup_pending = False
-            if self._backup_entries:
-                backup_root = os.path.dirname(self._backup_entries[0][1])
-                if self.overwrite_config == 'YES':
-                    LOG.info(f"💾 旧配置表已备份至: {backup_root}，导出后将生成新的配置表")
-                else:
-                    LOG.info(f"💾 旧配置表已备份至: {backup_root}，导出完成后将恢复旧配置表")
+        self._backup_config_tables_before_export()
 
         BlueprintExportHelper.set_runtime_blueprint_tree(tree)
         BlueprintExportHelper.reset_direct_export_runtime_state(clear_postprocess_caches=True)

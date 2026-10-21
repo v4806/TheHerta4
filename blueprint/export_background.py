@@ -437,6 +437,7 @@ def build_manifest(
     total_steps: int = 0,
     quick_export: bool = False,
     object_names: list = None,
+    preprocess_cache_dir: str = "",
 ) -> dict:
     """写 ``manifest.json`` 并返回清单内容。
 
@@ -471,6 +472,7 @@ def build_manifest(
         "total_steps": max(0, int(total_steps or 0)),
         "quick_export": bool(quick_export),
         "object_names": [str(name) for name in (object_names or []) if str(name)],
+        "preprocess_cache_dir": str(preprocess_cache_dir or ""),
         "stage_path": stage_path,
         "result_path": result_path,
         "log_path": log_path,
@@ -582,28 +584,16 @@ def _apply_manifest_environment(manifest: dict) -> None:
             lambda cls, _output_dir=output_dir: _output_dir
         )
 
+    # 前处理缓存目录只能由主进程算：worker 的 bpy.data.filepath 指向临时快照，
+    # 用 PreProcessCache.get_cache_dir() 会落到快照旁边的空目录，每次会话 100% 冷启动。
+    cache_dir = str(manifest.get("preprocess_cache_dir") or "")
+    if cache_dir:
+        try:
+            from .preprocess_cache import PreProcessCache
 
-def _backup_config_tables_in_worker(output_dir: str) -> None:
-    """后台导出前备份输出目录里的旧配置表；失败只告警，不阻断导出。
-
-    直出模式不调用（与同步直出一致：同步直出不搬配置表备份）。
-    """
-    if not output_dir:
-        return
-    try:
-        from ..common.config_table_backup import (
-            backup_config_tables,
-            find_config_table_files,
-        )
-
-        config_table_paths = find_config_table_files(output_dir)
-        if not config_table_paths:
-            return
-        entries = backup_config_tables(output_dir, config_table_paths)
-        if entries:
-            LOG.info(f"💾 后台实例已备份 {len(entries)} 个旧配置表")
-    except Exception as error:
-        LOG.warning(f"后台实例配置表备份失败（继续导出）: {error}")
+            PreProcessCache.set_override_cache_dir(cache_dir)
+        except Exception as error:
+            LOG.warning(f"后台实例前处理缓存目录设置失败（继续导出）: {error}")
 
 
 def _collect_ini_variable_warnings(output_dir: str) -> list:
@@ -806,11 +796,6 @@ def _run_worker(manifest_path: str) -> None:
                 )
             except Exception as sync_error:
                 LOG.warning(f"后台实例导出前同步失败（继续导出）: {sync_error}")
-
-        # 普通模式 / 快速局部导出：导出前备份旧配置表（失败只告警，不阻断）。
-        # 直出模式与同步直出一致，不做这一步。
-        if not bool(manifest.get("direct_export")):
-            _backup_config_tables_in_worker(output_dir)
 
         blueprint_model = None
         if quick_export:
@@ -1175,6 +1160,20 @@ def clear_progress_header(context=None) -> None:
     _set_status_text("", context)
 
 
+def _default_preprocess_cache_dir() -> str:
+    """主进程侧的前处理缓存目录：真实工程目录下的 .ssmt_preprocess_cache。
+
+    worker 的 bpy.data.filepath 指向临时快照，必须由主进程算好再随清单传过去。
+    """
+    try:
+        from .preprocess_cache import PreProcessCache
+
+        return str(PreProcessCache.get_original_cache_dir() or "")
+    except Exception as error:
+        LOG.warning(f"解析前处理缓存目录失败（后台实例将用默认目录）: {error}")
+        return ""
+
+
 class BackgroundExportSession:
     """一次后台导出的主进程侧会话：快照 → 清单 → 子进程 → 轮询 → 清理。"""
 
@@ -1196,6 +1195,7 @@ class BackgroundExportSession:
         total_steps: int = 0,
         quick_export: bool = False,
         object_names: list = None,
+        preprocess_cache_dir: str = "",
     ):
         self.tree_name = str(tree_name or "")
         self.output_dir = str(output_dir or "")
@@ -1215,6 +1215,8 @@ class BackgroundExportSession:
         #: 快速局部导出：worker 按 object_names 在快照里重定位网格并重建临时树
         self.quick_export = bool(quick_export)
         self.object_names = [str(name) for name in (object_names or []) if str(name)]
+        #: 前处理缓存目录由主进程算，worker 不能自己推（快照路径会指向临时目录）
+        self.preprocess_cache_dir = str(preprocess_cache_dir or "")
 
         self.snapshot_path = ""
         self.manifest_path = ""
@@ -1261,6 +1263,8 @@ class BackgroundExportSession:
             os.makedirs(self.session_dir, exist_ok=True)
 
             self.snapshot_path = save_export_snapshot(self.session_dir)
+            if not self.preprocess_cache_dir:
+                self.preprocess_cache_dir = _default_preprocess_cache_dir()
             self.manifest = build_manifest(
                 session_dir=self.session_dir,
                 snapshot_path=self.snapshot_path,
@@ -1277,6 +1281,7 @@ class BackgroundExportSession:
                 total_steps=self.total_steps,
                 quick_export=self.quick_export,
                 object_names=self.object_names,
+                preprocess_cache_dir=self.preprocess_cache_dir,
             )
 
             self.manifest_path = str(self.manifest.get("manifest_path") or "")
