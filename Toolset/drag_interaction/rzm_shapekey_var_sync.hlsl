@@ -77,6 +77,15 @@ Texture1D<float4> IniParams         : register(t120);
 #define VAR_SYNC_INIPARAM_BASE 81
 #define VAR_SYNC_MODE_BASE 90
 
+// 权重硬边界：只挡 inf/NaN 与彻底失控的数值，不是「形态键合理范围」。
+// 负权重（$Freq_xxx = -0.4）与大于 1 的权重必须原样进入 ShapeKeyDrive，
+// 旧代码在这里 clamp 到 0..1，会把这些值压平。
+// ⚠ 必须与 common/shapekey_weight_range.py 的 SHAPEKEY_WEIGHT_MIN/MAX 及
+//   其余 4 个形态键 CS 的同名 define 一致
+//   （tests/test_shapekey_weight_range_contract.py 核对）。
+#define SHAPEKEY_WEIGHT_MIN (-4.0)
+#define SHAPEKEY_WEIGHT_MAX (4.0)
+
 [numthreads(1, 1, 1)]
 void main(uint3 dispatchThreadID : SV_DispatchThreadID)
 {
@@ -129,14 +138,15 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
         uint slot = mapping.x;
         uint zone = mapping.y;
         uint ndStage = mapping.z;
-        float v = clamp(raw, 0.0, 1.0);
+        float v = clamp(raw, SHAPEKEY_WEIGHT_MIN, SHAPEKEY_WEIGHT_MAX);
         if (slot < driveSlots)
             ShapeKeyDrive[slot] = v;
         if (ndStage != 0xFFFFFFFFu && zone < clickSlots)
         {
             // 无方向档位的读取带 ClickCount 门控：变量非 0 时打开对应档位，
             // 归 0 时仅在当前活动档位就是本档位才清空（不干扰点击切出的其他档位）
-            if (v > 1e-6)
+            // 「非 0」按绝对值判：负权重同样表示这个形态键在起作用。
+            if (abs(v) > 1e-6)
                 ClickCount[zone] = ndStage;
             else if (ClickCount[zone] == ndStage)
                 ClickCount[zone] = 0u;

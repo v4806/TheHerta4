@@ -283,18 +283,46 @@ class UnifiedSingleKeyTests(unittest.TestCase):
         self.assertAlmostEqual(object_b.key_block("Smile").value, 0.5)
         self.assertAlmostEqual(plain.key_block("Wave").value, 0.0)
 
-    def test_single_value_is_clamped_by_value_range(self):
+    def test_single_value_above_range_widens_the_range_instead_of_clamping(self):
+        # 越界输入不再被静默夹回值域：值域跟着放宽，值原样写下（1.5 必须写进 ShapeKey.value）
         props = _FakeProps(value_min=0.0, value_max=0.5)
         objects = self._ten_objects()
         context = self._refresh(props, objects)
         item = next(item for item in props.shape_key_list if item.name == "Smile")
 
-        item.value = 1.0
+        item.value = 1.5
         skc.on_single_value_update(item, context)
 
-        self.assertEqual([obj.key_block("Smile").value for obj in objects], [0.5] * 10)
-        self.assertAlmostEqual(objects[0].key_block("Smile").slider_max, 0.5)
-        self.assertAlmostEqual(item.value, 0.5, msg="滑块显示值也必须跟着夹取，否则与写进形态键的值不一致")
+        self.assertEqual([obj.key_block("Smile").value for obj in objects], [1.5] * 10)
+        self.assertAlmostEqual(objects[0].key_block("Smile").slider_max, 1.5)
+        self.assertAlmostEqual(props.sk_value_max, 1.5, msg="值域必须跟着放宽，否则下一次刷新又会夹回去")
+        self.assertAlmostEqual(item.value, 1.5, msg="滑块显示值必须等于实际写进形态键的值")
+
+    def test_single_value_below_range_min_widens_the_range_instead_of_clamping(self):
+        props = _FakeProps(value_min=0.0, value_max=0.5)
+        objects = self._ten_objects()
+        context = self._refresh(props, objects)
+        item = next(item for item in props.shape_key_list if item.name == "Smile")
+
+        item.value = -0.4
+        skc.on_single_value_update(item, context)
+
+        self.assertEqual([obj.key_block("Smile").value for obj in objects], [-0.4] * 10)
+        self.assertAlmostEqual(objects[0].key_block("Smile").slider_min, -0.4)
+        self.assertAlmostEqual(props.sk_value_min, -0.4)
+        self.assertAlmostEqual(item.value, -0.4)
+
+    def test_single_value_inside_range_leaves_range_alone(self):
+        props = _FakeProps(value_min=0.0, value_max=0.5)
+        objects = self._ten_objects()
+        context = self._refresh(props, objects)
+        item = next(item for item in props.shape_key_list if item.name == "Smile")
+
+        item.value = 0.25
+        skc.on_single_value_update(item, context)
+
+        self.assertEqual([obj.key_block("Smile").value for obj in objects], [0.25] * 10)
+        self.assertAlmostEqual(props.sk_value_max, 0.5, msg="范围内取值不该改动值域")
 
     def test_single_value_update_is_suppressed_while_refreshing(self):
         props = _FakeProps()

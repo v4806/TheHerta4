@@ -73,6 +73,15 @@ Texture1D<float4> IniParams         : register(t120);
 
 #define DRIVE_PARAMS  IniParams[77]
 
+// 权重硬边界：只挡 inf/NaN 与彻底失控的数值，不是「形态键合理范围」。
+// 拖动累加必须能越过 0 和 1（否则 ini 里写成 1.6 的键一拖就被拉回界内），
+// 旧代码在这里 clamp 到 0..1。
+// ⚠ 必须与 common/shapekey_weight_range.py 的 SHAPEKEY_WEIGHT_MIN/MAX 及
+//   其余 4 个形态键 CS 的同名 define 一致
+//   （tests/test_shapekey_weight_range_contract.py 核对）。
+#define SHAPEKEY_WEIGHT_MIN (-4.0)
+#define SHAPEKEY_WEIGHT_MAX (4.0)
+
 uint ClampZoneID(float zoneValue, uint zoneCount)
 {
     return min((uint)max(round(zoneValue), 0.0), max(zoneCount, 1u) - 1u);
@@ -227,7 +236,8 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
                 // 位移驱动：该方向净位移（同向 +、对向 -）× 灵敏度，
                 // 向上时“上”增“下”减，向下时反之，左右同理
                 float net = dirWeight[dir] - dirWeight[(dir + 2u) % 4u];
-                next = clamp(current + net * moveLen * mouseSensitivity, 0.0, 1.0);
+                next = clamp(current + net * moveLen * mouseSensitivity,
+                             SHAPEKEY_WEIGHT_MIN, SHAPEKEY_WEIGHT_MAX);
             }
             ShapeKeyDrive[idx] = next;
         }

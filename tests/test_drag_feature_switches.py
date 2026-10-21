@@ -42,6 +42,31 @@ def _sk_node():
     )
 
 
+def _required_toolset_files(mod, node):
+    """生成器 ``_copy_shaders`` 会读取的全部 Toolset 文件名（按模块常量推导）。
+
+    夹具必须**造齐**这份清单：生成器侧对缺失文件是硬失败
+    （``_require_toolset_file`` → RuntimeError，t47 契约），而夹具刻意只造
+    部分文件会撞上它。这里不硬编码文件名，而是镜像 ``_copy_shaders`` 的
+    取用顺序，从模块常量推导 —— 清单新增依赖时夹具自动跟上，不会漂移。
+    """
+    names = list(mod.SHADER_FILES)
+    if node._feature_skd():
+        names += list(mod.SHADER_DRIVE_FILES)
+    if node._feature_var() and node._drag_drive_var_sync_bindings():
+        names += list(mod.SHADER_VARSYNC_FILES)
+    if getattr(node, "enable_hand_cursor", False):
+        names += list(mod.HAND_SHADER_FILES) + list(mod.HAND_ASSET_FILES)
+    if getattr(node, "enable_viewport_probe", False):
+        names += list(mod.VIEWPORT_SHADER_FILES)
+    seen, ordered = set(), []
+    for name in names:
+        if name not in seen:
+            seen.add(name)
+            ordered.append(name)
+    return ordered
+
+
 class DragFeatureSwitchTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -274,24 +299,38 @@ class DragFeatureSwitchTests(unittest.TestCase):
 
     # ------------------------------------------------------------------
     # S10：_copy_shaders 按 F1/F4 过滤 hlsl
+    # 夹具按生成器清单造齐文件（见 _required_toolset_files）：生成器对缺失
+    # 文件是硬失败（t47 契约），夹具只造部分文件会直接撞上它。
     # ------------------------------------------------------------------
 
     def test_copy_shaders_gates_drive_and_varsync_files(self):
         toolset = Path(tempfile.mkdtemp(prefix="drag_toolset_"))
-        all_files = (
-            "rzm_gs_probe.hlsl", "rzm_object_detect.hlsl",
-            "rzm_pin_detected.hlsl", "rzm_jiggle_screen_state.hlsl",
-            "rzm_jiggle_interaction.hlsl", "rzm_vis_publish.hlsl",
-            "rzm_shapekey_drive.hlsl", "rzm_shapekey_var_sync.hlsl",
-        )
-        for fname in all_files:
-            (toolset / fname).write_text(
-                "struct VertexAttributes { float3 position; };\n", encoding="utf-8")
-        base = set(all_files[:6])
         drive = {"rzm_shapekey_drive.hlsl"}
         var_sync = {"rzm_shapekey_var_sync.hlsl"}
         try:
+            def _seed_toolset(node):
+                """按生成器清单造齐文件（缺一个就 RuntimeError）。"""
+                for fname in _required_toolset_files(self.mod, node):
+                    target = toolset / fname
+                    if target.exists():
+                        continue
+                    if fname.endswith(".hlsl"):
+                        target.write_text(
+                            "struct VertexAttributes { float3 position; };\n",
+                            encoding="utf-8")
+                    else:
+                        # 二进制资产（Hand*.buf/ib）逐字节拷贝
+                        target.write_bytes(b"\x00" * 16)
+
+            def _baseline(node):
+                """与 F1/F4 无关、必然拷贝的 hlsl 集合（含视口探针）。"""
+                return {
+                    n for n in _required_toolset_files(self.mod, node)
+                    if n.endswith(".hlsl")
+                } - drive - var_sync
+
             def _run(node):
+                _seed_toolset(node)
                 out = Path(tempfile.mkdtemp(prefix="drag_res_"))
                 node._get_toolset_dir = lambda: str(toolset)
                 node._get_vertex_struct_definition = (
@@ -300,19 +339,19 @@ class DragFeatureSwitchTests(unittest.TestCase):
                 return {p.name for p in out.glob("*.hlsl")}
 
             sk = _sk_node()
-            # F1/F4 全关 → 仅基础 6 个
+            # F1/F4 全关 → 基础集合（视口探针 hlsl 恒拷贝）
             off = _make_node(self.mod, feature_shapekey_link=False,
                              feature_variable_link=False)
             off.id_data = types.SimpleNamespace(nodes=[sk])
-            self.assertEqual(_run(off), base)
+            self.assertEqual(_run(off), _baseline(off))
             # F1 开 F4 关 → 追加 drive、不含 var_sync
             drive_only = _make_node(self.mod, feature_variable_link=False)
             drive_only.id_data = types.SimpleNamespace(nodes=[sk])
-            self.assertEqual(_run(drive_only), base | drive)
-            # 全开 → 8 个全拷贝（含两文件均走 struct 替换路径）
+            self.assertEqual(_run(drive_only), _baseline(drive_only) | drive)
+            # 全开 → 追加 drive + var_sync（两文件均走 struct 替换路径）
             on = _make_node(self.mod)
             on.id_data = types.SimpleNamespace(nodes=[sk])
-            self.assertEqual(_run(on), base | drive | var_sync)
+            self.assertEqual(_run(on), _baseline(on) | drive | var_sync)
 
             # F1/F4 全开但一个区域都没绑 → 不拷贝 var_sync（否则 res/ 留下
             # 没有 ini 引用、也没有编译产物的孤儿 hlsl）
@@ -322,7 +361,7 @@ class DragFeatureSwitchTests(unittest.TestCase):
             unbound.id_data = types.SimpleNamespace(nodes=[unbound_sk])
             self.assertTrue(unbound._feature_var())
             self.assertEqual(unbound._drag_drive_var_sync_bindings(), [])
-            self.assertEqual(_run(unbound), base | drive)
+            self.assertEqual(_run(unbound), _baseline(unbound) | drive)
         finally:
             shutil.rmtree(toolset, ignore_errors=True)
 

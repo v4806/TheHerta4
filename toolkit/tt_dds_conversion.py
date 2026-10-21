@@ -1,4 +1,3 @@
-import hashlib
 import json
 import os
 import re
@@ -11,6 +10,11 @@ import bpy
 
 TOOLSET_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "Toolset")
 
+# 内置格式规则：**颜色贴图（DiffuseMap）用 sRGB，其余类型一律线性 bc7_unorm**。
+# 表里保留各类型条目只是为了让类型名可读（批量算子的报告、规则列表的「重置默认」都按
+# 类型列出），它们的 format 与兜底值相同 —— 要单独给某个类型换格式，改这里就行。
+# 注意：把磁盘上本来是 _SRGB 的现有 DDS 按非 sRGB 规则重编码会净压暗一次（实测见
+# :func:`_texconv_colorspace_flags` 的说明），所以给某类型降级前先确认那份贴图的来源。
 DDS_DEFAULT_RULES = [
     {
         "texture_type": "DiffuseMap",
@@ -89,7 +93,15 @@ _DDS_DXGI_FORMAT_IDS = {
     "bc3_unorm": 77,
     "bc3_unorm_srgb": 78,
     "bc4_unorm": 80,
+    "bc4_snorm": 81,
     "bc5_unorm": 83,
+    "bc5_snorm": 85,
+    "r8_unorm": 61,
+    "r8g8_unorm": 49,
+    "r8g8b8a8_typeless": 27,
+    "r16_unorm": 56,
+    "r16_float": 54,
+    "r16g16b16a16_float": 10,
     "r8g8b8a8_unorm": 28,
     "r8g8b8a8_unorm_srgb": 29,
     "b8g8r8a8_unorm": 87,
@@ -375,17 +387,27 @@ def resolve_texture_dds_format(
     texture_type: str = "",
     name_hints=(),
     format_override: str = "",
+    workspace_source_path: str = "",
+    match_name: str | None = None,
 ) -> str:
     """单文件转换的最终输出格式。
 
-    优先级：``format_override``（非空）→ ``format_for_texture_type(texture_type)``
-    → ``resolve_dds_target(源文件名, name_hints)`` 的最后兜底。导出侧有材质类型
-    信息时必须传 ``texture_type``，不能再让源文件名决定格式（实测
-    ``VivianGemADiffuse.png`` 不含 ``DiffuseMap`` 关键字会落到线性默认规则）。
+    优先级：显式 ``format_override`` → 工作空间原贴图的 DDS 头 → 材质类型规则
+    （:func:`format_for_texture_type`）→ :func:`resolve_dds_target`（源文件名 + hints）。
+
+    为什么把「原贴图的头」放在规则表前面：引擎读的是工作空间里那份 DDS，BC5 是双通道
+    格式，换成 BC7 写进去引擎照样只读两个通道 —— 多出来的通道白占显存，还可能因为
+    格式不匹配读错。所以能读到原贴图就照抄它的格式，规则表只在这张图不在工作空间里
+    （源不是 DDS、也定位不到原贴图）时兜底。
     """
     override = str(format_override or "").strip()
     if override:
         return override
+
+    for candidate in (workspace_source_path, source_path):
+        detected = read_dds_header_format(str(candidate or ""))
+        if detected:
+            return detected
 
     if props is None:
         try:
@@ -396,6 +418,12 @@ def resolve_texture_dds_format(
     type_format = format_for_texture_type(texture_type, props)
     if type_format:
         return type_format
+
+    # 材质资源名（导出侧真正的命名依据）优先于源文件名：源图常是带哈希前缀的中间文件。
+    if match_name:
+        matched_type, matched_format, _matched_by = resolve_dds_target(str(match_name), props)
+        if str(matched_type) != "default":
+            return str(matched_format or "bc7_unorm")
 
     dds_format = resolve_dds_target(
         os.path.basename(str(source_path or "")), props, name_hints=name_hints
@@ -425,15 +453,45 @@ def dds_header_dxgi_format(path: str):
     return struct.unpack_from("<I", header, 128)[0]
 
 
-def existing_dds_matches_format(path: str, dds_format: str) -> bool:
+def _dxgi_format_name(dxgi_id: int) -> str:
+    """DXGI 格式号 -> texconv 格式名；表外返回空串。"""
+    for name, value in _DDS_DXGI_FORMAT_IDS.items():
+        if value == dxgi_id:
+            return name
+    return ""
+
+
+def read_dds_header_format(path: str) -> str:
+    """读 DDS 头得出 texconv 认可的格式名；读不到 / 格式不在表里返回空串。
+
+    这是「输出格式必须与工作空间原贴图一致」的唯一权威来源：工作空间里那份 DDS
+    就是游戏引擎实际加载的字节，它的头就是答案。两张表（DX10 / legacy FOURCC）
+    覆盖工作空间里出现的格式；表外格式返回空串，交给规则表兜底。
+    """
+    header = _read_dds_header(path)
+    if header is None:
+        return ""
+    fourcc = bytes(header[84:88])
+    if fourcc != b"DX10":
+        return _DDS_LEGACY_FOURCC_FORMATS.get(fourcc, "")
+    if len(header) < _DDS_FULL_HEADER_SIZE:
+        return ""
+    name = _dxgi_format_name(struct.unpack_from("<I", header, 128)[0])
+    if name.endswith("_typeless"):
+        # typeless 只是「内存布局未声明语义」：物理布局与 UNORM 完全相同，按 UNORM 输出。
+        name = name[: -len("_typeless")] + "_unorm"
+    return name
+
+
+def existing_dds_matches_format(path: str, dds_format: str):
     """判断磁盘上已有的 DDS 是否已经是 ``dds_format`` 指定的格式。
 
     只读 148 字节文件头，不 import ``common/dds_pixel.py``（那个模块面向完整
     data 解码、且有循环 import 风险）。
 
-    「存在即跳过」会让规则变更（例如 MaterialMap 从 ``bc7_unorm`` 改成
-    ``bc7_unorm_srgb``）对旧文件失效，所以复用前必须先验头。任何不确定的
-    情况（文件不存在 / 头读不到 / 格式未知）都返回 False —— 重转是安全默认。
+    三态返回：``True`` 一致、``False`` 明确不一致、``None`` 无法判断（表外格式）。
+    文件不存在 / 头读不到一律 ``False``。「存在即跳过」会让格式变化对旧产物失效
+    （规则被改、工作空间原贴图换了格式），所以复用前必须先验头。
     """
     expected = str(dds_format or "").strip().lower()
     if not expected or not os.path.isfile(path):
@@ -443,228 +501,66 @@ def existing_dds_matches_format(path: str, dds_format: str) -> bool:
     if header is None:
         return False
 
-    fourcc = bytes(header[84:88])
-    if fourcc == b"DX10":
-        if len(header) < _DDS_FULL_HEADER_SIZE:
-            return False
-        actual = struct.unpack_from("<I", header, 128)[0]
-        return _DDS_DXGI_FORMAT_IDS.get(expected) == actual
-
-    # legacy FOURCC 头没有 sRGB 变体：任何 _srgb 目标都判不一致。
-    if expected.endswith("_srgb"):
-        return False
-    legacy_format = _DDS_LEGACY_FOURCC_FORMATS.get(fourcc)
-    return legacy_format is not None and legacy_format == expected
+    actual = read_dds_header_format(path)
+    if not actual:
+        # 表外格式读不出名字：判成不一致会让每次导出都重转一遍，所以答「不知道」。
+        return None
+    return actual == expected
 
 
-# ---------------------------------------------------------------------------
-# DDS 转换结果缓存
-# ---------------------------------------------------------------------------
-# 为什么缓存：一次 Mod 导出要给二十多张贴图各跑一次 texconv（4K BC7 编码累计 ~13s），
-# 而同一张源图在两次导出之间通常没有任何变化。缓存键只用「源路径 + size + mtime_ns +
-# 目标格式 + 色彩空间标志 + texconv 标识」，**刻意不读源文件内容**（源图常 20MB 以上，
-# 每次全量哈希反而会把省下来的时间吃回去），源图一改 size/mtime 就自动失效。
-# 缓存放在用户本地（%LOCALAPPDATA%），不写插件目录、不写用户工程目录。
-
-_DDS_CACHE_SCHEMA = "v1"
-_DDS_CACHE_ENV = "HERTA_DDS_CACHE"
-_DDS_CACHE_MAX_BYTES = 2 * 1024 * 1024 * 1024
-_DDS_CACHE_TRIM_RATIO = 0.8
-_DDS_CACHE_SUFFIX = ".dds"
-_DDS_CACHE_OFF_VALUES = frozenset({"0", "false", "no", "off"})
-_DDS_CACHE_KEY_LEN = 32
+# 进程内转换缓存：key = 规范化后的目标绝对路径，value = 转出它时的源文件指纹。
+# 一次导出里，同一个目标 DDS 只会被真正转一次。一个材质被 N 个物体（或多个段落）
+# 引用时，导出流程会为同一个目标反复走到这里 —— 没有这层缓存就是 N 次 texconv，
+# 而单张 4096² 的 BC7 转换约 4 秒，重复转换正是导出耗时的主要来源。
+# 生命周期：由 BlueprintExportHelper.clear_postprocess_caches() 在每次导出开始时
+# 调 :func:`clear_dds_conversion_cache` 清空，所以「覆盖现有资源」每次导出仍会
+# 重新生成一遍，只是不会在一次导出里重复生成。
+_dds_conversion_cache: dict = {}
 
 
-def dds_cache_enabled() -> bool:
-    """``HERTA_DDS_CACHE=0``（false/no/off 同义）关闭缓存，默认开启。"""
-    value = str(os.environ.get(_DDS_CACHE_ENV, "") or "").strip().lower()
-    return value not in _DDS_CACHE_OFF_VALUES
+def clear_dds_conversion_cache():
+    """清空导出期的 DDS 转换缓存（每次导出开始时调用一次）。"""
+    _dds_conversion_cache.clear()
 
 
-def dds_cache_dir() -> str:
-    """缓存目录：Windows 用 ``%LOCALAPPDATA%\\TheHerta4\\dds_cache``，其它平台 ``~/.cache``。
+def _source_signature(source_path: str):
+    """源文件指纹 ``(规范化路径, mtime_ns, size)``；源不存在时返回 ``None``。"""
+    try:
+        stat = os.stat(source_path)
+    except OSError:
+        return None
+    return (os.path.normcase(os.path.abspath(source_path)), stat.st_mtime_ns, stat.st_size)
 
-    只算路径、**不建目录** —— 「查缓存」不该为了算路径就在磁盘上留痕，目录由写入侧
-    ``os.makedirs(exist_ok=True)`` 创建。
+
+def _target_is_current(target_path: str, signature, expected_format: str = "") -> bool:
+    """目标文件是否已经是这份源文件、这个格式的最新产物。
+
+    只看 mtime（make 的时间戳规则）不足以复用：源图没变但期望格式变了（规则表被改，
+    或工作空间原贴图换了格式）时，磁盘上那份旧格式的产物会被永久沿用。给了
+    ``expected_format`` 就再验一次 DDS 头；头里格式无法识别（``None``）时按 mtime 放行。
     """
-    if os.name == "nt":
-        local_appdata = str(os.environ.get("LOCALAPPDATA", "") or "").strip()
-        if not local_appdata:
-            local_appdata = os.path.join(os.path.expanduser("~"), "AppData", "Local")
-        return os.path.join(local_appdata, "TheHerta4", "dds_cache")
-    return os.path.join(os.path.expanduser("~"), ".cache", "TheHerta4", "dds_cache")
+    try:
+        target_stat = os.stat(target_path)
+    except OSError:
+        return False
+    if target_stat.st_mtime_ns < signature[1]:
+        return False
+    if expected_format:
+        return existing_dds_matches_format(target_path, expected_format) is not False
+    return True
 
 
-def _dds_texconv_identity(texconv_executable) -> str:
-    """把 texconv 的「路径 + size + mtime」并进键：换版本后旧缓存自动失效。"""
-    path = str(texconv_executable or "")
-    if not path:
+def _verbatim_copy_source(source_path: str, workspace_source_path: str, dds_format: str) -> str:
+    """找出格式正好等于 ``dds_format`` 的原贴图：texconv 写不出该格式时原样复制它。"""
+    expected = str(dds_format or "").strip().lower()
+    if not expected:
         return ""
-    try:
-        stat = os.stat(path)
-    except OSError:
-        # 相对路径（测试桩）原样入键，不做 abspath —— 否则会随 cwd 漂移。
-        return path if not os.path.isabs(path) else os.path.normcase(path)
-    return f"{os.path.normcase(os.path.abspath(path))}|{stat.st_size}|{stat.st_mtime_ns}"
-
-
-def dds_cache_key(
-    source_path: str,
-    dds_format: str,
-    colorspace_flags=(),
-    texconv_executable: str = "",
-    source_stat=None,
-) -> str:
-    """算缓存键（sha256 前 32 位）。源文件 stat 由调用方传入可避免重复 stat。"""
-    source_abs = os.path.normcase(os.path.abspath(str(source_path or "")))
-    stat = source_stat if source_stat is not None else os.stat(source_abs)
-    payload = "\n".join(
-        (
-            _DDS_CACHE_SCHEMA,
-            source_abs,
-            str(stat.st_size),
-            str(stat.st_mtime_ns),
-            str(dds_format or "").strip().lower(),
-            ",".join(str(flag) for flag in (colorspace_flags or ())),
-            _dds_texconv_identity(texconv_executable),
-        )
-    )
-    return hashlib.sha256(payload.encode("utf-8", "surrogatepass")).hexdigest()[:_DDS_CACHE_KEY_LEN]
-
-
-def _dds_cache_entry_is_usable(path: str, dds_format: str) -> bool:
-    """缓存条目是否可用：必须是**完整且格式对得上**的 DDS。
-
-    texconv 的输出必然是带完整头的 DDS（≥148 字节）。文件缺失 / 被截断 / magic 不对 /
-    DXGI 格式号与目标不符都当「损坏」，回退重新转换（不在这里删文件，避免和并发导出抢写；
-    下次写入会用 ``os.replace`` 原子覆盖）。未知格式名只校验 DDS 头，不阻断缓存。
-    """
-    try:
-        if os.path.getsize(path) < _DDS_FULL_HEADER_SIZE:
-            return False
-    except OSError:
-        return False
-    if str(dds_format or "").strip().lower() in _DDS_DXGI_FORMAT_IDS:
-        return existing_dds_matches_format(path, dds_format)
-    return _read_dds_header(path) is not None
-
-
-def resolve_dds_cache_entry(
-    source_path: str,
-    dds_format: str,
-    colorspace_flags=(),
-    texconv_executable: str = "",
-    source_stat=None,
-):
-    """查缓存，命中返回缓存文件绝对路径；关闭 / 未命中 / 损坏 / 源文件不可读都返回 None。"""
-    if not dds_cache_enabled():
-        return None
-    try:
-        key = dds_cache_key(
-            source_path,
-            dds_format,
-            colorspace_flags=colorspace_flags,
-            texconv_executable=texconv_executable,
-            source_stat=source_stat,
-        )
-    except OSError:
-        return None
-    entry = os.path.join(dds_cache_dir(), key + _DDS_CACHE_SUFFIX)
-    if not _dds_cache_entry_is_usable(entry, dds_format):
-        return None
-    return entry
-
-
-def store_dds_cache(
-    source_path: str,
-    dds_format: str,
-    colorspace_flags=(),
-    texconv_executable: str = "",
-    produced_path: str = "",
-    source_stat=None,
-):
-    """把一次成功的转换产物写进缓存，返回缓存路径；关闭 / 产物不合格 / 写失败返回 None。
-
-    写失败只打印、不抛：缓存是纯加速层，任何异常都不得影响导出产物。
-    """
-    if not dds_cache_enabled():
-        return None
-    # 只缓存「看起来是完整 DDS」的产物：短文件 / 头不对说明转换异常，缓存它只会把坏
-    # 产物传播到下一轮；顺带也让单元测试的假产物不落进用户的真实缓存目录。
-    if not _dds_cache_entry_is_usable(produced_path, dds_format):
-        return None
-    try:
-        key = dds_cache_key(
-            source_path,
-            dds_format,
-            colorspace_flags=colorspace_flags,
-            texconv_executable=texconv_executable,
-            source_stat=source_stat,
-        )
-        cache_dir = dds_cache_dir()
-        os.makedirs(cache_dir, exist_ok=True)
-        entry = os.path.join(cache_dir, key + _DDS_CACHE_SUFFIX)
-        # 先写临时文件再 os.replace：并发导出最多重复一次转换，不会读到半截缓存。
-        staging = entry + f".{os.getpid()}.tmp"
-        shutil.copy2(produced_path, staging)
-        os.replace(staging, entry)
-    except Exception as exc:
-        print(f"[DDS缓存] 写入失败（忽略，不影响导出）: {exc}")
-        return None
-    trim_dds_cache(cache_dir, keep_path=entry)
-    return entry
-
-
-def trim_dds_cache(cache_dir: str = "", max_bytes=None, keep_path: str = "") -> None:
-    """缓存超上限时按文件 mtime 从旧到新删除，直到总量低于上限的 80%。
-
-    留 20% 缓冲是有意的：每次写入都贴着上限删一个文件既频繁又难读日志。
-    ``keep_path``（刚写入的那一个）不参与删除；若只剩它也仍然超限，就停手并保留它。
-    """
-    directory = cache_dir or dds_cache_dir()
-    limit = int(_DDS_CACHE_MAX_BYTES if max_bytes is None else max_bytes)
-    if limit <= 0:
-        return
-    entries = []
-    total = 0
-    try:
-        names = os.listdir(directory)
-    except OSError:
-        return
-    for name in names:
-        if not name.endswith(_DDS_CACHE_SUFFIX):
-            continue
-        path = os.path.join(directory, name)
-        try:
-            stat = os.stat(path)
-        except OSError:
-            continue
-        entries.append((stat.st_mtime_ns, stat.st_size, path))
-        total += stat.st_size
-    if total <= limit:
-        return
-
-    target_total = int(limit * _DDS_CACHE_TRIM_RATIO)
-    keep_normcase = os.path.normcase(keep_path) if keep_path else ""
-    removed = 0
-    freed = 0
-    for _mtime, size, path in sorted(entries):
-        if total <= target_total:
-            break
-        if keep_normcase and os.path.normcase(path) == keep_normcase:
-            continue
-        try:
-            os.remove(path)
-        except OSError:
-            continue
-        total -= size
-        removed += 1
-        freed += size
-    if removed:
-        print(
-            f"[DDS缓存] 超出上限 {limit // (1024 * 1024)}MB，清理 {removed} 个旧缓存"
-            f"（释放 {freed // (1024 * 1024)}MB，剩余 {total // (1024 * 1024)}MB）"
-        )
+    for candidate in (workspace_source_path, source_path):
+        candidate = str(candidate or "")
+        if candidate and os.path.isfile(candidate):
+            if str(read_dds_header_format(candidate)).strip().lower() == expected:
+                return candidate
+    return ""
 
 
 def convert_texture_to_dds(
@@ -674,19 +570,15 @@ def convert_texture_to_dds(
     texture_type: str = "",
     name_hints=(),
     format_override: str = "",
+    workspace_source_path: str = "",
+    match_name: str | None = None,
 ) -> tuple[bool, str]:
     """把单张贴图转成 DDS 写到 ``target_path``，供 Mod 导出流程复用。
 
-    输出格式由 :func:`resolve_texture_dds_format` 决定：显式 ``format_override``
-    优先，否则按「源文件名 → name_hints」推断；色彩空间标志由
-    :func:`_texconv_colorspace_flags` 按该格式选择 —— 这正是为「PNG 这类不带
-    色彩空间信息的输入」设计的（sRGB 输出用 ``--srgb-in`` 达成恒等，线性输出
-    用 ``--ignore-srgb``）。
-
-    结果按「源路径 + size + mtime + 目标格式 + 色彩空间标志 + texconv 标识」缓存
-    （见 :func:`resolve_dds_cache_entry` / :func:`store_dds_cache`）：同一张源图第二次
-    导出直接 ``copy2`` 缓存产物，不再启动 texconv；``HERTA_DDS_CACHE=0`` 可整体关闭。
-    缓存只是加速层 —— 未命中、损坏、写失败一律回落到原来的转换流程。
+    输出格式由 :func:`resolve_texture_dds_format` 决定：能读到工作空间原贴图就照抄它的
+    格式，读不到才退回规则表。texconv 写不出该格式时**不换格式重编码**，而是把原贴图
+    原样复制过去（返回 ``copied-verbatim:<格式>``）—— 换格式会让引擎按错误的
+    通道数 / 色彩空间读贴图，比不转换更糟。
 
     **不改动源文件**，返回 ``(True, "")`` 或 ``(False, 失败原因)``。
     """
@@ -697,47 +589,32 @@ def convert_texture_to_dds(
     if props is None:
         props = bpy.context.scene.texture_tools_props
 
+    hints = tuple(name_hints or ())
+
     dds_format = resolve_texture_dds_format(
         source_path,
         props,
         texture_type=texture_type,
-        name_hints=name_hints,
+        name_hints=hints,
         format_override=format_override,
+        workspace_source_path=workspace_source_path,
+        match_name=match_name,
     )
-
-    # 源文件 stat 只取一次：键和写入都用它，避免 22MB 源图被反复 stat。
-    try:
-        source_stat = os.stat(source_path)
-    except OSError:
-        source_stat = None
-
     colorspace_flags = _texconv_colorspace_flags(dds_format)
-    cached = resolve_dds_cache_entry(
-        source_path,
-        dds_format,
-        colorspace_flags=colorspace_flags,
-        texconv_executable=texconv_executable,
-        source_stat=source_stat,
-    )
-    if cached:
-        try:
-            target_dir = os.path.dirname(target_path)
-            if target_dir:
-                os.makedirs(target_dir, exist_ok=True)
-            shutil.copy2(cached, target_path)
-        except Exception as exc:
-            # 缓存命中但复制失败（磁盘满 / 目标被占用）：回退重新转换，别让导出中断。
-            print(f"[DDS缓存] 命中但复制失败，回退重新转换: {exc}")
-        else:
-            print(f"[DDS缓存] 命中 {os.path.basename(str(target_path))}")
-            return True, ""
 
     command = [texconv_executable, "-f", dds_format]
     command.extend(colorspace_flags)
 
     # 先转到临时目录再搬过去：texconv 的输出名固定是「源文件名词干 + .dds」，而导出侧
     # 要的目标名通常取材质资源名，两者不同；直接 -o 目标目录会写出一个多余的错误文件名。
-    with tempfile.TemporaryDirectory(prefix="herta_dds_export_") as staging:
+    # 临时目录必须和目标**同盘**：同卷 rename 是瞬时的，而放到系统临时目录（通常在 C 盘）
+    # 再搬到 Mod 目录（常在别的盘）会退化成「复制 21MB + 删除」，纯粹白费时间。
+    target_dir = os.path.dirname(target_path)
+    if target_dir:
+        os.makedirs(target_dir, exist_ok=True)
+
+    staging = tempfile.mkdtemp(prefix=".herta_dds_staging_", dir=target_dir or None)
+    try:
         command.extend(["-o", staging, "-y", source_path])
         try:
             process = subprocess.run(
@@ -752,6 +629,17 @@ def convert_texture_to_dds(
 
         if process.returncode != 0:
             detail = (process.stderr or process.stdout or "").strip()
+            verbatim = _verbatim_copy_source(source_path, workspace_source_path, dds_format)
+            if verbatim:
+                print(
+                    f"[DDS转换] texconv 写不出 {dds_format}，原样复制原贴图 "
+                    f"{os.path.basename(verbatim)}（保持工作空间原格式）"
+                )
+                try:
+                    shutil.copy2(verbatim, target_path)
+                except Exception as exc:
+                    return False, f"原样复制原贴图失败: {exc}"
+                return True, f"copied-verbatim:{dds_format}"
             return False, detail or f"texconv 退出码 {process.returncode}"
 
         produced = os.path.join(
@@ -760,26 +648,79 @@ def convert_texture_to_dds(
         if not os.path.exists(produced):
             return False, f"texconv 未生成 {produced}"
 
-        target_dir = os.path.dirname(target_path)
-        if target_dir:
-            os.makedirs(target_dir, exist_ok=True)
         try:
             shutil.move(produced, target_path)
         except Exception as exc:
             return False, f"写出目标文件失败: {exc}"
-
-    # 转换成功后把「刚刚写出的这一份」复制进缓存：缓存内容就是首次转换的字节，
-    # 之后命中时原样 copy2 出去（texconv 确定性，与重新转换结果一致）。
-    store_dds_cache(
-        source_path,
-        dds_format,
-        colorspace_flags=colorspace_flags,
-        texconv_executable=texconv_executable,
-        produced_path=target_path,
-        source_stat=source_stat,
-    )
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
     return True, ""
+
+
+def convert_texture_to_dds_cached(
+    source_path: str,
+    target_path: str,
+    props=None,
+    force: bool = False,
+    match_name: str | None = None,
+    texture_type: str = "",
+    name_hints=(),
+    format_override: str = "",
+    workspace_source_path: str = "",
+) -> tuple[bool, str]:
+    """带缓存的 :func:`convert_texture_to_dds`：同一目标在一次导出内只真正转一次。
+
+    缓存值是「源文件指纹 + 期望格式」—— 格式也算进去，这样规则变了或原贴图换了格式以后，
+    磁盘上那份旧格式的产物不会被当成最新结果复用。
+
+    ``force=True`` 对应节点上的「覆盖现有资源」：表示愿意重新生成，但仅限本次导出的
+    第一次 —— 同一张贴图被 N 个物体引用时不会再各转一遍。缓存每次导出开始时清空，
+    所以下次导出仍会重新生成。复用磁盘已有产物时同样返回 ``(True, "")``：调用方只
+    关心「目标就绪」。
+
+    ``match_name`` 沿用旧签名：材质资源名先查规则，命中就定格式（导出侧真正的命名依据）。
+    """
+    signature = _source_signature(source_path)
+    if signature is None:
+        return False, f"源文件不存在: {source_path}"
+
+    hints = tuple(name_hints or ())
+
+    expected_format = resolve_texture_dds_format(
+        source_path,
+        props,
+        texture_type=texture_type,
+        name_hints=hints,
+        format_override=format_override,
+        workspace_source_path=workspace_source_path,
+        match_name=match_name,
+    )
+
+    cache_key = os.path.normcase(os.path.abspath(target_path))
+    cache_value = (signature, expected_format)
+    # 命中缓存也要确认产物还在：同一次导出里目标目录可能被清掉（缓存只记「这一轮转过了」，
+    # 不负责保管文件），缺了这个判断就会对着不存在的目标返回成功。
+    if _dds_conversion_cache.get(cache_key) == cache_value and os.path.exists(target_path):
+        return True, ""
+
+    if not force and _target_is_current(target_path, signature, expected_format):
+        _dds_conversion_cache[cache_key] = cache_value
+        return True, ""
+
+    ok, reason = convert_texture_to_dds(
+        source_path,
+        target_path,
+        props,
+        texture_type=texture_type,
+        name_hints=hints,
+        format_override=format_override,
+        workspace_source_path=workspace_source_path,
+        match_name=match_name,
+    )
+    if ok:
+        _dds_conversion_cache[cache_key] = cache_value
+    return ok, reason
 
 
 class TT_OT_convert_to_dds(bpy.types.Operator):

@@ -27,10 +27,10 @@ Blender 里每个面由 ``material_index`` 指向**唯一一个**材质槽，一
   识别类型，不需要通道语义。
 
 渲染材质的各通道接法对齐独立插件「快速应用纹理」（MOD 规范）：
-  - DiffuseMap  -> Base Color + Alpha
-  - NormalMap   -> 与导入侧「自动上贴图时使用法线贴图」同一套按游戏类型接法
-                   （IdentityV 反相 G / 标准 / ZZMI·GIMI 由 R/G 重建 Z）
-  - LightMap    -> 绝区零（ZZMI）走通道拆分（G->金属度、B->高光）；其它接金属度
+  - DiffuseMap  -> Base Color（Alpha 不接线，保持 1.0）
+  - NormalMap   -> 贴图经「sRGB->Non-Color」+「法线贴图_补Z」两个转换组
+                   （由 R/G 重建 Z）后进 Normal
+  - LightMap    -> Specular IOR Level（该图在绝区零里是折射相关）
   - MaterialMap -> 粗糙度
   - BodyMaskMap -> 自发光强度（黑白遮罩，白色发光）
   - 其它类型    -> 不接
@@ -45,7 +45,6 @@ import os
 import bpy
 
 from .global_config import GlobalConfig
-from .global_properties import GlobalProterties
 from .logic_name import LogicName
 from .submesh_metadata import SubmeshMetadataResolver
 from .texture_metadata_helper import TextureMetadataResolver
@@ -160,35 +159,6 @@ def _attach_to_frame(node_tree, node, socket_type: str, location=None):
         return None
     node.parent = frame
     node.location = _RENDER_TEX if location is None else location
-    return frame
-
-
-def _attach_normal_chain(node_tree, nodes):
-    """把法线链的整组节点整体平移到 NormalMap 框内，保持它们彼此的相对位置。
-
-    法线图是按游戏类型搭的（IdentityV 反相 G / 标准 / ZZMI·GIMI 由 R/G 重建 Z），
-    节点数与形状都不同，所以不逐个指定坐标，而是取整组包围盒的最小角对齐到框内
-    左上角，组内相对关系原样保留。
-    """
-    created = [node for node in nodes if node is not None]
-    if not created:
-        return None
-    frame = _ensure_render_frame(node_tree, "NORMAL")
-    if frame is None:
-        return None
-    # 目标相对坐标要在挂 parent 之前算好：Blender 设 parent 时会保持节点的视觉
-    # 位置、把 location 重解释成相对值，挂完再基于 location 做偏移就会算偏。
-    min_x = min(node.location.x for node in created)
-    min_y = min(node.location.y for node in created)
-    targets = [
-        (node,
-         node.location.x - min_x + _RENDER_TEX[0],
-         node.location.y - min_y + _RENDER_TEX[1])
-        for node in created
-    ]
-    for node, target_x, target_y in targets:
-        node.parent = frame
-        node.location = (target_x, target_y)
     return frame
 
 
@@ -330,14 +300,6 @@ def resolve_mark_texture_path(extract_folder: str, mark) -> str:
         if os.path.isfile(candidate_path):
             return candidate_path
     return ""
-
-
-def _ignore_texture_alpha() -> bool:
-    """「导入贴图时忽略透明度通道」开关（轻量宿主缺访问器时按关处理）。"""
-    try:
-        return bool(GlobalProterties.ignore_texture_alpha())
-    except Exception:
-        return False
 
 
 # ---------------------------------------------------------------
@@ -653,11 +615,12 @@ def _wire_channel(node_tree, principled, socket_type: str, texture_path: str, lo
 
 
 def _wire_render_diffuse(node_tree, principled, texture_path: str) -> None:
-    """渲染材质的漫反射：原理化 BSDF 的 Base Color（+ 透明度）。
+    """渲染材质的漫反射：原理化 BSDF 的 Base Color。
 
-    和规范材质不同——规范材质的 DiffuseMap 单独占一个材质，可以继续用原来的
-    漫反射 BSDF + 透明混合；渲染材质要跟金属度/粗糙度/法线共存，只能用原理化 BSDF。
-    透明度沿用导入现有语义：受「导入贴图时忽略透明度通道」约束，忽略时不连 Alpha。
+    和规范材质不同——规范材质的 DiffuseMap 单独占一个材质，继续用原来的漫反射
+    BSDF + 透明混合（贴图透明度受「导入贴图时忽略透明度通道」约束）；渲染材质要跟
+    金属度/粗糙度/法线共存，只能用原理化 BSDF，漫反射只进 Base Color、Alpha 保持
+    1.0（与工作文件里的 MOD 规范材质一致）。
     """
     image = _link_texture_image(texture_path, "sRGB")
     tex_image = _new_texture_node(node_tree, image, _RENDER_TEX)
@@ -672,92 +635,49 @@ def _wire_render_diffuse(node_tree, principled, texture_path: str) -> None:
 # ---------------------------------------------------------------
 # 材质构建
 # ---------------------------------------------------------------
-#: 规范材质里各节点的坐标（照搬工作文件的排版）
-_SPEC_PRINCIPLED = {
-    "DIFFUSE": (180, 0), "NORMAL": (0, -160), "LIGHTMAP": (40, 0),
-    "SURFACE": (120, 0), "BODYMASK": (240, 0),
-}
-_SPEC_OUTPUT = {
-    "DIFFUSE": (480, 0), "NORMAL": (280, -160), "LIGHTMAP": (320, 0),
-    "SURFACE": (420, 0), "BODYMASK": (540, 0),
-}
-_SPEC_TEX = {
-    "DIFFUSE": (-120, 0), "NORMAL": (-820, -160), "LIGHTMAP": (-260, 0),
-    "SURFACE": (-160, 0), "BODYMASK": (-120, 0),
-}
-_SPEC_SRGB = {"NORMAL": (-480, -160)}
-_SPEC_NMAP = {"NORMAL": (-240, -160)}
+def _apply_diffuse_material(material, texture_path: str, logic_name: str) -> None:
+    """规范材质的漫反射：沿用 TheHerta4 原生方案（IdentityV 不透明、其余透明混合）。
 
+    这两个图函数内部自行 load 贴图、设 sRGB、清空节点树，行为与旧的单材质路径
+    完全一致，这里不再重复建图。贴图的透明度通道也由
+    ``create_transparent_material_graph`` 内部按「导入贴图时忽略透明度通道」决定
+    （默认 ``CHANNEL_PACKED``，忽略时 ``NONE``）。
+    """
+    from .mesh_create_helper import MeshCreateHelper
 
-def _wire_spec_channel(node_tree, principled, socket_type: str, texture_path: str) -> None:
-    """规范材质：一种贴图接一个原理化通道，只有法线需要转换组。"""
-    if socket_type == "NORMAL":
-        image = _link_texture_image(texture_path, "sRGB")
-        tex_image = _new_texture_node(node_tree, image, _SPEC_TEX["NORMAL"])
-        target = principled.inputs.get("Normal")
-        if target is None:
-            return
-        srgb_group = _ensure_node_group(_SRGB_GROUP)
-        normal_group = _ensure_normal_group_z()
-        if srgb_group is None or normal_group is None:
-            node_tree.links.new(tex_image.outputs["Color"], target)
-            return
-        srgb_node = node_tree.nodes.new("ShaderNodeGroup")
-        srgb_node.node_tree = srgb_group
-        srgb_node.label = srgb_group.name
-        srgb_node.location = _SPEC_SRGB["NORMAL"]
-        normal_node = node_tree.nodes.new("ShaderNodeGroup")
-        normal_node.node_tree = normal_group
-        normal_node.label = normal_group.name
-        normal_node.location = _SPEC_NMAP["NORMAL"]
-        node_tree.links.new(tex_image.outputs["Color"], srgb_node.inputs["Color"])
-        node_tree.links.new(srgb_node.outputs["Color"], normal_node.inputs["Color"])
-        node_tree.links.new(normal_node.outputs["Normal"], target)
+    if logic_name == LogicName.IdentityV:
+        material.blend_method = "OPAQUE"
+        MeshCreateHelper.create_diffuse_material_graph(
+            node_tree=material.node_tree,
+            texture_path=texture_path,
+        )
         return
 
-    image = _link_texture_image(texture_path, "sRGB")
-    image.alpha_mode = "NONE"
-    tex_image = _new_texture_node(node_tree, image, _SPEC_TEX.get(socket_type, (-120, 0)))
-
-    if socket_type == "DIFFUSE":
-        target = principled.inputs.get("Base Color")
-    elif socket_type == "LIGHTMAP":
-        target = principled.inputs.get("Specular IOR Level")
-        if target is None:
-            target = principled.inputs.get("Specular")
-    elif socket_type == "SURFACE":
-        target = principled.inputs.get("Roughness")
-    elif socket_type == "BODYMASK":
-        target = principled.inputs.get("Emission Strength")
-    else:
-        target = None
-    if target is not None:
-        node_tree.links.new(tex_image.outputs["Color"], target)
+    material.blend_method = "BLEND"
+    if hasattr(material, "use_transparency_overlap"):
+        material.use_transparency_overlap = False
+    elif hasattr(material, "show_transparent_back"):
+        material.show_transparent_back = False
+    MeshCreateHelper.create_transparent_material_graph(
+        node_tree=material.node_tree,
+        texture_path=texture_path,
+    )
 
 
 def _apply_spec_material(material, socket_type: str, texture_path: str,
                          logic_name: str) -> None:
-    """规范材质：原理化 BSDF + 单通道，与工作文件里的 MOD 规范材质完全一致。
+    """规范材质：一律按「颜色贴图」接法，不按类型接通道。
 
-    规范材质（``<类型名>_<网格名>``）本来只用于让导出侧按材质名识别贴图类型，
-    但它同样会被直接渲染，所以按类型接通道——与渲染材质（见
-    :func:`_build_render_material`）共用同一套语义与坐标。
+    规范材质（``<类型名>_<网格名>``）只用于让导出侧按材质名识别贴图类型，不需要通道
+    语义；而按类型接通道必须经过原理化 BSDF，原理化的镜面/粗糙度默认值会在渲染时
+    改变颜色（法线/光照/遮罩贴图尤其明显）。所以除渲染材质（``IMGPV_``，见
+    :func:`_build_render_material`）保留分通道接法外，其余材质统一走 TheHerta4
+    原生的颜色贴图图——纯漫反射 BSDF（``ShaderNodeBsdfDiffuse``）+ 透明混合，
+    与 DiffuseMap 完全同一套，节点树里不出现原理化 BSDF。
+
+    ``socket_type`` 只为不改动调用点而保留：规范材质不再按类型分流。
     """
-    material.use_nodes = True
-    node_tree = material.node_tree
-    _clear_nodes(node_tree)
-
-    principled = node_tree.nodes.new("ShaderNodeBsdfPrincipled")
-    principled.location = _SPEC_PRINCIPLED.get(socket_type, (0, 0))
-    output = node_tree.nodes.new("ShaderNodeOutputMaterial")
-    output.location = _SPEC_OUTPUT.get(socket_type, (300, 0))
-    node_tree.links.new(principled.outputs["BSDF"], output.inputs["Surface"])
-
-    material.blend_method = "HASHED"
-    if hasattr(material, "use_transparency_overlap"):
-        material.use_transparency_overlap = True
-
-    _wire_spec_channel(node_tree, principled, socket_type, texture_path)
+    _apply_diffuse_material(material, texture_path, logic_name)
 
 
 def _build_render_material(material, entries, logic_name: str) -> None:

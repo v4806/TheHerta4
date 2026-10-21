@@ -1,15 +1,22 @@
 # -*- coding: utf-8 -*-
 """ZZMI 跨组融合统一顶点组测试开关（cross_group_merged_vgmap_test）契约单测。
 
-背景：跨 SkeletonGroup（对象变换不同）的合并需要一层逐帧对象空间换算，尚未实现。
+背景（**2026-08 初建时的口径，已被下方 2026-10-10 更新取代**）：跨 SkeletonGroup（对象变换不同）的合并需要一层逐帧对象空间换算，当时尚未实现。
 本开关先把"实验入口"与**已验证可用的合并骨骼**（import_merged_vgmap，「使用融合统一
 顶点组」）分离出来，供后续实验/测试使用：
 
 1. 属性存在、标签精确为「跨组融合统一顶点组测试」、默认 False（关闭时零行为变化）；
 2. 面板放置：位于「使用融合统一顶点组」**正下方**，且仅 ZZMI 逻辑名下渲染；
-3. 分离契约：本开关在实现跨组功能前**不参与任何导入/导出决策** —— 除属性定义与
-   面板渲染外，生产代码不得引用它。这条断言故意做成"脆"的：一旦开始接入跨组链路，
-   必须在本文件里显式登记新的消费点，避免实验开关悄悄改变既有合并骨骼的行为。
+3. 分离契约（**2026-08 初建口径，已被下方 2026-10-10 更新取代**）：本开关在实现跨组
+   功能前**不参与任何导入/导出决策** —— 除属性定义与面板渲染外，生产代码不得引用它。
+   这条断言故意做成"脆"的：一旦开始接入跨组链路，必须在本文件里显式登记新的消费点，
+   避免实验开关悄悄改变既有合并骨骼的行为（现已登记 `ui/universal/zzmi.py`，见
+   `ALLOWED_REFERENCING_FILES`）。
+
+2026-10-10 更新（F1 接入，实机复现件根因）：`ui/universal/zzmi.py` 已登记为本开关的
+**消费点** —— `_merged_cross_group_enabled()` 读它决定是否把「被吸收进本组网格的别组
+部件」的骨骼写进**宿主组**骨架缓冲（`CustomShaderZZMIMergedSkeletonAttachX_*`）。
+关闭时逐字节保持历史行为（跨组件只写自己组 + 大声报警）。
 
 测试纪律：无 bpy（只读源码做断言）。
 """
@@ -23,11 +30,14 @@ PROPERTY_LABEL = "跨组融合统一顶点组测试"
 
 GLOBAL_PROPERTIES = REPO_ROOT / "common" / "global_properties.py"
 PANEL = REPO_ROOT / "ui" / "ui_panel_basic.py"
+GENERATOR = REPO_ROOT / "ui" / "universal" / "zzmi.py"
 
 # 允许引用本开关的文件（实现跨组链路时在此登记新消费点）
 ALLOWED_REFERENCING_FILES = {
     "common/global_properties.py",
     "ui/ui_panel_basic.py",
+    # 2026-10-10 F1：跨组骨骼合并的导出侧消费点（读开关决定是否写宿主组缓冲）
+    "ui/universal/zzmi.py",
 }
 
 # 生产代码扫描根（排除 tests/临时产物/备份/工具产物）
@@ -176,6 +186,58 @@ class SeparationContractTests(unittest.TestCase):
         referencing = _referencing_files()
         for expected in ALLOWED_REFERENCING_FILES:
             self.assertIn(expected, referencing)
+
+
+class CrossGroupConsumerContractTests(unittest.TestCase):
+    """F1 消费点契约（只读源码）：
+
+    * 默认 False ⇒ 检测函数直接返回空 ⇒ 产物与历史**逐字节相同**；
+    * 开启 ⇒ 跨组件骨骼写进**宿主组**骨架缓冲，调色板仍取跨组件自己的资源；
+    * 守卫感知开关：关闭时保留历史「禁止跨组别骨骼合并」文案。
+    """
+
+    def setUp(self):
+        self.source = _read(GENERATOR)
+
+    def _block(self, header: str) -> str:
+        self.assertIn(header, self.source, f"缺少 {header}")
+        return self.source.split(header, 1)[1]
+
+    def test_gate_reads_switch_with_false_default(self):
+        body = self._block("def _merged_cross_group_enabled() -> bool:")
+        body = body.split("\n    @staticmethod", 1)[0]
+        self.assertIn(
+            f'_zzmi_prop_flag("{PROPERTY_KEY}", False)',
+            body,
+            "开关必须按 False 缺省读取（关闭时零行为变化）",
+        )
+
+    def test_detection_short_circuits_when_disabled(self):
+        body = self._block("def _merged_cross_group_component_ids(self, skeleton_group: int)")
+        body = body.split("\n    def ", 1)[0]
+        self.assertIn("if not self._merged_cross_group_enabled():", body)
+        self.assertIn("return []", body)
+        # 判据必须与「几何被吸收」同源：引用骨骼并集 − 本组合法槽位
+        self.assertIn("offending = referenced - legal", body)
+
+    def test_cross_attach_targets_host_group_buffer(self):
+        body = self._block("def add_merged_skeleton_sections")
+        body = body.split("_merged_cross_group_component_ids(skeleton_group)", 1)[1]
+        chunk = body[:4000]
+        self.assertIn("_merged_cross_attach_name", chunk, "必须发射跨组 attach 段")
+        self.assertIn(
+            "_merged_skeleton_name(int(skeleton_group), slot)", chunk,
+            "写入目标必须是**宿主组**缓冲（skeleton_group 是宿主组）",
+        )
+        self.assertIn(
+            'cross_component["draw_ib"]', chunk,
+            "调色板/VgMap 必须取跨组件自己的资源",
+        )
+
+    def test_guard_is_switch_aware_but_keeps_legacy_text(self):
+        body = self._block("def _warn_cross_group_bone_references(self):")
+        self.assertIn("cross_enabled = self._merged_cross_group_enabled()", body)
+        self.assertIn("禁止跨组别骨骼合并", body, "关闭时仍要保留历史报警文案")
 
 
 class MergedRedirectDefaultTests(unittest.TestCase):

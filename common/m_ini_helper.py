@@ -196,7 +196,9 @@ class M_IniHelper:
         """获取 drawindexed 命令字符串列表
         
         根据 DrawCallModel 列表生成 drawindexed 命令，支持条件判断。
-        会根据 condition_str 对 obj_model 进行分组，相同条件的放在同一个 if 块中。
+        会按 condition_str 把相邻且条件相同的 obj_model 合并进同一个 if 块，
+        并严格保持 ordered_draw_obj_model_list 的顺序：同条件但不相邻的物体
+        各自成块，绝不会被挪到该条件首次出现的位置。
         
         Args:
             ordered_draw_obj_model_list: DrawCallModel 列表，按绘制顺序排列
@@ -207,47 +209,46 @@ class M_IniHelper:
             list[str]: drawindexed 命令字符串列表
         """
         # 传统的使用DrawIndexed方式调用这个
-        # 在输出之前，我们需要根据condition对obj_model进行分组
-        condition_str_obj_model_list_dict:dict[str,list[DrawCallModel]] = {}
-        for obj_model in ordered_draw_obj_model_list:
-            condition_str = obj_model.get_condition_str()
-
-            obj_model_list = condition_str_obj_model_list_dict.get(condition_str,[])
-            
-            obj_model_list.append(obj_model)
-            condition_str_obj_model_list_dict[condition_str] = obj_model_list
-        
+        # 只有「相邻且条件相同」的 obj_model 才合并进同一个 if 块。
+        # 旧实现用 dict 按 condition_str 聚合，会把同条件但不相邻的物体
+        # （尤其是「无任何物体切换门控」的物体）整体挪到该条件首次出现的位置，
+        # 使 ini 里的 drawindexed 行序与蓝图收集顺序（= 顶点/索引区分配顺序）脱钩。
         drawindexed_str_list:list[str] = []
-        for condition_str, obj_model_list in condition_str_obj_model_list_dict.items():
+
+        def _emit_body(obj_model_list: list[DrawCallModel], indent: str) -> None:
+            for obj_model in obj_model_list:
+                display_name = str(getattr(obj_model, 'obj_name', '') or getattr(obj_model, 'display_name', '') or '')
+                drawindexed_str_list.append(indent + "; [mesh:" + display_name + "] [vertex_count:" + str(obj_model.vertex_count) + "]" )
+                drawindexed = (
+                    obj_model.get_drawindexed_str(obj_name_draw_offset_dict)
+                    if base_vertex == 0
+                    else obj_model.get_drawindexed_str(
+                        obj_name_draw_offset_dict,
+                        base_vertex=base_vertex,
+                    )
+                )
+                drawindexed_str_list.append(indent + drawindexed)
+
+        def _flush_run(condition_str: str, obj_model_list: list[DrawCallModel]) -> None:
             if condition_str != "":
                 drawindexed_str_list.append("if " + condition_str)
-                for obj_model in obj_model_list:
-                    display_name = str(getattr(obj_model, 'obj_name', '') or getattr(obj_model, 'display_name', '') or '')
-                    drawindexed_str_list.append("  ; [mesh:" + display_name + "] [vertex_count:" + str(obj_model.vertex_count) + "]" )
-                    drawindexed = (
-                        obj_model.get_drawindexed_str(obj_name_draw_offset_dict)
-                        if base_vertex == 0
-                        else obj_model.get_drawindexed_str(
-                            obj_name_draw_offset_dict,
-                            base_vertex=base_vertex,
-                        )
-                    )
-                    drawindexed_str_list.append("  " + drawindexed)
+                _emit_body(obj_model_list, "  ")
                 drawindexed_str_list.append("endif")
             else:
-                for obj_model in obj_model_list:
-                    display_name = str(getattr(obj_model, 'obj_name', '') or getattr(obj_model, 'display_name', '') or '')
-                    drawindexed_str_list.append("; [mesh:" + display_name + "] [vertex_count:" + str(obj_model.vertex_count) + "]" )
-                    drawindexed = (
-                        obj_model.get_drawindexed_str(obj_name_draw_offset_dict)
-                        if base_vertex == 0
-                        else obj_model.get_drawindexed_str(
-                            obj_name_draw_offset_dict,
-                            base_vertex=base_vertex,
-                        )
-                    )
-                    drawindexed_str_list.append(drawindexed)
+                _emit_body(obj_model_list, "")
             drawindexed_str_list.append("")
+
+        run_condition_str = ""
+        run_obj_model_list: list[DrawCallModel] = []
+        for obj_model in ordered_draw_obj_model_list:
+            condition_str = obj_model.get_condition_str()
+            if run_obj_model_list and condition_str != run_condition_str:
+                _flush_run(run_condition_str, run_obj_model_list)
+                run_obj_model_list = []
+            run_condition_str = condition_str
+            run_obj_model_list.append(obj_model)
+        if run_obj_model_list:
+            _flush_run(run_condition_str, run_obj_model_list)
 
         return drawindexed_str_list
     
@@ -258,31 +259,35 @@ class M_IniHelper:
         obj_name_draw_offset_dict: dict[str, int] | None = None,
     ) -> list[str]:
         # 使用DrawIndexedInstanced方式调用这个
-        # 在输出之前，我们需要根据condition对obj_model进行分组
-        condition_str_obj_model_list_dict:dict[str,list[DrawCallModel]] = {}
-        for obj_model in ordered_draw_obj_model_list:
-            condition_str = obj_model.get_condition_str()
-
-            obj_model_list = condition_str_obj_model_list_dict.get(condition_str,[])
-            
-            obj_model_list.append(obj_model)
-            condition_str_obj_model_list_dict[condition_str] = obj_model_list
-        
+        # 分组规则同 get_drawindexed_str_list：只合并相邻同条件，严格保持传入顺序。
         drawindexed_str_list:list[str] = []
-        for condition_str, obj_model_list in condition_str_obj_model_list_dict.items():
+
+        def _emit_body(obj_model_list: list[DrawCallModel], comment_indent: str, command_indent: str) -> None:
+            for obj_model in obj_model_list:
+                display_name = str(getattr(obj_model, 'obj_name', '') or getattr(obj_model, 'display_name', '') or '')
+                drawindexed_str_list.append(comment_indent + "; [mesh:" + display_name + "] [vertex_count:" + str(obj_model.vertex_count) + "]" )
+                drawindexed_str_list.append(command_indent + obj_model.get_drawindexed_instanced_str(obj_name_draw_offset_dict))
+
+        def _flush_run(condition_str: str, obj_model_list: list[DrawCallModel]) -> None:
             if condition_str != "":
                 drawindexed_str_list.append("if " + condition_str)
-                for obj_model in obj_model_list:
-                    display_name = str(getattr(obj_model, 'obj_name', '') or getattr(obj_model, 'display_name', '') or '')
-                    drawindexed_str_list.append("  ; [mesh:" + display_name + "] [vertex_count:" + str(obj_model.vertex_count) + "]" )
-                    drawindexed_str_list.append("  " + obj_model.get_drawindexed_instanced_str(obj_name_draw_offset_dict))
+                _emit_body(obj_model_list, "  ", "  ")
                 drawindexed_str_list.append("endif")
             else:
-                for obj_model in obj_model_list:
-                    display_name = str(getattr(obj_model, 'obj_name', '') or getattr(obj_model, 'display_name', '') or '')
-                    drawindexed_str_list.append("; [mesh:" + display_name + "] [vertex_count:" + str(obj_model.vertex_count) + "]" )
-                    drawindexed_str_list.append("  " + obj_model.get_drawindexed_instanced_str(obj_name_draw_offset_dict))
+                _emit_body(obj_model_list, "", "  ")
             drawindexed_str_list.append("")
+
+        run_condition_str = ""
+        run_obj_model_list: list[DrawCallModel] = []
+        for obj_model in ordered_draw_obj_model_list:
+            condition_str = obj_model.get_condition_str()
+            if run_obj_model_list and condition_str != run_condition_str:
+                _flush_run(run_condition_str, run_obj_model_list)
+                run_obj_model_list = []
+            run_condition_str = condition_str
+            run_obj_model_list.append(obj_model)
+        if run_obj_model_list:
+            _flush_run(run_condition_str, run_obj_model_list)
 
         return drawindexed_str_list
 

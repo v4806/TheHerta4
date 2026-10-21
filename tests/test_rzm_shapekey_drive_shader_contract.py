@@ -79,9 +79,10 @@ class ShapeKeyDriveShaderContractTests(unittest.TestCase):
         # 位移积分/主导方向只看锁存绑定（zoneDriven），不再被当帧实时命中截断
         self.assertIn("bool zoneDriven = boundZone >= 0 && zone == (uint)boundZone;", self.source)
         gate = self.source.index("if (zoneDriven)")
-        integrate = self.source.index(
-            "next = clamp(current + net * moveLen * mouseSensitivity, 0.0, 1.0);")
+        # 权重硬边界由 define 决定（>1 / <0 要能生效），这里只盯积分语句仍在锁存门控之后
+        integrate = self.source.index("next = clamp(current + net * moveLen * mouseSensitivity,")
         self.assertLess(gate, integrate)
+        self.assertIn("SHAPEKEY_WEIGHT_MIN, SHAPEKEY_WEIGHT_MAX", self.source)
         self.assertIn("if (zoneDriven)\n            ActiveDir[zone] = activeDir;", self.source)
         self.assertNotIn("if (zoneHit)\n", self.source)
 

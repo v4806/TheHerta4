@@ -55,10 +55,36 @@ RWBuffer<float4> merged_skeleton : register(u0);
 // 标准版 3DMigoto 是 IniParams[0]=(x1,y1,z1,w1)，本 fork 布局从 [1] 起。
 Texture1D<float4> IniParams : register(t120);
 #define ZZ_ATTACH_COUNT IniParams[1].y
+// 新鲜度守卫（2026-10-20，丽娜共享槽 97「运动时飘」的根因修复）：
+// 跨部件按骨骼矩阵 bitwise 去重后，**同一个 canonical 槽位会被多个部件写**
+// （这就是省槽位的代价），而每个部件的 palette 只在**它自己的 deform 段**由
+// `ResourceZZPalette_<DrawIB>_s<槽> = copy vs-t0 unless_null` 捕获。某个部件本帧
+// 没画（实测：只剩 3 个顶点的子网格被裁掉 / VLR 后不再提交）时，它的 palette
+// 停在上一帧，而它的 attach 仍被每个部件的 deform 段无条件跑一遍 ⇒ 用**上一帧
+// 矩阵**覆盖本帧刚写好的共享槽位。写入次序决定谁最后落笔，于是该骨骼稳定滞后
+// 一帧：头/发（4046 个顶点全压在共享槽 97 上）在运动时就看得最明显。
+//
+// 守卫语义 = **绝不把当帧值降级成旧值**：
+//   z2 = 该 (部件, 槽) 的本帧到达计数（ini 的 `$zz_ms_seen_<部件>_<槽>`：
+//        deform 段里 occ 命中时累加，`[Present]` 清零）；
+//   y2 = 1 启用守卫（缺省 0 = 关闭 ⇒ 任何未升级的调用点行为逐字节不变）。
+// 用第 2 组参数（y2/z2）而不是第 1 组（z1/w1）：第 1 组的四个分量已被
+// y1=骨骼数、z1/w1=蒙皮 CS 的行宽/前缀行数占用，混用会让「attach CS 不发射
+// 蒙皮专属参数」这条既有断言失效。
+// 计数为 0 ⇒ 这一帧根本没捕获这份 palette ⇒ 直接返回。跳过写入与「写一份同样的
+// 旧值」在槽内容上等价；但当另有部件本帧写过该槽时，跳过保住了**当帧**那份。
+#define ZZ_ATTACH_SEEN IniParams[2].z
+#define ZZ_ATTACH_GUARD IniParams[2].y
 
 [numthreads(64, 1, 1)]
 void main(uint3 dispatch_id : SV_DispatchThreadID)
 {
+    // 守卫必须排在任何资源读取之前：陈旧 palette 可能连长度都不对。
+    if (ZZ_ATTACH_GUARD > 0.5f && ZZ_ATTACH_SEEN < 0.5f)
+    {
+        return;
+    }
+
     uint bone_index = dispatch_id.x;
     uint count = (uint)ZZ_ATTACH_COUNT;
     if (bone_index >= count)

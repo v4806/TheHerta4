@@ -55,6 +55,15 @@ Buffer<float4> Candidate         : register(t0);
 Buffer<uint> ZoneStageCounts     : register(t1);
 Texture1D<float4> IniParams      : register(t120);
 
+// 权重硬边界：只挡 inf/NaN 与彻底失控的数值，不是「形态键合理范围」。
+// 拖动累加必须能越过 0 和 1（否则 ini 里写成 1.6 的键一拖就被拉回界内），
+// 旧代码在这里 clamp 到 0..1。
+// ⚠ 必须与 common/shapekey_weight_range.py 的 SHAPEKEY_WEIGHT_MIN/MAX 及
+//   其余 4 个形态键 CS 的同名 define 一致
+//   （tests/test_shapekey_weight_range_contract.py 核对）。
+#define SHAPEKEY_WEIGHT_MIN (-4.0)
+#define SHAPEKEY_WEIGHT_MAX (4.0)
+
 uint ClampZone(uint zoneId, uint zoneCount)
 {
     // 256-zone model: zone ids are 0-255 (buffer index directly).
@@ -223,7 +232,8 @@ void main(uint3 tid : SV_DispatchThreadID)
             if (zoneDriven)
             {
                 float net = dirWeight[dir] - dirWeight[(dir + 2u) % 4u];
-                next = clamp(current + net * moveLen * mouseSensitivity, 0.0, 1.0);
+                next = clamp(current + net * moveLen * mouseSensitivity,
+                             SHAPEKEY_WEIGHT_MIN, SHAPEKEY_WEIGHT_MAX);
             }
             ShapeKeyDrive[idx] = next;
         }

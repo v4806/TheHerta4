@@ -121,29 +121,72 @@ class SSMT_OT_FillMarkedTextureMaterials(bpy.types.Operator):
         return {'FINISHED'}
 
 
+def _merged_skeleton_logic_names() -> tuple:
+    """骨骼合并**复选框**（「使用融合统一顶点组」）适用的逻辑名集合。
+
+    WWMI（融合统一顶点组）/ EFMI（终末地）/ ZZMI（绝区零）/ HIMI（崩坏3）共用
+    同一把开关与同一批工作空间缓存键（VGMap/VGOffset/VGCount）。本次只**新增
+    HIMI**：WWMI / EFMI / ZZMI 的复选框可见性与改动前逐字相同。
+
+    在**调用时**求值并逐项 getattr 兜底：轻量宿主/测试桩可能只给 LogicName
+    挂了子集属性，模块导入期不得因此崩溃。
+    """
+    return (
+        getattr(LogicName, "WWMI", "WWMI"),
+        getattr(LogicName, "EFMI", "EFMI"),
+        getattr(LogicName, "ZZMI", "ZZMI"),
+        getattr(LogicName, "HIMI", "HIMI"),
+    )
+
+
+def _merged_skeleton_cache_logic_names() -> tuple:
+    """「清除骨骼合并VGMap缓存」**按钮**适用的逻辑名集合。
+
+    与复选框集合**刻意不同**：按钮是破坏性操作（删除工作空间 json 里的
+    VGMap/VGOffset/VGCount），本轮只给 HIMI 开这个口子 —— **WWMI 保持改动前
+    的不可用状态**（原来就是 EFMI / ZZMI 两个），避免这轮 HIMI 工作顺带改变
+    其它游戏的可用性。
+
+    若日后要按「复选框可见即可清缓存」的口径统一，把本函数改成
+    ``return _merged_skeleton_logic_names()`` 即可（并同步更新
+    tests/test_himi_clear_merged_skeleton_cache.py 里的门控钉子）。
+    """
+    return (
+        getattr(LogicName, "EFMI", "EFMI"),
+        getattr(LogicName, "ZZMI", "ZZMI"),
+        getattr(LogicName, "HIMI", "HIMI"),
+    )
+
+
 class SSMT_OT_ClearMergedSkeletonCache(bpy.types.Operator):
     """清除骨骼合并 VGMap 缓存（单次确认）。
 
     本操作会删除工作空间所有子网格 json 的 VGMap/VGOffset/VGCount 缓存字段，
     删除后不可恢复，故先弹窗说明将清除的内容，确认后才真正执行。
+
+    实现复用 ``EFMISkeletonMergeHelper.clear_vgmap_cache``：它按「携带缓存/裁决键」
+    判定并清 VGMap/VGOffset/VGCount/VGMapAlgorithmVersion/SkeletonGroup 等键，对
+    HIMI 组件同样有效（HIMI 复用同一批键，见 HIMI骨骼合并计划书.md §5.1）。清除后
+    下次一键导入时 ``HIMISkeletonMergeHelper.missing_merged_metadata_exist`` 会因
+    VGMap 缺失而放行预生成，重新写出完整元数据（闭环）。
     """
     bl_idname = "ssmt.clear_merged_skeleton_cache"
     bl_label = "清除骨骼合并VGMap缓存"
     bl_description = (
         "删除当前工作空间所有子网格 json 的 VGMap/VGOffset/VGCount 缓存；"
         "去重策略变更后旧缓存会被幂等跳过，清除后下次一键导入将按当前策略重新生成。"
-        "EFMI（终末地）/ ZZMI（绝区零）模式下可用"
+        "EFMI（终末地）/ ZZMI（绝区零）/ HIMI（崩坏3）模式下可用"
     )
     bl_options = {'REGISTER'}
 
     @classmethod
     def poll(cls, context):
-        return GlobalConfig.logic_name in (LogicName.EFMI, LogicName.ZZMI)
+        return GlobalConfig.logic_name in _merged_skeleton_cache_logic_names()
 
     def _precheck(self, context):
         """模式 + 工作空间前置校验；返回错误信息字符串，无错误返回 None。"""
-        if GlobalConfig.logic_name not in (LogicName.EFMI, LogicName.ZZMI):
-            return "仅 EFMI（终末地）/ ZZMI（绝区零）模式下可用"
+        if GlobalConfig.logic_name not in _merged_skeleton_cache_logic_names():
+            return "仅 EFMI（终末地）/ ZZMI（绝区零）/ HIMI（崩坏3）模式下可用"
         workspace_root = GlobalConfig.path_workspace_folder()
         if not workspace_root or not os.path.isdir(workspace_root):
             return "当前工作空间目录无效，无法清理"
@@ -516,6 +559,10 @@ class PanelBasicInformation(bpy.types.Panel):
         )
         generate_operator.blueprint_name = selected_blueprint_name
 
+        # 后台导出（默认关）：勾选后生成 Mod 走「快照 + 干净后台实例」，主界面不阻塞；
+        # 取消勾选时行为与原来完全一致（同步导出）。
+        blueprint_box.prop(global_properties, "background_export_enabled", icon='RENDER_STILL')
+
         layout.separator()
 
         layout.operator(SSMTQuickExportSelected.bl_idname, text="快速局部导出", icon='EXPORT')
@@ -600,9 +647,13 @@ class PanelBasicInformation(bpy.types.Panel):
                 parallel_box.label(text=message, icon='CHECKMARK' if is_valid else 'ERROR')
 
         # 骨骼合并复选框（import_merged_vgmap，「使用融合统一顶点组」）：
-        # WWMI（融合统一顶点组）/ ZZMI / EFMI（骨骼合并，Merged Skeleton）共用同一把开关；
-        # 勾选 = 导入全局顶点组、导出走合并骨架；不勾选 = 完全维持原路线（见 ZZMI骨骼合并计划书.md §5.1）。
-        if GlobalConfig.logic_name in (LogicName.WWMI, LogicName.ZZMI, LogicName.EFMI):
+        # WWMI（融合统一顶点组）/ ZZMI / EFMI（骨骼合并，Merged Skeleton）/ HIMI 共用
+        # 同一把开关；勾选 = 导入全局顶点组、导出走合并骨架；不勾选 = 完全维持原路线
+        # （见 ZZMI骨骼合并计划书.md §5.1、HIMI骨骼合并计划书.md §1.2）。
+        # HIMI 必须在此可见：该属性默认 True，若不可见用户无法回退到局部顶点组。
+        # 集合取自 _merged_skeleton_logic_names()（WWMI/EFMI/ZZMI/HIMI）；清除按钮另用
+        # _merged_skeleton_cache_logic_names()（EFMI/ZZMI/HIMI，WWMI 保持不可用）。
+        if GlobalConfig.logic_name in _merged_skeleton_logic_names():
             layout.prop(global_properties, "import_merged_vgmap")
         # ZZMI 专用实验开关：跨组融合统一顶点组测试。
         # 与上面已验证可用的合并骨骼**完全分离**（同组内合并不受影响、关闭本开关
@@ -623,8 +674,11 @@ class PanelBasicInformation(bpy.types.Panel):
         if GlobalConfig.logic_name == LogicName.WWMI or GlobalConfig.logic_name == LogicName.NTEMI:
             layout.prop(global_properties, "import_skip_empty_vertex_groups")
 
-        # 骨骼合并（EFMI/ZZMI）：一键清除子网格 json 里缓存的 VGMap（去重策略变更后强制重生成）
-        if GlobalConfig.logic_name in (LogicName.EFMI, LogicName.ZZMI):
+        # 骨骼合并（EFMI/ZZMI/HIMI）：一键清除子网格 json 里缓存的 VGMap
+        # （去重策略变更后强制重生成）。可见性与按钮自己的 poll() 同源
+        # （_merged_skeleton_cache_logic_names）——HIMI 的缓存回退路径只能靠这里，
+        # 缺失即「复选框可见但无法回退」。WWMI 刻意不在本集合里（保持改动前状态）。
+        if GlobalConfig.logic_name in _merged_skeleton_cache_logic_names():
             layout.operator(SSMT_OT_ClearMergedSkeletonCache.bl_idname, icon='TRASH')
 
 

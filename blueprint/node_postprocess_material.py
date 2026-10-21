@@ -8,11 +8,7 @@ import shutil
 
 from ..common.global_config import GlobalConfig
 from ..common.logic_name import LogicName
-from ..toolkit.tt_dds_conversion import (
-    convert_texture_to_dds,
-    existing_dds_matches_format,
-    resolve_texture_dds_format,
-)
+from ..toolkit.tt_dds_conversion import convert_texture_to_dds_cached
 from . import fx_namespace
 from .node_postprocess_base import SSMTNode_PostProcess_Base
 
@@ -1382,7 +1378,8 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
         except Exception:
             pass
 
-    def copy_texture_file(self, texture_image, target_folder, material, forced_filename=None):
+    def copy_texture_file(self, texture_image, target_folder, material, forced_filename=None,
+                          workspace_source_path=None):
         if not texture_image or not texture_image.filepath:
             return None
         try:
@@ -1400,37 +1397,18 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
             if file_extension.lower() != ".dds" and getattr(self, "export_textures_as_dds", False):
                 converted_name = f"{stem}.dds"
                 converted_path = os.path.join(target_folder, converted_name)
-                # 导出侧已知贴图类型（材质名本身就是 DiffuseMap_xxx 这类命名），
-                # 拿它当兜底提示：编辑期源图名可能只有 Diffuse 而没有 DiffuseMap
-                # （实测 VivianGemADiffuse.png），只按源文件名匹配会落到线性默认规则。
-                name_hints = [getattr(material, "name", ""), stem]
-                # 材质名前缀就是贴图类型（DiffuseMap / MaterialMap / ...），导出侧
-                # 必须用它决定 DDS 格式，不能再让源文件名带偏。
+                # 格式来源优先级：工作空间里这张材质的原贴图 DDS 头 → 材质类型规则 → 源文件名。
+                # 引擎读的就是原贴图那份字节（BC5 是双通道格式），照抄它的格式才不会读错。
                 texture_type = str(getattr(material, "name", "") or "").strip().split("_")[0]
-                # 「已存在 DDS」不能盲信：必须与当前规则期望的格式一致才跳过，
-                # 否则规则改对后旧线性 DDS 会被永远沿用。
-                if os.path.exists(converted_path):
-                    expected_format = resolve_texture_dds_format(
-                        source_path,
-                        bpy.context.scene.texture_tools_props,
-                        texture_type=texture_type,
-                        name_hints=name_hints,
-                    )
-                    if existing_dds_matches_format(converted_path, expected_format) and (
-                        not self.material_to_resource_override or forced_filename == converted_name
-                    ):
-                        return converted_name
-                # 同一轮导出内这张图已经转过：forced_filename 是本次导出里同一材质
-                # （同一 stem）上一次调用返回的 .dds 名，且文件确实存在。此时再调一次
-                # texconv 重转同一张图，结果与上一次完全相同，纯属重复劳动 ——
-                # 实测「身体」那套 5 张贴图各被重转 14 次，一次导出 82 次转换里 70 次
-                # 是这种重复（占整次导出 ~70% 的墙钟时间）。
-                # 「覆盖现有资源」的语义不受影响：本轮第一次该覆盖的仍然覆盖了。
-                ok, reason = convert_texture_to_dds(
+                ok, reason = convert_texture_to_dds_cached(
                     source_path,
                     converted_path,
+                    props=bpy.context.scene.texture_tools_props,
+                    force=bool(self.material_to_resource_override),
+                    match_name=stem,
                     texture_type=texture_type,
-                    name_hints=name_hints,
+                    name_hints=(getattr(material, "name", ""), stem),
+                    workspace_source_path=workspace_source_path or "",
                 )
                 if ok:
                     return converted_name
@@ -1495,6 +1473,29 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
                 definition = f"global persist {key} = 0"
                 constants_lines.append(definition)
 
+    def _workspace_source_paths_for_materials(self, obj):
+        """材质名 → 工作空间里该材质原贴图的路径。
+
+        导出格式必须照抄原贴图的 DDS 头（引擎按原通道读，BC5 就是双通道），这条映射就是
+        在导出期找到那份原贴图的唯一桥梁：节点从 modimp_texture_slots 里拿到 source_path。
+        拿不到（节点不是从工作空间导入、或槽位缺 source_path）就返回空表，格式回落到规则表。
+        """
+        mapping = {}
+        if obj is None:
+            return mapping
+        try:
+            slots = self._collect_modimp_texture_slots(obj)
+        except Exception:
+            return mapping
+        for slot_info in slots.values():
+            source_path = str(slot_info.get("source_path", "") or "").strip()
+            if not source_path:
+                continue
+            for material in self._find_workspace_slot_materials(obj, slot_info):
+                mapping.setdefault(str(getattr(material, "name", "") or ""), source_path)
+        return mapping
+
+
     def generate_material_lines(self, matching_materials, param_name, texture_type, obj,
                                 texture_folder, all_sections,
                                 object_to_diffuse_swapkey, material_group_to_swapkey,
@@ -1508,6 +1509,8 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
         # RabbitFX/NTEMIFX 是大写 $…\brightness 同名字段，HI3FX 同样叫 brightness
         # （但它是 IniParams row230.w，语义一致）。
         brightness_param_name = fx_namespace.current_profile().param("brightness")
+        # 材质名 → 工作空间里该材质原贴图的路径：导出格式照抄这份原贴图的 DDS 头。
+        workspace_source_by_material = self._workspace_source_paths_for_materials(obj)
 
         if len(matching_materials) == 1:
             material = matching_materials[0]
@@ -1523,6 +1526,7 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
                 texture_folder,
                 all_sections,
                 resource_name_override=resource_name,
+                workspace_source_path=workspace_source_by_material.get(str(getattr(material, "name", "") or "")),
             )
             if new_line:
                 generated_lines.append(new_line)
@@ -1553,6 +1557,7 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
                     texture_folder,
                     all_sections,
                     resource_name_override=resource_name,
+                    workspace_source_path=workspace_source_by_material.get(str(getattr(material, "name", "") or "")),
                 )
                 if new_line:
                     generated_lines.append(f"if {current_swap_variable} == {index}")
@@ -1566,7 +1571,8 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
 
         return generated_lines, next_swap_key_num
 
-    def create_resource_entry(self, material, param_name, texture_folder, all_sections, resource_name_override=None):
+    def create_resource_entry(self, material, param_name, texture_folder, all_sections,
+                              resource_name_override=None, workspace_source_path=None):
         global _material_resource_cache
 
         # 细分进度：每张材质贴图开始复制/转 DDS 前先刷新状态栏文本。
@@ -1591,9 +1597,12 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
                 texture_folder,
                 material,
                 forced_filename=cached_entry.get("filename"),
+                workspace_source_path=workspace_source_path,
             )
         else:
-            copied_filename = self.copy_texture_file(texture_image, texture_folder, material)
+            copied_filename = self.copy_texture_file(
+                texture_image, texture_folder, material, workspace_source_path=workspace_source_path
+            )
             resource_name = resource_name_override or f"Resource_{self._material_resource_stem(material)}"
             if copied_filename:
                 _material_resource_cache[cache_key] = {
@@ -2533,34 +2542,16 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
             _LOG.info(f"      调试开关已开启，跳过 {section_name} 的 FX/TTL 生成")
 
         mesh_lines_info_phase2 = [(i, self.extract_mesh_name(line)) for i, line in enumerate(lines) if self.extract_mesh_name(line)]
+        # 段体内容 -> 段名：同一个 mesh 在一个段里会随物体切换分支出现多次，
+        # 内容（材质 + drawindexed）完全一致时复用同一个透明段，不再生成
+        # _2/_3… 这样内容逐字节重复的段。
+        transparency_body_section_names: dict = {}
+        for existing_section_name, existing_section_body in transparency_sections_to_add.items():
+            transparency_body_section_names.setdefault(tuple(existing_section_body), str(existing_section_name))
         for mesh_index, mesh_name in reversed(mesh_lines_info_phase2):
             transparency_shader_name, transparency_value = self.extract_transparency_info_from_mesh_name(mesh_name)
             if transparency_shader_name:
-                base_shader_name = transparency_shader_name
-                suffix = 2
-                existing_section_names = {
-                    str(existing_name or "").strip().strip('[]').casefold()
-                    for existing_name in all_sections
-                }
-                generated_section_names = {
-                    str(existing_name or "").casefold()
-                    for existing_name in transparency_sections_to_add
-                }
-                while (
-                    transparency_shader_name.casefold() in generated_section_names
-                    or transparency_shader_name.casefold() in existing_section_names
-                ):
-                    transparency_shader_name = f"{base_shader_name}_{suffix}"
-                    suffix += 1
-                transparency_sections_to_add[transparency_shader_name] = [
-                    "blend = ADD BLEND_FACTOR INV_BLEND_FACTOR",
-                    f"blend_factor[0] = {transparency_value}", f"blend_factor[1] = {transparency_value}",
-                    f"blend_factor[2] = {transparency_value}", "blend_factor[3] = 1",
-                    "handling = skip",
-                    "; --- Start of Overridden Mesh Content ---"
-                ]
-                lines.insert(mesh_index + 1, f"run = {transparency_shader_name}")
-                start_move_idx = mesh_index + 2
+                start_move_idx = mesh_index + 1
                 end_move_idx = len(lines)
                 conditional_depth = 0
                 draw_seen = False
@@ -2582,6 +2573,7 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
                     if draw_seen and conditional_depth == 0:
                         end_move_idx = i + 1
                         break
+                final_block = []
                 if start_move_idx < end_move_idx:
                     block_to_move = lines[start_move_idx:end_move_idx]
                     reset_keywords = _FX_RESET_REF_LINES + _FX_RESET_PARAM_LINES
@@ -2589,20 +2581,50 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
                         line for line in block_to_move
                         if not any(keyword in line for keyword in reset_keywords)
                     ]
-                    final_block = []
                     for line in filtered_block_to_move:
                         if any(run_line in line for run_line in _FX_RUN_LINES):
                             # Run 只有在前面已经出现过资源别名时才搬过去：整段没有
                             # 别名绑定（只剩一条孤立的 Run）时它是空转，丢掉。
                             has_resource_before = any(
-                                prefix in prev_line for prefix in _FX_RESOURCE_PREFIXES
+                                prefix in prev_line
+                                for prev_line in final_block
+                                for prefix in _FX_RESOURCE_PREFIXES
                             )
                             if has_resource_before:
                                 final_block.append(line)
                         else:
                             final_block.append(line)
-                    transparency_sections_to_add[transparency_shader_name].extend(final_block)
-                    del lines[start_move_idx:end_move_idx]
+                body_lines = [
+                    "blend = ADD BLEND_FACTOR INV_BLEND_FACTOR",
+                    f"blend_factor[0] = {transparency_value}", f"blend_factor[1] = {transparency_value}",
+                    f"blend_factor[2] = {transparency_value}", "blend_factor[3] = 1",
+                    "handling = skip",
+                    "; --- Start of Overridden Mesh Content ---"
+                ] + final_block
+                reused_section_name = transparency_body_section_names.get(tuple(body_lines))
+                if reused_section_name is not None:
+                    transparency_shader_name = reused_section_name
+                else:
+                    base_shader_name = transparency_shader_name
+                    suffix = 2
+                    existing_section_names = {
+                        str(existing_name or "").strip().strip('[]').casefold()
+                        for existing_name in all_sections
+                    }
+                    generated_section_names = {
+                        str(existing_name or "").casefold()
+                        for existing_name in transparency_sections_to_add
+                    }
+                    while (
+                        transparency_shader_name.casefold() in generated_section_names
+                        or transparency_shader_name.casefold() in existing_section_names
+                    ):
+                        transparency_shader_name = f"{base_shader_name}_{suffix}"
+                        suffix += 1
+                    transparency_sections_to_add[transparency_shader_name] = body_lines
+                    transparency_body_section_names[tuple(body_lines)] = transparency_shader_name
+                lines.insert(mesh_index + 1, f"run = {transparency_shader_name}")
+                del lines[mesh_index + 2:end_move_idx + 1]
         return next_swap_key_num
 
     @staticmethod

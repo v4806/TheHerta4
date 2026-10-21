@@ -72,11 +72,7 @@ _install_module(
 )
 _install_module(
     f"{PKG}.toolkit.tt_dds_conversion",
-    convert_texture_to_dds=lambda *_args, **_kwargs: (True, ""),
-    # 期望格式 / 已有 DDS 头校验：本文件的用例把它们当可替换的决策点，
-    # 真实文件头解析在 test_dds_conversion.py 里用最小 DDS 头单独覆盖。
-    resolve_texture_dds_format=lambda *_args, **_kwargs: "bc7_unorm",
-    existing_dds_matches_format=lambda *_args, **_kwargs: True,
+    convert_texture_to_dds_cached=lambda *_args, **_kwargs: (True, ""),
 )
 
 # 细分进度上报桩：真实实现在 blueprint/export_progress.py（无 stage 文件时静默），
@@ -150,44 +146,56 @@ class ExportTextureAsDDSTests(unittest.TestCase):
     def test_png_source_is_converted_to_dds(self):
         """核心：开关开启时 PNG 源转成 DDS 写进 Mod，返回 .dds 文件名。
 
-        同时锁定导出侧接线：hints 里必须带材质名与资源 stem，
-        这样源图名不含 DiffuseMap 关键字时也能按材质名得到 sRGB 规则。"""
+        同时锁定导出侧接线：材质资源名与类型名必须传给转换入口，这样源图名不含
+        类型关键字时也能按材质名得到正确规则。"""
         source = self._make_source("VivianGemADiffuse.png")
         node = self._make_node()
         calls = []
 
-        def fake_convert(source_path, target_path, props=None, texture_type="", name_hints=(), format_override=""):
-            calls.append((source_path, target_path, tuple(name_hints), format_override))
+        def fake_convert(source_path, target_path, **kwargs):
+            calls.append((source_path, target_path, kwargs))
             with open(target_path, "wb") as handle:
                 handle.write(b"DDS payload")
             return True, ""
 
         with mock.patch.object(
-            node_postprocess_material, "convert_texture_to_dds", side_effect=fake_convert
+            node_postprocess_material, "convert_texture_to_dds_cached", side_effect=fake_convert
         ):
             result = node.copy_texture_file(_FakeImage(source), self.target_dir, _FakeMaterial())
 
         self.assertEqual("Body_Material.dds", result)
-        self.assertEqual(
-            [
-                (
-                    source,
-                    os.path.join(self.target_dir, "Body_Material.dds"),
-                    ("Body_Material", "Body_Material"),
-                    "",
-                )
-            ],
-            calls,
-        )
+        self.assertEqual(1, len(calls))
+        source_path, target_path, kwargs = calls[0]
+        self.assertEqual(source, source_path)
+        self.assertEqual(os.path.join(self.target_dir, "Body_Material.dds"), target_path)
+        self.assertEqual("Body_Material", kwargs.get("match_name"))
+        self.assertEqual("Body", kwargs.get("texture_type"))
+        self.assertEqual(("Body_Material", "Body_Material"), kwargs.get("name_hints"))
+        self.assertEqual("", kwargs.get("workspace_source_path"))
         # 源 PNG 必须原样保留：编辑期还要继续用它
         self.assertTrue(os.path.exists(source))
+
+    def test_material_name_is_used_for_format_resolution(self):
+        """格式判定串是材质名（= 目标 .dds 名），不是源 PNG 名"""
+        source = self._make_source("c209c22b-45087-0-NormalMap.png")
+        node = self._make_node()
+
+        with mock.patch.object(
+            node_postprocess_material, "convert_texture_to_dds_cached"
+        ) as convert_mock:
+            convert_mock.return_value = (True, "")
+            node.copy_texture_file(
+                _FakeImage(source), self.target_dir, _FakeMaterial("DiffuseMap_Body")
+            )
+
+        self.assertEqual("DiffuseMap_Body", convert_mock.call_args.kwargs["match_name"])
 
     def test_switch_off_copies_source_as_is(self):
         """开关关闭时保持改动前的行为：原样复制源文件，不调用转换"""
         source = self._make_source("c209c22b-45087-0-DiffuseMap.png")
         node = self._make_node(export_as_dds=False)
 
-        with mock.patch.object(node_postprocess_material, "convert_texture_to_dds") as convert_mock:
+        with mock.patch.object(node_postprocess_material, "convert_texture_to_dds_cached") as convert_mock:
             result = node.copy_texture_file(_FakeImage(source), self.target_dir, _FakeMaterial())
 
         self.assertEqual("Body_Material.png", result)
@@ -202,7 +210,7 @@ class ExportTextureAsDDSTests(unittest.TestCase):
         base = node_postprocess_material.SSMTNode_PostProcess_MaterialBase
         node.copy_texture_file = types.MethodType(base.copy_texture_file, node)
 
-        with mock.patch.object(node_postprocess_material, "convert_texture_to_dds") as convert_mock:
+        with mock.patch.object(node_postprocess_material, "convert_texture_to_dds_cached") as convert_mock:
             result = node.copy_texture_file(_FakeImage(source), self.target_dir, _FakeMaterial())
 
         self.assertEqual("Body_Material.png", result)
@@ -213,7 +221,7 @@ class ExportTextureAsDDSTests(unittest.TestCase):
         source = self._make_source("c209c22b-45087-0-DiffuseMap.dds")
         node = self._make_node()
 
-        with mock.patch.object(node_postprocess_material, "convert_texture_to_dds") as convert_mock:
+        with mock.patch.object(node_postprocess_material, "convert_texture_to_dds_cached") as convert_mock:
             result = node.copy_texture_file(_FakeImage(source), self.target_dir, _FakeMaterial())
 
         self.assertEqual("Body_Material.dds", result)
@@ -227,7 +235,7 @@ class ExportTextureAsDDSTests(unittest.TestCase):
         node = self._make_node()
 
         with mock.patch.object(
-            node_postprocess_material, "convert_texture_to_dds", return_value=(False, "texconv 崩了")
+            node_postprocess_material, "convert_texture_to_dds_cached", return_value=(False, "texconv 崩了")
         ):
             result = node.copy_texture_file(_FakeImage(source), self.target_dir, _FakeMaterial())
 
@@ -241,7 +249,7 @@ class ExportTextureAsDDSTests(unittest.TestCase):
         node = self._make_node()
 
         with mock.patch.object(
-            node_postprocess_material, "convert_texture_to_dds", return_value=(False, "texconv 崩了")
+            node_postprocess_material, "convert_texture_to_dds_cached", return_value=(False, "texconv 崩了")
         ):
             result = node.copy_texture_file(
                 _FakeImage(source),
@@ -266,7 +274,12 @@ class ExportTextureAsDDSTests(unittest.TestCase):
         self.assertEqual("Body_Material.png", result)
 
     def test_existing_target_dds_is_reused(self):
-        """目标 DDS 已存在且格式与期望一致 → 复用，不重复跑 texconv（重复导出要快）"""
+        """目标 DDS 已存在时由带缓存的入口决定复用，节点层不再自己判断存在性。
+
+        真正的「目标比源新就直接复用、不跑 texconv」由
+        ``test_dds_conversion.DDSConversionCacheTests`` 覆盖；这里只确认节点层
+        确实把决定权交了出去，而不是又自己转一遍。
+        """
         source = self._make_source("c209c22b-45087-0-DiffuseMap.png")
         os.makedirs(self.target_dir, exist_ok=True)
         target = os.path.join(self.target_dir, "Body_Material.dds")
@@ -275,118 +288,41 @@ class ExportTextureAsDDSTests(unittest.TestCase):
         node = self._make_node()
 
         with mock.patch.object(
-            node_postprocess_material, "existing_dds_matches_format", return_value=True
-        ) as match_mock, mock.patch.object(
-            node_postprocess_material, "convert_texture_to_dds"
+            node_postprocess_material, "convert_texture_to_dds_cached"
         ) as convert_mock:
+            convert_mock.return_value = (True, "")
             result = node.copy_texture_file(_FakeImage(source), self.target_dir, _FakeMaterial())
 
         self.assertEqual("Body_Material.dds", result)
-        convert_mock.assert_not_called()
-        match_mock.assert_called_once_with(target, "bc7_unorm")
+        self.assertFalse(convert_mock.call_args.kwargs["force"])
 
-    def test_existing_dds_with_wrong_format_is_reconverted(self):
-        """旧线性 DDS 与当前规则期望的格式不一致 → 必须重转覆盖，不能「存在即跳过」"""
-        source = self._make_source("VivianGemADiffuse.png")
-        os.makedirs(self.target_dir, exist_ok=True)
-        target = os.path.join(self.target_dir, "Body_Material.dds")
-        with open(target, "wb") as handle:
-            handle.write(b"stale linear dds")
-        node = self._make_node()
-        converted = []
-
-        def fake_convert(source_path, target_path, props=None, texture_type="", name_hints=(), format_override=""):
-            converted.append((source_path, target_path, tuple(name_hints)))
-            with open(target_path, "wb") as handle:
-                handle.write(b"fresh srgb dds")
-            return True, ""
-
-        with mock.patch.object(
-            node_postprocess_material,
-            "resolve_texture_dds_format",
-            return_value="bc7_unorm_srgb",
-        ) as resolve_mock, mock.patch.object(
-            node_postprocess_material, "existing_dds_matches_format", return_value=False
-        ) as match_mock, mock.patch.object(
-            node_postprocess_material, "convert_texture_to_dds", side_effect=fake_convert
-        ) as convert_mock:
-            result = node.copy_texture_file(_FakeImage(source), self.target_dir, _FakeMaterial())
-
-        self.assertEqual("Body_Material.dds", result)
-        # 期望格式由 resolve 得到，再拿它去校验已有文件头
-        match_mock.assert_called_once_with(target, "bc7_unorm_srgb")
-        self.assertEqual("bc7_unorm_srgb", resolve_mock.return_value)
-        convert_mock.assert_called_once()
-        # 重转也必须带上 hints（材质名 + stem），否则又会被源图名带偏
-        self.assertEqual(
-            [(source, target, ("Body_Material", "Body_Material"))], converted
-        )
-        with open(target, "rb") as handle:
-            self.assertEqual(b"fresh srgb dds", handle.read())
-
-    def test_material_prefix_is_passed_as_texture_type(self):
-        """材质名前缀（DiffuseMap）必须作为 texture_type 传给格式解析：
-        源图名 VivianGemADiffuse.png 不含 DiffuseMap 关键字，也不能靠文件名决定格式。"""
-        source = self._make_source("VivianGemADiffuse.png")
-        os.makedirs(self.target_dir, exist_ok=True)
-        target = os.path.join(self.target_dir, "DiffuseMap_VivianGemADiffuse.dds")
-        with open(target, "wb") as handle:
-            handle.write(b"stale linear dds")
-        node = self._make_node()
-        calls = []
-
-        def fake_convert(
-            source_path, target_path, props=None, texture_type="", name_hints=(), format_override=""
-        ):
-            calls.append((texture_type, tuple(name_hints)))
-            with open(target_path, "wb") as handle:
-                handle.write(b"fresh srgb dds")
-            return True, ""
-
-        with mock.patch.object(
-            node_postprocess_material,
-            "resolve_texture_dds_format",
-            return_value="bc7_unorm_srgb",
-        ) as resolve_mock, mock.patch.object(
-            node_postprocess_material, "existing_dds_matches_format", return_value=False
-        ), mock.patch.object(
-            node_postprocess_material, "convert_texture_to_dds", side_effect=fake_convert
-        ):
-            result = node.copy_texture_file(
-                _FakeImage(source),
-                self.target_dir,
-                _FakeMaterial("DiffuseMap_VivianGemADiffuse"),
-            )
-
-        self.assertEqual("DiffuseMap_VivianGemADiffuse.dds", result)
-        self.assertEqual(
-            [("DiffuseMap", ("DiffuseMap_VivianGemADiffuse", "DiffuseMap_VivianGemADiffuse"))],
-            calls,
-        )
-        self.assertEqual(
-            "DiffuseMap", resolve_mock.call_args.kwargs.get("texture_type")
-        )
-        with open(target, "rb") as handle:
-            self.assertEqual(b"fresh srgb dds", handle.read())
-
-    def test_existing_dds_is_still_reconverted_when_override_requested(self):
-        """保留 material_to_resource_override 既有语义：覆盖模式下永远重转"""
+    def test_override_flag_passes_force_to_converter(self):
+        """「覆盖现有资源」把 force 交给带缓存的入口：愿意重新生成，但同一目标
+        在一次导出里仍只重生成一次 —— 一个材质被 N 个物体引用不会转 N 次。"""
         source = self._make_source("c209c22b-45087-0-DiffuseMap.png")
-        os.makedirs(self.target_dir, exist_ok=True)
-        target = os.path.join(self.target_dir, "Body_Material.dds")
-        with open(target, "wb") as handle:
-            handle.write(b"already converted")
         node = self._make_node(override=True)
 
         with mock.patch.object(
-            node_postprocess_material, "existing_dds_matches_format", return_value=True
-        ), mock.patch.object(
-            node_postprocess_material, "convert_texture_to_dds", return_value=(True, "")
+            node_postprocess_material, "convert_texture_to_dds_cached"
         ) as convert_mock:
-            result = node.copy_texture_file(_FakeImage(source), self.target_dir, _FakeMaterial())
+            convert_mock.return_value = (True, "")
+            node.copy_texture_file(_FakeImage(source), self.target_dir, _FakeMaterial())
 
-        self.assertEqual("Body_Material.dds", result)
-        convert_mock.assert_called_once()
+        self.assertEqual(1, convert_mock.call_count)
+        self.assertTrue(convert_mock.call_args.kwargs["force"])
+
+    def test_default_does_not_force_regeneration(self):
+        """默认（不覆盖）时 force 必须为假，让入口按「目标比源新」复用磁盘产物"""
+        source = self._make_source("c209c22b-45087-0-DiffuseMap.png")
+        node = self._make_node()
+
+        with mock.patch.object(
+            node_postprocess_material, "convert_texture_to_dds_cached"
+        ) as convert_mock:
+            convert_mock.return_value = (True, "")
+            node.copy_texture_file(_FakeImage(source), self.target_dir, _FakeMaterial())
+
+        self.assertFalse(convert_mock.call_args.kwargs["force"])
 
     def test_missing_source_returns_none(self):
         """源文件不存在时返回 None，不产生 INI 引用"""
@@ -423,13 +359,13 @@ class PSBindingExportAsDDSTests(unittest.TestCase):
         source = self._make_source("body-DiffuseMap.png")
         node = self._make_node()
 
-        def fake_convert(source_path, target_path, props=None, **_kwargs):
+        def fake_convert(source_path, target_path, props=None, force=False, **_kwargs):
             with open(target_path, "wb") as handle:
                 handle.write(b"DDS payload")
             return True, ""
 
         with mock.patch.object(
-            node_postprocess_psbinding, "convert_texture_to_dds", side_effect=fake_convert
+            node_postprocess_psbinding, "convert_texture_to_dds_cached", side_effect=fake_convert
         ):
             result = node._copy_texture_file(source, Path(self.output_dir))
 
@@ -443,7 +379,7 @@ class PSBindingExportAsDDSTests(unittest.TestCase):
         source = self._make_source("body-DiffuseMap.png")
         node = self._make_node(export_as_dds=False)
 
-        with mock.patch.object(node_postprocess_psbinding, "convert_texture_to_dds") as convert_mock:
+        with mock.patch.object(node_postprocess_psbinding, "convert_texture_to_dds_cached") as convert_mock:
             result = node._copy_texture_file(source, Path(self.output_dir))
 
         self.assertEqual("Textures/body-DiffuseMap.png", result)
@@ -454,7 +390,7 @@ class PSBindingExportAsDDSTests(unittest.TestCase):
         node = self._make_node()
 
         with mock.patch.object(
-            node_postprocess_psbinding, "convert_texture_to_dds", return_value=(False, "boom")
+            node_postprocess_psbinding, "convert_texture_to_dds_cached", return_value=(False, "boom")
         ):
             result = node._copy_texture_file(source, Path(self.output_dir))
 
@@ -479,14 +415,14 @@ class DiffuseSwitchExportAsDDSTests(unittest.TestCase):
     def test_png_is_converted_to_dds(self):
         source = self._make_source("alt-DiffuseMap.png")
 
-        def fake_convert(source_path, target_path, props=None, **_kwargs):
+        def fake_convert(source_path, target_path, props=None, force=False, **_kwargs):
             with open(target_path, "wb") as handle:
                 handle.write(b"DDS payload")
             return True, ""
 
         with mock.patch.object(
             node_postprocess_diffuse_switch,
-            "convert_texture_to_dds",
+            "convert_texture_to_dds_cached",
             side_effect=fake_convert,
         ):
             result = node_postprocess_diffuse_switch.copy_texture(
@@ -501,7 +437,7 @@ class DiffuseSwitchExportAsDDSTests(unittest.TestCase):
         source = self._make_source("alt-DiffuseMap.png")
 
         with mock.patch.object(
-            node_postprocess_diffuse_switch, "convert_texture_to_dds"
+            node_postprocess_diffuse_switch, "convert_texture_to_dds_cached"
         ) as convert_mock:
             result = node_postprocess_diffuse_switch.copy_texture(source, self.ini_path)
 
@@ -563,7 +499,7 @@ class ObjectTextureExportAsDDSTests(unittest.TestCase):
                 self._ini_text(), "LOD0.5eb66b57-26148-0", "", group, None, self.mod_dir
             )
         with mock.patch.object(
-            node_postprocess_object_texture, "convert_texture_to_dds", converter
+            node_postprocess_object_texture, "convert_texture_to_dds_cached", converter
         ):
             return node_postprocess_object_texture._apply_object_texture_replacements(
                 self._ini_text(), "LOD0.5eb66b57-26148-0", "", group, None, self.mod_dir
@@ -572,7 +508,7 @@ class ObjectTextureExportAsDDSTests(unittest.TestCase):
     def test_png_slot_is_converted_to_dds(self):
         source = self._make_source("body-DiffuseMap.png")
 
-        def fake_convert(source_path, target_path, props=None, **_kwargs):
+        def fake_convert(source_path, target_path, props=None, force=False, **_kwargs):
             with open(target_path, "wb") as handle:
                 handle.write(b"DDS payload")
             return True, ""
@@ -591,7 +527,7 @@ class ObjectTextureExportAsDDSTests(unittest.TestCase):
         group = self._make_group(diffuse_path=source, export_as_dds=False)
 
         with mock.patch.object(
-            node_postprocess_object_texture, "convert_texture_to_dds"
+            node_postprocess_object_texture, "convert_texture_to_dds_cached"
         ) as convert_mock:
             text, modified, _message = self._run(group)
 
@@ -603,7 +539,7 @@ class ObjectTextureExportAsDDSTests(unittest.TestCase):
         source = self._make_source("body-DiffuseMap.png")
 
         with mock.patch.object(
-            node_postprocess_object_texture, "convert_texture_to_dds", return_value=(False, "boom")
+            node_postprocess_object_texture, "convert_texture_to_dds_cached", return_value=(False, "boom")
         ):
             text, modified, _message = self._run(self._make_group(diffuse_path=source))
 

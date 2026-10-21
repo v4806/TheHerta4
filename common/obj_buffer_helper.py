@@ -571,10 +571,14 @@ class ObjBufferHelper:
         return encoded.reshape(-1, 1)
 
     @staticmethod
-    def parse_elementname_data_dict(mesh:bpy.types.Mesh, d3d11_game_type:D3D11GameType):
+    def parse_elementname_data_dict(
+        mesh: bpy.types.Mesh, d3d11_game_type: D3D11GameType, vertex_group_names=None
+    ):
         '''
         - 注意这里是从mesh.loops中获取数据，而不是从mesh.vertices中获取数据
         - 所以后续使用的时候要用mesh.loop里的索引来进行获取数据
+        - 【t66】`vertex_group_names` = `[vg.name for vg in obj.vertex_groups]`：
+          BLENDINDICES 的槽号按**组名**解析（组名 = 全局槽的十进制写法）；不传 ⇒ 旧行为。
         '''
 
         original_elementname_data_dict: dict = {}
@@ -705,7 +709,18 @@ class ObjBufferHelper:
             print("尘白禁区权重处理")
             blendweights_dict, blendindices_dict = VertexGroupUtils.get_blendweights_blendindices_v4_fast(mesh=mesh,normalize_weights = normalize_weights,blend_size=blend_size)
         else:
-            blendweights_dict, blendindices_dict = VertexGroupUtils.get_blendweights_blendindices_v3(mesh=mesh,normalize_weights = normalize_weights)
+            # 【t66 门控】按组名解析槽号**只对 HIMI 生效**：其它逻辑一律传 None
+            # ⇒ `resolve_group_slot` 不被调用，BLENDINDICES 仍是「`object.vertex_groups`
+            # 列表序号」= 本次改动之前的逐字节行为。
+            # 机制与单测保留（`utils/vertexgroup_utils.resolve_group_slot`），待某个游戏
+            # 验证过「组名 = 全局骨骼槽」口径之后再逐个放开。
+            if GlobalConfig.logic_name != getattr(LogicName, "HIMI", "HIMI"):
+                vertex_group_names = None
+            blendweights_dict, blendindices_dict = VertexGroupUtils.get_blendweights_blendindices_v3(
+                mesh=mesh,
+                normalize_weights=normalize_weights,
+                vertex_group_names=vertex_group_names,   # 【t66】按组名解析槽号（仅 HIMI）
+            )
 
 
         # 检查是否存在 ENCODEDDATA 元素 (用于 EFMI 格式的 TBN 编码)
@@ -953,6 +968,48 @@ class ObjBufferHelper:
         # 构建 index -> original vertex id（使用每个 unique 行的第一个 loop 对应的 vertex）
         original_vertex_ids = loop_vertex_indices[unique_first_indices_insertion]
         index_vertex_id_dict = dict(enumerate(original_vertex_ids.astype(int).tolist()))
+
+        # ------------------------------------------------------------------ #
+        # 【t84】行↔源映射插桩（**只打日志、不改行为**）—— **只在 HIMI 打开**。
+        # 它是排查 HIMI 合并导出行错位时的一次性诊断；留在通用路径上会让**每个游戏**
+        # 的每一次导出都刷屏。其它逻辑保持改动前：一行都不打。
+        # ------------------------------------------------------------------ #
+        # 口径：
+        #   * 去重键 = `numpy.unique(structured(vertex_id + element bytes))`（本函数 `:872-893`）
+        #     ⇒ **同一个源顶点只要 element 字节不同就会各占一行** ⇒ 行数 > 源顶点数（本例 1321 vs 1298，
+        #     多出的 23 = 那些"同顶点多变体"的顶点数）；
+        #   * 每行的 `src_v` 就在这一行给出（`:934`）；`donor_row(r)` = 与第 r 行 `src_v` 相同的**最早**行
+        #     （同顶点变体 ⇒ 位置按定义相同）；`ib_majority(r)` 需要源 IB 对照，由 `.dbg` 侧脚本给出。
+        if GlobalConfig.logic_name == getattr(LogicName, "HIMI", "HIMI"):
+            try:
+                import numpy as _np
+
+                _ids = original_vertex_ids.astype(int)
+                _uniq, _counts = _np.unique(_ids, return_counts=True)
+                _multi = _uniq[_counts > 1]
+                # donor_row：同 src_v 的第一次出现行
+                _donor = {}
+                for _row, _vid in enumerate(_ids.tolist()):
+                    _donor.setdefault(int(_vid), int(_row))
+                print(
+                    f"[t84-POS] loops={n_loops} rows(n_unique)={int(_ids.shape[0])} "
+                    f"distinct_src_v={int(_uniq.shape[0])} extra_rows={int(_ids.shape[0]) - int(_uniq.shape[0])} "
+                    f"multi_src_v={int(_multi.shape[0])}"
+                )
+                if _multi.size:
+                    head = []
+                    for _vid in _multi.tolist()[:8]:
+                        rows = [int(r) for r in _np.nonzero(_ids == _vid)[0].tolist()]
+                        head.append({"src_v": int(_vid), "rows": rows, "donor_row": _donor[int(_vid)]})
+                    print(f"[t84-POS]   同顶点多变体（前 8）：{head}")
+                # 行↔源映射表摘要（前 12 行 + 末 4 行）
+                head_rows = [(int(r), int(v)) for r, v in enumerate(_ids.tolist()[:12])]
+                tail_rows = [(int(r), int(v)) for r, v in
+                             enumerate(_ids.tolist()[max(0, int(_ids.shape[0]) - 4):],
+                                       start=max(0, int(_ids.shape[0]) - 4))]
+                print(f"[t84-POS]   row→src_v 头={head_rows} 尾={tail_rows}")
+            except Exception as _exc:  # noqa: BLE001 - 插桩绝不许弄坏导出
+                print(f"[t84-POS] 插桩异常（已忽略）：{_exc}")
 
         # (4) 为每个 polygon 构建 IB（使用 inverse 映射）
         # inverse is already ordered by loops; concatenating polygon slices in

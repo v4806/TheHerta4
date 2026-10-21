@@ -112,7 +112,10 @@ class DDSConversionTests(unittest.TestCase):
         self.assertEqual(matched_by, r"(?i)(?:^|[_\-. ])DiffuseMap_high(?:[_\-. ]|$)")
 
     def test_default_rules_pick_first_matching_keyword(self):
-        """测试文件名同时包含 NormalMap 和 DiffuseMap 时，取最先出现的匹配规则"""
+        """测试文件名同时包含 NormalMap 和 DiffuseMap 时，取最先出现的匹配规则
+
+        （两个类型格式不同：命中错了会从线性变成 sRGB，断言能看出来。）
+        """
         props = types.SimpleNamespace(dds_use_custom_rules=False, dds_rules=[])
         texture_type, dds_format, _matched_by = dds_conversion.resolve_dds_target(
             "NormalMap_DiffuseMap_high_丝袜.png", props
@@ -121,11 +124,49 @@ class DDSConversionTests(unittest.TestCase):
         self.assertEqual(dds_format, "r8g8b8a8_unorm")
 
     def test_default_rules_single_keyword_normalmap(self):
-        """测试仅包含 NormalMap 时正常匹配"""
+        """测试仅包含 NormalMap 时正常匹配
+
+        法线兜底不压缩：通道数必须与实际贴图一致，BC5 这类两通道原格式由工作空间原贴图给出。
+        """
         props = types.SimpleNamespace(dds_use_custom_rules=False, dds_rules=[])
         texture_type, dds_format, _matched_by = dds_conversion.resolve_dds_target("cloth_NormalMap.png", props)
         self.assertEqual(texture_type, "NormalMap")
         self.assertEqual(dds_format, "r8g8b8a8_unorm")
+
+    def test_default_rule_table_is_only_a_fallback(self):
+        """内置规则表只是兜底：真正的格式来自工作空间原贴图的 DDS 头。
+
+        兜底表照抄常见的引擎约定 —— 颜色类贴图走 sRGB，遮罩/数据类线性。
+        """
+        props = types.SimpleNamespace(dds_use_custom_rules=False, dds_rules=[])
+        srgb_types = (
+            "DiffuseMap_Body.png",
+            "MaterialMap_Body.png",
+            "RampMap_Body.png",
+            "HighLightMap_Body.png",
+            "Glowmap_5_Body.png",
+        )
+        for name in srgb_types:
+            with self.subTest(name=name):
+                self.assertEqual("bc7_unorm_srgb", dds_conversion.resolve_dds_target(name, props)[1])
+
+        linear_names = (
+            "LightMap_Body.png",
+            "WengineFx_Body.png",
+            "FXMap_Body.png",
+            "TTLMap_Body.png",
+            "RoughnessMap_Body.png",
+            "ORMMap_Body.png",
+            "UnknownMask.png",
+        )
+        for name in linear_names:
+            with self.subTest(name=name):
+                self.assertEqual("bc7_unorm", dds_conversion.resolve_dds_target(name, props)[1])
+
+        # 法线图兜底不压缩：BC5 之类的原格式由工作空间原贴图给出，兜底时保留四通道。
+        self.assertEqual("r8g8b8a8_unorm", dds_conversion.resolve_dds_target("NormalMap_Body.png", props)[1])
+        self.assertEqual(["--srgb-in"], dds_conversion._texconv_colorspace_flags("bc7_unorm_srgb"))
+
 
     def test_default_rules_recognize_ttlmap(self):
         """测试 TTLMap 前缀与 FXMap 一样按遮罩格式识别（bc7_unorm）"""
@@ -536,7 +577,7 @@ class ConvertTextureToDDSTests(unittest.TestCase):
         self.target = os.path.join(self.temp_dir, "out", "Body_Material.dds")
         self.props = types.SimpleNamespace(dds_use_custom_rules=False, dds_rules=[])
 
-    def _run(self, capture=None, returncode=0):
+    def _run(self, capture=None, returncode=0, match_name=None):
         def fake_run(command, **_kwargs):
             if capture is not None:
                 capture.append(command)
@@ -545,14 +586,18 @@ class ConvertTextureToDDSTests(unittest.TestCase):
                 produced = os.path.join(
                     out_dir, os.path.splitext(os.path.basename(command[-1]))[0] + ".dds"
                 )
-                Path(produced).write_bytes(b"DDS payload")
+                Path(produced).write_bytes(
+                    _dds_header(dxgi_format=dds_conversion._DDS_DXGI_FORMAT_IDS.get(command[command.index("-f") + 1]))
+                )
             return types.SimpleNamespace(
                 returncode=returncode, stdout="", stderr="boom" if returncode else ""
             )
 
         with mock.patch.object(dds_conversion, "find_texconv", return_value="texconv.exe"), \
                 mock.patch.object(dds_conversion.subprocess, "run", side_effect=fake_run):
-            return dds_conversion.convert_texture_to_dds(self.source, self.target, self.props)
+            return dds_conversion.convert_texture_to_dds(
+                self.source, self.target, self.props, match_name=match_name
+            )
 
     def test_diffuse_map_uses_srgb_rule_and_writes_target(self):
         """DiffuseMap 按规则表走 bc7_unorm_srgb，并用 --srgb-in 保证颜色不变"""
@@ -578,6 +623,31 @@ class ConvertTextureToDDSTests(unittest.TestCase):
         self.assertEqual("r8g8b8a8_unorm", command[command.index("-f") + 1])
         self.assertIn("--ignore-srgb", command)
 
+    def test_match_name_overrides_source_filename(self):
+        """判定串换成材质名后，源 PNG 名里的关键词不再决定格式
+
+        源名是 NormalMap（线性），材质名是 DiffuseMap（sRGB）→ 以材质名为准。
+        """
+        self.source = os.path.join(self.temp_dir, "c209c22b-45087-0-NormalMap.png")
+        Path(self.source).write_bytes(b"png payload")
+        commands = []
+        ok, reason = self._run(capture=commands, match_name="DiffuseMap_Body")
+
+        self.assertTrue(ok, reason)
+        command = commands[0]
+        self.assertEqual("bc7_unorm_srgb", command[command.index("-f") + 1])
+        self.assertIn("--srgb-in", command)
+
+    def test_source_filename_still_decides_without_match_name(self):
+        """不传判定串时保持原口径：按源文件名判定（批量算子与其它导出节点走这条）"""
+        self.source = os.path.join(self.temp_dir, "c209c22b-45087-0-Body.png")
+        Path(self.source).write_bytes(b"png payload")
+        commands = []
+        ok, reason = self._run(capture=commands)
+
+        self.assertTrue(ok, reason)
+        self.assertEqual("bc7_unorm", commands[0][commands[0].index("-f") + 1])
+
     def test_source_file_is_untouched(self):
         """编辑期的源 PNG 必须原样保留，导出只是另外产出一份 DDS"""
         ok, _reason = self._run()
@@ -599,6 +669,103 @@ class ConvertTextureToDDSTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("boom", reason)
         self.assertFalse(os.path.exists(self.target))
+
+
+class DDSConversionCacheTests(unittest.TestCase):
+    """带缓存的转换入口：一次导出里同一个目标只真正跑一次 texconv。
+
+    一个材质被多个物体引用是常态（实测一份导出 ini 里同一张 LightMap 被引用 282 次），
+    而单张 4096² 的 BC7 转换约 4 秒 —— 每引用一次就重转一次是导出耗时的主要来源。
+    """
+
+    def setUp(self):
+        dds_conversion.clear_dds_conversion_cache()
+        self.temp_dir = tempfile.mkdtemp(prefix="dds_cache_")
+        self.source = os.path.join(self.temp_dir, "c209c22b-45087-0-DiffuseMap.png")
+        Path(self.source).write_bytes(b"png payload")
+        self.target = os.path.join(self.temp_dir, "out", "Body_Material.dds")
+        self.props = types.SimpleNamespace(dds_use_custom_rules=False, dds_rules=[])
+
+    def _run(self, force=False, match_name=None):
+        calls = []
+
+        def fake_run(command, **_kwargs):
+            calls.append(command)
+            out_dir = command[command.index("-o") + 1]
+            produced = os.path.join(
+                out_dir, os.path.splitext(os.path.basename(command[-1]))[0] + ".dds"
+            )
+            Path(produced).write_bytes(
+                _dds_header(dxgi_format=dds_conversion._DDS_DXGI_FORMAT_IDS.get(command[command.index("-f") + 1]))
+            )
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with mock.patch.object(dds_conversion, "find_texconv", return_value="texconv.exe"), \
+                mock.patch.object(dds_conversion.subprocess, "run", side_effect=fake_run):
+            result = dds_conversion.convert_texture_to_dds_cached(
+                self.source, self.target, self.props, force=force, match_name=match_name
+            )
+        return result, calls
+
+    def test_match_name_is_forwarded_to_format_resolution(self):
+        """带缓存的入口把判定串透传下去：材质导出按材质名（而非源名）定格式"""
+        _result, calls = self._run(match_name="NormalMap_Body")
+
+        # 源名是 DiffuseMap（sRGB），材质名是 NormalMap（线性）→ 以材质名为准
+        self.assertEqual("r8g8b8a8_unorm", calls[0][calls[0].index("-f") + 1])
+
+    def test_same_target_is_converted_once_even_with_force(self):
+        """核心：同一目标被反复请求时只跑一次 texconv，「覆盖现有资源」也不例外"""
+        first, first_calls = self._run(force=True)
+        second, second_calls = self._run(force=True)
+
+        self.assertTrue(first[0], first[1])
+        self.assertTrue(second[0], second[1])
+        self.assertEqual(1, len(first_calls))
+        self.assertEqual(0, len(second_calls))
+
+    def test_existing_target_is_reused_without_running_texconv(self):
+        """目标比源新时直接复用磁盘上那份 —— 即使进程内缓存已被清空"""
+        self._run()
+        dds_conversion.clear_dds_conversion_cache()
+        _result, calls = self._run()
+
+        self.assertEqual(0, len(calls))
+
+    def test_updated_source_triggers_reconversion(self):
+        """源贴图被重新编辑后必须重转，否则导出出去的是旧图"""
+        self._run()
+        stat = os.stat(self.source)
+        os.utime(self.source, (stat.st_atime + 10, stat.st_mtime + 10))
+        _result, calls = self._run()
+
+        self.assertEqual(1, len(calls))
+
+    def test_force_regenerates_after_cache_reset(self):
+        """每次导出开始清空缓存，「覆盖现有资源」在下次导出仍会重新生成一遍"""
+        self._run(force=True)
+        dds_conversion.clear_dds_conversion_cache()
+        _result, calls = self._run(force=True)
+
+        self.assertEqual(1, len(calls))
+
+    def test_deleted_target_is_regenerated(self):
+        """产物被删掉后缓存不能继续声称「已就绪」，必须重新转一份出来"""
+        self._run()
+        os.remove(self.target)
+        _result, calls = self._run()
+
+        self.assertEqual(1, len(calls))
+        self.assertTrue(os.path.exists(self.target))
+
+    def test_missing_source_reports_failure(self):
+        """源不存在时直接报错，不能凭空产出目标文件"""
+        ok, reason = dds_conversion.convert_texture_to_dds_cached(
+            os.path.join(self.temp_dir, "nope.png"), self.target, self.props
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("不存在", reason)
 
 
 if __name__ == "__main__":

@@ -743,8 +743,38 @@ class VertexGroupUtils:
         blendindices_dict[0] = blendindices
         return blendweights_dict, blendindices_dict
     
+    # ------------------------------------------------------------------ #
+    # 【t66 根治】顶点组 → 骨骼槽：**按组名解析**，而不是取组列表序号
+    # ------------------------------------------------------------------ #
+    # 为什么（用户实测）：`LOD0.b35cfc6c-8052-0` 上出现
+    #   顶点组 #275 的名字是 `279`、顶点组 #279 的名字是 `275`
+    # ⇒ 老实现写的是 `g.group`（= **对象 vertex_groups 列表里的序号**），
+    #   于是"刷 275"的顶点实际读到 279 的矩阵（左腿往前、它往后）。
+    # 组名的语义（t58 已证）：合并路径里组名就是**全局骨骼槽号的十进制写法**；
+    # 把 87/88/93/94 合并成一个组时，组名会被写成合并后的目标槽（例如 `275`）⇒
+    # 按名解析才拿得到"作者想要的那个槽"，按序号只会拿到列表位置。
+    # 非十进制名（其它游戏/旧工作空间的 `Bone.001` 之类）**回退旧行为**（= 取序号），
+    # 因此对"索引 == 名字"的正常产物，本改动**逐字节等价**。
+    @staticmethod
+    def resolve_group_slot(vertex_group_names, group_index: int) -> int:
+        """``vertex_group_names`` = ``[vg.name for vg in obj.vertex_groups]``（可为 None）。
+
+        组名是十进制整数 ⇒ 用它当槽号；否则回退 ``group_index``（旧行为）。
+        """
+        try:
+            index = int(group_index)
+        except (TypeError, ValueError):
+            return int(group_index or 0)
+        if vertex_group_names and 0 <= index < len(vertex_group_names):
+            name = str(vertex_group_names[index]).strip()
+            if name.isdigit():
+                return int(name)
+        return index
+
     @classmethod
-    def get_blendweights_blendindices_v3(cls,mesh, normalize_weights: bool = False):
+    def get_blendweights_blendindices_v3(
+        cls, mesh, normalize_weights: bool = False, vertex_group_names=None
+    ):
         mesh_loops = mesh.loops
         mesh_loops_length = len(mesh_loops)
         mesh_vertices = mesh.vertices
@@ -786,7 +816,10 @@ class VertexGroupUtils:
         # 填充权重和索引数据
         for v_idx, groups in enumerate(sorted_groups):
             count = min(len(groups), total_groups)
-            all_groups[v_idx, :count] = [g.group for g in groups][:count]
+            # 【t66】按**组名**解析槽号（组名 = 全局槽的十进制写法）；非十进制名回退序号。
+            all_groups[v_idx, :count] = [
+                cls.resolve_group_slot(vertex_group_names, g.group) for g in groups
+            ][:count]
             all_weights[v_idx, :count] = [g.weight for g in groups][:count]
 
         # 关键步骤：整体归一化所有权重

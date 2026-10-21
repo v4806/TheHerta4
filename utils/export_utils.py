@@ -107,6 +107,12 @@ class ExportUtils:
             original_elementname_data_dict = ObjBufferHelper.parse_elementname_data_dict(
                 mesh=mesh,
                 d3d11_game_type=d3d11_game_type,
+                # 【t66 根治】把**组名**传下去：BLENDINDICES 的槽号按组名解析（组名 = 全局槽的十进制写法），
+                # 而不是取 `object.vertex_groups` 的列表序号 —— 后者在"索引≠名字"时会绑错骨。
+                # 取不到 `vertex_groups`（替身/特殊对象）⇒ 传 None = 旧行为（逐字节等价）。
+                vertex_group_names=[
+                    vg.name for vg in (getattr(resolved_obj, "vertex_groups", None) or ())
+                ] or None,
             )
 
         return ObjElementContext(

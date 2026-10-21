@@ -10,6 +10,12 @@
 - `common/obj_buffer_helper.py` 的 `ObjBufferHelper.parse_elementname_data_dict`
   （ZZMI 合并分支：汇总超限顶点数 / 最大丢弃权重占比 / 样本顶点索引并打印；占比
   ≥5% 时额外提示回 Blender 用 清理 Clean → 限制总影响数 Limit Total → 归一化 All）。
+
+第三层（本次新增）：**t66 门控** —— `parse_elementname_data_dict` 只在 HIMI 把
+`vertex_group_names` 交给 v3 提取器（按组名解析槽号），其它逻辑一律传 `None`
+⇒ 仍是「`object.vertex_groups` 列表序号」= 改动前的逐字节行为。
+机制本身（名字优先、非十进制名回退序号）由
+`tests/test_himi_merged_runtime.py::HIMIVertexGroupNameResolutionTests` 钉住。
 """
 import contextlib
 import importlib.util
@@ -99,6 +105,8 @@ obj_buffer_helper = _load_module(
 ObjBufferHelper = obj_buffer_helper.ObjBufferHelper
 VertexGroupUtils = vertexgroup_utils.VertexGroupUtils
 Fatal = ssmt_error_utils.Fatal
+# 门控用例要读/改当前逻辑名（模块对象在上面只装进了 sys.modules，这里取个名字）
+GlobalConfig = sys.modules[f"{PKG}.common.global_config"].GlobalConfig
 
 
 class _Assignment:
@@ -309,6 +317,75 @@ class ZZMIBlendDowncastGuardTests(unittest.TestCase):
         game_type = _FakeGameType(blend_format="R32G32B32A32_UINT", byte_width=16)
         self.assertEqual(
             ObjBufferHelper.parse_elementname_data_dict(mesh, game_type), {}
+        )
+
+
+class GroupNameResolutionGateTests(unittest.TestCase):
+    """【t66 门控】按组名解析 BLENDINDICES 槽号**只对 HIMI 生效**。
+
+    `parse_elementname_data_dict` 把 `vertex_group_names` 交给 v3 提取器之前有一道门：
+    `GlobalConfig.logic_name != HIMI ⇒ vertex_group_names = None`。本用例用**间谍**替换
+    v3 提取器，直接观察它实际收到的参数 —— 非 HIMI 必须是 `None`（旧行为），
+    HIMI 必须拿到组名表（新行为）。
+
+    「拿到组名表之后会按名字写槽号」由
+    `tests/test_himi_merged_runtime.py::HIMIVertexGroupNameResolutionTests` 覆盖；
+    两条合起来才等于「HIMI 新、其余旧」。
+    """
+
+    def setUp(self):
+        self._original_logic = GlobalConfig.logic_name
+        self._original_v3 = VertexGroupUtils.get_blendweights_blendindices_v3
+        self.calls = []
+        saved = self._original_v3
+
+        def spy(*args, **kwargs):
+            self.calls.append(kwargs.get("vertex_group_names"))
+            return saved(*args, **kwargs)
+
+        VertexGroupUtils.get_blendweights_blendindices_v3 = spy
+
+    def tearDown(self):
+        VertexGroupUtils.get_blendweights_blendindices_v3 = self._original_v3
+        GlobalConfig.logic_name = self._original_logic
+
+    def _names_seen_by_extractor(self, logic_name, names):
+        GlobalConfig.logic_name = logic_name
+        self.calls.clear()
+        # 组列表序号 1，而组名表把序号 1 映射到 "9" ⇒ 名字与序号刻意不一致
+        mesh = _Mesh([[(1, 1.0)]], [0])
+        ObjBufferHelper.parse_elementname_data_dict(
+            mesh, _FakeGameType(), vertex_group_names=names
+        )
+        return self.calls
+
+    def test_non_himi_logics_keep_the_old_index_behaviour(self):
+        """EFMI / GIMI / SRMI / HTMI 走 else 分支：提取器必须收到 None（= 旧行为）。
+
+        刻意不含 ZZMI / ZZMIDX12（合并开关打开时走 for_layout 分支）、
+        WWMI / NTEMI / SnowBreak（走 v4_fast）—— 那几条根本不经过这道门。
+        """
+        for logic_name in ("EFMI", "GIMI", "SRMI", "HTMI"):
+            with self.subTest(logic_name=logic_name):
+                self.assertEqual(
+                    self._names_seen_by_extractor(logic_name, ["5", "9"]),
+                    [None],
+                )
+
+    def test_himi_receives_the_group_names(self):
+        """HIMI 是唯一放行的逻辑：提取器必须收到组名表。"""
+        self.assertEqual(
+            self._names_seen_by_extractor("HIMI", ["5", "9"]),
+            [["5", "9"]],
+        )
+
+    def test_gate_is_present_in_the_call_site(self):
+        """源码级钉子：门控一旦被删掉（例如为了「统一口径」而顺手放开），本用例失败。"""
+        source = (ROOT / "common" / "obj_buffer_helper.py").read_text(encoding="utf-8")
+        self.assertIn(
+            'if GlobalConfig.logic_name != getattr(LogicName, "HIMI", "HIMI"):\n'
+            "                vertex_group_names = None",
+            source,
         )
 
 

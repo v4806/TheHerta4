@@ -17,8 +17,10 @@
 
 import importlib.util
 import os
+import shutil
 import struct
 import sys
+import tempfile
 import types
 import unittest
 from collections import OrderedDict
@@ -193,7 +195,7 @@ def _make_node(mod, **props):
         phys_release_kick=0.12, phys_target_follow=1.10,
         mult_radius=1.0, mult_strength=0.333, mult_spring=0.333, mult_damping=1.0,
         zone_objects=[], bake_reference_object=None, mask_plateau=0.0,
-        collision_enabled=False, collision_margin=0.002, collision_mode="SOFT",
+        collision_enabled=False, collision_margin=0.002, collision_mode="HARD",
         collision_point_budget=4096, collision_cell_size=0.0,
     )
     defaults.update(props)
@@ -804,7 +806,7 @@ class DragNodeEmitTests(unittest.TestCase):
         return node, sections, comps
 
     @staticmethod
-    def _zone_item(zone_id, weight=1.0, enabled=True, grabbable=True):
+    def _zone_item(zone_id, weight=1.0, enabled=True, grabbable=True, drag_along_normal=False):
         settings = types.SimpleNamespace(
             enabled=enabled,
             brush_strength=weight,
@@ -815,6 +817,7 @@ class DragNodeEmitTests(unittest.TestCase):
             falloff=0.0,
             damping=0.0,
             grabbable=grabbable,
+            drag_along_normal=drag_along_normal,
         )
         empty = types.SimpleNamespace(
             name=f"zone_{zone_id}",
@@ -1731,11 +1734,15 @@ class DragNodeEmitTests(unittest.TestCase):
         ])
 
     def test_jiggle_temp_vb0_empty_declaration_and_copy_roundtrip(self):
-        # R9 回退：恢复 TempVB0 空声明 + copy 往返自愈链（Alt 模型消失回归修复）
+        # R9 回退：恢复 TempVB0 声明 + copy 往返自愈链（Alt 模型消失回归修复）
+        # 声明形态已演进（方法名保留为历史）：空声明 / RWBuffer+format 会让 D3D 建视图失败
+        # （E_INVALIDARG）或按 16 B 元素取址错位；现发射与 hlsl 同构的
+        # `RWStructuredBuffer<VertexAttributes>`（stride 40、被 cs-t24 当 SRV 读 ⇒ 需 shader_resource）
         _, sections, _ = self._emit()
         self.assertEqual(
             sections["[ResourceDragJiggleTempVB0_abc123_43191_testns]"],
-            ["type = RWBuffer"],
+            ["type = RWStructuredBuffer", "stride = 40", "array = 14078",
+             "bind_flags = shader_resource unordered_access"],
         )
         self.assertNotIn("[ResourceDragJiggleShadowVB_abc123_43191_testns]", sections)
         jig = "\n".join(sections["[CustomShaderDragJiggleabc123_43191_testns]"])
@@ -1747,6 +1754,22 @@ class DragNodeEmitTests(unittest.TestCase):
         self.assertIn("ResourceDragJiggleTempVB0_abc123_43191_testns = copy cs-u5", jig)
         self.assertNotIn("ShadowVB", jig)
         self.assertIn("Dispatch = 55, 1, 1", jig)  # ceil(14078/256)
+
+    def test_jiggle_temp_vb0_array_tracks_component_vertex_count(self):
+        # 回归（洛克茜 d5e1e7ff 实机爆炸）：array 曾写死 19039，而该部件真实顶点数
+        # 是 262153 ⇒ 变形 CS 只写前 19039 行，其余行在换绑成绘制 vb0 后被索引到、
+        # 读到 0 ⇒ 整片网格塌到原点。契约：array == 该部件 vertex_count，
+        # 且与该段 Dispatch 出自同一个数（同一部件不得有两个顶点数来源）。
+        node = _make_node(self.mod)
+        sections = _base_sections(vertex_count=262153)
+        comps = node._locate_components(sections, ["abc123"])
+        node._emit_sections(sections, comps, "testns")
+        self.assertEqual(comps[0]["vertex_count"], 262153)
+        vb0 = sections["[ResourceDragJiggleTempVB0_abc123_43191_testns]"]
+        self.assertIn("array = 262153", vb0)
+        self.assertNotIn("array = 19039", vb0)
+        jig = "\n".join(sections["[CustomShaderDragJiggleabc123_43191_testns]"])
+        self.assertIn("Dispatch = 1025, 1, 1", jig)  # ceil(262153/256)，与 array 同源
 
     def test_legacy_jiggle_vb0_sections_stripped_on_read(self):
         # 迁移：历代命名（TempVB0 空声明段 / ShadowVB 真声明段）在重读时都被剔除，
@@ -1954,7 +1977,9 @@ class DragNodeEmitTests(unittest.TestCase):
         self.assertIn("cs-t65 = ResourceDragJiggleZoneIDs", jig)
         self.assertIn("cs-t66 = ResourceDragJiggleZoneWeights", jig)
         self.assertIn("cs-t75 = ResourceDragZoneParams", jig)
-        self.assertIn("x119 = 0", jig)
+        # x119 = NORMAL_SIGN_MODE（丝袜滑移总闸所在参数块的 .x）：发射侧现为 1
+        # （滑移总闸改动），旧期望 0 已过期（t46 更新）
+        self.assertIn("x119 = 1", jig)
         self.assertNotIn("x77 = ", jig)
         self.assertNotIn("x99 = ", jig)
 
@@ -2381,7 +2406,7 @@ class DragNodeEmitTests(unittest.TestCase):
 
     def test_zone_params_buffer_uses_stable_id_and_grabbable_flag(self):
         import tempfile
-        item = self._zone_item(255, grabbable=False)
+        item = self._zone_item(255, grabbable=False, drag_along_normal=True)
         settings = item.zone_object.ssmt_drag_zone
         settings.radius = 0.25
         settings.strength = 1.5
@@ -4808,6 +4833,10 @@ class DragCollisionTests(unittest.TestCase):
             "h": 0.1, "h_c": 0.4,
             "dims": (10, 8, 6), "cdims": (3, 2, 2),
         }
+        comps[0]["collision_trigrid"] = {
+            "bmin": (0.0, 0.0, 0.0), "cell": 0.0125,
+            "dims": (64, 34, 102), "cell_count": 3242,
+        }
         node._emit_sections(sections, comps, "testns")
         return node, sections, comps
 
@@ -4914,6 +4943,61 @@ class DragCollisionTests(unittest.TestCase):
         settings = types.SimpleNamespace(collider_objects=[])
         self.assertIsNone(self.mod._collider_vertex_mask(settings, 6, None, None))
 
+    def test_collider_zone_ids_only_counts_zones_with_colliders(self):
+        """区域级隔离的入口判据：只有真配了碰撞体的区域进集合（节点级开关 + override）。"""
+        node = _make_node(self.mod, collision_enabled=True, zone_objects=[
+            self._collider_item(0, []),
+            self._collider_item(1, ["Thigh"]),
+            self._collider_item(2, ["Skirt"], override=2),
+        ])
+        self.assertEqual(node._collider_zone_ids(), {1})
+        off = _make_node(self.mod, collision_enabled=False,
+                         zone_objects=[self._collider_item(1, ["Thigh"])])
+        self.assertEqual(off._collider_zone_ids(), set())
+
+    def test_collision_zone_participation_narrows_to_collider_zones(self):
+        """没有碰撞体的区域的顶点参与位为 False ⇒ 运行时 CollisionSolve 直接放行。"""
+        node = _make_node(self.mod, collision_enabled=True, zone_objects=[
+            self._collider_item(0, []),
+            self._collider_item(1, ["Thigh"]),
+        ])
+        # 稀疏权重文件用桩替代（本机沙箱里临时目录不可用，不值得为测试造 FS）
+        ids_flat = np.array([0, 1, 0xFFFFFFFF, 0xFFFFFFFF,
+                             0, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
+                             0, 1, 0xFFFFFFFF, 0xFFFFFFFF], dtype=np.uint32)
+        w_flat = np.array([0.9, 0.1, 0.0, 0.0,
+                           1.0, 0.0, 0.0, 0.0,
+                           0.6, 0.0, 0.0, 0.0], dtype=np.float32)
+        comp = {"base_name": "stem", "base_resource": "Res"}
+        orig_isfile, orig_fromfile = os.path.isfile, np.fromfile
+        state = {"exists": True}
+        os.path.isfile = lambda p: state["exists"]
+        np.fromfile = lambda p, dtype=None, **kw: np.array(
+            ids_flat if "JiggleZoneIDs" in str(p) else w_flat, dtype=dtype)
+        try:
+            got = node._collision_zone_participation("unused", {}, comp, 3, 3, 0)
+            # 顶点0 命中有碰撞体的区域 1；顶点1 只属空碰撞体区域 0；顶点2 属区域1 但权重为 0
+            np.testing.assert_array_equal(got, np.array([True, False, False]))
+            # 权重文件缺失 ⇒ None（退回旧的全量参与行为，不阻断导出）
+            state["exists"] = False
+            self.assertIsNone(node._collision_zone_participation("unused", {}, comp, 3, 3, 0))
+        finally:
+            os.path.isfile, np.fromfile = orig_isfile, orig_fromfile
+
+        no_collider = _make_node(self.mod, collision_enabled=True,
+                                 zone_objects=[self._collider_item(0, [])])
+        got = no_collider._collision_zone_participation("unused", {}, {"base_name": "x"}, 4, 4, 0)
+        np.testing.assert_array_equal(got, np.zeros(4, dtype=bool))
+
+    def test_rebound_pin_is_per_vertex_not_global_state(self):
+        """回弹钉原位不得再清零共享态（清零会把同组件里没碰撞体的区域一起钉住）。"""
+        shader = (REPO_ROOT / "Toolset" / "drag_interaction" /
+                  "rzm_jiggle_interaction.hlsl").read_text(encoding="utf-8")
+        self.assertIn("bool reboundBlocked = !mouseHeld && CollisionSkinActive()", shader)
+        self.assertIn("bool reboundPinned = reboundBlocked && "
+                      "ColliderVertexL0[i * 2u + 1u].w > 0.5;", shader)
+        self.assertNotIn("nextCurrent.xyz = float3(0.0, 0.0, 0.0);", shader)
+
     def test_collect_collider_objects_respects_override_and_enabled(self):
         node = _make_node(self.mod, collision_enabled=True,
                           zone_objects=[self._collider_item(0, ["Thigh"], override=0)])
@@ -4938,60 +5022,104 @@ class DragCollisionTests(unittest.TestCase):
         lines = sections[f"[CustomShaderDragJiggle{cn}_testns]"]
         text = "\n".join(lines)
         self.assertIn(f"cs-t76 = ResourceDragColliderPoints_{cn}_testns", text)
-        self.assertIn(f"cs-t77 = ResourceDragColliderCellsFine_{cn}_testns", text)
-        self.assertIn(f"cs-t78 = ResourceDragColliderCellsCoarse_{cn}_testns", text)
         self.assertIn(f"cs-t79 = ResourceDragColliderVertexL0_{cn}_testns", text)
-        # x101: enabled=1 margin=0.002 mode=0(soft) safety=0.9
-        self.assertIn("x101 = 1 0.002 0 0.9", text)
-        self.assertIn("x102 = 0 0 0 0.1", text)
-        self.assertIn("x103 = 10 8 6 0.4", text)
-        # x104 携带 drag_mode 变量（模式三门控在 shader 内再确认）
-        self.assertIn("x104 = $ssmtdrag_drag_enabled_testns 3 2 2", text)
+        # x101: enabled=1 margin=0.002 mode=1(hard，默认已改为硬钳制) safety=0.9
+        # 3DMigoto 的 ini 解析器不支持一行多值：`x101 = 1 0.002 1 0.9` 会在第二个 token
+        # 处报 Syntax Error 并整行丢弃（实测 Unrecognised entry），必须逐行拆成 x/y/z/w。
+        self.assertIn("x101 = 1", lines)
+        self.assertIn("y101 = 0.002", lines)
+        self.assertIn("z101 = 1", lines)
+        self.assertIn("w101 = 0.9", lines)
+        # x104 只承载 drag_mode 变量（网格查询已废弃，不再混入 cdims 字面量；
+        # 「变量 + 字面量」混合多值没有先例、无法确认 3DMigoto 解析行为）
+        self.assertIn("x104 = $ssmtdrag_drag_enabled_testns", lines)
+        self.assertNotIn("$ssmtdrag_drag_enabled_testns 3 2 2", text)
+        self.assertNotIn("x101 = 1 0.002 1 0.9", text)
+        # 已删除的槽位不得回归：102/103 = 旧粗/细网格，105/106 = 旧 SDF
+        for slot in ("x102", "y102", "z102", "w102", "x103", "y103", "z103", "w103",
+                     "x105", "y105", "z105", "w105", "x106", "y106", "z106", "w106"):
+            self.assertNotIn(f"{slot} =", text)
+        # x108/x109：动态三角形网格（origin + cell / dims + cell_count）
+        self.assertIn("x108 = 0", lines)
+        self.assertIn("y108 = 0", lines)
+        self.assertIn("z108 = 0", lines)
+        self.assertIn("w108 = 0.0125", lines)
+        self.assertIn("x109 = 64", lines)
+        self.assertIn("y109 = 34", lines)
+        self.assertIn("z109 = 102", lines)
+        self.assertIn("w109 = 3242", lines)
+        self.assertIn(f"cs-t83 = ResourceDragColliderTriGrid_{cn}_testns", text)
+        self.assertIn(f"cs-t84 = ResourceDragColliderTriGridTris_{cn}_testns", text)
+        self.assertIn(f"cs-t87 = ResourceDragColliderTriGridVerts_{cn}_testns", text)
 
     def test_jiggle_section_without_collision_writes_zero_and_no_bindings(self):
         node, sections, comps = self._emit()  # 无 collision_grid
         cn = comps[0]["comp_name"]
         text = "\n".join(sections[f"[CustomShaderDragJiggle{cn}_testns]"])
         self.assertIn("x101 = 0", text)
+        self.assertIn("x108 = 0", text)
+        self.assertIn("x109 = 0", text)
         self.assertNotIn("cs-t76", text)
         self.assertNotIn("cs-t79", text)
+        self.assertNotIn("cs-t83", text)
 
     def test_component_resources_emit_collider_sections(self):
         node, sections, comps = self._emit_with_collision_grid()
         cn = comps[0]["comp_name"]
-        for suffix in ("ColliderPoints", "ColliderCellsFine", "ColliderCellsCoarse", "ColliderVertexL0"):
+        for suffix in ("ColliderPoints", "ColliderVertexL0", "ColliderTriGrid",
+                       "ColliderTriGridTris", "ColliderTriGridVerts"):
             self.assertIn(f"[ResourceDrag{suffix}_{cn}_testns]", sections)
+        # 已删除的 cells / SDF 资源段不得回归
+        for suffix in ("ColliderCellsFine", "ColliderCellsCoarse", "ColliderSDF"):
+            self.assertNotIn(f"[ResourceDrag{suffix}_{cn}_testns]", sections)
 
     def test_component_resources_no_collider_sections_by_default(self):
         node, sections, comps = self._emit()
         cn = comps[0]["comp_name"]
-        for suffix in ("ColliderPoints", "ColliderCellsFine", "ColliderCellsCoarse", "ColliderVertexL0"):
+        for suffix in ("ColliderPoints", "ColliderVertexL0", "ColliderTriGrid",
+                       "ColliderTriGridTris", "ColliderTriGridVerts",
+                       "ColliderCellsFine", "ColliderCellsCoarse", "ColliderSDF"):
             self.assertNotIn(f"[ResourceDrag{suffix}_{cn}_testns]", sections)
 
     # ---- HLSL 契约 ----
 
     def test_shader_collision_contract(self):
         shader = (REPO_ROOT / "Toolset" / "drag_interaction" / "rzm_jiggle_interaction.hlsl").read_text(encoding="utf-8")
-        # 寄存器与 ini 发射的 cs-t76..t79 一致
-        for reg in ("t76", "t77", "t78", "t79"):
+        # 寄存器与 ini 发射的 cs-t76/t79（点云 + L0）与三角网格 cs-t83/t84/t87 一致
+        for reg in ("t76", "t79", "t83", "t84", "t87"):
             self.assertIn(f"register({reg})", shader)
-        # 参数宏槽位与 ini 发射的 x101..x104 一致
+        # 已删除的绑定不得回归：t77/t78 = 旧粗/细网格，t80 = 旧 SDF
+        for reg in ("t77", "t78", "t80"):
+            self.assertNotIn(f"register({reg})", shader)
+        # 参数宏槽位与 ini 发射的 x101/x104/x108/x109 一致
         self.assertIn("#define COLLISION_PARAMS    IniParams[101]", shader)
-        self.assertIn("#define COLLISION_BOX       IniParams[102]", shader)
-        self.assertIn("#define COLLISION_GRID      IniParams[103]", shader)
         self.assertIn("#define COLLISION_META      IniParams[104]", shader)
+        self.assertIn("#define COLLISION_TRIGRID       IniParams[108]", shader)
+        self.assertIn("#define COLLISION_TRIGRID_DIMS  IniParams[109]", shader)
+        # 已删除的 slot 宏不得回归（102/103 = 旧网格，105/106 = 旧 SDF）
+        self.assertNotIn("COLLISION_BOX", shader)
+        self.assertNotIn("COLLISION_SDF", shader)
+        for slot in ("IniParams[102]", "IniParams[103]",
+                     "IniParams[105]", "IniParams[106]"):
+            self.assertNotIn(slot, shader)
         # 模式三门控（拉扯模式）在 shader 内显式再确认
         self.assertIn("COLLISION_META.x >= 2.0", shader)
-        # 设计契约：触发用带符号表面距离（旧 bestD > margin 在稀疏点云下
-        # 最近邻间距 ≫ margin，约束恒放行 → 防穿模从不触发）
-        self.assertIn("float s1 = dot(p1 - bestQ, bestN);", shader)
-        self.assertNotIn("if (bestD > margin)", shader)
-        # 设计契约：逐顶点导出距离阈值（任何位移后距离不得低于 t0）
-        self.assertIn("float threshold = l0q.w;", shader)
-        self.assertIn("if (s1 >= threshold)", shader)
-        # 无 while 循环（固定二分 + 固定上限扫描）；排除注释里的 "While" 字样
-        self.assertNotIn("while (", shader)
-        self.assertNotIn("while(", shader)
+        # 仅权重顶点参与碰撞（非权重顶点没有导出阈值）
+        self.assertIn("float4 l0n = ColliderVertexL0[i * 2u + 1u];", shader)
+        self.assertIn("if (l0n.w <= 0.5)", shader)
+        # 默认路径 = 动态三角形网格；DIMS.w = 0（未烘焙）时落回点云约束
+        self.assertIn("if (COLLISION_TRIGRID_DIMS.w > 0.5)", shader)
+        self.assertIn("return CollisionSolveGrid(i, p0, offset, vn);", shader)
+        # 点云回退路径保留：切平面 + 拉伸上限 + CCD 粗扫 + SOFT 投影
+        self.assertIn("bool CollisionSatisfied(", shader)
+        self.assertIn("float3 CollisionSolve(uint i, float3 p0, float3 offset, float3 vn)", shader)
+        self.assertIn("if (COLLISION_PARAMS.z <= 0.5)", shader)
+        self.assertIn("nearLim[pos] = d + COLLISION_STRETCH;", shader)
+        # 已删除的 SDF 路径与两个编译期开关不得回归
+        self.assertNotIn("SampleSDF", shader)
+        self.assertNotIn("ColliderSDF", shader)
+        self.assertNotIn("DRAG_ALONG_FACE_NORMAL", shader)
+        self.assertNotIn("COLLISION_HOLD_AT_THRESHOLD", shader)
 
     # ---- 端到端烘焙 ----
 
@@ -5018,17 +5146,102 @@ class DragCollisionTests(unittest.TestCase):
             self.assertTrue(node._write_collision_resources(td, {}, comp, "testns"))
             p = Path(td) / "Meshes"
             self.assertTrue((p / "sampleColliderPoints.buf").exists())
-            self.assertTrue((p / "sampleColliderCellsFine.buf").exists())
-            self.assertTrue((p / "sampleColliderCellsCoarse.buf").exists())
             self.assertTrue((p / "sampleColliderVertexL0.buf").exists())
+            # 已删除的 cells / SDF 烘盘不得回归
+            self.assertFalse((p / "sampleColliderCellsFine.buf").exists())
+            self.assertFalse((p / "sampleColliderCellsCoarse.buf").exists())
+            self.assertFalse((p / "sampleColliderSDF.buf").exists())
             self.assertIn("collision_grid", comp)
+            self.assertNotIn("collision_sdf", comp)
             # 点云交错布局：每点 2×float4 = 8 float
             pts = np.fromfile(p / "sampleColliderPoints.buf", dtype=np.float32)
             self.assertEqual(len(pts) % 8, 0)
-            self.assertEqual(len(pts) // 8, 8)  # 8 碰撞体顶点未抽稀
+            point_count = len(pts) // 8
+            # 8 个碰撞体顶点 + 面内采样（12 个三角形各至少 1 点）⇒ 明显多于纯顶点数
+            self.assertGreater(point_count, 8)
+            self.assertLessEqual(point_count, 4096)
             # L0：每顶点 2 float4，共 8 顶点
             l0 = np.fromfile(p / "sampleColliderVertexL0.buf", dtype=np.float32)
             self.assertEqual(len(l0), 8 * 2 * 4)
+
+    def test_collider_block_ids_splits_disconnected_blocks(self):
+        """分离的两块碰撞体各自成块（用于各自的朝外判定）。"""
+        a = np.random.RandomState(7).rand(200, 3).astype(np.float32) * 0.1
+        b = (np.random.RandomState(8).rand(200, 3).astype(np.float32) * 0.1
+             + np.array([5.0, 0.0, 0.0], dtype=np.float32))
+        pts = np.concatenate([a, b], axis=0)
+        ids, count = self.NodeCls._collider_block_ids(pts, 0.05)
+        self.assertEqual(count, 2)
+        self.assertEqual(len(set(ids[:200].tolist())), 1)
+        self.assertEqual(len(set(ids[200:].tolist())), 1)
+        self.assertNotEqual(int(ids[0]), int(ids[-1]))
+
+    def test_collider_block_ids_single_block_for_continuous_surface(self):
+        """连续曲面（近邻间距远小于格边长）必须判为一块。"""
+        grid = np.stack(np.meshgrid(np.arange(10), np.arange(10), np.arange(10)), axis=-1)
+        pts = (grid.reshape(-1, 3).astype(np.float32)) * 0.01
+        ids, count = self.NodeCls._collider_block_ids(pts, 0.05)
+        self.assertEqual(count, 1)
+        self.assertEqual(len(set(ids.tolist())), 1)
+
+    def test_collider_vertex_normals_outward_for_two_blocks(self):
+        """多块碰撞体：每块各自朝外（用整体质心会把离群块整块算反）。"""
+        def cube(offset):
+            v = np.array([
+                [-1, -1, -1], [1, -1, -1], [1, 1, -1], [-1, 1, -1],
+                [-1, -1, 1], [1, -1, 1], [1, 1, 1], [-1, 1, 1],
+            ], dtype=np.float32)
+            return v + np.asarray(offset, dtype=np.float32)
+
+        verts = np.concatenate([cube([0, 0, 0]), cube([10, 0, 0])], axis=0)
+        base = np.array([
+            [0, 1, 2], [0, 2, 3],
+            [4, 6, 5], [4, 7, 6],
+            [0, 4, 5], [0, 5, 1],
+            [3, 2, 6], [3, 6, 7],
+            [0, 3, 7], [0, 7, 4],
+            [1, 5, 6], [1, 6, 2],
+        ], dtype=np.int64)
+        tris = np.concatenate([base, base + 8], axis=0)
+        mask = np.ones(16, dtype=bool)
+        n = self.NodeCls._collider_vertex_normals(verts, tris, mask, 16)
+        centers = np.concatenate([
+            np.zeros((8, 3), dtype=np.float32),
+            np.tile(np.array([[10, 0, 0]], dtype=np.float32), (8, 1)),
+        ], axis=0)
+        dots = np.einsum("ij,ij->i", n, verts - centers)
+        self.assertTrue(np.all(dots > 0.0), f"两块都应朝外，dot={dots}")
+
+    def test_sample_collider_surface_fills_face_interior(self):
+        """面内采样点落在三角形上、法线与面法线一致，且填补顶点之间的空洞。"""
+        verts = np.array([
+            [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0],
+        ], dtype=np.float32)
+        tris = np.array([[0, 1, 2]], dtype=np.int64)
+        mask = np.ones(3, dtype=bool)
+        pts, tid, nrm = self.NodeCls._sample_collider_surface(verts, tris, mask, 256)
+        self.assertEqual(len(pts), 256)
+        self.assertEqual(len(tid), 256)
+        self.assertTrue(np.allclose(pts[:, 2], 0.0, atol=1e-6))
+        self.assertTrue(np.all(pts[:, 0] >= -1e-6))
+        self.assertTrue(np.all(pts[:, 1] >= -1e-6))
+        self.assertTrue(np.all(pts[:, 0] + pts[:, 1] <= 1.0 + 1e-6))
+        self.assertTrue(np.allclose(np.abs(nrm[:, 2]), 1.0, atol=1e-6))
+        # 面内最近邻距应显著小于纯顶点采样（1.0 量级）
+        d = np.linalg.norm(pts[:, None, :] - pts[None, :, :], axis=-1)
+        np.fill_diagonal(d, np.inf)
+        self.assertLess(float(d.min(axis=1).max()), 0.35)
+
+    def test_sample_collider_surface_deterministic(self):
+        """固定 seed ⇒ 同一模型每次导出结果一致。"""
+        verts = np.random.RandomState(11).rand(30, 3).astype(np.float32)
+        tris = np.array([[0, 1, 2], [3, 4, 5], [6, 7, 8]], dtype=np.int64)
+        mask = np.ones(30, dtype=bool)
+        p1, t1, n1 = self.NodeCls._sample_collider_surface(verts, tris, mask, 64)
+        p2, t2, n2 = self.NodeCls._sample_collider_surface(verts, tris, mask, 64)
+        np.testing.assert_array_equal(p1, p2)
+        np.testing.assert_array_equal(t1, t2)
+        np.testing.assert_array_equal(n1, n2)
 
     def test_collision_l0_pads_zzmi_redirect_vertex_prefix(self):
         import tempfile
@@ -5472,5 +5685,149 @@ class DragTwoComponentIndependenceTests(unittest.TestCase):
         self.assertIn("object_id_map", str(ctx.exception))
 
 
+class _FakeRefCollection:
+    """PointerProperty 集合的极简替身：可迭代、可 add()、有长度。"""
+
+    def __init__(self, refs=()):
+        self._items = list(refs)
+
+    def add(self):
+        item = types.SimpleNamespace(object=None)
+        self._items.append(item)
+        return item
+
+    def __iter__(self):
+        return iter(self._items)
+
+    def __len__(self):
+        return len(self._items)
+
+    def names(self):
+        return [getattr(item.object, "name", None) for item in self._items]
+
+
+def _fake_mesh(name):
+    return types.SimpleNamespace(name=name, type='MESH')
+
+
+class DragZoneListOperatorTests(unittest.TestCase):
+    """包含物体 / 碰撞体列表的批量添加（Shift 多选后一次加入多个）。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.mod = _load_drag_module()
+
+    def setUp(self):
+        # bpy.data.objects.get(name) → 本用例注册的权重球空物体
+        self.objects = {}
+        self._saved_objects = self.mod.bpy.data.objects
+        self.mod.bpy.data.objects = types.SimpleNamespace(get=self.objects.get)
+
+    def tearDown(self):
+        self.mod.bpy.data.objects = self._saved_objects
+
+    def _make_zone_empty(self):
+        settings = types.SimpleNamespace(
+            include_objects=_FakeRefCollection(),
+            collider_objects=_FakeRefCollection(),
+        )
+        empty = types.SimpleNamespace(name="SSMT_DragZone_0", ssmt_drag_zone=settings)
+        self.objects[empty.name] = empty
+        return empty, settings
+
+    def _run(self, operator_cls, empty, selected=(), active=None):
+        op = operator_cls()
+        reports = []
+        op.report = lambda level, message: reports.append((set(level), message))
+        op.empty_name = empty.name
+        context = types.SimpleNamespace(
+            active_object=active, selected_objects=list(selected),
+        )
+        result = op.execute(context)
+        return result, reports
+
+    # ---- 包含物体 ----
+
+    def test_include_add_inserts_every_selected_mesh_in_selection_order(self):
+        empty, settings = self._make_zone_empty()
+        body, skirt, hair = _fake_mesh("Body"), _fake_mesh("Skirt"), _fake_mesh("Hair")
+        result, reports = self._run(
+            self.mod.SSMT_OT_DragZoneIncludeAdd, empty,
+            selected=[hair, body, skirt], active=body,
+        )
+        self.assertEqual(result, {'FINISHED'})
+        self.assertEqual(settings.include_objects.names(), ["Hair", "Body", "Skirt"])
+        self.assertEqual(reports[0][0], {'INFO'})
+        self.assertIn("已加入 3 个包含物体", reports[0][1])
+
+    def test_include_add_skips_existing_entries_and_non_mesh_objects(self):
+        empty, settings = self._make_zone_empty()
+        existing = _fake_mesh("Body")
+        settings.include_objects.add().object = existing
+        empty_obj = types.SimpleNamespace(name="Empty", type='EMPTY')
+        fresh = _fake_mesh("Skirt")
+        result, reports = self._run(
+            self.mod.SSMT_OT_DragZoneIncludeAdd, empty,
+            selected=[existing, fresh, empty_obj], active=fresh,
+        )
+        self.assertEqual(result, {'FINISHED'})
+        self.assertEqual(settings.include_objects.names(), ["Body", "Skirt"])
+        self.assertIn("1 个已存在", reports[0][1])
+
+    def test_include_add_reports_when_everything_already_present(self):
+        empty, settings = self._make_zone_empty()
+        body = _fake_mesh("Body")
+        settings.include_objects.add().object = body
+        result, reports = self._run(
+            self.mod.SSMT_OT_DragZoneIncludeAdd, empty, selected=[body], active=body,
+        )
+        self.assertEqual(result, {'FINISHED'})
+        self.assertEqual(len(settings.include_objects), 1)
+        self.assertIn("已在包含列表", reports[0][1])
+
+    def test_include_add_falls_back_to_active_object_without_selection(self):
+        empty, settings = self._make_zone_empty()
+        body = _fake_mesh("Body")
+        result, _reports = self._run(
+            self.mod.SSMT_OT_DragZoneIncludeAdd, empty, selected=[], active=body,
+        )
+        self.assertEqual(result, {'FINISHED'})
+        self.assertEqual(settings.include_objects.names(), ["Body"])
+
+    def test_include_add_cancels_without_any_mesh_selection(self):
+        empty, settings = self._make_zone_empty()
+        empty_obj = types.SimpleNamespace(name="Empty", type='EMPTY')
+        result, reports = self._run(
+            self.mod.SSMT_OT_DragZoneIncludeAdd, empty,
+            selected=[empty_obj], active=None,
+        )
+        self.assertEqual(result, {'CANCELLED'})
+        self.assertEqual(len(settings.include_objects), 0)
+        self.assertEqual(reports[0][0], {'WARNING'})
+
+    # ---- 碰撞体 ----
+
+    def test_collider_add_inserts_every_selected_mesh(self):
+        empty, settings = self._make_zone_empty()
+        thigh, skirt = _fake_mesh("Thigh"), _fake_mesh("Skirt")
+        result, reports = self._run(
+            self.mod.SSMT_OT_DragZoneColliderAdd, empty,
+            selected=[thigh, skirt], active=thigh,
+        )
+        self.assertEqual(result, {'FINISHED'})
+        self.assertEqual(settings.collider_objects.names(), ["Thigh", "Skirt"])
+        self.assertEqual(len(settings.include_objects), 0)
+        self.assertIn("已加入 2 个碰撞体", reports[0][1])
+
+    def test_include_and_collider_lists_stay_independent(self):
+        empty, settings = self._make_zone_empty()
+        body = _fake_mesh("Body")
+        self._run(self.mod.SSMT_OT_DragZoneIncludeAdd, empty, selected=[body], active=body)
+        result, _reports = self._run(
+            self.mod.SSMT_OT_DragZoneColliderAdd, empty, selected=[body], active=body,
+        )
+        self.assertEqual(result, {'FINISHED'})
+        self.assertEqual(settings.include_objects.names(), ["Body"])
+        self.assertEqual(settings.collider_objects.names(), ["Body"])
 if __name__ == "__main__":
     unittest.main()

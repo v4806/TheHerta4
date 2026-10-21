@@ -246,7 +246,40 @@ class SubMeshModel:
             cache_key = (obj_hash, original_name)
             cached_result = None if preserve_distinct_export_contexts else data_hash_cache.get(cache_key)
 
-            if cached_result is not None:
+            # 【t81-F3 纵深防御】命中后**校验指纹**：几何不同（顶点数/索引数不同）⇒ 视为**未命中**。
+            # 即使将来键仍然不足（例如又出现别的"同名同哈希不同几何"），也不会静默把别人的几何写进来。
+            # 指纹取 `source_obj` 的真实尺寸（与 `:289-290` 写入缓存时的口径一致）。
+            fingerprint_ok = True
+            fingerprint_note = ""
+            if cached_result is not None and source_obj is not None:
+                try:
+                    own_vertex_count = len(source_obj.data.vertices)
+                    own_index_count = len(source_obj.data.polygons) * 3
+                except Exception:  # noqa: BLE001 - 拿不到尺寸就不校验（保守起见按命中处理，但会打日志）
+                    own_vertex_count = own_index_count = None
+                if own_vertex_count is not None:
+                    cached_offset_probe, cached_v_probe, cached_i_probe = cached_result
+                    if own_vertex_count != cached_v_probe or own_index_count != cached_i_probe:
+                        fingerprint_ok = False
+                        fingerprint_note = (
+                            f"指纹不符（自身 {own_vertex_count} 顶点/{own_index_count} 索引，"
+                            f"缓存 {cached_v_probe}/{cached_i_probe}）⇒ 视为未命中"
+                        )
+
+            # 【t81 导出期日志】零假设钉死：命中/未命中 + 键 + 指纹 + 缓存账目（只打日志，不改行为）。
+            # **只在 HIMI 打开**：这是 HIMI 合并导出的排查日志，其它逻辑保持改动前：不打。
+            if GlobalConfig.logic_name == getattr(LogicName, "HIMI", "HIMI"):
+                print(
+                    f"[SubMeshModel][t81] draw_call={i} blender_obj='{blender_obj_name}' "
+                    f"original='{original_name}' hash={str(obj_hash)[:16]} key={cache_key!r} "
+                    f"preserve_distinct={preserve_distinct_export_contexts} "
+                    f"hit={'yes' if cached_result is not None else 'no'} "
+                    f"fingerprint_ok={fingerprint_ok} "
+                    f"cached={cached_result if cached_result is not None else None} "
+                    f"{fingerprint_note}"
+                )
+
+            if cached_result is not None and fingerprint_ok:
                 cached_offset, cached_vertex_count, cached_index_count = cached_result
                 draw_call_model.vertex_count = cached_vertex_count
                 draw_call_model.index_count = cached_index_count
@@ -257,6 +290,9 @@ class SubMeshModel:
                 reuse_count += 1
                 print(f"  ♻️复用: '{blender_obj_name}' (原始: {original_name}) → offset={cached_offset}, vertices={cached_vertex_count}, indices={cached_index_count}")
                 continue
+            if cached_result is not None and not fingerprint_ok:
+                print(f"  ⚠️拒绝复用（t81-F3 指纹不符）: '{blender_obj_name}' (原始: {original_name}) "
+                      f"→ 改用自己写几何；{fingerprint_note}")
 
             if source_obj is None:
                 from ..utils.ssmt_error_utils import SSMTErrorUtils
@@ -316,6 +352,45 @@ class SubMeshModel:
         else:
             print(f"[SubMeshModel] 数据复用统计: 无复用, 全部 {total} 个对象独立处理")
         print(f"[SubMeshModel] 合并输入统计: 直接复用前处理副本 {direct_source_reuse_count} 个, 额外复制临时物体 {duplicated_temp_count} 个")
+
+        # ------------------------------------------------------------------ #
+        # 【t83-A3】位置流插桩（**只打日志、不改行为**）—— **只在 HIMI 打开**：
+        # 零假设钉死"行数多出来/位置写错"，是 HIMI 合并导出排查用的一次性诊断；
+        # 留在通用路径上会让每个游戏的每次导出都刷屏。其它逻辑保持改动前：不打。
+        # ------------------------------------------------------------------ #
+        # 三态判据（配合 t82 的"产物 1321 行 = 源 1298 + 23"）：
+        #   ① `draw_call_rows_sum != merged_verts` ⇒ **组装期就多/少行了**（位置流的行映射有问题）；
+        #   ② 两者相等但产物仍错 ⇒ 错在**落盘之后**（插桩往后挪一层：`drawib_export_base` 写盘处）；
+        #   ③ 每行的 `src_v` 与 IB 多数决不一致 ⇒ 写入点就是位置流（再看 `src_v` 是谁提供的）。
+        if GlobalConfig.logic_name == getattr(LogicName, "HIMI", "HIMI"):
+            try:
+                _dc_rows = sum(int(getattr(d, "vertex_count", 0) or 0) for d in self.drawcall_model_list)
+                _dc_index = sum(int(getattr(d, "index_count", 0) or 0) for d in self.drawcall_model_list)
+                _merged_verts = None
+                if submesh_temp_obj_list:
+                    try:
+                        _merged_verts = len(submesh_temp_obj_list[0].data.vertices)
+                    except Exception:  # noqa: BLE001
+                        _merged_verts = None
+                print(
+                    f"[t82-POS] part={self.unique_str} draw_calls={len(self.drawcall_model_list)} "
+                    f"draw_call_rows_sum={_dc_rows} draw_call_index_sum={_dc_index} "
+                    f"merged_verts={_merged_verts} "
+                    f"rows_delta={None if _merged_verts is None else _dc_rows - _merged_verts} "
+                    f"reuse={reuse_count} direct_reuse={direct_source_reuse_count} "
+                    f"duplicated={duplicated_temp_count} "
+                    f"offsets={[int(getattr(d, 'index_offset', -1) or -1) for d in self.drawcall_model_list]}"
+                )
+                if submesh_temp_obj_list:
+                    _obj = submesh_temp_obj_list[0]
+                    print(
+                        f"[t82-POS]   merged_obj={getattr(_obj, 'name', '?')} "
+                        f"verts={len(_obj.data.vertices)} polys={len(_obj.data.polygons)} "
+                        f"loops={len(_obj.data.loops)} "
+                        f"vgroups={len(getattr(_obj, 'vertex_groups', []) or [])}"
+                    )
+            except Exception as _exc:  # noqa: BLE001 - 插桩绝不许弄坏导出
+                print(f"[t82-POS] 插桩异常（已忽略）：{_exc}")
 
         join_start = perf_counter()
         if submesh_temp_obj_list:
@@ -975,6 +1050,23 @@ class SubMeshModel:
         # Keep the base exporter on the legacy geometry-reuse path.
         # Direct shape key export now supplements missing per-object data later,
         # and forcing distinct export contexts here inflates the base buffers.
+        #
+        # 【t81-F1】HIMI 合并/join 导出：**禁用几何复用**（`preserve_distinct_export_contexts` 的既有语义）。
+        #   为什么：复用键只有 `(obj_hash, original_name)`，而合并/join 会把同一源对象用在不同 draw call 上
+        #   （去重 + 紧凑重编号后行序不同）⇒ **键相同、几何不同** ⇒ 命中方不写自己的几何、直接拿
+        #   首写方的 offset/count ⇒ 位置被跨行复制（t80 实测 46 行 / 产物段长边 190）。
+        #   维护者已有同类先例：直出 ShapeKey 场景就是靠这个开关禁复用（`:227-228` / `:247`）。
+        # 【t83-A1】去掉 `import_merged_vgmap()` 这半条件：t82 已确认本缺陷与缓存无关（12/12 `hit=no`），
+        #   而这个门本来就不该"只在合并开关打开时"才禁复用 —— **HIMI 的 join 路径两种模式都会走**，
+        #   所以普通导出同样禁用；日志里同时打 `logic_name` 与开关实际取值，让"没生效"可判。
+        if GlobalConfig.logic_name == LogicName.HIMI:
+            print(
+                f"[SubMeshModel][t83-A1] HIMI 禁用几何复用 "
+                f"(logic_name={GlobalConfig.logic_name!r}, "
+                f"import_merged_vgmap={bool(GlobalProterties.import_merged_vgmap())}) "
+                f"unique_str={self.unique_str}"
+            )
+            return True
         return False
 
     def _deduplicate_draw_calls(self):

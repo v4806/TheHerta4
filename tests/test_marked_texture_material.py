@@ -365,7 +365,7 @@ class BuildMarkedMaterialsTests(unittest.TestCase):
         self.render_calls = []
 
         def _fake_spec(material, socket_type, texture_path, logic_name):
-            # 规范材质的真实路径：_apply_spec_material（原理化 BSDF + 单通道）
+            # 规范材质的真实路径：_apply_spec_material（颜色贴图图，不按类型接通道）
             self.spec_calls.append((material.name, texture_path, logic_name))
             self.spec_types.append(socket_type)
 
@@ -379,9 +379,8 @@ class BuildMarkedMaterialsTests(unittest.TestCase):
         def _fake_render(material, entries, logic_name):
             self.render_calls.append((material.name, list(entries), logic_name))
 
-        # 2026-10-09 起规范材质与渲染材质共用「原理化 BSDF + 单通道」这一套
-        # （与工作文件里的 MOD 规范材质完全一致），所以这里只验证分派与产出，
-        # 不真建节点。
+        # 规范材质走原生的颜色贴图图（漫反射 BSDF + 透明混合）、渲染材质走原理化
+        # 分通道，所以这里只验证分派与产出，不真建节点。
         for target, fake in (
             ("_apply_spec_material", _fake_spec),
             ("_make_principled_material", _fake_principled),

@@ -146,6 +146,16 @@ class GlobalProterties(bpy.types.PropertyGroup):
         default=True,
     ) # type: ignore
 
+    background_export_enabled: bpy.props.BoolProperty(
+        name="后台导出",
+        description=(
+            "默认开启：生成 Mod 会先保存一份工程副本，再交给独立的干净 Blender 后台实例"
+            "执行完整导出（各轮次 + 后处理），主界面不阻塞，状态栏显示进度，按 ESC 可取消；"
+            "取消勾选则沿用原有的同步导出（导出期间 Blender 会卡住直到结束）"
+        ),
+        default=True,
+    ) # type: ignore
+
     zzz_use_slot_fix: bpy.props.BoolProperty(
         name="槽位风格贴图使用SlotFix技术",
         description="仅适用于槽位风格贴图，勾选后，特定名称标记的贴图将使用SlotFix风格，能一定程度上解决槽位风格贴图跨槽位的问题，跨Pixel槽位指的是在前一个DrawCall中是ps-t3但是下一个DrawCall变为ps-t5这种情况，但由于负责维护的人也在偷懒所以并不可靠",
@@ -276,7 +286,34 @@ class GlobalProterties(bpy.types.PropertyGroup):
 
     cross_group_merged_vgmap_test: bpy.props.BoolProperty(
         name="跨组融合统一顶点组测试",
-        description="【实验开关，仅 ZZMI】跨 SkeletonGroup 的融合统一顶点组测试：允许把对象变换（渲染 vs-cb1 对象空间）不同的部件合并进同一个对象。与已验证可用的合并骨骼（使用融合统一顶点组）完全分离，开启不会改变后者的既有行为；跨组部件需要一个逐帧的对象空间换算，未完成前本开关不参与导入/导出决策",
+        description=(
+            "【实验开关，仅 ZZMI】跨 SkeletonGroup（对象变换 / 渲染 vs-cb1 对象空间"
+            "不同）的骨骼合并总开关，默认关闭。开启后：① 被吸收进宿主网格的**别组**"
+            "部件，其骨骼写进**吸收它的宿主组**骨架缓冲（跨组 attach，旧行为会让被"
+            "吸收的顶点读未初始化矩阵 ⇒ 部件消失）；② 合并网格**按来源拆分绘制**——"
+            "对象变换 cb1 是**每次绘制一份**的常量（464 B，顶点没有索引它的机制），而"
+            "合并后的网格里有两群顶点属于不同对象空间 ⇒ 只能一个来源一次 drawindexed、"
+            "每次换一份 `vs-cb1`。骨骼矩阵仍然全部合并在**同一份**骨架缓冲里（「一个"
+            "物体用所有 IB 的骨骼矩阵」这一点不变），拆的只是绘制调用；③ 每个来源的段"
+            "**放回该来源自己的渲染段**里画（`ib` / `vb1` / `vb0` 由该段自己绑成合并"
+            "网格那一份）——那里的 `vs-cb1` 天然就是它自己的当帧对象变换，因此**不依赖"
+            "帧内绘制顺序**、也不需要任何跨对象空间的校准矩阵（旧做法把全部段塞进宿主"
+            "段，跨组 cb1 可能还是上一帧的值 ⇒ 影子/镜像物体）；④ 拆分绘制继承合并"
+            "物体那行 `; [mesh:<名>] [vertex_count:<N>]` 标注，且各来源段统一写**合并"
+            "物体（宿主）的名字**，拖拽交互 / 形态键 / 显隐钩子才认得出这个物体。"
+            "历史方案均已实测否决并移除：F4/F7 在宿主渲染段重算跨组校准再写回顶点流"
+            "（重算 CS 实际未执行；把自建缓冲当 `vb0` 的四次尝试全部静默失败）、F5 把"
+            "palette 捕获后移让 palette 与 cb1 同源（合并骨架缓冲宿主与跨组共用 ⇒ 整块"
+            "骨架一起慢一帧，用户实测「两边都在抖、连原始物体都错」）。"
+            "残余：某来源部件本帧未被游戏提交渲染时，它那一段不会被画（与游戏自身的"
+            "剔除口径一致，方向比「用陈旧 cb1 画错」更安全）；palette / cb1 首帧未捕获"
+            "时该帧骨架为未初始化值（一帧闪动后自愈）；跨组供骨件当帧被剔除时该帧合并"
+            "几何不写（与组内部件既有口径一致）。**已知未解问题**：角色展示页（大世界"
+            "之外的那条渲染路径）里我方段的 `draw` / `drawindexed` 命令不执行、画面不推进"
+            "且什么都看不见（大世界一切正常；进程未死、资源级覆盖仍生效）；原因未定，"
+            "排查存档见 `ZZMI骨骼合并计划书.md` ⑭ 与 §9。与已验证可用"
+            "的合并骨骼（使用融合统一顶点组）完全分离，关闭时逐字节保持历史行为"
+        ),
         default=False,
     ) # type: ignore
 
@@ -486,6 +523,16 @@ class GlobalProterties(bpy.types.PropertyGroup):
         return cls._instance().open_mod_folder_after_generate_mod
 
     @classmethod
+    def is_background_export_enabled(cls) -> bool:
+        """后台导出开关（默认关＝沿用原有同步导出，行为完全不变）。
+
+        注意：不能叫 ``background_export_enabled``——同名类方法会被 PropertyGroup
+        注册时的 ``background_export_enabled`` BoolProperty 描述符覆盖，类上访问拿到
+        的是描述符/bool，调用会 ``'bool' object is not callable``（2026-10-20 实测）。
+        """
+        return cls._bool_attr("background_export_enabled", False)
+
+    @classmethod
     def zzz_use_slot_fix(cls):
         return cls._instance().zzz_use_slot_fix
 
@@ -583,7 +630,15 @@ class GlobalProterties(bpy.types.PropertyGroup):
         """跨组融合统一顶点组测试开关（仅 ZZMI，实验用，默认关闭）。
 
         与 `import_merged_vgmap`（已验证可用的合并骨骼）**完全分离**：互不影响，
-        关闭本开关时任何既有行为都不变。跨组功能未实现前读取本开关不产生行为。
+        关闭本开关时任何既有行为都不变。
+
+        **2026-10-10 起本开关已真实接入导出侧**（不再是死开关）：开启后 F1 把跨组
+        部件的骨骼写进**宿主组**骨架缓冲、F2 从各组部件的渲染段捕获对象→世界 cb1、
+        F3 把合并几何的落笔改成顺序无关、v19 按来源拆分绘制（每个来源各绑自己的
+        `vs-cb1`）。**已知未解问题（2026-10-10 报告，至今未定位）**：角色展示页
+        （大世界之外那条渲染路径）下本方案的段命令 `draw` / `drawindexed` 不执行 ——
+        画面不推进、什么都看不见（大世界一切正常；进程未死、资源级覆盖仍生效）。
+        排查存档见 `ZZMI骨骼合并计划书.md` ⑭ 与 §9；默认关闭正是为此。
         """
         return cls._bool_attr("cross_group_merged_vgmap_test", False)
 

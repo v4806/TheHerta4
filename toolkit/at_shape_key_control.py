@@ -13,6 +13,11 @@ DEFAULT_VALUE_MIN = 0.0
 DEFAULT_VALUE_MAX = 1.0
 EPS = 1e-4
 
+# Blender 的 ShapeKey.slider_min / slider_max 自身硬限（RNA 层固定 ±10，超出被静默截断）。
+# 形态键权重现在允许 1.5 / -0.5 这类值，值域放到这里为止；更宽的值只能写进 ini 的
+# $Freq_xxx（shader 侧硬边界见 common/shapekey_weight_range.py）。
+SLIDER_HARD_LIMIT = 10.0
+
 # 刷新/批量写值期间抑制属性回调，避免递归与重复写值
 _suppress_update = False
 
@@ -210,7 +215,11 @@ def derive_group_position(key_names, key_values, value_range):
 # ============================================================
 
 def set_key_block_range(key_block, value_min, value_max):
-    """把值域写进形态键自身的 slider_min / slider_max（滑块范围随它变化）。"""
+    """把值域写进形态键自身的 slider_min / slider_max（滑块范围随它变化）。
+
+    不再夹到 0..1：1.5 / -0.5 这类值必须能写进去。Blender 自身的硬限是 ±10，
+    超出会打印一行警告而不是静默截断。
+    """
     if value_max <= value_min:
         return False
     if (abs(float(key_block.slider_min) - value_min) < 1e-6
@@ -224,6 +233,16 @@ def set_key_block_range(key_block, value_min, value_max):
     else:
         key_block.slider_min = value_min
         key_block.slider_max = value_max
+
+    # Blender 的 slider_min / slider_max 自己有 ±10 的硬上下限，超出会被静默截断。
+    # 形态键现在允许 1.5 / -0.5 这类值（1.6 外推是模组里的常见幅度），所以真被截断
+    # 就要吵一声 —— 不静默夹掉是这条链路的约定。
+    applied_min = float(key_block.slider_min)
+    applied_max = float(key_block.slider_max)
+    if abs(applied_min - float(value_min)) > 1e-6 or abs(applied_max - float(value_max)) > 1e-6:
+        owner = getattr(getattr(key_block, "id_data", None), "name", "?")
+        print(f"[形态键] {owner} / {key_block.name}: 值域 {value_min:g} ~ {value_max:g} "
+              f"超出 Blender slider 硬限 ±{SLIDER_HARD_LIMIT:g}，实际生效 {applied_min:g} ~ {applied_max:g}")
     return True
 
 
@@ -266,6 +285,7 @@ def apply_shape_key_range(context, props):
 
     value_min, value_max = value_range
     objects = driving_objects(context)
+    clamped_count = 0
     for item in props.shape_key_list:
         for name in item_key_names(item):
             for obj in objects:
@@ -276,6 +296,10 @@ def apply_shape_key_range(context, props):
                 clamped = min(max(float(key_block.value), value_min), value_max)
                 if abs(clamped - float(key_block.value)) > 1e-6:
                     key_block.value = clamped
+                    clamped_count += 1
+    if clamped_count:
+        # 值域是用户显式设的，夹取是它的语义；但要把夹了几个说出来，不闷着改数据
+        print(f"[形态键] 值域改为 {value_min:g} ~ {value_max:g}：{clamped_count} 个形态键的值被夹回值域")
 
     # 值域只夹取各自的值，不做任何跨物体联动；顺便把列表记录值刷新成夹取后的实际值
     was_suppressed = _suppress_update
@@ -346,7 +370,19 @@ def on_single_value_update(item, context=None):
 
     value_range = get_value_range(props) or (DEFAULT_VALUE_MIN, DEFAULT_VALUE_MAX)
     value_min, value_max = value_range
-    value = min(max(float(item.value), value_min), value_max)
+    requested = float(item.value)
+    if requested < value_min - 1e-6 or requested > value_max + 1e-6:
+        # 越界输入不夹掉：把值域扩到能包含它，再把值原样写进去。
+        # 静默夹成 0/1 正是「Blender 侧写不进 1.5」的来源。
+        new_min = min(value_min, max(requested, -SLIDER_HARD_LIMIT))
+        new_max = max(value_max, min(requested, SLIDER_HARD_LIMIT))
+        props.sk_value_min = new_min
+        props.sk_value_max = new_max
+        value_range = (new_min, new_max)
+        value_min, value_max = value_range
+        note = "" if abs(requested) <= SLIDER_HARD_LIMIT else f"（Blender slider 硬限 ±{SLIDER_HARD_LIMIT:g}）"
+        print(f"[形态键] 输入 {requested:g} 超出原值域，已把值域扩到 {new_min:g} ~ {new_max:g}{note}")
+    value = min(max(requested, value_min), value_max)
     if abs(value - float(item.value)) > 1e-6:
         # 越界输入回写滑块本身，否则滑块显示的值和实际写进形态键的值会对不上
         _write_item_value_quiet(item, value)

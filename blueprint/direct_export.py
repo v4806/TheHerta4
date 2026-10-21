@@ -8,10 +8,12 @@ from ..common.global_key_count_helper import GlobalKeyCountHelper
 from ..common.global_properties import GlobalProterties
 from ..utils.log_utils import LOG
 from ..utils.timer_utils import TimerUtils
+from . import export_progress
 from .direct_export_multifile import DirectMultiFileGenerator
 from .direct_export_shapekey import DirectShapeKeyGenerator
 from .export_helper import BlueprintExportHelper
 from .export_parallel import ExportRoundExecutor
+from .export_step_plan import build_step_plan
 from .model import BluePrintModel
 from .preprocess import PreProcessHelper
 from .preprocess_parallel import ParallelPreprocessCoordinator
@@ -47,6 +49,217 @@ def _get_sync_root_tree(node, context=None):
     if root_tree:
         return root_tree
     return getattr(node, "id_data", None)
+
+
+#: 节点进度键的分隔符：``树名/节点名``。导出会递归展开嵌套蓝图，不同蓝图
+#: 树里的同名节点必须能区分开，所以 worker 上报一律带所属树名。
+_NODE_KEY_SEPARATOR = "/"
+#: 嵌套蓝图节点与 SSMT 蓝图树类型：与导出流程 ``_collect_postprocess_nodes`` /
+#: ``model.py::_resolve_nested_blueprint_collect`` 同一套递归口径。
+_NODE_TYPE_BLUEPRINT_NEST = "SSMTNode_Blueprint_Nest"
+_BLUEPRINT_TREE_IDNAME = "SSMTBlueprintTreeType"
+_BLUEPRINT_NONE_NAME = "NONE"
+
+
+def _node_progress_key(tree, node) -> str:
+    """节点进度键：``树名/节点名``；没有树名时退回纯节点名（旧格式兼容）。"""
+    node_name = str(getattr(node, "name", "") or "").strip()
+    if not node_name:
+        return ""
+    tree_name = str(getattr(tree, "name", "") or "").strip()
+    if not tree_name:
+        return node_name
+    return f"{tree_name}{_NODE_KEY_SEPARATOR}{node_name}"
+
+
+def _iter_nested_blueprint_trees(tree):
+    """某个蓝图树里 ``SSMTNode_Blueprint_Nest`` 引用到的嵌套蓝图树。
+
+    跳过静音节点、``NONE`` / 空名、不存在的树、非 SSMT 蓝图树（与导出流程
+    ``model.py::_resolve_nested_blueprint_collect`` 同口径）；异常静默。
+    """
+    for node in getattr(tree, "nodes", None) or ():
+        try:
+            if str(getattr(node, "bl_idname", "") or "") != _NODE_TYPE_BLUEPRINT_NEST:
+                continue
+            if bool(getattr(node, "mute", False)):
+                continue
+            blueprint_name = str(getattr(node, "blueprint_name", "") or "").strip()
+            if not blueprint_name or blueprint_name == _BLUEPRINT_NONE_NAME:
+                continue
+            nested_tree = bpy.data.node_groups.get(blueprint_name)
+            if nested_tree is None:
+                continue
+            if str(getattr(nested_tree, "bl_idname", "") or "") != _BLUEPRINT_TREE_IDNAME:
+                continue
+            yield nested_tree
+        except Exception:
+            continue
+
+
+def _iter_blueprint_trees(tree):
+    """主蓝图树 + 递归展开的嵌套蓝图树（先主树，再按引用顺序广度优先）。
+
+    ``visited`` 按对象 id 记已展开的树，循环引用（A 嵌 B、B 又嵌 A）不会死循环。
+    """
+    if tree is None:
+        return
+
+    visited = set()
+    pending = [tree]
+    while pending:
+        current = pending.pop(0)
+        if current is None or id(current) in visited:
+            continue
+        visited.add(id(current))
+        yield current
+        for nested_tree in _iter_nested_blueprint_trees(current):
+            if id(nested_tree) not in visited:
+                pending.append(nested_tree)
+
+
+def _report_postprocess_node(node, status: str) -> None:
+    """后台导出时上报后处理节点进度；同步导出（没有进度文件）时静默。
+
+    后处理节点可能来自嵌套蓝图，键用 ``node.id_data``（节点所属蓝图树）拿树名。
+    """
+    try:
+        key = _node_progress_key(getattr(node, "id_data", None), node)
+        if key:
+            export_progress.report_node(key, status)
+    except Exception:
+        pass
+
+
+#: 直出流程里参与节点高亮、但没有自己的后处理上报入口的阶段节点。
+#: 这些节点不进入主进程预计算的步骤预算，只用 ``count_step=False`` 更新
+#: ``stage.json`` 的 ``nodes`` 表，让 ``_sync_node_highlight`` 按阶段逐个上色。
+#: 收集物体 / 前处理阶段真正读取的节点（前处理本身没有专属节点，保持它 running）。
+_OBJECT_INFO_NODE_IDNAMES = ("SSMTNode_Object_Info",)
+#: 解析蓝图 / 构建导出器时读取的节点：顶点组处理（model.py 里批量执行）、
+#: 物体组（处理链上的分组节点）、蓝图嵌套（展开嵌套蓝图）。
+_BLUEPRINT_PARSE_NODE_IDNAMES = (
+    "SSMTNode_VertexGroupProcess",
+    "SSMTNode_Object_Group",
+    "SSMTNode_Blueprint_Nest",
+)
+#: 基础导出（Generate Mod）使用的输出节点；NTMI ModImp 是另一种输出节点类型。
+_RESULT_OUTPUT_NODE_IDNAMES = (
+    "SSMTNode_Result_Output",
+    "SSMTNode_Result_Output_NTMIModImp",
+)
+
+
+def _iter_stage_node_names(tree, bl_idnames):
+    """按 ``bl_idname`` 从主树 + 递归嵌套树里取节点进度键。
+
+    键格式 ``树名/节点名``；跳过静音节点与空名，去重。
+    """
+    if tree is None:
+        return []
+    desired = {str(value or "") for value in (bl_idnames or ()) if str(value or "")}
+    if not desired:
+        return []
+
+    keys = []
+    seen_keys = set()
+    for current_tree in _iter_blueprint_trees(tree):
+        for node in getattr(current_tree, "nodes", None) or ():
+            try:
+                if bool(getattr(node, "mute", False)):
+                    continue
+                if str(getattr(node, "bl_idname", "") or "") not in desired:
+                    continue
+                key = _node_progress_key(current_tree, node)
+                if not key or key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                keys.append(key)
+            except Exception:
+                continue
+    return keys
+
+
+def _collect_participant_node_names(tree):
+    """收集主进程会补全状态的非后处理节点键（与 ``ui_func_export`` 同口径）。
+
+    与导出流程一致地递归遍历主树 + 嵌套蓝图树，键格式 ``树名/节点名``。
+    主进程的 ``_participant_phase_status`` 在 ``stage.json`` 里出现任何节点后
+    会把**没上报**的参与节点一律猜成 done。worker 先把它们登记为 pending，
+    才能让主进程不再"整片"上色；状态由下面的阶段上报逐个推进。
+    """
+    if tree is None:
+        return []
+
+    try:
+        checker = getattr(BlueprintExportHelper, "_is_node_connected_to_output", None)
+    except Exception:
+        checker = None
+
+    keys = []
+    seen_keys = set()
+    for current_tree in _iter_blueprint_trees(tree):
+        for node in getattr(current_tree, "nodes", None) or ():
+            try:
+                if bool(getattr(node, "mute", False)):
+                    continue
+                bl_idname = str(getattr(node, "bl_idname", "") or "")
+                if bl_idname.startswith("SSMTNode_PostProcess_"):
+                    continue
+                if bl_idname.startswith("SSMTNode_Result_"):
+                    continue
+                if bl_idname in ("NodeReroute", "NodeFrame"):
+                    continue
+                if callable(checker):
+                    try:
+                        if not checker(current_tree, node):
+                            continue
+                    except Exception:
+                        continue
+                key = _node_progress_key(current_tree, node)
+                if not key or key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                keys.append(key)
+            except Exception:
+                continue
+    return keys
+
+
+def _report_participant_nodes(tree, status: str) -> None:
+    """批量上报主进程关注的参与节点（pending 批量写，done 只驱动高亮）。"""
+    try:
+        names = _collect_participant_node_names(tree)
+        if not names:
+            return
+        if str(status or "") == export_progress.STATE_PENDING:
+            export_progress.report_nodes(names)
+            return
+        for name in names:
+            export_progress.report_node(name, status, count_step=False)
+    except Exception:
+        pass
+
+
+def _report_stage_nodes(tree, bl_idnames, status: str) -> None:
+    """把某阶段真正使用的蓝图节点按 ``bl_idname`` 批量写进 stage.json。
+
+    - ``pending`` 用 ``report_nodes`` 批量登记，导出开始时一次上蓝灰色；
+    - ``running`` / ``done`` 用 ``report_node(..., count_step=False)``，
+      只驱动节点高亮，不占用主进程预算的步骤数；
+    - 任何异常静默，进度上报绝不能拖垮导出。
+    """
+    try:
+        names = _iter_stage_node_names(tree, bl_idnames)
+        if not names:
+            return
+        if str(status or "") == export_progress.STATE_PENDING:
+            export_progress.report_nodes(names)
+            return
+        for name in names:
+            export_progress.report_node(name, status, count_step=False)
+    except Exception:
+        pass
 
 
 def _prepare_postprocess_nodes(postprocess_nodes, name_mapping: dict[str, str] | None = None):
@@ -373,7 +586,21 @@ class DirectExportSession:
         return False
 
     def run(self):
+        # 步骤清单在导出开始前一次算好：后台导出已由 ``_run_worker`` 用同一个
+        # 计划函数建好（ensure_plan 不会覆盖）；同步直出（没有后台会话清单）时
+        # 在这里自建，保证 total 从第一步起就是最终值、全程不变。
+        try:
+            export_progress.ensure_plan(
+                build_step_plan(self.tree, direct_export=True)
+            )
+        except Exception:
+            pass
+
         TimerUtils.start_stage("Direct-CollectNodes")
+        # 先把主进程关注的参与节点统一登记为 pending；主进程对"没上报"的
+        # 参与节点会整体猜成 done，逐个上报前必须先占住这些名字。
+        _report_participant_nodes(self.tree, export_progress.STATE_PENDING)
+        _report_stage_nodes(self.tree, _RESULT_OUTPUT_NODE_IDNAMES, export_progress.STATE_PENDING)
         self._collect_direct_nodes()
         TimerUtils.end_stage("Direct-CollectNodes")
 
@@ -385,6 +612,7 @@ class DirectExportSession:
         TimerUtils.end_stage("Direct-SetupState")
 
         TimerUtils.start_stage("Direct-CollectObjects")
+        _report_stage_nodes(self.tree, _OBJECT_INFO_NODE_IDNAMES, export_progress.STATE_RUNNING)
         object_names = self._collect_objects()
         TimerUtils.end_stage("Direct-CollectObjects")
 
@@ -395,10 +623,18 @@ class DirectExportSession:
         else:
             base_copy_map, _nested_trees = self._run_preprocess(object_names, preserve_shape_keys=False)
         TimerUtils.end_stage("Direct-Preprocess")
+        # 前处理没有专属节点：收集物体时点亮的物体信息节点一直保持 running，
+        # 直到前处理真正结束才置为 done。
+        _report_stage_nodes(self.tree, _OBJECT_INFO_NODE_IDNAMES, export_progress.STATE_DONE)
 
         try:
             if has_shapekey:
                 TimerUtils.start_stage("Direct-BlueprintModel")
+                _report_stage_nodes(
+                    self.tree,
+                    _BLUEPRINT_PARSE_NODE_IDNAMES,
+                    export_progress.STATE_RUNNING,
+                )
                 self.base_blueprint_model = self._build_blueprint_model()
                 TimerUtils.end_stage("Direct-BlueprintModel")
 
@@ -410,6 +646,11 @@ class DirectExportSession:
                     preserve_shape_key_mix=False,
                 )
                 TimerUtils.end_stage("Direct-BuildExporter")
+                _report_stage_nodes(
+                    self.tree,
+                    _BLUEPRINT_PARSE_NODE_IDNAMES,
+                    export_progress.STATE_DONE,
+                )
                 self.shapekey_source_blueprint_model = self.base_blueprint_model
                 self.shapekey_source_exporter = self.base_exporter
                 base_name_mapping = dict(BluePrintModel._object_name_mapping)
@@ -418,13 +659,28 @@ class DirectExportSession:
                 BlueprintExportHelper.set_suppress_shapekey_resource_export(True)
                 try:
                     TimerUtils.start_stage("Direct-BaseExport")
+                    _report_stage_nodes(
+                        self.tree,
+                        _RESULT_OUTPUT_NODE_IDNAMES,
+                        export_progress.STATE_RUNNING,
+                    )
                     self._export_full(self.base_exporter, "Meshes0000")
                     TimerUtils.end_stage("Direct-BaseExport")
+                    _report_stage_nodes(
+                        self.tree,
+                        _RESULT_OUTPUT_NODE_IDNAMES,
+                        export_progress.STATE_DONE,
+                    )
                 finally:
                     BlueprintExportHelper.set_suppress_shapekey_resource_export(False)
 
             if not has_shapekey:
                 TimerUtils.start_stage("Direct-BlueprintModel")
+                _report_stage_nodes(
+                    self.tree,
+                    _BLUEPRINT_PARSE_NODE_IDNAMES,
+                    export_progress.STATE_RUNNING,
+                )
                 self.base_blueprint_model = self._build_blueprint_model()
                 TimerUtils.end_stage("Direct-BlueprintModel")
 
@@ -437,12 +693,32 @@ class DirectExportSession:
                     preserve_shape_key_mix=False,
                 )
                 TimerUtils.end_stage("Direct-BuildExporter")
+                _report_stage_nodes(
+                    self.tree,
+                    _BLUEPRINT_PARSE_NODE_IDNAMES,
+                    export_progress.STATE_DONE,
+                )
                 base_name_mapping = dict(BluePrintModel._object_name_mapping)
                 mod_export_path = GlobalConfig.path_generate_mod_folder()
                 TimerUtils.start_stage("Direct-BaseExport")
+                _report_stage_nodes(
+                    self.tree,
+                    _RESULT_OUTPUT_NODE_IDNAMES,
+                    export_progress.STATE_RUNNING,
+                )
                 self._export_full(self.base_exporter, "Meshes0000")
                 TimerUtils.end_stage("Direct-BaseExport")
+                _report_stage_nodes(
+                    self.tree,
+                    _RESULT_OUTPUT_NODE_IDNAMES,
+                    export_progress.STATE_DONE,
+                )
 
+
+            # 基础导出结束后，所有前处理 / 蓝图解析 / 导出轮次节点都已执行完；
+            # 没在上面的阶段映射里逐个上报的参与节点在这里统一置为 done
+            # （不推进一步，只补高亮状态）。
+            _report_participant_nodes(self.tree, export_progress.STATE_DONE)
 
             _prepare_postprocess_nodes(
                 self.ordered_postprocess_nodes,
@@ -467,7 +743,17 @@ class DirectExportSession:
             elif has_shapekey:
                 LOG.info("Direct ShapeKey: skipped standard slot export; generating direct resources from Meshes0000 and preprocess records")
 
+            try:
+                keys = [
+                    _node_progress_key(getattr(node, "id_data", None), node)
+                    for node in self.ordered_postprocess_nodes
+                ]
+                export_progress.report_nodes([key for key in keys if key])
+            except Exception:
+                pass
+
             for postprocess_node in self.ordered_postprocess_nodes:
+                _report_postprocess_node(postprocess_node, export_progress.STATE_RUNNING)
                 if postprocess_node.bl_idname == "SSMTNode_PostProcess_ShapeKey":
                     if getattr(postprocess_node, "direct_export_mode", False):
                         # 直出模式下直接从 Meshes0000 和前处理记录构造 ShapeKey 资源。
@@ -483,6 +769,7 @@ class DirectExportSession:
                         execute_postprocess = getattr(postprocess_node, "execute_postprocess", None)
                         if callable(execute_postprocess):
                             execute_postprocess(mod_export_path)
+                    _report_postprocess_node(postprocess_node, export_progress.STATE_DONE)
                     continue
 
                 if postprocess_node.bl_idname == "SSMTNode_PostProcess_MultiFile":
@@ -499,11 +786,13 @@ class DirectExportSession:
                         execute_postprocess = getattr(postprocess_node, "execute_postprocess", None)
                         if callable(execute_postprocess):
                             execute_postprocess(mod_export_path)
+                    _report_postprocess_node(postprocess_node, export_progress.STATE_DONE)
                     continue
 
                 execute_postprocess = getattr(postprocess_node, "execute_postprocess", None)
                 if callable(execute_postprocess):
                     execute_postprocess(mod_export_path)
+                _report_postprocess_node(postprocess_node, export_progress.STATE_DONE)
 
         finally:
             try:
