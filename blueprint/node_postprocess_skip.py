@@ -9,14 +9,38 @@
    「选中部件 -> draw_ib -> 导出期登记的段名」；
 3. 把这些段从导出 ini 里**整段删除**（资源声明段 ``Resource*`` 与检测段
    ``TextureOverrideCheckHash*`` 已在圈定层排除，保持不动）；
-4. 按 draw_ib 追加本节点自己的跳过段，并登记进导出段登记
+4. 从**选中的物体名**解析绘制条目 ``(hash, indexCount, firstIndex)``，按条目追加
+   本节点自己的跳过段，并登记进导出段登记
    （``common/export_section_registry``）—— 因此链上后面的「条件判断」节点
    能圈到新段，把 ``handling = skip`` 包进 ``if``：条件不通过时跳过失效，
    效果等同删掉跳过段。
 
-跳过段形状（每个 draw_ib 一段，hash 统一小写）::
+无导出段的 IB（游戏原生绘制）
+--------------------------------
+若某个 draw_ib 在本次导出里**没有登记段**（该 IB 是游戏原生绘制、不在本 mod 的
+接管范围里），节点**不再早退**：直接追加跳过段（完整三元组形式；解析不出三段
+时是 ``[TextureOverride_IB_<hash>]`` + ``hash`` + ``handling = skip``）让原生绘制
+被跳过（没有段可删，删除步骤为 0 段）。有导出段的 IB 仍走「先删段、再追加」，
+删除范围**仍按 draw_ib 集合**（不变）。
+
+跳过段形状（**优先用完整三元组**，来自物体名前缀，hash 统一小写）::
 
     ; --- AUTO-APPENDED SKIP BLOCK ---
+    ; skip <hash>_<indexCount>_<firstIndex>
+    [TextureOverride_IB_<hash>_<indexCount>_<firstIndex>]
+    hash = <hash>
+    match_first_index = <firstIndex>
+    match_index_count = <indexCount>
+    handling = skip
+
+**为什么要三段**：只写 ``hash`` 的跳过段在部分游戏里不生效（同一 IB hash 被
+多次绘制、或需要按 index 区间区分绘制批次），必须同时匹配 ``match_first_index``
+与 ``match_index_count`` 才能稳定跳过。三元组来自物体名前缀
+（``LOD0.999bff94-6462-17946.前发`` -> ``999bff94`` / ``6462`` / ``17946``），
+解析实现见 :func:`_parse_part_draw`。
+
+物体名解析不出三段时（例如老工程里的 ``Body_copy``）**回退为只 hash 的旧形式**::
+
     ; skip <hash>
     [TextureOverride_IB_<hash>]
     hash = <hash>
@@ -58,6 +82,19 @@ _RUNTIME_SUFFIX_RE = re.compile(r"(_(?:copy|dup\d*|chain\d*|bpe\d*))+$", re.IGNO
 #: 其它节点在配置表尾部追加块的通用标记前缀（用于把本节点块与它们分开）。
 _AUTO_APPENDED_OTHER_PREFIX = "; --- AUTO-APPENDED "
 
+#: 物体名前缀里的「三段绘制信息」：``<hash>-<indexCount>-<firstIndex>``。
+#: 例：``LOD0.999bff94-6462-17946.前发`` -> ``999bff94`` / ``6462`` / ``17946``。
+#: 后面允许跟分隔符（``.`` / ``_`` / ``-``）或字符串结束。
+_PART_DRAW_RE = re.compile(r"^([0-9a-fA-F]{8})-(\d+)-(\d+)(?:[._\-]|$)")
+
+#: 物体名可选的 ``LODx.`` 前缀（``LOD0.`` / ``LOD1.`` ...）。
+_PART_LOD_PREFIX_RE = re.compile(r"^LOD\d+[.]", re.IGNORECASE)
+
+#: 只 hash 的兜底解析口径（与 ``node_postprocess_condition._parse_hash_from_object_name``
+#: 同口径）：先看开头 8 位十六进制，再找前后带分隔符的 8 位十六进制。
+_PART_HASH_PREFIX_RE = re.compile(r"^[0-9a-fA-F]{8}")
+_PART_HASH_FALLBACK_RE = re.compile(r"(?<![0-9a-fA-F])([0-9a-fA-F]{8})(?=[-_.]|$)")
+
 
 # --------------------------------------------------------------------------- #
 # 纯函数（不依赖 bpy，便于 headless 测试）
@@ -72,6 +109,167 @@ def _strip_runtime_suffixes(name):
             break
         current = stripped
     return current
+
+
+def _parse_part_draw(name):
+    """从物体名解析 ``(hash, index_count, first_index)``；解析不出三段返回 ``None``。
+
+    物体名格式（SSMT 导出期的部件名前缀）::
+
+        [LODx.]<hash>-<indexCount>-<firstIndex>[.<部件名>[.<序号>]]
+
+    - 去首尾空白；``LOD\\d+.`` 前缀可缺省；
+    - 必须**三段齐全**（hash 8 位十六进制 + 两个非负整数）才算完整，否则 ``None``
+      —— 缺段的条目由调用方回退成只 hash 的旧形式；
+    - hash 统一小写，``index_count`` / ``first_index`` 转 ``int``。
+
+    样例::
+
+        >>> _parse_part_draw("LOD0.999bff94-6462-17946.前发")
+        ('999bff94', 6462, 17946)
+        >>> _parse_part_draw("LOD0.38b3bd13-4086-0.麻花辫.001")
+        ('38b3bd13', 4086, 0)
+        >>> _parse_part_draw("随便一个物体") is None
+        True
+    """
+    value = str(name or "").strip()
+    if not value:
+        return None
+    value = _PART_LOD_PREFIX_RE.sub("", value)
+    match = _PART_DRAW_RE.match(value)
+    if not match:
+        return None
+    try:
+        return (match.group(1).lower(), int(match.group(2)), int(match.group(3)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_part_hash(name):
+    """只解析物体名里的 8 位 IB hash（三段解析失败时的兜底）；失败返回 ""。"""
+    value = str(name or "").strip()
+    if not value:
+        return ""
+    value = _PART_LOD_PREFIX_RE.sub("", value)
+    match = _PART_HASH_PREFIX_RE.match(value)
+    if match:
+        return match.group(0).lower()
+    fallback = _PART_HASH_FALLBACK_RE.search(value)
+    return fallback.group(1).lower() if fallback else ""
+
+
+def _normalize_skip_entries(entries):
+    """把条目整理成 ``[(hash, index_count|None, first_index|None)]``（去重、保序）。
+
+    接受三种写法：``(hash, count, first)`` 三元组（完整段）、``(hash,)`` 单元素、
+    以及裸字符串 / ``None``（``index_count`` / ``first_index`` 为 ``None`` 表示
+    「只有 hash」的回退条目）。去重键 = ``(hash, count, first)``。
+    """
+    result = []
+    seen = set()
+    for item in entries or ():
+        if item is None:
+            continue
+        if isinstance(item, str):
+            hash_val, index_count, first_index = item, None, None
+        else:
+            try:
+                values = tuple(item)
+            except TypeError:
+                continue
+            if not values:
+                continue
+            hash_val = values[0]
+            index_count = values[1] if len(values) > 1 else None
+            first_index = values[2] if len(values) > 2 else None
+
+        hash_text = str(hash_val or "").strip().lower()
+        if not hash_text:
+            continue
+        try:
+            count_value = int(index_count) if index_count is not None else None
+            first_value = int(first_index) if first_index is not None else None
+        except (TypeError, ValueError):
+            count_value = None
+            first_value = None
+        if count_value is None or first_value is None:
+            count_value = None
+            first_value = None
+
+        key = (hash_text, count_value, first_value)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(key)
+    return result
+
+
+def _entries_from_names(names):
+    """从选中物体名解析跳过条目；三段解析失败时回退为只 hash 条目。
+
+    - 三段齐全的物体 -> ``(hash, index_count, first_index)`` 完整段；
+    - 只解析得出 hash 的物体 -> ``(hash, None, None)`` 回退段；
+    - 解析不出任何 hash 的名字**不产生条目**（不制造垃圾段）；
+    - 若同一个 hash 已经有完整段（另一个物体解析出了三段），**丢弃该 hash 的
+      回退段**：只 hash 的段会匹配该 IB 的全部绘制、把精确段的范围覆盖掉。
+
+    顺序与去重：按输入顺序、以 ``(hash, index_count, first_index)`` 去重。
+    """
+    prepared = []  # [(entry_or_None, hash_or_None)]，保持输入顺序
+    full_hashes = set()
+    for name in names or ():
+        parsed = _parse_part_draw(name)
+        if parsed is not None:
+            prepared.append(parsed)
+            full_hashes.add(parsed[0])
+        else:
+            prepared.append(_parse_part_hash(name) or None)
+
+    entries = []
+    seen = set()
+    for item in prepared:
+        if item is None:
+            continue
+        if isinstance(item, str):
+            if item in full_hashes:
+                continue
+            entry = (item, None, None)
+        else:
+            entry = item
+        if entry in seen:
+            continue
+        seen.add(entry)
+        entries.append(entry)
+    return entries
+
+
+def _hash_only_entries(values):
+    """把一组 hash（通常是 draw_ib）整理成只 hash 的条目列表（去重、保序）。"""
+    entries = []
+    seen = set()
+    for value in values or ():
+        hash_val = str(value or "").strip().lower()
+        if not hash_val or hash_val in seen:
+            continue
+        seen.add(hash_val)
+        entries.append((hash_val, None, None))
+    return entries
+
+
+def _skip_section_name(entry):
+    """条目对应的段名：三段齐全用完整名，否则退回 ``TextureOverride_IB_<hash>``。"""
+    hash_val, index_count, first_index = entry
+    if index_count is None or first_index is None:
+        return f"TextureOverride_IB_{hash_val}"
+    return f"TextureOverride_IB_{hash_val}_{index_count}_{first_index}"
+
+
+def _format_skip_entry(entry):
+    """条目的日志写法：``hash_count_first`` 或 ``hash``。"""
+    hash_val, index_count, first_index = entry
+    if index_count is None or first_index is None:
+        return str(hash_val)
+    return f"{hash_val}_{index_count}_{first_index}"
 
 
 def _section_ranges(lines):
@@ -141,28 +339,6 @@ def _delete_sections(content, section_names):
     return kept, deleted_names
 
 
-def _skip_entries(draw_ibs):
-    """把 draw_ib 集合整理成 ``[(原样 draw_ib, 小写 hash)]``（按输入顺序去重）。
-
-    - 段名 / ``hash =`` 统一用小写（导出期 hash 是小写，例如
-      ``TextureOverride_IB_92cb56c9``）；
-    - 原样字符串用于 ``export_section_registry`` 登记：条件判断节点按导出期的
-      ``match_draw_ib`` 原样查询，登记值必须与它逐字一致。
-    """
-    entries = []
-    seen = set()
-    for value in draw_ibs or ():
-        raw = str(value or "").strip()
-        if not raw:
-            continue
-        lowered = raw.lower()
-        if lowered in seen:
-            continue
-        seen.add(lowered)
-        entries.append((raw, lowered))
-    return entries
-
-
 def _strip_skip_block(content):
     """剥掉本节点上一次追加的整块（含标记行），返回剩下的正文。
 
@@ -201,27 +377,39 @@ def _strip_skip_block(content):
     return f"{newline}{newline}".join(parts) + newline
 
 
-def _build_skip_block(draw_ibs, newline="\n"):
-    """把 draw_ib 集合组装成 SKIP 块文本（``draw_ibs`` 为空时返回 ""）。"""
-    entries = _skip_entries(draw_ibs)
-    if not entries:
+def _build_skip_block(entries, newline="\n"):
+    """把跳过条目组装成 SKIP 块文本（没有有效条目时返回 ""）。
+
+    ``entries`` 为 ``[(hash, index_count, first_index)]``；``index_count`` /
+    ``first_index`` 为 ``None`` 的条目是「只 hash」回退段，仍用旧形式。
+    """
+    normalized = _normalize_skip_entries(entries)
+    if not normalized:
         return ""
 
     lines = [SKIP_BLOCK_MARKER]
-    for _raw, hash_val in entries:
-        lines.append(f"; skip {hash_val}")
-        lines.append(f"[TextureOverride_IB_{hash_val}]")
-        lines.append(f"hash = {hash_val}")
-        lines.append("handling = skip")
+    for hash_val, index_count, first_index in normalized:
+        if index_count is None or first_index is None:
+            lines.append(f"; skip {hash_val}")
+            lines.append(f"[TextureOverride_IB_{hash_val}]")
+            lines.append(f"hash = {hash_val}")
+            lines.append("handling = skip")
+        else:
+            lines.append(f"; skip {hash_val}_{index_count}_{first_index}")
+            lines.append(f"[TextureOverride_IB_{hash_val}_{index_count}_{first_index}]")
+            lines.append(f"hash = {hash_val}")
+            lines.append(f"match_first_index = {first_index}")
+            lines.append(f"match_index_count = {index_count}")
+            lines.append("handling = skip")
         lines.append("")  # 段之间的空行；块末尾同样以换行结束
     return newline.join(lines)
 
 
-def _append_skip_block(content, draw_ibs):
-    """把跳过块追加到文本末尾（**不剥旧块**；``draw_ibs`` 为空时原样返回）。"""
+def _append_skip_block(content, entries):
+    """把跳过块追加到文本末尾（**不剥旧块**；没有条目时原样返回）。"""
     text = str(content or "")
     newline = "\r\n" if "\r\n" in text else "\n"
-    block = _build_skip_block(draw_ibs, newline=newline)
+    block = _build_skip_block(entries, newline=newline)
     if not block:
         return text
 
@@ -231,13 +419,13 @@ def _append_skip_block(content, draw_ibs):
     return f"{body}{newline}{newline}{block}"
 
 
-def _apply_skip_block(content, draw_ibs):
-    """剥掉旧块后把新块追加到末尾（幂等）；``draw_ibs`` 为空时只剥不追加。"""
+def _apply_skip_block(content, entries):
+    """剥掉旧块后把新块追加到末尾（幂等）；没有条目时只剥不追加。"""
     text = str(content or "")
     stripped = _strip_skip_block(text)
-    if not _skip_entries(draw_ibs):
+    if not _normalize_skip_entries(entries):
         return stripped
-    return _append_skip_block(stripped, draw_ibs)
+    return _append_skip_block(stripped, entries)
 
 
 def _get_section_registry():
@@ -370,11 +558,11 @@ class SSMTNode_PostProcess_Skip(SSMTNode_PostProcess_Base):
         if not draw_ibs:
             print("跳过部件：选定的部件未匹配到任何 DrawIB（物体名与导出对象不一致），跳过")
             return True
-        if not target_names:
-            print(
-                f"跳过部件：导出期段登记里没有这些 DrawIB 的段（IB: {sorted(draw_ibs)}），跳过"
-            )
-            return True
+        # 导出期段登记里没有这些 DrawIB 的段**不再早退**：这类 IB 是游戏原生绘制、
+        # 不在本 mod 的接管范围里，没有段可删；用户既然把它加进跳过列表，就应当
+        # 直接追加完整跳过段（hash + match_first_index + match_index_count +
+        # handling = skip）让原生绘制被跳过（删除步骤自然 0 段）。有导出段的 IB
+        # 仍走「先删段、再追加」。
 
         try:
             with open(target_ini, "rb") as handle:
@@ -391,10 +579,21 @@ class SSMTNode_PostProcess_Skip(SSMTNode_PostProcess_Base):
             return False
 
         # ---- 删除 + 追加 ----
+        # 追加条目来自**选中物体名的前缀三段**（hash / indexCount / firstIndex）：
+        # 只写 hash 的跳过段在部分游戏里不生效，必须带 match_first_index /
+        # match_index_count。解析不出三段的名字回退为只 hash 条目；全都解析不出时
+        # 再退回 draw_ib 的只 hash 条目（避免整节点变成空操作）。
+        entries = _entries_from_names(selected_names)
+        if not entries:
+            entries = _hash_only_entries(draw_ibs)
+            if entries:
+                print("跳过部件：物体名里没有可完整解析的 <hash>-<indexCount>-<firstIndex>，回退为只 hash 的跳过段")
+        entry_list = ", ".join(_format_skip_entry(entry) for entry in entries)
+
         # 先剥掉本节点上一次追加的块：否则第二次执行会把旧跳过段当成目标段重复删 / 计数。
         stripped_content = _strip_skip_block(content)
         updated, deleted_names = _delete_sections(stripped_content, target_names)
-        updated = _append_skip_block(updated, draw_ibs)
+        updated = _append_skip_block(updated, entries)
 
         written = updated != content
         if written:
@@ -412,34 +611,50 @@ class SSMTNode_PostProcess_Skip(SSMTNode_PostProcess_Base):
                 return False
 
         # ---- 登记新段：让链上后面的条件判断节点能圈到跳过段并给它加条件 ----
-        skip_entries = _skip_entries(draw_ibs)
         registry = _get_section_registry()
         if registry is not None:
-            for raw_draw_ib, hash_val in skip_entries:
+            for entry in entries:
+                hash_val = entry[0]
                 try:
                     registry.register_section(
-                        f"TextureOverride_IB_{hash_val}",
+                        _skip_section_name(entry),
                         section_type="TextureOverrideIB",
-                        draw_ib=raw_draw_ib,
+                        draw_ib=hash_val,
                         ini_path=target_ini,
                     )
                 except Exception as exc:
                     print(f"跳过部件：登记导出段失败（{exc}）")
 
-        print(
-            f"跳过部件：选中 {len(selected_names)} 个部件、圈定 IB {len(draw_ibs)} 个"
-            f"（{', '.join(sorted(str(value) for value in draw_ibs))}）；"
-            f"删除段 {len(deleted_names)} 个"
-            f"{'（' + '、'.join(deleted_names) + '）' if deleted_names else ''}；"
-            f"新增跳过段 {len(skip_entries)} 个"
-            f"{'' if written else '（配置表已是最新，未改写）'} -> {target_ini}"
-        )
+        # ---- 日志：区分「有导出段（删段+追加）」与「无导出段（只追加）」 ----
+        ib_list = ", ".join(sorted(str(value) for value in draw_ibs))
+        suffix = "" if written else "（配置表已是最新，未改写）"
+        if deleted_names:
+            message = (
+                f"跳过部件：选中 {len(selected_names)} 个部件、圈定 IB {len(draw_ibs)} 个"
+                f"（{ib_list}）；"
+                f"删除段 {len(deleted_names)} 个（{'、'.join(deleted_names)}）；"
+                f"新增跳过段 {len(entries)} 个（{entry_list}）{suffix} -> {target_ini}"
+            )
+        else:
+            message = (
+                f"跳过部件：选中 {len(selected_names)} 个部件、圈定 IB {len(draw_ibs)} 个"
+                f"（{ib_list}）；"
+                f"这些 IB 不在本次导出中（无段可删），只追加跳过段 {len(entries)} 个"
+                f"（{entry_list}）{suffix} -> {target_ini}"
+            )
+        print(message)
         try:
             from . import export_progress
-            export_progress.report_stage(
-                f"跳过部件：{len(draw_ibs)} 个IB / 删除 {len(deleted_names)} 段 / "
-                f"新增 {len(skip_entries)} 段 / {len(selected_names)} 个部件"
-            )
+            if deleted_names:
+                export_progress.report_stage(
+                    f"跳过部件：{len(draw_ibs)} 个IB / 删除 {len(deleted_names)} 段 / "
+                    f"新增 {len(entries)} 段（{entry_list}）/ {len(selected_names)} 个部件"
+                )
+            else:
+                export_progress.report_stage(
+                    f"跳过部件：{len(draw_ibs)} 个IB / 无导出段可删 / "
+                    f"新增 {len(entries)} 段（{entry_list}）/ {len(selected_names)} 个部件"
+                )
         except Exception:
             pass
         return True
