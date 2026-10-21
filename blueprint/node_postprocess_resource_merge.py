@@ -7,6 +7,10 @@ import tempfile
 
 from .node_postprocess_base import SSMTNode_PostProcess_Base
 
+# 轻量测试宿主（fake bpy）只桩了 BoolProperty；真实 Blender 一定有 IntProperty。
+# 生产环境下这就是 bpy.props.IntProperty，属性声明与行为不变。
+_IntProperty = getattr(bpy.props, "IntProperty", bpy.props.BoolProperty)
+
 
 class SSMTNode_PostProcess_ResourceMerge(SSMTNode_PostProcess_Base):
     bl_idname = 'SSMTNode_PostProcess_ResourceMerge'
@@ -19,6 +23,21 @@ class SSMTNode_PostProcess_ResourceMerge(SSMTNode_PostProcess_Base):
         default=False,
     )  # type: ignore
 
+    use_similarity_dedup: bpy.props.BoolProperty(
+        name="相似度去重",
+        description="开启后对像素级去重未合并的DDS按缩略特征比对相似度：达到阈值的贴图视为同一张图，合并引用并删除重复文件。适合有损压缩导致像素不完全一致的重复贴图；BC6H等暂不支持的格式自动跳过",
+        default=False,
+    )  # type: ignore
+
+    similarity_threshold: _IntProperty(
+        name="相似度阈值",
+        description="两张贴图缩略特征相似度不低于该百分比时视为同一张图并合并（值越大越严格）",
+        min=50,
+        max=100,
+        default=90,
+        subtype='PERCENTAGE',
+    )  # type: ignore
+
     def draw_buttons(self, context, layout):
         layout.label(text="计算DDS贴图文件MD5哈希值", icon='FILE_CACHE')
         layout.label(text="合并内容相同的DDS资源引用")
@@ -29,6 +48,11 @@ class SSMTNode_PostProcess_ResourceMerge(SSMTNode_PostProcess_Base):
             layout.label(text="额外执行像素级去重：", icon='INFO')
             layout.label(text="解码DDS像素内容，像素完全相同（如相同内容")
             layout.label(text="不同格式/编码/压缩的贴图）也合并删除")
+        layout.separator()
+        layout.prop(self, "use_similarity_dedup", icon='DUPLICATE')
+        if getattr(self, "use_similarity_dedup", False):
+            layout.prop(self, "similarity_threshold", slider=True)
+            layout.label(text="相似度 ≥ 阈值即视为同一张图并合并", icon='INFO')
         layout.separator()
         layout.label(text="执行前会自动备份ini文件", icon='BACK')
 
@@ -233,6 +257,13 @@ class SSMTNode_PostProcess_ResourceMerge(SSMTNode_PostProcess_Base):
                 pixel_primary_filename,
             )
 
+        if getattr(self, "use_similarity_dedup", False):
+            self._similarity_dedup_phase(
+                resource_entries,
+                files_to_delete,
+                pixel_primary_filename,
+            )
+
         print(f"[ResourceMerge] 扫描完成: {len(file_hash_to_first_ref)} 个唯一资源, {len(files_to_delete)} 个重复文件待删除")
 
         modified = False
@@ -353,6 +384,170 @@ class SSMTNode_PostProcess_ResourceMerge(SSMTNode_PostProcess_Base):
         if matched or skipped:
             print(
                 f"[ResourceMerge] 像素去重完成: 合并 {matched} 个, 无法解码跳过 {skipped} 个"
+            )
+
+
+    # ------------------------------------------------------------------
+    # 相似度去重（像素级去重之后执行：MD5 / 像素级没有合并掉的剩余文件）
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _rewire_primary_filename(mapping, old_filename, new_filename):
+        """代表文件自己被合并掉时，把此前指向它的映射改指到新的代表文件。"""
+        if not old_filename or old_filename == new_filename:
+            return
+        for key, value in list(mapping.items()):
+            if value == old_filename:
+                mapping[key] = new_filename
+
+    @staticmethod
+    def _clamp_similarity_threshold(value):
+        """阈值钳制到 50~100；非整数按默认 90。"""
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            number = 90
+        return max(50, min(100, number))
+
+    def _similarity_threshold_value(self):
+        return self._clamp_similarity_threshold(getattr(self, "similarity_threshold", 90))
+
+    @staticmethod
+    def _similarity_feature(pixels, grid=32):
+        """RGBA8 像素图 -> 约 grid×grid 灰度块均值特征（numpy，4K 图也快）。
+
+        缩略方式为均值池化：按行/列等分切块，用 np.add.reduceat 求块内和再除以块面积，
+        不需要 Pillow、不做逐像素 Python 循环。整图灰度用整数权重 77/150/29（≈BT.601）。
+        """
+        import numpy as np
+
+        if pixels is None or getattr(pixels, "ndim", 0) != 3 or pixels.shape[2] < 3:
+            return None
+        height, width = int(pixels.shape[0]), int(pixels.shape[1])
+        if height <= 0 or width <= 0:
+            return None
+        # uint16 足够：255*(77+150+29)=65280 < 65535，无溢出
+        rgb = pixels[:, :, :3].astype(np.uint16)
+        gray = (
+            rgb[:, :, 0] * np.uint16(77)
+            + rgb[:, :, 1] * np.uint16(150)
+            + rgb[:, :, 2] * np.uint16(29)
+        ) >> 8
+
+        out_h = min(int(grid), height)
+        out_w = min(int(grid), width)
+        row_edges = (np.arange(out_h + 1, dtype=np.int64) * height // out_h).astype(np.intp)
+        col_edges = (np.arange(out_w + 1, dtype=np.int64) * width // out_w).astype(np.intp)
+
+        # 先按列池化（宽块高度很小，必要时升到 uint32 防溢出），再按行池化
+        max_col_block = int(np.max(np.diff(col_edges)))
+        source = gray if max_col_block * 255 <= 65535 else gray.astype(np.uint32)
+        col_sums = np.add.reduceat(source, col_edges[:-1], axis=1).astype(np.uint32)
+        block_sums = np.add.reduceat(col_sums, row_edges[:-1], axis=0)
+        counts = np.outer(np.diff(row_edges), np.diff(col_edges)).astype(np.float64)
+        return block_sums.astype(np.float64) / counts
+
+    @staticmethod
+    def _report_similarity_progress(done, total):
+        """只更新进度文本（不推动百分比）；同步导出 / 单测没有进度模块时静默。"""
+        try:
+            from . import export_progress
+
+            export_progress.report_stage(f"资源合并：相似度去重 {done}/{total}")
+        except Exception:
+            pass
+
+    def _similarity_dedup_phase(self, resource_entries, files_to_delete, pixel_primary_filename):
+        """相似度去重：同尺寸 DDS 的 32×32 灰度特征相似度 ≥ 阈值即视为同一张图。"""
+        try:
+            from ..common import dds_pixel
+            import numpy as np
+        except Exception as exc:
+            print(f"[ResourceMerge] 相似度去重模块不可用（{exc}），本ini跳过相似度合并")
+            return
+
+        threshold = self._similarity_threshold_value()
+        ratio = threshold / 100.0
+
+        # 候选：MD5 扫描成功、且未被 MD5 / 像素级去重合并掉的文件
+        candidates = {}
+        for entry in resource_entries:
+            file_hash = entry.get("file_hash")
+            norm_path = entry.get("_norm_path")
+            if not file_hash or not norm_path or norm_path in candidates:
+                continue
+            if entry["file_path"] in files_to_delete:
+                continue
+            candidates[norm_path] = entry
+
+        total = len(candidates)
+        if total < 2:
+            return
+
+        representatives = {}  # dims -> [(norm_path, feature, entry)]
+        matched = 0
+        skipped = 0
+        done = 0
+        for norm_path, entry in candidates.items():
+            try:
+                with open(norm_path, 'rb') as f:
+                    data = f.read()
+            except OSError as exc:
+                print(f"[ResourceMerge] 相似度去重: 读取失败 {norm_path}: {exc}")
+                done += 1
+                if done % 8 == 0 or done == total:
+                    self._report_similarity_progress(done, total)
+                continue
+
+            dims = dds_pixel.dds_dimensions(data)
+            if dims is None:
+                skipped += 1
+                print(f"[ResourceMerge] 相似度去重: 跳过无法解析的 {os.path.basename(norm_path)}（{dds_pixel.last_error}）")
+            else:
+                pixels = dds_pixel.decode_dds_rgba8(data)
+                if pixels is None:
+                    skipped += 1
+                    print(f"[ResourceMerge] 相似度去重: 跳过无法解码的 {os.path.basename(norm_path)}（{dds_pixel.last_error}）")
+                else:
+                    feature = self._similarity_feature(pixels)
+                    if feature is None:
+                        skipped += 1
+                        print(f"[ResourceMerge] 相似度去重: 跳过无法生成特征的 {os.path.basename(norm_path)}")
+                    else:
+                        duplicate_of = None
+                        similarity = 0.0
+                        for rep_path, rep_feature, rep_entry in representatives.setdefault(dims, []):
+                            if rep_feature.shape != feature.shape:
+                                continue
+                            similarity = 1.0 - float(np.mean(np.abs(rep_feature - feature))) / 255.0
+                            if similarity >= ratio:
+                                duplicate_of = rep_entry
+                                break
+                        if duplicate_of is not None:
+                            matched += 1
+                            # 代表文件若曾在像素级阶段作为主文件，先把它名下的映射改指到新主文件
+                            self._rewire_primary_filename(
+                                pixel_primary_filename,
+                                entry["filename"],
+                                duplicate_of["filename"],
+                            )
+                            pixel_primary_filename[norm_path] = duplicate_of["filename"]
+                            files_to_delete[entry["file_path"]] = entry["filename"]
+                            print(
+                                f"[ResourceMerge]   相似重复! {os.path.basename(norm_path)} "
+                                f"与 {os.path.basename(duplicate_of['file_path'])} 相似度 "
+                                f"{similarity * 100:.2f}%（阈值 {threshold}%），合并"
+                            )
+                        else:
+                            representatives[dims].append((norm_path, feature, entry))
+
+            done += 1
+            if done % 8 == 0 or done == total:
+                self._report_similarity_progress(done, total)
+
+        if matched or skipped:
+            print(
+                f"[ResourceMerge] 相似度去重完成（阈值 {threshold}%）: 合并 {matched} 个, "
+                f"无法解码跳过 {skipped} 个"
             )
 
 
