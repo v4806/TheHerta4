@@ -38,6 +38,12 @@ class SSMTNode_PostProcess_ResourceMerge(SSMTNode_PostProcess_Base):
         subtype='PERCENTAGE',
     )  # type: ignore
 
+    clean_unreferenced_textures: bpy.props.BoolProperty(
+        name="清理未引用贴图",
+        description="勾选后，导出结束前删除 Textures 目录里没有被任何 ini Resource 段引用的 .dds 贴图（清理旧导出的残留孤儿文件）；只处理贴图目录里的 .dds，不动 .buf 和其它目录",
+        default=False,
+    )  # type: ignore
+
     def draw_buttons(self, context, layout):
         layout.label(text="计算DDS贴图文件MD5哈希值", icon='FILE_CACHE')
         layout.label(text="合并内容相同的DDS资源引用")
@@ -53,6 +59,10 @@ class SSMTNode_PostProcess_ResourceMerge(SSMTNode_PostProcess_Base):
         if getattr(self, "use_similarity_dedup", False):
             layout.prop(self, "similarity_threshold", slider=True)
             layout.label(text="相似度 ≥ 阈值即视为同一张图并合并", icon='INFO')
+        layout.separator()
+        layout.prop(self, "clean_unreferenced_textures", icon='TRASH')
+        if getattr(self, "clean_unreferenced_textures", False):
+            layout.label(text="清理未被 ini 引用的孤儿 .dds", icon='INFO')
         layout.separator()
         layout.label(text="执行前会自动备份ini文件", icon='BACK')
 
@@ -187,10 +197,17 @@ class SSMTNode_PostProcess_ResourceMerge(SSMTNode_PostProcess_Base):
             print("[ResourceMerge] 在路径中未找到任何.ini文件，跳过")
             return
 
+        # 先完成所有 ini 的引用合并，再统一清理孤儿贴图：多 ini 时任一 ini 引用即保留
+        referenced_paths = set()
         for ini_file in ini_files:
-            self.process_ini_file(ini_file, mod_export_path)
+            ini_references = self.process_ini_file(ini_file, mod_export_path)
+            if ini_references:
+                referenced_paths.update(ini_references)
 
         print("[ResourceMerge] 资源引用合并完成！")
+
+        if getattr(self, "clean_unreferenced_textures", False):
+            self._orphan_texture_cleanup_phase(mod_export_path, referenced_paths)
 
     def process_ini_file(self, ini_file, mod_export_path):
         print(f"[ResourceMerge] 正在处理ini文件: {ini_file}")
@@ -267,11 +284,17 @@ class SSMTNode_PostProcess_ResourceMerge(SSMTNode_PostProcess_Base):
         print(f"[ResourceMerge] 扫描完成: {len(file_hash_to_first_ref)} 个唯一资源, {len(files_to_delete)} 个重复文件待删除")
 
         modified = False
+        referenced_paths = set()
         for entry in resource_entries:
             original_filename = entry["filename"]
             primary_filename = self._resolve_primary_filename(
                 entry, file_hash_to_first_ref, pixel_primary_filename
             )
+            # 收集最终 ini 里仍被引用的路径（改写前后的名字都算，供孤儿贴图清理使用）
+            for filename in (original_filename, primary_filename):
+                resolved = self._resolve_mod_local_path(mod_export_path, filename)
+                if resolved is not None:
+                    referenced_paths.add(self._normalize_cleanup_path(resolved))
             if original_filename == primary_filename:
                 continue
             match = entry["match"]
@@ -296,6 +319,8 @@ class SSMTNode_PostProcess_ResourceMerge(SSMTNode_PostProcess_Base):
                 print(f"[ResourceMerge] 已删除重复文件: {display_name}")
             except OSError as e:
                 print(f"[ResourceMerge] 删除文件失败 {file_path}: {e}")
+
+        return referenced_paths
 
     @staticmethod
     def _resolve_primary_filename(entry, file_hash_to_first_ref, pixel_primary_filename):
@@ -549,6 +574,91 @@ class SSMTNode_PostProcess_ResourceMerge(SSMTNode_PostProcess_Base):
                 f"[ResourceMerge] 相似度去重完成（阈值 {threshold}%）: 合并 {matched} 个, "
                 f"无法解码跳过 {skipped} 个"
             )
+
+    # ------------------------------------------------------------------
+    # 清理未引用贴图（所有去重阶段之后执行：只清理 Textures 目录里的孤儿 .dds）
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _normalize_cleanup_path(path):
+        """清理阶段的路径比较口径：Windows 不区分大小写，/ 与 \\ 统一。"""
+        return os.path.normcase(os.path.normpath(os.path.abspath(str(path or ""))))
+
+    @staticmethod
+    def _report_cleanup_progress(done, total):
+        """只更新进度文本（不推动百分比）；同步导出 / 单测没有进度模块时静默。"""
+        try:
+            from . import export_progress
+
+            export_progress.report_stage(f"资源合并：清理未引用贴图 {done}/{total}")
+        except Exception:
+            pass
+
+    def _orphan_texture_cleanup_phase(self, mod_export_path, referenced_paths):
+        """删除 Textures 目录里没有被任何 ini Resource 段引用的 .dds 孤儿文件。
+
+        只扫 Textures 这一层、只删常规 .dds 文件；删除前用 _resolve_mod_local_path
+        重新确认目标仍在 mod 根内，失败静默跳过。
+        """
+        textures_dir = os.path.join(mod_export_path, "Textures")
+        normalized_refs = {self._normalize_cleanup_path(path) for path in (referenced_paths or ())}
+        try:
+            dir_entries = list(os.scandir(textures_dir))
+        except OSError:
+            print("[ResourceMerge] 清理未引用贴图: 0 个")
+            return
+
+        orphan_candidates = []
+        for dir_entry in dir_entries:
+            if not self._is_dds_filename(dir_entry.name):
+                continue
+            try:
+                if not dir_entry.is_file(follow_symlinks=False):
+                    continue
+            except OSError:
+                continue
+            # 解析结果同时确认文件仍在 mod 根内（Textures 是指向根外的符号链接时也跳过）
+            resolved = self._resolve_mod_local_path(
+                mod_export_path, os.path.join("Textures", dir_entry.name)
+            )
+            if resolved is None:
+                continue
+            if self._normalize_cleanup_path(resolved) in normalized_refs:
+                continue
+            orphan_candidates.append(resolved)
+
+        total = len(orphan_candidates)
+        if total == 0:
+            print("[ResourceMerge] 清理未引用贴图: 0 个")
+            return
+
+        root = os.path.realpath(os.path.abspath(mod_export_path))
+        cleaned = 0
+        done = 0
+        for file_path in orphan_candidates:
+            try:
+                relative = os.path.relpath(file_path, root)
+            except ValueError:
+                relative = os.path.basename(file_path)
+            checked = self._resolve_mod_local_path(mod_export_path, relative)
+            if checked is None or os.path.normcase(checked) != os.path.normcase(file_path):
+                done += 1
+                self._report_cleanup_progress(done, total)
+                continue
+            try:
+                if os.path.islink(checked) or not os.path.isfile(checked):
+                    done += 1
+                    self._report_cleanup_progress(done, total)
+                    continue
+                os.remove(checked)
+                cleaned += 1
+                print(f"[ResourceMerge] 已删除未引用贴图: {os.path.basename(checked)}")
+            except OSError:
+                pass
+            done += 1
+            if done % 8 == 0 or done == total:
+                self._report_cleanup_progress(done, total)
+
+        print(f"[ResourceMerge] 清理未引用贴图: {cleaned} 个")
 
 
 classes = (
