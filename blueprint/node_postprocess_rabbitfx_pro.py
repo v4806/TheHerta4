@@ -24,6 +24,12 @@
   （RabbitFX.ini ``[CommandListRun]`` 结尾），这里再显式写一遍作为双保险，
   同时覆盖「只绑定、不 Run」的异常路径。
 
+**代码范围定位**：本节点不再按 ``[mesh:...]`` / ``drawindexed`` / ``endif`` 关键词
+自己切块，而是复用 :mod:`blueprint.ini_scope` 的结构化圈定 —— 段 → ``if``/``endif``
+深度配对 → 行分类 → 绘制单元。目标单元按「IB 键一致 + 部件名完全相等」判定
+（同一个 IB 下的相邻部件不会被误当成目标）；参数块插在单元内 ``run`` / ``draw``
+之前，复位块插在单元所在条件块最内层 ``endif`` 之后。
+
 **命名空间随游戏走**：本节点注入的名字全部取自
 :mod:`blueprint.fx_namespace` 的档案，不再写死 ``RabbitFX``。
 
@@ -51,6 +57,30 @@ from .node_postprocess_rabbitfx import (
     _extract_hash_from_object,
     _extract_resource_suffix,
 )
+
+#: 「段 → if/endif 块 → 行分类 → 绘制单元」的结构化圈定（纯函数，不依赖 bpy）。
+#: 正常插件导入走相对导入；纯 Python 单测按文件路径装载本模块时包结构不完整
+#: （``PKG.blueprint.__path__`` 为空），退化成按文件路径直接装载。
+try:  # pragma: no cover - 分支由测试装载方式决定
+    from . import ini_scope as ini_scope
+except ImportError:  # pragma: no cover
+    import importlib.util as _importlib_util
+
+    _INI_SCOPE_PATH = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "ini_scope.py"
+    )
+    _ini_scope_spec = _importlib_util.spec_from_file_location(
+        "ssmt_ini_scope_fallback", _INI_SCOPE_PATH
+    )
+    if _ini_scope_spec is None or not os.path.isfile(_INI_SCOPE_PATH):
+        # 缺 blueprint/ini_scope.py（发行包漏收录 / 单独检出本文件）时，
+        # 这里必须给出说得出话的 ImportError，而不是 module_from_spec(None) 的
+        # AttributeError——后者在日志里看不出到底缺了什么。
+        raise ImportError(
+            f"本节点依赖 blueprint/ini_scope.py，但未找到: {_INI_SCOPE_PATH}"
+        )
+    ini_scope = _importlib_util.module_from_spec(_ini_scope_spec)
+    _ini_scope_spec.loader.exec_module(ini_scope)
 
 NODE_IDNAME = 'SSMTNode_PostProcess_RabbitFXPro'
 MATERIAL_NODE_IDNAME = 'SSMTNode_PostProcess_CustomMaterialAssign'
@@ -88,8 +118,19 @@ _VAR_PREFIX = "$rfxpro_"
 _VAR_IF_RE = re.compile(r"^if\s+\$rfxpro_", re.IGNORECASE)
 
 _MESH_LINE_RE = re.compile(r"^\s*\[mesh:(?P<name>.+?)\]\s*$", re.IGNORECASE)
-_DRAW_LINE_RE = re.compile(r"^(drawindexed|draw)\s*=", re.IGNORECASE)
 _IF_LINE_RE = re.compile(r"^if\s+", re.IGNORECASE)
+
+#: 名称里的 IB 编号段（``8位hex-数字-数字``）：部件名比对前必须剥掉，否则同一个
+#: IB 下的所有 mesh 看起来都同名（实机 bug：``右手.001`` 被当成 ``右乳球.001``）。
+_IB_SEGMENT_RE = re.compile(
+    r"(?<![0-9a-fA-F])[0-9a-fA-F]{8}[._-]\d+[._-]\d+(?!\d)"
+)
+#: 名字开头的 ``LOD0.`` 前缀（同一部件在不同 LOD 里名字不同）。
+_LOD_PREFIX_RE = re.compile(r"^LOD\d+[._-]", re.IGNORECASE)
+#: 运行时附加在名字末尾的后缀（``_copy`` / ``.copy`` / ``-copy``，可重复出现）。
+_RUNTIME_SUFFIX_RE = re.compile(r"(?:[._-]copy)+$", re.IGNORECASE)
+#: 名字末尾的序号段（``.001`` / ``_001``）：序号本身必须完全一致才算同一个部件。
+_TRAILING_INDEX_RE = re.compile(r"^(?P<base>.+?)[._-](?P<index>\d{1,4})$")
 
 
 def _mesh_object_poll(_self, obj):
@@ -113,36 +154,85 @@ def _find_material_node_in_tree(node):
     return None
 
 
-def _extract_mesh_name(line):
-    match = _MESH_LINE_RE.match(str(line or ""))
-    return match.group("name").strip() if match else ""
-
-
 def _normalize_suffix(suffix):
     return str(suffix or "").strip().replace("-", "_").lower()
 
 
-def _mesh_name_matches(mesh_name, hash_val, suffix_pattern):
-    """mesh 注释里的物体名是否属于目标物体（哈希相同 + 标识互相包含）。"""
-    if not mesh_name:
+def _part_name(name):
+    """从物体名 / mesh 注释名里取出「部件名」。
+
+    剥掉 ``LOD0.`` 前缀、IB 编号段（``8位hex-数字-数字``）以及运行时附加的
+    ``_copy`` 尾巴，剩下的就是部件名（``右手.001`` / ``右乳球.001`` / ``双乳钩``）。
+
+    导出 ini 的 mesh 注释与 Blender 物体名两边都按这个口径归一：既能让同一个
+    部件的多个 mesh 单元都对齐到目标物体，又不会把同一 IB 下的相邻部件误当成
+    目标（旧口径 ``_extract_resource_suffix`` 只取到 IB 编号，后缀互相包含即匹配，
+    于是 ``右手.001`` 命中了 ``右乳球.001`` 的单元）。
+    """
+    text = str(name or "").strip()
+    if not text:
+        return ""
+    text = _LOD_PREFIX_RE.sub("", text)
+    text = _IB_SEGMENT_RE.sub("", text)
+    text = _RUNTIME_SUFFIX_RE.sub("", text)
+    return text.strip(" \t._-")
+
+
+def _part_names_equal(left, right):
+    """两个部件名是否相等（大小写不敏感；序号段必须完全一致）。
+
+    ``.001`` / ``_001`` 这类序号只允许分隔符写法不同，序号本身必须相同 ——
+    ``右手.001`` 与 ``右手.002``、``右手`` 与 ``右手.001`` 都不算同一个部件。
+    """
+    if not left or not right:
         return False
-    mesh_hash = _extract_hash_from_object(mesh_name).lower()
-    if not mesh_hash or mesh_hash != str(hash_val or "").lower():
-        return False
-    if not suffix_pattern:
+    if left.casefold() == right.casefold():
         return True
-    mesh_suffix = _normalize_suffix(_extract_resource_suffix(mesh_name))
-    if not mesh_suffix:
+    left_match = _TRAILING_INDEX_RE.match(left)
+    right_match = _TRAILING_INDEX_RE.match(right)
+    if not left_match or not right_match:
         return False
-    return suffix_pattern in mesh_suffix or mesh_suffix in suffix_pattern
+    if left_match.group("index") != right_match.group("index"):
+        return False
+    return left_match.group("base").casefold() == right_match.group("base").casefold()
 
 
-def _iter_mesh_blocks(lines):
-    """按 ``[mesh:...]`` 切块，产出 (块首, 块尾) —— 块尾不含。"""
-    starts = [i for i, line in enumerate(lines) if _extract_mesh_name(line)]
-    for index, start in enumerate(starts):
-        end = starts[index + 1] if index + 1 < len(starts) else len(lines)
-        yield start, end
+def _ib_key_same_hash(left, right):
+    """两个 IB 键是否指向同一条 IB（只比 8 位 hash）。
+
+    完整键（``hash-数字-数字``）里的 count / first_index 会随重新导出、合并子网格、
+    拆分子网格变化，而 IB 还是同一条；这里拿它当硬判定会把目标静默跳过（一个
+    材质参数都不注入，实机上就是贴图不亮）。任一侧取不到 hash 时按相容处理。
+    """
+    if not left or not right:
+        return True
+    left_hex = left.get("hex")
+    right_hex = right.get("hex")
+    if left_hex and right_hex:
+        return left_hex == right_hex
+    return True
+
+
+def _unit_matches_target(mesh_name, target_scope, target_part, section_scope=None):
+    """绘制单元的 mesh 名是否就是这个目标物体（IB hash + 部件名双重校验）。
+
+    ``target_scope`` 是目标物体名的 IB 键（:func:`ini_scope.mesh_ib_key` 口径，
+    与材质转资源 pro 的 ``_ib_key_from_name`` 一致）；``section_scope`` 是段名的
+    IB 键，用来排除同名部件落在别的 IB 段里的情况。
+
+    IB 键只比 8 位 hash：count / first_index 是导出期快照，同一部件重新导出就会变；
+    真正区分「是不是这个部件」靠 :func:`_part_names_equal`（``右手.001`` 与
+    ``右乳球.001`` 依旧不会被混为一谈）。
+    """
+    mesh_scope = ini_scope.mesh_ib_key(mesh_name)
+    if section_scope is not None and not _ib_key_same_hash(section_scope, mesh_scope):
+        return False
+    if not _ib_key_same_hash(target_scope, mesh_scope):
+        return False
+    if not target_part:
+        # 物体名里取不到部件名（只有 IB 键）时无法再细分，只能按 IB 判定。
+        return True
+    return _part_names_equal(target_part, _part_name(mesh_name))
 
 
 def _marker_kind(line):
@@ -200,46 +290,207 @@ def _strip_previous_blocks(lines):
     return kept
 
 
-def _find_draw_index(lines, start, end):
-    """绘制行索引；没有 drawindexed 时退回最后一条 ``run = `` 行。
+def _leading_whitespace(line):
+    """行首缩进（插进去的块跟锚点行保持同级，结构才合法）。"""
+    text = str(line or "")
+    stripped = text.lstrip()
+    return text[: len(text) - len(stripped)]
 
-    着色器替换 / 拖拽交互 / EFMI 合并骨骼会把绘制搬进 ``run =`` 引用的段，
-    此时段内只剩 ``run =``，与材质转资源的复位插入口径保持一致。
-    """
-    for index in range(start, end):
-        if _DRAW_LINE_RE.match(str(lines[index]).strip()):
+
+def _trailing_indent(lines):
+    """块末尾非空行的缩进（复位块跟着它写，不破坏缩进）。"""
+    for line in reversed(list(lines or [])):
+        if str(line).strip():
+            return _leading_whitespace(line)
+    return ""
+
+
+def _profile_run_between(lines, start, end, profile):
+    """``[start, end)`` 内第一条本命名空间 ``Run`` 行的索引；没有返回 ``None``。"""
+    for index in range(max(0, start), min(end, len(lines))):
+        if profile.run_line_re.match(str(lines[index]).strip()):
             return index
-    fallback = -1
-    for index in range(start, end):
-        stripped = str(lines[index]).strip().casefold()
-        if stripped.startswith("run =") or stripped.startswith("run="):
-            fallback = index
-    return fallback
+    return None
 
 
-def _find_draw_block_end(lines, start, end):
-    """绘制语句（含包裹它的 if/endif）之后的插入位置。
+def _unit_anchor(lines, start, end, profile):
+    """参数块的插入锚点 ``(锚点行, 第一个 draw 行)``；没有可用锚点时为 ``-1``。
 
-    与材质转资源的复位插入口径一致：取绘制行之后最后一个 endif 的下一位，
-    没有 endif 时取绘制行的下一位。
+    规则（实机修正）：参数必须在本单元的 ``Run`` 之前、``draw`` 之前生效，所以
+
+    1. 取单元内**第一个 draw**；
+    2. 若单元内还有 ``run =`` 行排在它之前，取更早的那条 —— 否则外部/其它节点
+       写在 draw 之后的 ``run`` 会把参数块顶到 draw 后面（对本次绘制无效）；
+    3. 单元里没有 draw（着色器替换把绘制搬进 ``run =`` 引用的段）时，退回
+       「本命名空间的 Run 行，没有则最后一条 ``run``」。
+
+    返回 ``(锚点行, draw 行)``；单元里既没有 draw 也没有 run 时锚点为 ``-1``。
     """
-    draw_index = _find_draw_index(lines, start, end)
-    if draw_index < 0:
-        return end
-    depth = 0
-    last_endif = -1
+    first_draw = -1
+    first_run = -1
+    last_run = -1
+    profile_run = -1
     for index in range(start, end):
         stripped = str(lines[index]).strip()
-        if _IF_LINE_RE.match(stripped):
-            depth += 1
-        elif stripped.casefold() == "endif":
-            if depth > 0:
-                depth -= 1
-            if index > draw_index:
-                last_endif = index
-    if last_endif > draw_index:
-        return last_endif + 1
-    return draw_index + 1
+        kind = ini_scope.classify_line(stripped)
+        if kind == "draw":
+            if first_draw < 0:
+                first_draw = index
+        elif kind == "run":
+            if first_run < 0:
+                first_run = index
+            last_run = index
+            if profile_run < 0 and profile.run_line_re.match(stripped):
+                profile_run = index
+    if first_draw >= 0:
+        anchor = first_draw
+        if 0 <= first_run < first_draw:
+            anchor = first_run
+        return anchor, first_draw
+    anchor = profile_run if profile_run >= 0 else last_run
+    return anchor, -1
+
+
+def _absorb_reset_block(lines, position):
+    """把紧跟在 ``position`` 之后的本节点复位块并入可写范围（重跑幂等）。
+
+    复位块写在单元末尾（单元在条件块内时 = 最内层 ``endif`` 之后），位置落在
+    :func:`ini_scope.iter_draw_units` 给的单元区间之外；重跑时必须把它一起剥掉，
+    否则会一轮一轮累积。只吸收紧邻的复位标记块，不吞别的目标/节点的内容。
+    """
+    total = len(lines)
+    scan = position
+    while scan < total and not str(lines[scan]).strip():
+        scan += 1
+    if scan >= total:
+        return position
+    if str(lines[scan]).strip().casefold() != _RESET_BEGIN.casefold():
+        return position
+    for offset in range(scan + 1, total):
+        if str(lines[offset]).strip().casefold() == _RESET_END.casefold():
+            return offset + 1
+    return position
+
+
+#: 资源别名清空行（材质转资源写的 ``Resource\RabbitFX\Glowmap = ref null`` / ``= null``）。
+_RESET_SLOT_NULL_RE = re.compile(
+    r"^resource\\[^=\s]+\\[^=\s]+\s*=\s*(?:ref\s+)?null\s*$", re.IGNORECASE
+)
+#: 变量归零行（``$\RabbitFX\H = 0`` / ``brightness = 0`` / ...）。
+_RESET_PARAM_ZERO_RE = re.compile(
+    r"^\$\\[^=\s]+\\(?:h|s|v|brightness|interpolate)\s*=\s*0(?:\.0+)?\s*$",
+    re.IGNORECASE,
+)
+#: 命令列表调用行（``Run`` / ``Reset``）。
+_RESET_RUN_RE = re.compile(
+    r"^run\s*=\s*commandlist\\[^\\\s]+\\(?:run|reset)\s*$", re.IGNORECASE
+)
+
+
+def _reset_line_key(line):
+    """复位行的归一化比较键（去重用）。
+
+    ``= ref null`` 与 ``= null``、``= 0`` 与 ``= 0.0`` 是同一件事，实机里材质转资源
+    这两种写法都有；不归一化会漏掉去重、写出等价但重复的复位行。
+    """
+    text = " ".join(str(line or "").strip().split())
+    text = re.sub(r"=\s*ref\s+null\s*$", "= null", text, flags=re.IGNORECASE)
+    text = re.sub(r"=\s*0(?:\.0+)?\s*$", "= 0", text)
+    return text.casefold()
+
+
+def _is_reset_like_line(line):
+    """是不是一条复位行（见 :func:`_collect_trailing_reset_lines`）。"""
+    text = str(line or "").strip()
+    if not text:
+        return False
+    return bool(
+        _RESET_SLOT_NULL_RE.match(text)
+        or _RESET_PARAM_ZERO_RE.match(text)
+        or _RESET_RUN_RE.match(text)
+    )
+
+
+def _collect_trailing_reset_lines(lines, position):
+    """收集 ``position`` 之后紧邻的**块外**复位行（材质转资源写下的）。
+
+    实机 bug：chain 内最后一个兄弟单元的 draw 之后、``endif`` 之外还有材质转资源
+    写的 ``Glowmap = ref null`` / ``brightness = 0`` / ``Run``；旧去重只看单元区间，
+    于是本节点又写了一份等价复位 —— 块内块外两套。把这些紧邻的复位行一并交给
+    去重集合，重复行就不会再写进 Reset 块。
+    """
+    collected = []
+    total = len(lines)
+    index = position
+    while index < total:
+        stripped = str(lines[index]).strip()
+        if not stripped:
+            index += 1
+            continue
+        if not _is_reset_like_line(stripped):
+            break
+        collected.append(stripped)
+        index += 1
+    return collected
+
+
+def _unit_edit_scope(lines, unit):
+    """单元的**可写**行范围 ``(起, 止)``（止独占）。
+
+    止 = 单元内容末尾；单元是 chain 内**最后一个**兄弟（末尾正好是 ``endif``）时
+    包含该 ``endif`` —— 复位块插在它**之前**，留在条件块内（实机要求：不要写到
+    ``endif`` 之外造成块外重复）。中间的兄弟单元止于下一个 ``; [mesh:...]``，
+    区间互不重叠。
+
+    被 ``else`` 截断的单元（then 分支的最后一个兄弟）止于 ``else`` 行**本身**：
+    复位块写在 then 分支末尾、``else`` 之前。不能顺着扩到所属 ``if`` 的 ``endif``
+    —— 那会把 else 分支整个包进本单元的可写范围，复位块落到另一支的参数块中间，
+    那一支物体的贴图静默全灭（同一个 if/else 里两支各有目标时必现）。
+
+    止之后紧邻的本节点旧复位块会被吸收进范围，保证重跑幂等。
+    """
+    start = int(unit["start"])
+    end = int(unit["end"])
+    chain = tuple(unit.get("chain") or ())
+    if chain:
+        endif_index = chain[-1][1]
+        if 0 <= endif_index < len(lines) and end == endif_index:
+            return start, _absorb_reset_block(lines, endif_index + 1)
+    return start, _absorb_reset_block(lines, end)
+
+
+def _reset_insert_position(unit, block):
+    """复位块在 ``block`` 内的插入位置（``block`` 坐标）。
+
+    统一口径：draw 之后、下一个兄弟 mesh / 条件块 ``endif`` 之前。最后一个兄弟
+    单元的 ``block`` 末尾是 chain 的 ``endif``（见 :func:`_unit_edit_scope`），
+    复位块插在它前面；其它单元插在块末尾（下一个 mesh 注释之前）。
+    """
+    chain = tuple(unit.get("chain") or ())
+    if chain and int(unit["end"]) == chain[-1][1]:
+        for index in range(len(block) - 1, -1, -1):
+            if ini_scope.classify_line(str(block[index]).strip()) == "endif":
+                return index
+    return len(block)
+
+
+def _section_fallback_unit(lines):
+    """整段回退用的伪单元（段里没有 mesh 注释，只能按 hash + 段名定位整段）。"""
+    total = len(lines)
+    draw_lines = [
+        index
+        for index in range(total)
+        if ini_scope.classify_line(str(lines[index]).strip()) == "draw"
+    ]
+    return {
+        "start": 0,
+        "end": total,
+        "mesh": "",
+        "chain": (),
+        "material_lines": [],
+        "draw_lines": draw_lines,
+        "is_target": True,
+    }
 
 
 def _collect_existing_refs(lines, start, end, profile):
@@ -289,9 +540,11 @@ def _format_float(value):
     return text
 
 
-def _insert_block(lines, position, block_lines):
+def _insert_block(lines, position, block_lines, indent=""):
+    """在 ``position`` 处插入一段行；``indent`` 用于跟锚点行保持同级缩进。"""
     for offset, line in enumerate(block_lines):
-        lines.insert(position + offset, line)
+        text = indent + line if indent and str(line).strip() else line
+        lines.insert(position + offset, text)
 
 
 # ────────────────────────── 材质侧探测 ──────────────────────────
@@ -852,11 +1105,16 @@ class SSMTNode_PostProcess_RabbitFXPro(SSMTNode_PostProcess_Base):
         sections, preamble = self._parse_ini(content)
 
         buffer_name = self.buffer_resource_name()
-        changed = False
-        for item in targets:
-            changed |= self._process_target(sections, item, buffer_name)
-        if sync_source is not None:
-            changed |= self._process_sync_source(sections, sync_source, buffer_name)
+        # 先一次性圈定所有目标（含提取源）的绘制单元，再统一注入：同一轮里
+        # 后处理的目标不会把别的目标刚写进去的参数块当成上一轮残留剥掉。
+        jobs, missing_targets, source_missing = self._plan_injections(
+            sections, targets, sync_source
+        )
+        changed = self._apply_injections(sections, jobs, buffer_name)
+        for obj, hash_val in missing_targets:
+            self._log_missing_target(sections, obj, hash_val)
+        if source_missing and sync_source is not None:
+            print(f"[RabbitFXPro] W-Engine 源 {sync_source.name}: 未找到可注入的绘制段")
         if self.enable_sync and self.fx_profile.supports_sync and changed:
             changed |= self._ensure_buffer_resource(sections, buffer_name)
         if changed and self.enable_glow and self._breathing():
@@ -885,81 +1143,140 @@ class SSMTNode_PostProcess_RabbitFXPro(SSMTNode_PostProcess_Base):
 
     # ──────────────────── 目标物体：参数注入 ────────────────────
 
-    def _process_target(self, sections, item, buffer_name):
-        obj = item.target_object
-        hash_val = _extract_hash_from_object(obj.name).lower()
-        suffix_pattern = _normalize_suffix(_extract_resource_suffix(obj.name))
-        if not hash_val:
-            print(f"[RabbitFXPro] 跳过 {obj.name}: 无法解析哈希")
-            return False
+    def _plan_injections(self, sections, targets, sync_source):
+        """在当前（未改动）内容上一次性圈定所有目标与提取源的绘制单元。
 
+        圈定与实际注入分离：先按未改动的内容把每个目标的单元全部圈好，再统一
+        注入。这样同一轮里后处理的目标不会把别的目标刚写进去的参数块当成
+        「上一轮残留」剥掉 —— 多个目标共享同一个 IB 时，一个目标只改属于它
+        自己的单元（各自的 ``; [mesh:...]`` 块），互不剥离。
+        """
+        jobs = []
+        seen_units = set()
+        missing_targets = []
+
+        def collect(obj, kind):
+            hash_val = _extract_hash_from_object(obj.name).lower()
+            if not hash_val:
+                print(f"[RabbitFXPro] 跳过 {obj.name}: 无法解析哈希")
+                # None = 名字解析失败，已经单独提示过，不再报「未找到绑定」。
+                return hash_val, None
+            suffix_pattern = _normalize_suffix(_extract_resource_suffix(obj.name))
+            found = self._collect_target_units(sections, obj, hash_val, suffix_pattern)
+            if not found:
+                return hash_val, False
+            for section_name, units in found:
+                for unit in units:
+                    key = (section_name, int(unit["start"]))
+                    if key in seen_units:
+                        # 同一单元只注入一次（多个目标落到同一个单元时）。
+                        continue
+                    seen_units.add(key)
+                    jobs.append((section_name, unit, obj.name, kind))
+            return hash_val, True
+
+        for item in targets:
+            obj = item.target_object
+            hash_val, found = collect(obj, "target")
+            if found is False:
+                missing_targets.append((obj, hash_val))
+        source_missing = False
+        if sync_source is not None:
+            _hash_val, found = collect(sync_source, "source")
+            source_missing = found is False
+        return jobs, missing_targets, source_missing
+
+    def _apply_injections(self, sections, jobs, buffer_name):
+        """按段分组、单元从后往前注入（插行不影响前面单元的索引）。"""
         changed = False
-        # 从后往前处理，避免插入行导致后续块的索引位移。
-        for section_name, blocks in reversed(self._collect_target_blocks(sections, hash_val, suffix_pattern)):
+        by_section = OrderedDict()
+        for section_name, unit, label, kind in jobs:
+            by_section.setdefault(section_name, []).append((unit, label, kind))
+        for section_name, entries in by_section.items():
             section_lines = sections.get(section_name)
             if section_lines is None:
                 continue
-            for start, end in reversed(blocks):
-                changed |= self._patch_mesh_block(section_lines, start, end, obj.name, buffer_name)
-        if not changed:
-            profile = self.fx_profile
-            print(
-                f"[RabbitFXPro] 未找到 {obj.name} 的 {profile.key} 贴图绑定，跳过"
-                f"（哈希 {hash_val}；确认本节点接在材质转资源之后）"
-            )
-            if not profile.supports_pro_injection:
-                print(
-                    f"[RabbitFXPro] 提示: 当前逻辑的 FX 命名空间是 {profile.key}，"
-                    "本节点只对 RabbitFX / HI3FX 注入参数"
-                )
-            else:
-                others = [
-                    found.key
-                    for found in _binding_namespaces(sections)
-                    if found.key != profile.key
-                ]
-                if others:
-                    print(
-                        f"[RabbitFXPro] 提示: 该配置表里的绑定用的是 "
-                        f"{'、'.join(others)} 命名空间，与当前逻辑的 {profile.key} 不一致，"
-                        "本节点只注入当前逻辑对应的命名空间"
-                    )
+            entries.sort(key=lambda entry: int(entry[0]["start"]), reverse=True)
+            for unit, label, kind in entries:
+                if kind == "source":
+                    changed |= self._patch_sync_source_unit(section_lines, unit, buffer_name)
+                else:
+                    changed |= self._patch_mesh_unit(section_lines, unit, label, buffer_name)
         return changed
 
-    def _collect_target_blocks(self, sections, hash_val, suffix_pattern):
-        """返回 [(段名, [(块首, 块尾), ...]), ...]，按段内 mesh 注释匹配目标物体。
+    def _log_missing_target(self, sections, obj, hash_val):
+        """没找到贴图绑定时给出可读提示（口径与旧实现一致）。"""
+        profile = self.fx_profile
+        print(
+            f"[RabbitFXPro] 未找到 {obj.name} 的 {profile.key} 贴图绑定，跳过"
+            f"（哈希 {hash_val}；确认本节点接在材质转资源之后）"
+        )
+        if not profile.supports_pro_injection:
+            print(
+                f"[RabbitFXPro] 提示: 当前逻辑的 FX 命名空间是 {profile.key}，"
+                "本节点只对 RabbitFX / HI3FX 注入参数"
+            )
+            return
+        others = [
+            found.key
+            for found in _binding_namespaces(sections)
+            if found.key != profile.key
+        ]
+        if others:
+            print(
+                f"[RabbitFXPro] 提示: 该配置表里的绑定用的是 "
+                f"{'、'.join(others)} 命名空间，与当前逻辑的 {profile.key} 不一致，"
+                "本节点只注入当前逻辑对应的命名空间"
+            )
+
+    def _collect_target_units(self, sections, obj, hash_val, suffix_pattern):
+        """返回 [(段名, [绘制单元, ...]), ...]：只收属于这个物体自己的单元。
+
+        圈定口径（全局 ``blueprint/ini_scope``）：段 → ``if``/``endif`` 深度配对
+        → 行分类 → 绘制单元（``; [mesh:...]`` 起，到下一个兄弟 mesh 注释 / 所在
+        条件块 ``endif`` / ``;MARK:`` 之前），单元边界由结构决定，不再按关键词猜。
+
+        单元是否本目标按「IB 键一致 **且** 部件名完全相等」判定 —— 同一 IB 下的
+        相邻部件（``右手.001`` 与 ``右乳球.001``）不会再被当成同一个目标。
 
         不限定 ``[TextureOverride_*]``：EFMI 合并骨骼把绘制内容放在
         ``[CommandList_*]`` 回调段里，ZZMI 的 TTL 重建也会另开段，材质转资源
-        写下的 FX 绑定跟着 mesh 块走，所以只要段里带这个物体的 mesh 块
-        就一起处理。
+        写下的 FX 绑定跟着 mesh 单元走，所以只要段里带这个物体的单元就一起处理。
         """
         profile = self.fx_profile
+        target_scope = ini_scope.mesh_ib_key(obj.name)
+        target_part = _part_name(obj.name)
         result = []
         for section_name, section_lines in sections.items():
             if not section_name.startswith('['):
                 continue
-            blocks = [
-                (start, end)
-                for start, end in _iter_mesh_blocks(section_lines)
-                if _mesh_name_matches(
-                    _extract_mesh_name(section_lines[start]), hash_val, suffix_pattern
-                )
-            ]
-            usable = [
-                (start, end)
-                for start, end in blocks
-                if _find_draw_index(section_lines, start, end) >= 0
-                or _collect_existing_refs(section_lines, start, end, profile)[2] >= 0
-            ]
-            if usable:
-                result.append((section_name, usable))
+            section_scope = ini_scope.section_ib_key(section_name, section_lines)
+            units = []
+            for unit in ini_scope.iter_draw_units(section_lines):
+                mesh_name = unit["mesh"]
+                if target_scope is None:
+                    # 物体名里没有完整 IB 键时退回「8 位 hash 相同」口径。
+                    if _extract_hash_from_object(mesh_name).lower() != hash_val:
+                        continue
+                if not _unit_matches_target(
+                    mesh_name, target_scope, target_part, section_scope
+                ):
+                    continue
+                # 单元内没有 draw / run 时无处可插（旧实现同样跳过这类块）。
+                if _unit_anchor(section_lines, unit["start"], unit["end"], profile)[0] < 0:
+                    continue
+                units.append(unit)
+            if units:
+                result.append((section_name, units))
         if result:
             return result
 
-        # 回退：段里没有匹配的 mesh 注释（名字被映射/合并过）时，按 hash + 段名匹配整段。
+        # 回退：段里**完全没有 mesh 注释**（名字被映射/合并过）时，按 hash + 段名
+        # 匹配整段；整段内的定位同样走 ini_scope 的行分类（第一个 draw / run）。
         for section_name, section_lines in sections.items():
             if not section_name.startswith('[TextureOverride'):
+                continue
+            if ini_scope.section_mesh_names(section_lines):
                 continue
             if not any(
                 str(line).strip().lower().startswith('hash =')
@@ -971,15 +1288,26 @@ class SSMTNode_PostProcess_RabbitFXPro(SSMTNode_PostProcess_Base):
                 continue
             if _collect_existing_refs(section_lines, 0, len(section_lines), profile)[2] < 0:
                 continue
-            result.append((section_name, [(0, len(section_lines))]))
+            result.append((section_name, [_section_fallback_unit(section_lines)]))
         return result
 
-    def _patch_mesh_block(self, lines, start, end, object_label, buffer_name):
+    def _patch_mesh_unit(self, lines, unit, object_label, buffer_name):
+        """在结构化圈定的一个单元内注入参数块与复位块。
+
+        参数块插在本单元的 ``Run`` / ``draw`` 之前（取更早者，见
+        :func:`_unit_anchor`）；复位块插在 draw 之后、下一个兄弟 mesh / 条件块
+        ``endif`` 之前（见 :func:`_reset_insert_position`），不会写到 endif 之外。
+        去重集合 = 单元内容 + 紧邻的块外复位行（材质转资源写的），已有的行不再写。
+        缩进跟随锚点行 / 末尾行，条件块里嵌套的材质切换 ``if`` 不会被拆散。
+        """
         profile = self.fx_profile
-        block = _strip_previous_blocks(lines[start:end])
+        start, scope_end = _unit_edit_scope(lines, unit)
+        # 块外紧邻的复位行（材质转资源pro 写在 endif 之后）也要算「已存在」。
+        trailing_reset_lines = _collect_trailing_reset_lines(lines, scope_end)
+        block = _strip_previous_blocks(lines[start:scope_end])
         glow_ref, fxmap_ref, run_index = _collect_existing_refs(block, 0, len(block), profile)
-        draw_index = _find_draw_index(block, 0, len(block))
-        if draw_index < 0:
+        anchor, draw_index = _unit_anchor(block, 0, len(block), profile)
+        if anchor < 0:
             return False
         if not glow_ref and not fxmap_ref and run_index < 0:
             return False
@@ -993,24 +1321,47 @@ class SSMTNode_PostProcess_RabbitFXPro(SSMTNode_PostProcess_Base):
         if not param_lines and not cs_lines:
             return False
 
-        insert_at = run_index if run_index >= 0 else draw_index
-        if param_lines and run_index < 0:
+        # 锚点到 draw 之间没有本命名空间的 Run 时补一条，保证参数在本次 draw
+        # 前被执行（块内 run 排在 draw 之后就是实机 bug 的成因）。
+        run_limit = draw_index if draw_index >= 0 else len(block)
+        run_position = _profile_run_between(block, anchor, run_limit, profile)
+        if param_lines and run_position is None:
             param_lines = [*param_lines, profile.run_line]
         # ColorShift 必须在 Run 之后（Run 结尾会把 ResourceFXMap 清空）。
-        cs_position = (run_index + 1) if run_index >= 0 else (insert_at + len(param_lines))
+        cs_position = (
+            run_position + 1 if run_position is not None else anchor + len(param_lines)
+        )
+
+        anchor_indent = _leading_whitespace(block[anchor]) if block else ""
+        insertions = []
+        if cs_lines:
+            insertions.append((cs_position, cs_lines, anchor_indent))
+        if param_lines:
+            insertions.append((anchor, param_lines, anchor_indent))
+        if self.enable_reset:
+            reset_lines = self._build_reset_lines(
+                block,
+                wrote_glow,
+                wrote_sync,
+                wrote_colorshift,
+                trailing_reset_lines,
+            )
+            if reset_lines:
+                insertions.append(
+                    (
+                        _reset_insert_position(unit, block),
+                        reset_lines,
+                        _trailing_indent(block),
+                    )
+                )
 
         # 先插靠后的位置，前面的索引才不会位移。
-        if cs_lines:
-            _insert_block(block, cs_position, cs_lines)
-        if param_lines:
-            _insert_block(block, insert_at, param_lines)
+        for position, block_lines, indent in sorted(
+            insertions, key=lambda item: item[0], reverse=True
+        ):
+            _insert_block(block, position, block_lines, indent)
 
-        if self.enable_reset:
-            reset_lines = self._build_reset_lines(block, wrote_glow, wrote_sync, wrote_colorshift)
-            if reset_lines:
-                _insert_block(block, _find_draw_block_end(block, 0, len(block)), reset_lines)
-
-        lines[start:end] = block
+        lines[start:scope_end] = block
         return True
 
     def _build_param_lines(self, glow_ref, fxmap_ref, object_label, buffer_name):
@@ -1140,12 +1491,19 @@ class SSMTNode_PostProcess_RabbitFXPro(SSMTNode_PostProcess_Base):
             _CS_END,
         ]
 
-    def _build_reset_lines(self, block, wrote_glow, wrote_sync, wrote_colorshift):
+    def _build_reset_lines(
+        self, block, wrote_glow, wrote_sync, wrote_colorshift, extra_lines=()
+    ):
         """只复位本节点真正写过的东西；材质转资源已有的复位行不重复写。
 
         RabbitFX/NTEMIFX：运行时 ``Run`` 结尾自带变量复位，所以写 0 + 再 Run 一次即可。
         HI3FX：``Run`` **不**复位变量，写 0 会让后续绘制一直吃 ``brightness = 0``
         （模型变黑），所以改成调 ``CommandList\\HI3FX\\Reset``。
+
+        ``extra_lines`` 是单元区间**之外**紧邻的复位行（材质转资源写在 ``endif``
+        之后的那几行）：它们同样算「已存在」，否则会写出块内块外两套等价复位。
+        比较用 :func:`_reset_line_key` 归一化（``= ref null`` ↔ ``= null``、
+        ``0`` ↔ ``0.0``）。
         """
         profile = self.fx_profile
         candidates = []
@@ -1178,43 +1536,26 @@ class SSMTNode_PostProcess_RabbitFXPro(SSMTNode_PostProcess_Base):
             candidates.append("$\\rabbitfx\\blendmode = 0")
             if self.sync_brightness_only:
                 candidates.append("$\\rabbitfx\\syncbrightnessonly = 0")
-        existing = {str(line).strip().casefold() for line in block}
-        lines = [line for line in candidates if line and line.casefold() not in existing]
+        existing = {
+            _reset_line_key(line)
+            for line in list(block) + list(extra_lines or ())
+        }
+        lines = [line for line in candidates if line and _reset_line_key(line) not in existing]
         if not lines:
             return []
         return [_RESET_BEGIN, *lines, _RESET_END]
 
     # ──────────────────── W-Engine 提取源 ────────────────────
 
-    def _process_sync_source(self, sections, obj, buffer_name):
-        hash_val = _extract_hash_from_object(obj.name).lower()
-        suffix_pattern = _normalize_suffix(_extract_resource_suffix(obj.name))
-        if not hash_val:
-            print(f"[RabbitFXPro] W-Engine 源 {obj.name}: 无法解析哈希，跳过")
+    def _patch_sync_source_unit(self, lines, unit, buffer_name):
+        """在提取源自己的绘制单元里插 ERun 块（单元圈定口径与目标相同）。"""
+        profile = self.fx_profile
+        start, scope_end = _unit_edit_scope(lines, unit)
+        trailing_reset_lines = _collect_trailing_reset_lines(lines, scope_end)
+        block = _strip_previous_blocks(lines[start:scope_end])
+        anchor, _draw_index = _unit_anchor(block, 0, len(block), profile)
+        if anchor < 0:
             return False
-
-        changed = False
-        for section_name, blocks in reversed(self._collect_target_blocks(sections, hash_val, suffix_pattern)):
-            section_lines = sections.get(section_name)
-            if section_lines is None:
-                continue
-            for start, end in reversed(blocks):
-                changed |= self._patch_sync_source_block(section_lines, start, end, buffer_name)
-        if not changed:
-            print(f"[RabbitFXPro] W-Engine 源 {obj.name}: 未找到可注入的绘制段")
-        return changed
-
-    def _patch_sync_source_block(self, lines, start, end, buffer_name):
-        block = _strip_previous_blocks(lines[start:end])
-        draw_index = _find_draw_index(block, 0, len(block))
-        if draw_index < 0:
-            return False
-        run_index = -1
-        run_line_re = self.fx_profile.run_line_re
-        for index in range(0, draw_index):
-            if run_line_re.match(str(block[index]).strip()):
-                run_index = index
-                break
 
         block_lines = [_SYNC_BEGIN]
         if self.buffer_mode == 'RWBUFFER':
@@ -1230,19 +1571,23 @@ class SSMTNode_PostProcess_RabbitFXPro(SSMTNode_PostProcess_Base):
             block_lines.append(UPDATE_BUFFER_LINE)
             block_lines.append(E_RUN_LINE)
         block_lines.append(_SYNC_END)
-        _insert_block(block, run_index if run_index >= 0 else draw_index, block_lines)
+        _insert_block(block, anchor, block_lines, _leading_whitespace(block[anchor]))
 
         if self.enable_reset:
             reset_line = f"{SET_FX_BUFFER_REF} = ref null"
-            existing = {str(line).strip().casefold() for line in block}
-            if reset_line.casefold() not in existing:
+            existing = {
+                _reset_line_key(line)
+                for line in list(block) + list(trailing_reset_lines)
+            }
+            if _reset_line_key(reset_line) not in existing:
                 _insert_block(
                     block,
-                    _find_draw_block_end(block, 0, len(block)),
+                    _reset_insert_position(unit, block),
                     [_RESET_BEGIN, reset_line, _RESET_END],
+                    _trailing_indent(block),
                 )
 
-        lines[start:end] = block
+        lines[start:scope_end] = block
         return True
 
     # ──────────────────── 资源与变量声明 ────────────────────
