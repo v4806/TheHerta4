@@ -56,7 +56,21 @@ _install_module(
 )
 _install_module(f"{PKG}.common.logic_name", LogicName=types.SimpleNamespace())
 _install_module(f"{PKG}.common.global_config", GlobalConfig=types.SimpleNamespace())
-_install_module(f"{PKG}.common.global_properties", GlobalProterties=types.SimpleNamespace())
+_install_module(
+    f"{PKG}.common.global_properties",
+    GlobalProterties=types.SimpleNamespace(),
+    # node_obj 的「顶点去重精度控制」提示条按这个元组遍历复选框（见 common/global_properties.py）
+    DEDUPLICATE_ELEMENT_TYPES=(
+        "POSITION",
+        "NORMAL",
+        "TANGENT",
+        "BINORMAL",
+        "TEXCOORD",
+        "COLOR",
+        "BLENDWEIGHT",
+        "BLENDINDICES",
+    ),
+)
 _install_module(f"{PKG}.common.object_prefix_helper", ObjectPrefixHelper=types.SimpleNamespace())
 _install_module(f"{PKG}.blueprint.node_base", SSMTBlueprintTree=object, SSMTNodeBase=object)
 

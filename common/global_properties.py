@@ -6,6 +6,20 @@ import os
 _blueprint_enum_items_cache = []
 _workspace_safe_identifier_map: dict[str, str] = {}
 
+# 「顶点去重精度控制」面板的 8 个类型复选框，与下面 deduplicate_* 开关一一对应。
+# 全勾＝面板默认；导出时默认走历史的全字段去重键（见 utils/export_utils.py）。
+DEDUPLICATE_ELEMENT_TYPES: tuple[str, ...] = (
+    "POSITION",
+    "NORMAL",
+    "TANGENT",
+    "BINORMAL",
+    "TEXCOORD",
+    "COLOR",
+    "BLENDWEIGHT",
+    "BLENDINDICES",
+)
+
+
 
 def _make_safe_identifier(name: str) -> str:
     return hashlib.md5(name.encode("utf-8")).hexdigest()[:16]
@@ -509,6 +523,21 @@ class GlobalProterties(bpy.types.PropertyGroup):
         default=True,
     ) # type: ignore
 
+    # 默认开启＝缝合标记特殊通道。只有被标记了缝合边(use_seam)的顶点才走
+    # 「忽略顶点编号、只比 POSITION + TEXCOORD」的特殊去重；没标记的顶点照旧按
+    # 上面勾选的类型 + 顶点编号去重。所以不标记就等于没有这套机制，默认开着是安全的。
+    deduplicate_ignore_vertex_id: bpy.props.BoolProperty(
+        name="缝合标记特殊去重",
+        description=(
+            "开启后，被标记了缝合边(Mark Seam)的顶点只按 位置 + UV 比较、且不看顶点编号："
+            "同一 IB 内编号不同、但位置与 UV 逐字节相同的标记顶点会合并成同一行。"
+            "没标记缝合边的顶点照旧按上面勾选的类型 + 顶点编号去重，行为与以前一致。"
+            "合并行取最先出现的那个 loop 的其余字段（法线/切线/顶点色/骨骼）；"
+            "比较是字节级精确比较，不是容差——位置有微小差异就不会合并"
+        ),
+        default=True,
+    ) # type: ignore
+
     @classmethod
     def _instance(cls):
         return bpy.context.scene.global_properties
@@ -756,24 +785,21 @@ class GlobalProterties(bpy.types.PropertyGroup):
     @classmethod
     def get_deduplicate_element_set(cls) -> set:
         instance = cls._instance()
-        element_set = set()
-        if instance.deduplicate_POSITION:
-            element_set.add("POSITION")
-        if instance.deduplicate_NORMAL:
-            element_set.add("NORMAL")
-        if instance.deduplicate_TANGENT:
-            element_set.add("TANGENT")
-        if instance.deduplicate_BINORMAL:
-            element_set.add("BINORMAL")
-        if instance.deduplicate_TEXCOORD:
-            element_set.add("TEXCOORD")
-        if instance.deduplicate_COLOR:
-            element_set.add("COLOR")
-        if instance.deduplicate_BLENDWEIGHT:
-            element_set.add("BLENDWEIGHT")
-        if instance.deduplicate_BLENDINDICES:
-            element_set.add("BLENDINDICES")
-        return element_set
+        return {
+            element_type
+            for element_type in DEDUPLICATE_ELEMENT_TYPES
+            if getattr(instance, f"deduplicate_{element_type}", False)
+        }
+
+    @classmethod
+    def deduplicate_element_set_is_default(cls) -> bool:
+        """面板是否仍是默认（8 个类型全勾）。全勾＝导出时走历史全字段去重键。"""
+        return len(cls.get_deduplicate_element_set()) == len(DEDUPLICATE_ELEMENT_TYPES)
+
+    @classmethod
+    def deduplicate_ignore_vertex_id(cls) -> bool:
+        """去重时是否把顶点编号摘出去重键（跨顶点合并）。缺省 False＝保持原口径。"""
+        return cls._bool_attr("deduplicate_ignore_vertex_id", True)
 
 
 def register():

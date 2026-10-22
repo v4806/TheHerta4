@@ -521,6 +521,104 @@ class ExportUtils:
         )
 
     @staticmethod
+    def _deduplicate_ignore_vertex_id() -> bool:
+        """读「缝合标记特殊去重」开关，读不到/非法时回退 True（兼容老属性组与测试替身）。
+
+        默认开着是安全的：只有网格里标了缝合边的顶点才走特殊通道。
+        """
+        getter = getattr(GlobalProterties, "deduplicate_ignore_vertex_id", None)
+        if callable(getter):
+            try:
+                return bool(getter())
+            except Exception:
+                return True
+        if getter is None:
+            return True
+        return bool(getter)
+
+    @staticmethod
+    def recalculate_element_vertex_ndarray(
+        obj: bpy.types.Object,
+        element_vertex_ndarray: numpy.ndarray,
+        d3d11_game_type: D3D11GameType,
+        dtype: numpy.dtype,
+    ):
+        """在去重之前，逐 loop 行重算属性（轮廓线 TANGENT / HI3 2.0 的 COLOR）。
+
+        这里的行就是 loop 数组、本来就按三角形顺序排列，所以喂恒等 IB（arange(n)）：
+        算子按三角形遍历求角点权重、再按位置分组累加，恒等 IB 让"每个角点各自一行"与
+        重算之后的行一一对应，两个算子内部一行都不用改。
+
+        重算发生在去重**之前**，于是去重键比较的就是重算之后的值——被合并的行在重算
+        口径下本来就相等，"先收窄再重算会改变均值/切线"这件事从顺序上消失，面板勾选
+        也不需要为它额外增加任何类型。
+
+        两个算子都有 early-return 分支（开关关着、元素类型缺列、勾了标准切线基准），
+        那种情况原样返回入参；返回结果统一规整成同 dtype、同长度、可写的数组，对不上
+        就原样退回入参，不抛。
+        """
+        if element_vertex_ndarray is None or len(element_vertex_ndarray) == 0:
+            return element_vertex_ndarray
+
+        recalculated = ObjBufferHelper.average_normal_tangent_xxmi(
+            obj=obj,
+            indexed_vertices=element_vertex_ndarray,
+            flattened_ib=numpy.arange(len(element_vertex_ndarray), dtype=numpy.int32),
+            d3d11GameType=d3d11_game_type,
+            dtype=dtype,
+        )
+        recalculated = ObjBufferHelper.average_normal_color(
+            obj=obj,
+            indexed_vertices=recalculated,
+            d3d11GameType=d3d11_game_type,
+            dtype=dtype,
+        )
+        return ExportUtils._coerce_recalculated_element_vertex_ndarray(
+            recalculated=recalculated,
+            fallback=element_vertex_ndarray,
+        )
+
+    @staticmethod
+    def _coerce_recalculated_element_vertex_ndarray(recalculated, fallback):
+        """把重算结果规整成同 dtype、同长度、可写的结构化数组；对不上就原样退回 fallback。"""
+        if recalculated is fallback:
+            return fallback
+        if not isinstance(recalculated, numpy.ndarray):
+            # 有分支返回 bytes 列表（每行一条）。
+            try:
+                recalculated = numpy.frombuffer(
+                    b"".join(bytes(row) for row in recalculated),
+                    dtype=fallback.dtype,
+                )
+            except Exception:
+                return fallback
+        if recalculated.dtype != fallback.dtype or len(recalculated) != len(fallback):
+            return fallback
+        return numpy.array(recalculated, dtype=fallback.dtype, copy=True)
+
+    @staticmethod
+    def _deduplicate_element_set_is_panel_default():
+        """读「顶点去重精度控制」面板是否仍是默认（8 个类型全勾）。读不到就当非默认。"""
+        checker = getattr(GlobalProterties, "deduplicate_element_set_is_default", None)
+        if not callable(checker):
+            return False
+        try:
+            return bool(checker())
+        except Exception:
+            return False
+
+    @staticmethod
+    def _deduplicate_element_set_for_export():
+        """这次导出交给去重的元素类型。
+
+        面板没动过（8 个类型全勾）⇒ None：走历史的全字段去重键，导出逐字节不变。
+        面板被显式改过 ⇒ 就是勾选集本身，不补任何东西（重算已经在去重之前做完了）。
+        """
+        if ExportUtils._deduplicate_element_set_is_panel_default():
+            return None
+        return GlobalProterties.get_deduplicate_element_set()
+
+    @staticmethod
     def build_unity_index_buffers(
         obj: bpy.types.Object,
         mesh: bpy.types.Mesh,
@@ -539,24 +637,19 @@ class ExportUtils:
                 dtype=dtype,
             )
 
-        # These two recalculate operators historically ran on the fully split
-        # unified vertex set. If local dedup precision narrows the compared
-        # fields, vertices can merge earlier and both COLOR/TANGENT averages
-        # change. Keep the remote-compatible behavior while either recalc path
-        # is enabled.
-        # 全局开关的判断必须与 actual 写入方保持一致：average_normal_color 只在 HIMI
-        # （HI3 2.0，UI 才显示该栏）下真正改写 COLOR。否则非 HIMI 游戏会仅仅因为默认值
-        # AVERAGE 就被禁掉局部去重，导出顶点数与"关掉该开关"时不一致。
-        recalculate_average_normal_enabled = (
-            GlobalProterties.recalculate_tangent()
-            or (
-                GlobalProterties.recalculate_color()
-                and GlobalConfig.logic_name == LogicName.HIMI
-            )
-            or obj.get("3DMigoto:RecalculateTANGENT", False)
-            or obj.get("3DMigoto:RecalculateCOLOR", False)
+        # 属性重算（average_normal_tangent_xxmi / average_normal_color）跑在去重**之前**：
+        # 先按 loop 行把 TANGENT / COLOR 算出来，再交给下面的 calc_index_vertex_buffer_wwmi_v2
+        # 去重。于是去重键比较的就是重算之后的值，算子也永远拿得到完整的角点数据——原来那条
+        # "重算开着就退回全字段去重"的门控因此不存在了，面板勾选直接生效（见
+        # _deduplicate_element_set_for_export）。GF2 的 TANGENT 分支在上面提前返回、走它
+        # 自己的老路径，不受这里的顺序影响。
+        element_vertex_ndarray = ExportUtils.recalculate_element_vertex_ndarray(
+            obj=obj,
+            element_vertex_ndarray=element_vertex_ndarray,
+            d3d11_game_type=d3d11_game_type,
+            dtype=dtype,
         )
-        deduplicate_element_set = None if recalculate_average_normal_enabled else GlobalProterties.get_deduplicate_element_set()
+        deduplicate_element_set = ExportUtils._deduplicate_element_set_for_export()
 
         ib, _, _, unique_element_vertex_ndarray, unique_first_loop_indices = \
             ObjBufferHelper.calc_index_vertex_buffer_wwmi_v2(
@@ -565,34 +658,16 @@ class ExportUtils:
                 dtype=dtype,
                 d3d11_game_type=d3d11_game_type,
                 deduplicate_element_set=deduplicate_element_set,
+                deduplicate_ignore_vertex_id=ExportUtils._deduplicate_ignore_vertex_id(),
                 flip_triangles=False,
             )
 
         index_loop_id_dict = dict(enumerate(unique_first_loop_indices.tolist()))
 
-        vertex_data_list = [row.tobytes() for row in unique_element_vertex_ndarray]
-
-        indexed_vertices = ObjBufferHelper.average_normal_tangent_xxmi(
-            obj=obj,
-            indexed_vertices=vertex_data_list,
-            flattened_ib=ib,
-            d3d11GameType=d3d11_game_type,
-            dtype=dtype,
-        )
-
-        indexed_vertices = ObjBufferHelper.average_normal_color(
-            obj=obj,
-            indexed_vertices=indexed_vertices,
-            d3d11GameType=d3d11_game_type,
-            dtype=dtype,
-        )
-
-        if isinstance(indexed_vertices, numpy.ndarray):
-            n_unique = len(indexed_vertices)
-            row_size = indexed_vertices.dtype.itemsize
-            post_processed_bytes = numpy.ascontiguousarray(indexed_vertices).view(numpy.uint8).reshape(n_unique, row_size)
-        else:
-            post_processed_bytes = numpy.array([numpy.frombuffer(bd, dtype=numpy.uint8) for bd in indexed_vertices])
+        row_size = unique_element_vertex_ndarray.dtype.itemsize
+        post_processed_bytes = numpy.ascontiguousarray(unique_element_vertex_ndarray).view(
+            numpy.uint8
+        ).reshape(len(unique_element_vertex_ndarray), row_size)
 
         category_stride_dict = d3d11_game_type.get_real_category_stride_dict()
         category_buffer_dict = {}
@@ -773,6 +848,7 @@ class ExportUtils:
         dtype: numpy.dtype,
         d3d11_game_type: D3D11GameType,
         deduplicate_element_set: set = None,
+        deduplicate_ignore_vertex_id: bool = True,
     ):
         return ObjBufferHelper.calc_index_vertex_buffer_wwmi_v2(
             mesh=mesh,
@@ -780,6 +856,7 @@ class ExportUtils:
             dtype=dtype,
             d3d11_game_type=d3d11_game_type,
             deduplicate_element_set=deduplicate_element_set,
+            deduplicate_ignore_vertex_id=deduplicate_ignore_vertex_id,
         )
 
     @staticmethod
@@ -811,7 +888,16 @@ class ExportUtils:
                 d3d11_game_type=element_context.d3d11_game_type,
             )
 
-        deduplicate_element_set = GlobalProterties.get_deduplicate_element_set()
+        # 与 unity 路径同序：先按 loop 行重算属性，再按面板勾选去重。这样
+        # build_wwmi_shapekey_payload 拿到的 index_vertex_id_dict 对应的还是同一套
+        # "重算后的行"，形态键 payload 的取数口径不变。
+        element_vertex_ndarray = ExportUtils.recalculate_element_vertex_ndarray(
+            obj=element_context.obj,
+            element_vertex_ndarray=element_vertex_ndarray,
+            d3d11_game_type=element_context.d3d11_game_type,
+            dtype=element_context.total_structured_dtype,
+        )
+        deduplicate_element_set = ExportUtils._deduplicate_element_set_for_export()
 
         ib, category_buffer_dict, index_vertex_id_dict, unique_element_vertex_ndarray, unique_first_loop_indices = ExportUtils.build_wwmi_index_buffers(
             mesh=element_context.mesh,
@@ -819,6 +905,7 @@ class ExportUtils:
             dtype=element_context.total_structured_dtype,
             d3d11_game_type=element_context.d3d11_game_type,
             deduplicate_element_set=deduplicate_element_set,
+            deduplicate_ignore_vertex_id=ExportUtils._deduplicate_ignore_vertex_id(),
         )
         if BlueprintExportHelper.should_suppress_shapekey_resource_export():
             shapekey_offsets, shapekey_vertex_ids, shapekey_vertex_offsets, export_shapekey = [], [], [], False

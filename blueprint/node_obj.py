@@ -5,7 +5,7 @@ from bpy.types import NodeTree, Node, NodeSocket
 
 from ..common.logic_name import LogicName
 from ..common.global_config import GlobalConfig
-from ..common.global_properties import GlobalProterties
+from ..common.global_properties import DEDUPLICATE_ELEMENT_TYPES, GlobalProterties
 from ..common.object_prefix_helper import ObjectPrefixHelper
 from .node_base import SSMTBlueprintTree, SSMTNodeBase
 
@@ -484,6 +484,23 @@ class SSMTNode_Result_Output(SSMTNodeBase):
             col.prop(context.scene.global_properties, "deduplicate_COLOR")
             col.prop(context.scene.global_properties, "deduplicate_BLENDWEIGHT")
             col.prop(context.scene.global_properties, "deduplicate_BLENDINDICES")
+            col.separator()
+            col.prop(context.scene.global_properties, "deduplicate_ignore_vertex_id")
+            if context.scene.global_properties.deduplicate_ignore_vertex_id:
+                hint_box = box.box()
+                hint_col = hint_box.column()
+                hint_col.label(text="缝合边(Mark Seam)标记的顶点：只比位置+UV、不看顶点编号", icon='INFO')
+                hint_col.label(text="没标记的顶点：照旧按勾选类型+顶点编号去重", icon='INFO')
+            # 全勾＝面板默认＝历史的全字段去重键。显式改过勾选后导出就按勾选去重。
+            # 属性重算在去重之前完成（见 utils/export_utils.py），不需要为它补任何类型。
+            properties = context.scene.global_properties
+            if not all(
+                getattr(properties, f"deduplicate_{element_type}")
+                for element_type in DEDUPLICATE_ELEMENT_TYPES
+            ):
+                hint_box = box.box()
+                hint_col = hint_box.column()
+                hint_col.label(text="已按勾选类型去重（全勾＝历史全字段）", icon='INFO')
 
     def update(self):
         if self.inputs and self.inputs[-1].is_linked:

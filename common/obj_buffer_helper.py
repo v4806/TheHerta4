@@ -849,12 +849,78 @@ class ObjBufferHelper:
     
 
     @staticmethod
+    def _deduplicate_active_columns(
+        dtype:numpy.dtype,
+        deduplicate_element_set:'set | None',
+        row_size:int) -> numpy.ndarray:
+        '''
+        返回长度 = row_size 的 bool 数组：True 表示该字节列参与去重键比较。
+
+        deduplicate_element_set 为 None 时全部字段参与；否则按 `_filter_deduplicate_elements`
+        的同一条规则（字段名等于、或以元素类型开头）匹配，例如 TEXCOORD 匹配 TEXCOORD1。
+        '''
+        active = numpy.zeros(row_size, dtype=bool)
+        offset = 0
+        for field_name in dtype.names:
+            field_size = dtype.fields[field_name][0].itemsize
+            if deduplicate_element_set is None:
+                keep = True
+            else:
+                keep = any(
+                    field_name == element_type or field_name.startswith(element_type)
+                    for element_type in deduplicate_element_set
+                )
+            if keep:
+                active[offset:offset + field_size] = True
+            offset += field_size
+        return active
+
+    @staticmethod
+    def _seam_marked_loop_mask(mesh, loop_vertex_indices:numpy.ndarray):
+        '''
+        返回每个 loop 是否属于「标记了缝合边的顶点」；没有可用标记时返回 None。
+
+        判定口径（宽）：顶点只要有一条邻接边 use_seam=True 就算被标记。
+        读不到边信息（没有边/没有该属性）时返回 None，调用方按「没有标记」处理。
+        '''
+        try:
+            edges = getattr(mesh, "edges", None)
+            if edges is None:
+                return None
+            n_edges = len(edges)
+            if n_edges == 0:
+                return None
+
+            seam_flags = numpy.zeros(n_edges, dtype=bool)
+            try:
+                edges.foreach_get("use_seam", seam_flags)
+            except Exception:
+                seam_flags[:] = [bool(getattr(edge, "use_seam", False)) for edge in edges]
+            if not bool(seam_flags.any()):
+                return None
+
+            vertices = getattr(mesh, "vertices", None)
+            n_vertices = len(vertices) if vertices is not None else 0
+            if n_vertices == 0:
+                return None
+
+            edge_vertices = numpy.empty(n_edges * 2, dtype=int)
+            edges.foreach_get("vertices", edge_vertices)
+            marked_vertices = numpy.zeros(n_vertices, dtype=bool)
+            marked_vertices[edge_vertices.reshape(n_edges, 2)[seam_flags].ravel()] = True
+            return marked_vertices[loop_vertex_indices]
+        except Exception as exc:  # noqa: BLE001 - 标记读不到就退化成正常通道，绝不弄坏导出
+            print(f"顶点去重精度控制: 读取缝合边标记失败，特殊通道已跳过（{exc}）")
+            return None
+
+    @staticmethod
     def calc_index_vertex_buffer_wwmi_v2(
         mesh:bpy.types.Mesh, 
         element_vertex_ndarray:numpy.ndarray, 
         dtype:numpy.dtype,
         d3d11_game_type:D3D11GameType,
         deduplicate_element_set:set = None,
+        deduplicate_ignore_vertex_id: bool = True,
         flip_triangles: bool = True):
         '''
         - 用 numpy 将结构化顶点视图为一行字节，避免逐顶点 bytes() 与 dict 哈希。
@@ -863,6 +929,12 @@ class ObjBufferHelper:
         - 当 structured dtype 非连续时，内部会做一次拷贝（ascontiguousarray）；通常开销小于逐顶点哈希开销。
         - deduplicate_element_set: 指定哪些元素类型参与去重，为 None 时使用全部元素。
           元素类型名称包括: POSITION, NORMAL, TANGENT, BINORMAL, TEXCOORD, COLOR, BLENDWEIGHT, BLENDINDICES
+        - deduplicate_ignore_vertex_id: 缝合标记特殊通道的总开关，默认开启。
+          只有「至少有一条邻接边被标记为缝合边(use_seam)」的顶点走特殊通道：键只取
+          POSITION + TEXCOORD，且不含顶点编号 ⇒ 编号不同、位置与 UV 逐字节相同的标记
+          顶点会合并成一行。没被标记的顶点照旧走正常通道（勾选的类型 + 顶点编号）。
+          网格上一条缝合边都没标时，本开关不改变任何输出（等于没有这套机制）。
+          合并行仍取首个出现 loop 的完整数据与顶点编号，下游 shapekey/骨骼映射语义不变。
         '''
 
         # (1) loop -> vertex mapping
@@ -880,15 +952,57 @@ class ObjBufferHelper:
             raw = vb.tobytes()
             row_bytes = numpy.frombuffer(raw, dtype=numpy.uint8).reshape(n_loops, row_size)
 
-        # 根据 deduplicate_element_set 过滤参与去重的元素
-        if deduplicate_element_set is not None:
-            filtered_row_bytes = ObjBufferHelper._filter_deduplicate_elements(
-                element_vertex_ndarray, dtype, d3d11_game_type, deduplicate_element_set, n_loops
-            )
-        else:
-            filtered_row_bytes = row_bytes
+        # 两个通道：
+        #   * 特殊通道：顶点只要有一条邻接边被标记为缝合边(use_seam)，键就只取
+        #     POSITION + TEXCOORD 且不含顶点编号（编号用 0xFFFFFFFF 占位，保持键宽度统一）
+        #     ⇒ 编号不同、位置与 UV 相同的标记顶点会合并成一行。
+        #   * 正常通道：键 = 勾选的类型 + 顶点编号（历史行为，与改动前逐字节一致）。
+        seam_loop_mask = None
+        if deduplicate_ignore_vertex_id:
+            seam_loop_mask = ObjBufferHelper._seam_marked_loop_mask(mesh, loop_vertex_indices)
+            if seam_loop_mask is not None and not bool(seam_loop_mask.any()):
+                seam_loop_mask = None
 
-        filtered_row_size = filtered_row_bytes.shape[1]
+        if seam_loop_mask is not None:
+            active_columns = ObjBufferHelper._deduplicate_active_columns(
+                dtype, deduplicate_element_set, row_size
+            )
+            if deduplicate_element_set is not None and not bool(active_columns.any()):
+                SSMTErrorUtils.raise_fatal(
+                    "顶点去重精度控制: 没有选择任何元素参与去重，请至少选择一个元素类型"
+                )
+            # 标记顶点只比 位置 + UV：把这些之外的所有列清零，等价于「不参与比较」
+            special_columns = ObjBufferHelper._deduplicate_active_columns(
+                dtype, {"POSITION", "TEXCOORD"}, row_size
+            )
+            filtered_row_bytes = numpy.array(row_bytes, copy=True)
+            dropped_columns = numpy.nonzero(~active_columns)[0]
+            if dropped_columns.size:
+                filtered_row_bytes[:, dropped_columns] = 0
+            special_rows = numpy.nonzero(seam_loop_mask)[0]
+            if special_rows.size:
+                # 标记顶点：先整行清零，再把 位置 + UV 的列按原始字节填回去
+                filtered_row_bytes[seam_loop_mask] = 0
+                special_columns_idx = numpy.nonzero(special_columns)[0]
+                if special_columns_idx.size:
+                    special_slice = numpy.ix_(special_rows, special_columns_idx)
+                    filtered_row_bytes[special_slice] = row_bytes[special_slice]
+            filtered_row_size = row_size
+            vid_values = loop_vertex_indices.astype(numpy.uint32)
+            vid_values[seam_loop_mask] = numpy.uint32(0xFFFFFFFF)
+            vid_bytes = vid_values.view(numpy.uint8).reshape(n_loops, 4)
+            vid_width = 4
+        else:
+            # 根据 deduplicate_element_set 过滤参与去重的元素
+            if deduplicate_element_set is not None:
+                filtered_row_bytes = ObjBufferHelper._filter_deduplicate_elements(
+                    element_vertex_ndarray, dtype, d3d11_game_type, deduplicate_element_set, n_loops
+                )
+            else:
+                filtered_row_bytes = row_bytes
+            filtered_row_size = filtered_row_bytes.shape[1]
+            vid_bytes = loop_vertex_indices.astype(numpy.uint32).view(numpy.uint8).reshape(n_loops, 4)
+            vid_width = 4
 
         # WWMI-Tools deduplicates loop rows including the loop's VertexId -> they
         # effectively perform uniqueness on loop attributes + VertexId treated as
@@ -898,24 +1012,26 @@ class ObjBufferHelper:
         # Afterwards we select unique rows from the original `row_bytes` using
         # the indices returned by numpy.unique to preserve exact original layout.
 
-        # Build 4-byte vertex index array (little-endian) and concatenate to row bytes
-        # to form combined rows: [row_bytes | vid_bytes]. Use numpy.unique on combined
-        # rows to get uniqueness, then reorder unique results to match insertion
-        # order (first occurrence). This vectorized path keeps behavior identical
-        # to the OrderedDict+bytes approach but runs much faster in numpy.
-        # Build 4-byte vertex index array (little-endian)
-        vid_bytes = loop_vertex_indices.astype(numpy.uint32).view(numpy.uint8).reshape(n_loops, 4)
+        # 键 = [参与比较的字节 | 4 字节顶点编号]。顶点编号在特殊通道里是占位符，
+        # 在正常通道里是真实编号，两种通道的键宽度一致。
 
         # Combine row bytes + vid bytes, but to make numpy.unique faster we pad the
         # combined row to a multiple of 8 bytes and view it as uint64 blocks.
-        total_bytes = filtered_row_size + 4
+        total_bytes = filtered_row_size + vid_width
         pad = (-total_bytes) % 8
         padded_width = total_bytes + pad
+
+        if padded_width == 0:
+            SSMTErrorUtils.raise_fatal(
+                "顶点去重精度控制: 去重键宽度为 0（没有勾选任何参与去重的数据类型，"
+                "又勾选了「无视顶点编号」），无法去重，请至少勾选一个数据类型"
+            )
 
         # Allocate padded combined buffer and fill
         combined_padded = numpy.zeros((n_loops, padded_width), dtype=numpy.uint8)
         combined_padded[:, :filtered_row_size] = filtered_row_bytes
-        combined_padded[:, filtered_row_size:filtered_row_size+4] = vid_bytes
+        if vid_bytes is not None:
+            combined_padded[:, filtered_row_size:filtered_row_size+4] = vid_bytes
 
         # View as uint64 blocks (shape: n_loops x n_blocks)
         n_blocks = padded_width // 8
