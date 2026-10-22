@@ -24,6 +24,7 @@ _NODE_TYPE_BLUEPRINT_NEST = 'SSMTNode_Blueprint_Nest'
 _NODE_TYPE_CROSS_IB = 'SSMTNode_CrossIB'
 _NODE_TYPE_SHADER_REPLACE = 'SSMTNode_ShaderReplace'
 _NODE_TYPE_MULTI_FILE_EXPORT = 'SSMTNode_MultiFile_Export'
+_NODE_TYPE_MERGE_WELD = 'SSMTNode_MergeWeld'
 
 _KNOWN_NODE_TYPES = {
     _NODE_TYPE_OBJECT_INFO,
@@ -42,6 +43,7 @@ _KNOWN_NODE_TYPES = {
     _NODE_TYPE_CROSS_IB,
     _NODE_TYPE_SHADER_REPLACE,
     _NODE_TYPE_MULTI_FILE_EXPORT,
+    _NODE_TYPE_MERGE_WELD,
 }
 
 
@@ -396,6 +398,11 @@ class ChainTraverser:
 
         elif node_type == 'NodeReroute':
             pass
+
+        elif node_type == _NODE_TYPE_MERGE_WELD:
+            chain.merge_weld_nodes.append(current_node)
+            chain.node_path.append(current_node)
+            chain.node_param_signatures.append(ProcessingChain.extract_node_signature(current_node))
 
         elif node_type == _NODE_TYPE_DATA_TYPE:
             chain.node_path.append(current_node)

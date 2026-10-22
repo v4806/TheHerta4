@@ -1377,6 +1377,7 @@ class SSMT_MT_NodeMenu_Blueprint(bpy.types.Menu):
         _add_node_entry(layout, "跨IB节点", 'ARROW_LEFTRIGHT', "SSMTNode_CrossIB")
         _add_node_entry(layout, "着色器替换节点", 'SHADERFX', "SSMTNode_ShaderReplace")
         _add_node_entry(layout, "多文件导出", 'FILE', "SSMTNode_MultiFile_Export")
+        _add_node_entry(layout, "边界焊接", 'GROUP', "SSMTNode_MergeWeld")
 
 
 class SSMT_MT_NodeMenu_PostProcess(bpy.types.Menu):

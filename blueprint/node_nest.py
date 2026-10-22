@@ -24,6 +24,7 @@ class SSMTNode_Blueprint_Nest(SSMTNodeBase):
         'SSMTNode_VertexGroupMatch': '顶点组匹配',
         'SSMTNode_VertexGroupProcess': '顶点组处理',
         'SSMTNode_VertexGroupMappingInput': '映射表输入',
+        'SSMTNode_MergeWeld': '边界焊接',
         'SSMTNode_Blueprint_Nest': '嵌套蓝图',
         'SSMTNode_CrossIB': '跨IB',
         'SSMTNode_MultiFile_Export': '多文件导出',

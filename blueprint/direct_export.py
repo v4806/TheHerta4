@@ -140,6 +140,7 @@ _OBJECT_INFO_NODE_IDNAMES = ("SSMTNode_Object_Info",)
 #: 物体组（处理链上的分组节点）、蓝图嵌套（展开嵌套蓝图）。
 _BLUEPRINT_PARSE_NODE_IDNAMES = (
     "SSMTNode_VertexGroupProcess",
+    "SSMTNode_MergeWeld",
     "SSMTNode_Object_Group",
     "SSMTNode_Blueprint_Nest",
 )

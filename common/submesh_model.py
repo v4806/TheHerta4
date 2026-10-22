@@ -9,6 +9,7 @@ from ..utils.collection_utils import CollectionUtils
 from ..utils.timer_utils import TimerUtils
 from ..utils.shapekey_utils import ShapeKeyUtils
 from .logic_name import LogicName
+from .merge_weld import compute_weld_groups
 from .global_config import GlobalConfig
 from .global_properties import GlobalProterties
 from .d3d11_gametype import D3D11GameType
@@ -27,12 +28,22 @@ from concurrent.futures import ThreadPoolExecutor
 from time import perf_counter
 
 
+# 导出期跨分块焊接的临时分块标记：
+# - INT 顶点属性用于 join 后读取分块号（首选）；
+# - 临时顶点组作为 join 丢失自定义属性时的退化标记（焊接后删除）。
+WELD_BLOCK_ATTR = "_ssmt_weld_block"
+WELD_BLOCK_GROUP_PREFIX = "__SSMT_WELD_BLOCK_"
+
+
 @dataclass
 class SubMeshModel:
     # 初始化时需要填入此属性
     drawcall_model_list:list[DrawCallModel] = field(default_factory=list)
     source_obj_unique_str_count:dict[str, int] = field(default_factory=dict, repr=False)
     has_multi_file_export_nodes:bool = False
+    # 导出期跨分块边界顶点焊接规格：None = 不焊接
+    # {"object_names": set[str], "weld_distance": float}
+    weld_spec:dict = field(default=None, repr=False)
 
     # post_init中计算得到这些属性
     match_draw_ib:str = field(init=False, default="")
@@ -213,6 +224,25 @@ class SubMeshModel:
         cache_key_to_geometry_record = {}
         cache_key_to_candidate_names = {}
 
+        # 跨分块边界顶点焊接：规格来自蓝图节点（weld_spec），只作用于导出临时副本
+        weld_spec = self.weld_spec if isinstance(self.weld_spec, dict) else None
+        weld_object_names = set(weld_spec.get("object_names") or ()) if weld_spec else set()
+        try:
+            weld_distance = (
+                float(weld_spec.get("weld_distance", 1e-6)) if weld_spec else 0.0
+            )
+        except (TypeError, ValueError):
+            weld_distance = 0.0
+        weld_enabled = bool(weld_object_names) and weld_distance > 0.0
+        weld_block_counter = 0
+        # block id -> DrawCallModel：焊接后按分块重算 vertex_count 用
+        weld_block_drawcalls = {}
+        if weld_enabled:
+            print(
+                f"[合并顶点] {self.unique_str} 启用跨分块边界焊接: "
+                f"物体={sorted(weld_object_names)}, 距离={weld_distance}"
+            )
+
         reuse_count = 0
         direct_source_reuse_count = 0
         duplicated_temp_count = 0
@@ -244,7 +274,12 @@ class SubMeshModel:
                 obj_hash = f"FALLBACK_{blender_obj_name}"
             original_name = original_names[i]
             cache_key = (obj_hash, original_name)
-            cached_result = None if preserve_distinct_export_contexts else data_hash_cache.get(cache_key)
+            # 焊接要求每个分块都有独立临时副本与分块标记，禁止数据哈希复用
+            cached_result = (
+                None
+                if (preserve_distinct_export_contexts or weld_enabled)
+                else data_hash_cache.get(cache_key)
+            )
 
             # 【t81-F3 纵深防御】命中后**校验指纹**：几何不同（顶点数/索引数不同）⇒ 视为**未命中**。
             # 即使将来键仍然不足（例如又出现别的"同名同哈希不同几何"），也不会静默把别人的几何写进来。
@@ -309,7 +344,13 @@ class SubMeshModel:
 
             print(f"  🆕 处理: '{blender_obj_name}' (原始: {original_name}, hash={obj_hash[:16]}...)")
 
-            if self._should_duplicate_source_for_merge(source_obj):
+            current_weld_block_id = 0
+            if weld_enabled and blender_obj_name in weld_object_names:
+                weld_block_counter += 1
+                current_weld_block_id = weld_block_counter
+
+            # 参与焊接的物体必须使用临时副本，绝不在源物体/源网格上写标记
+            if self._should_duplicate_source_for_merge(source_obj) or current_weld_block_id > 0:
                 copy_start = perf_counter()
                 new_obj = source_obj.copy()
                 new_obj.data = source_obj.data.copy()
@@ -321,6 +362,10 @@ class SubMeshModel:
             else:
                 temp_obj = source_obj
                 direct_source_reuse_count += 1
+
+            if current_weld_block_id > 0:
+                self._tag_weld_block(temp_obj, current_weld_block_id)
+                weld_block_drawcalls[current_weld_block_id] = draw_call_model
 
             draw_call_model.vertex_count = len(temp_obj.data.vertices)
             draw_call_model.index_count = len(temp_obj.data.polygons) * 3
@@ -417,6 +462,38 @@ class SubMeshModel:
         if not merged_obj_uses_preprocessed_copy:
             merged_obj_name = "TEMP_SUBMESH_MERGED_" + self.unique_str
             ObjUtils.rename_object(submesh_merged_obj, merged_obj_name)
+
+        # 跨分块边界顶点焊接：join 完成之后、顶点组预处理与写 buffer 之前
+        if weld_enabled and weld_block_counter > 0:
+            weld_stats = self._weld_cross_block_boundaries(
+                submesh_merged_obj, weld_distance
+            )
+            block_reductions = (
+                weld_stats.get("block_vertex_reductions", {}) if weld_stats else {}
+            )
+            applied_reduction = 0
+            for block_id, reduction in sorted(block_reductions.items()):
+                target_drawcall = weld_block_drawcalls.get(int(block_id))
+                if target_drawcall is None:
+                    continue
+                reduction = int(reduction)
+                if reduction <= 0:
+                    continue
+                old_count = int(target_drawcall.vertex_count)
+                new_count = max(0, old_count - reduction)
+                applied_reduction += old_count - new_count
+                target_drawcall.vertex_count = new_count
+            # 本 SubMesh 顶点数取焊接后 merged mesh 的实际顶点数
+            self.vertex_count = int(len(submesh_merged_obj.data.vertices))
+            recalculated_sum = sum(
+                int(item.vertex_count) for item in self.drawcall_model_list
+            )
+            print(
+                f"[合并顶点] {self.unique_str} 重算后顶点数: "
+                f"drawcall 合计={recalculated_sum}, "
+                f"merged mesh={self.vertex_count}, "
+                f"分块减量合计={applied_reduction}"
+            )
 
         if need_normalize:
             normalize_start = perf_counter()
@@ -882,6 +959,247 @@ class SubMeshModel:
         4. 自检：非数字组名只警告；空组正常（无顶点引用的骨骼，无害）。
         """
         self._prepare_merged_skeleton_vertex_groups(obj)
+
+    @staticmethod
+    def _tag_weld_block(temp_obj, block_id):
+        """在 join 前的临时副本上写分块标记（INT 属性 + 退化用临时顶点组）。
+
+        仅作用于 calc_buffer 内部创建的导出临时副本；绝不触碰源物体/源网格。
+        """
+        mesh = temp_obj.data
+        vertex_count = len(mesh.vertices)
+        if vertex_count <= 0:
+            return
+
+        values = numpy.full(vertex_count, int(block_id), dtype=numpy.int32)
+        attribute = mesh.attributes.get(WELD_BLOCK_ATTR)
+        if (
+            attribute is None
+            or attribute.domain != 'POINT'
+            or attribute.data_type != 'INT'
+        ):
+            if attribute is not None:
+                mesh.attributes.remove(attribute)
+            attribute = mesh.attributes.new(WELD_BLOCK_ATTR, 'INT', 'POINT')
+        attribute.data.foreach_set("value", values)
+
+        group_name = WELD_BLOCK_GROUP_PREFIX + str(int(block_id))
+        vertex_group = temp_obj.vertex_groups.get(group_name)
+        if vertex_group is None:
+            vertex_group = temp_obj.vertex_groups.new(name=group_name)
+        vertex_group.add(list(range(vertex_count)), 1.0, 'REPLACE')
+
+    @staticmethod
+    def _compute_weld_block_vertex_reductions(groups, blocks):
+        """按分块统计焊接后各 block 的顶点减少量。
+
+        groups 内每个分组的代表索引按 block 升序；remove_doubles 每组使
+        顶点总数减少 (代表数 - 1)，保留的是最小 block 的代表，因此其余
+        参与分块各减 1（同分块每组至多一个代表，故每 block 每组最多减 1）。
+        """
+        reductions = {}
+        for representative_indices in groups or ():
+            # 首项 = 最小 block 的代表，计数不变，只统计其余代表
+            for representative_index in representative_indices[1:]:
+                block_id = int(blocks[representative_index])
+                if block_id <= 0:
+                    continue
+                reductions[block_id] = reductions.get(block_id, 0) + 1
+        return reductions
+
+    def _weld_cross_block_boundaries(self, obj, distance):
+        """join 后按分块标记焊接跨分块边界顶点（只作用于导出临时副本）。
+
+        规则见计划书第 3 / 4.1 节：仅候选（block > 0 且边界顶点）参与，
+        同格内每个分块只取一个索引最小的代表，只有跨 >= 2 个分块才合并。
+        """
+        import bmesh
+
+        mesh = obj.data
+        loop_count_before = len(mesh.loops)
+        face_count_before = len(mesh.polygons)
+        vertex_count_before = len(mesh.vertices)
+        weld_result = None
+        marker_source = "未知"
+        block_vertex_reductions = {}
+
+        bm = bmesh.new()
+        try:
+            bm.from_mesh(mesh)
+            bm.verts.ensure_lookup_table()
+            bm.verts.index_update()
+
+            blocks = self._read_weld_blocks_from_attributes(bm)
+            marker_source = "INT 属性"
+            if blocks is None:
+                blocks = self._read_weld_blocks_from_vertex_groups(bm, obj)
+                marker_source = "临时顶点组"
+            if blocks is None:
+                raise RuntimeError(
+                    f"[合并顶点] {self.unique_str} join 后无法读取分块标记"
+                    f"（{WELD_BLOCK_ATTR} 属性与临时顶点组均丢失），中止导出"
+                )
+
+            boundaries = [False] * len(bm.verts)
+            for edge in bm.edges:
+                if edge.is_boundary:
+                    for vert in edge.verts:
+                        boundaries[vert.index] = True
+
+            positions = [(vert.co.x, vert.co.y, vert.co.z) for vert in bm.verts]
+            weld_result = compute_weld_groups(
+                positions, boundaries, blocks, distance
+            )
+            block_vertex_reductions = self._compute_weld_block_vertex_reductions(
+                weld_result["groups"], blocks
+            )
+
+            if weld_result["groups"]:
+                bm.verts.index_update()
+                # remove_doubles 会重排 bm.verts，先按原始索引快照 BMVert 引用；
+                # 每组的代表对象互不重叠，逐组调用不会互相影响。
+                ordered_verts = list(bm.verts)
+                for representative_indices in weld_result["groups"]:
+                    representative_verts = [
+                        ordered_verts[index] for index in representative_indices
+                    ]
+                    if len(representative_verts) < 2:
+                        continue
+                    # 只传本组代表：同分块其他顶点不在列表内，不会被合并
+                    bmesh.ops.remove_doubles(
+                        bm, verts=representative_verts, dist=distance
+                    )
+                bm.verts.ensure_lookup_table()
+
+            block_layer = bm.verts.layers.int.get(WELD_BLOCK_ATTR)
+            if block_layer is not None:
+                bm.verts.layers.int.remove(block_layer)
+
+            bm.to_mesh(mesh)
+        finally:
+            bm.free()
+
+        stray_attribute = mesh.attributes.get(WELD_BLOCK_ATTR)
+        if stray_attribute is not None:
+            mesh.attributes.remove(stray_attribute)
+        self._remove_weld_temp_vertex_groups(obj)
+        mesh.update()
+
+        if weld_result is None:
+            raise RuntimeError(
+                f"[合并顶点] {self.unique_str} 焊接未产生结果（内部状态异常），中止导出"
+            )
+
+        # 校验一：面数 / loop 数必须与 join 后完全一致，否则 loop 范围会错位
+        if len(mesh.polygons) != face_count_before:
+            raise RuntimeError(
+                f"[合并顶点] {self.unique_str} 焊接后面数变化: "
+                f"{face_count_before} -> {len(mesh.polygons)}，中止导出"
+            )
+        if len(mesh.loops) != loop_count_before:
+            raise RuntimeError(
+                f"[合并顶点] {self.unique_str} 焊接后 loop 数变化: "
+                f"{loop_count_before} -> {len(mesh.loops)}（loop 范围可能错位），中止导出"
+            )
+
+        # 校验二：每个形态键的数据长度必须等于焊接后顶点数，防止 buffer 错位
+        key_blocks = getattr(getattr(mesh, "shape_keys", None), "key_blocks", None)
+        if key_blocks:
+            vertex_count_after = len(mesh.vertices)
+            for key_block in key_blocks:
+                if len(key_block.data) != vertex_count_after:
+                    raise RuntimeError(
+                        f"[合并顶点] {self.unique_str} 形态键 '{key_block.name}' 数据长度 "
+                        f"{len(key_block.data)} != 焊接后顶点数 {vertex_count_after}，中止导出"
+                    )
+
+        vertex_count_after = int(len(mesh.vertices))
+        recomputed_vertex_count = int(vertex_count_before) - sum(
+            block_vertex_reductions.values()
+        )
+        stats = {
+            "merged_group_count": int(weld_result["merged_group_count"]),
+            "involved_block_count": int(weld_result["involved_block_count"]),
+            "skipped_single_block_count": int(weld_result["skipped_single_block_count"]),
+            "excluded_non_boundary_count": int(weld_result["excluded_non_boundary_count"]),
+            "block_vertex_reductions": {
+                int(block_id): int(reduction)
+                for block_id, reduction in block_vertex_reductions.items()
+            },
+            "vertex_count_before": int(vertex_count_before),
+            "vertex_count_after": vertex_count_after,
+        }
+        print(
+            f"[合并顶点] {self.unique_str}: 合并 {stats['merged_group_count']} 组 / "
+            f"涉及 {stats['involved_block_count']} 个分块 / "
+            f"跳过 {stats['skipped_single_block_count']} 组（单分块）/ "
+            f"排除 {stats['excluded_non_boundary_count']} 个非边界顶点；"
+            f"标记来源={marker_source}，顶点 {vertex_count_before} -> {vertex_count_after}，"
+            f"面 {face_count_before} -> {len(mesh.polygons)}，"
+            f"loop {loop_count_before} -> {len(mesh.loops)}，"
+            f"重算后顶点数={recomputed_vertex_count}"
+            f"（分块减量合计={sum(block_vertex_reductions.values())}）"
+        )
+        if recomputed_vertex_count != vertex_count_after:
+            print(
+                f"[合并顶点] {self.unique_str} 警告: 按分块标记重算的顶点数 "
+                f"{recomputed_vertex_count} != 焊接后 mesh 实际顶点数 "
+                f"{vertex_count_after}（部分代表未被合并），以 mesh 实际为准"
+            )
+        try:
+            from ..blueprint.export_helper import BlueprintExportHelper as _BlueprintExportHelper
+            setter = getattr(_BlueprintExportHelper, "set_merge_weld_last_stats", None)
+            if callable(setter):
+                setter(stats)
+        except Exception as error:
+            print(f"[合并顶点] 统计写回 BlueprintExportHelper 失败（不影响导出）: {error}")
+        return stats
+
+    @staticmethod
+    def _read_weld_blocks_from_attributes(bm):
+        """读取 join 后的 INT 分块属性；属性丢失或全 0 时返回 None。"""
+        layer = bm.verts.layers.int.get(WELD_BLOCK_ATTR)
+        if layer is None:
+            return None
+        blocks = [int(vert[layer]) for vert in bm.verts]
+        if not any(block_id > 0 for block_id in blocks):
+            return None
+        return blocks
+
+    @staticmethod
+    def _read_weld_blocks_from_vertex_groups(bm, obj):
+        """退化方案：从临时顶点组读取分块号；无临时组时返回 None。"""
+        index_to_block = {}
+        for vertex_group in obj.vertex_groups:
+            name = str(vertex_group.name)
+            if not name.startswith(WELD_BLOCK_GROUP_PREFIX):
+                continue
+            try:
+                block_id = int(name[len(WELD_BLOCK_GROUP_PREFIX):])
+            except ValueError:
+                continue
+            index_to_block[int(vertex_group.index)] = block_id
+        if not index_to_block:
+            return None
+
+        deform_layer = bm.verts.layers.deform.active
+        blocks = [0] * len(bm.verts)
+        if deform_layer is None:
+            return blocks
+        for vert in bm.verts:
+            for group_index in vert[deform_layer].keys():
+                block_id = index_to_block.get(int(group_index))
+                if block_id:
+                    blocks[vert.index] = block_id
+                    break
+        return blocks
+
+    @staticmethod
+    def _remove_weld_temp_vertex_groups(obj):
+        """删除焊接用临时顶点组，避免其进入后续顶点组预处理。"""
+        for vertex_group in list(obj.vertex_groups):
+            if str(vertex_group.name).startswith(WELD_BLOCK_GROUP_PREFIX):
+                obj.vertex_groups.remove(vertex_group)
 
     def _ensure_target_shape_key_union(self, target_obj: bpy.types.Object, source_objs: list[bpy.types.Object]):
         objects = [

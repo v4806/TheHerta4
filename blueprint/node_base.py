@@ -161,7 +161,7 @@ class SSMTNodeBase(Node):
             return _NODE_COLOR_GROUP
         if bl_idname == 'SSMTNode_ObjectSwap':
             return _NODE_COLOR_SWITCH
-        if bl_idname in {'SSMTNode_VertexGroupMappingInput', 'SSMTNode_VertexGroupMatch', 'SSMTNode_VertexGroupProcess'}:
+        if bl_idname in {'SSMTNode_VertexGroupMappingInput', 'SSMTNode_VertexGroupMatch', 'SSMTNode_VertexGroupProcess', 'SSMTNode_MergeWeld'}:
             return _NODE_COLOR_VERTEX_GROUP
         if bl_idname in {'SSMTNode_ShapeKey', 'SSMTNode_ShapeKey_Output'}:
             return _NODE_COLOR_SHAPEKEY

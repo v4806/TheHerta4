@@ -42,6 +42,11 @@ class BlueprintExportHelper:
     capture_direct_shapekey_positions = False
     direct_shapekey_position_records = {}
 
+    # 「合并顶点」节点在链执行阶段收集的焊接组（node_key / object_names / weld_distance），
+    # 供导出层按物体名匹配 SubMeshModel；last_stats 由导出层焊接完成后回写，供节点面板显示。
+    runtime_merge_weld_groups = []
+    runtime_merge_weld_last_stats = None
+
     MAX_EXPORT_COUNT_LIMIT = 1000
     BLUEPRINT_NONE_IDENTIFIER = "__NONE__"
     BLUEPRINT_NONE_ENUM_NUMBER = 0
@@ -487,8 +492,68 @@ class BlueprintExportHelper:
         BlueprintExportHelper.runtime_shapekey_buffer_name_map = {}
 
     @staticmethod
+    def set_merge_weld_groups(groups):
+        """登记本次导出的焊接组；格式与接口契约一致，只保留有效条目。"""
+        normalized_groups = []
+        for group in groups or []:
+            if not isinstance(group, dict):
+                continue
+            object_names = {str(name) for name in (group.get("object_names") or []) if name}
+            if not object_names:
+                continue
+            try:
+                weld_distance = float(group.get("weld_distance", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                weld_distance = 0.0
+            normalized_groups.append({
+                "node_key": str(group.get("node_key", "") or ""),
+                "object_names": object_names,
+                "weld_distance": weld_distance,
+            })
+        BlueprintExportHelper.runtime_merge_weld_groups = normalized_groups
+
+    @staticmethod
+    def get_merge_weld_groups():
+        """取焊接组副本（object_names 为独立 set，调用方改不到内部状态）。"""
+        return [
+            {
+                "node_key": group.get("node_key", ""),
+                "object_names": set(group.get("object_names") or set()),
+                "weld_distance": group.get("weld_distance", 0.0),
+            }
+            for group in BlueprintExportHelper.runtime_merge_weld_groups
+        ]
+
+    @staticmethod
+    def clear_merge_weld_groups():
+        BlueprintExportHelper.runtime_merge_weld_groups = []
+
+    @staticmethod
+    def set_merge_weld_last_stats(stats):
+        """回写最近一次焊接统计（导出层焊接完成后调用）；传 None/空 dict 表示清空。"""
+        if not isinstance(stats, dict) or not stats:
+            BlueprintExportHelper.runtime_merge_weld_last_stats = None
+            return
+        BlueprintExportHelper.runtime_merge_weld_last_stats = {
+            "merged_group_count": int(stats.get("merged_group_count", 0) or 0),
+            "involved_block_count": int(stats.get("involved_block_count", 0) or 0),
+            "skipped_single_block_count": int(stats.get("skipped_single_block_count", 0) or 0),
+            "excluded_non_boundary_count": int(stats.get("excluded_non_boundary_count", 0) or 0),
+        }
+
+    @staticmethod
+    def get_merge_weld_last_stats():
+        """取最近一次焊接统计副本；没有数据时返回 None（节点面板可安全调用）。"""
+        stats = BlueprintExportHelper.runtime_merge_weld_last_stats
+        if not stats:
+            return None
+        return dict(stats)
+
+    @staticmethod
     def reset_direct_export_runtime_state(clear_postprocess_caches: bool = False):
         BlueprintExportHelper.clear_runtime_shapekey_buffer_names()
+        BlueprintExportHelper.clear_merge_weld_groups()
+        BlueprintExportHelper.set_merge_weld_last_stats(None)
         BlueprintExportHelper.set_preserve_current_shapekey_mix_for_export(False)
         BlueprintExportHelper.set_suppress_shapekey_resource_export(False)
         BlueprintExportHelper.set_capture_direct_shapekey_positions(False)

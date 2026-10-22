@@ -69,6 +69,7 @@ _MODULE_REGISTRY = [
     {"name": "node_vertex_group_match", "required": False},
     {"name": "node_vertex_group_process", "required": False},
     {"name": "node_vertex_group_mapping_input", "required": False},
+    {"name": "node_merge_weld", "required": False},
     {"name": "nest_navigate", "required": False},
     {"name": "node_nest", "required": False},
     {"name": "node_cross_ib", "required": False},

@@ -27,6 +27,7 @@ _NODE_TYPE_BLUEPRINT_NEST = 'SSMTNode_Blueprint_Nest'
 _NODE_TYPE_CROSS_IB = 'SSMTNode_CrossIB'
 _NODE_TYPE_SHADER_REPLACE = 'SSMTNode_ShaderReplace'
 _NODE_TYPE_MULTI_FILE_EXPORT = 'SSMTNode_MultiFile_Export'
+_NODE_TYPE_MERGE_WELD = 'SSMTNode_MergeWeld'
 _NODE_TYPE_POSTPROCESS_DRAG_INTERACTION = 'SSMTNode_PostProcess_DragInteraction'
 
 _SINGLE_INSTANCE_POSTPROCESS_LABELS = {
@@ -65,6 +66,7 @@ _KNOWN_NODE_TYPES = {
     _NODE_TYPE_CROSS_IB,
     _NODE_TYPE_SHADER_REPLACE,
     _NODE_TYPE_MULTI_FILE_EXPORT,
+    _NODE_TYPE_MERGE_WELD,
 }
 
 
@@ -251,6 +253,7 @@ class ProcessingChain:
     multi_file_option_count: int = 0
 
     vertex_group_process_nodes: List[bpy.types.Node] = field(default_factory=list)
+    merge_weld_nodes: List[bpy.types.Node] = field(default_factory=list)
     vertex_group_mapping_nodes: List[bpy.types.Node] = field(default_factory=list)
     shader_replace_info_list: List[dict] = field(default_factory=list)
     export_object_name_override: str = ""
@@ -365,6 +368,13 @@ class ProcessingChain:
             obj_count = len(getattr(node, 'object_list', []))
             params.append(f"objs={obj_count}")
             return f"MultiFileExport[{','.join(params)}]"
+
+        elif node_type == 'MergeWeld':
+            try:
+                weld_distance = float(getattr(node, 'weld_distance', 1e-6))
+            except (TypeError, ValueError):
+                weld_distance = 1e-6
+            return f"MergeWeld[dist={weld_distance:.6g}]"
 
         elif node_type == 'DataType':
             params = []
@@ -482,6 +492,7 @@ class ProcessingChain:
         new_chain.multi_file_option_index = self.multi_file_option_index
         new_chain.multi_file_option_count = self.multi_file_option_count
         new_chain.vertex_group_process_nodes = list(self.vertex_group_process_nodes)
+        new_chain.merge_weld_nodes = list(self.merge_weld_nodes)
         new_chain.vertex_group_mapping_nodes = list(self.vertex_group_mapping_nodes)
         new_chain.shader_replace_info_list = list(self.shader_replace_info_list)
         new_chain.export_object_name_override = self.export_object_name_override
@@ -580,6 +591,7 @@ class BluePrintModel:
         self.postprocess_nodes: List[bpy.types.Node] = []
         self.nested_blueprint_trees: List[bpy.types.NodeTree] = []
         self.vertex_group_process_nodes: List[bpy.types.Node] = []
+        self.merge_weld_nodes: List[bpy.types.Node] = []
         self.multi_file_export_nodes: List[bpy.types.Node] = []
         self.cross_ib_nodes: List[bpy.types.Node] = []
 
@@ -719,6 +731,7 @@ class BluePrintModel:
         self.nested_blueprint_trees = []
         self.cross_ib_nodes = []
         self.shader_replace_nodes = []
+        self.merge_weld_nodes = []
 
         output_node = BlueprintExportHelper.get_node_from_bl_idname(tree, _NODE_TYPE_RESULT_OUTPUT)
 
@@ -745,6 +758,11 @@ class BluePrintModel:
                     self.cross_ib_nodes.append(node)
                     LOG.debug(f"   🔧 发现跨IB节点: {node.name}")
 
+            elif node.bl_idname == _NODE_TYPE_MERGE_WELD:
+                if output_node and BlueprintExportHelper._is_node_connected_to_output(tree, node):
+                    self.merge_weld_nodes.append(node)
+                    LOG.debug(f"   发现合并顶点节点: {node.name}")
+
             elif node.bl_idname == _NODE_TYPE_SHADER_REPLACE:
                 if output_node and BlueprintExportHelper._is_node_connected_to_output(tree, node):
                     self.shader_replace_nodes.append(node)
@@ -762,12 +780,15 @@ class BluePrintModel:
             LOG.info(f"   🔧 收集到 {len(self.cross_ib_nodes)} 个跨IB节点")
         if self.shader_replace_nodes:
             LOG.info(f"   🔧 收集到 {len(self.shader_replace_nodes)} 个着色器替换节点")
+        if self.merge_weld_nodes:
+            LOG.info(f"   🔧 收集到 {len(self.merge_weld_nodes)} 个合并顶点节点")
 
     def _collect_special_nodes_from_nested_trees(self):
         existing_vg_keys = {_get_node_unique_key(n) for n in self.vertex_group_process_nodes}
         existing_mf_keys = {_get_node_unique_key(n) for n in self.multi_file_export_nodes}
         existing_cross_keys = {_get_node_unique_key(n) for n in self.cross_ib_nodes}
         existing_sr_keys = {_get_node_unique_key(n) for n in self.shader_replace_nodes}
+        existing_mw_keys = {_get_node_unique_key(n) for n in self.merge_weld_nodes}
 
         for nested_tree in self.nested_blueprint_trees:
             nested_output = BlueprintExportHelper.get_node_from_bl_idname(nested_tree, _NODE_TYPE_RESULT_OUTPUT)
@@ -799,11 +820,122 @@ class BluePrintModel:
                         existing_cross_keys.add(node_key)
                         LOG.debug(f"   🔧 发现嵌套蓝图跨IB节点: {node.name} (蓝图: {nested_tree.name})")
 
+                elif node.bl_idname == _NODE_TYPE_MERGE_WELD:
+                    if node_key not in existing_mw_keys:
+                        self.merge_weld_nodes.append(node)
+                        existing_mw_keys.add(node_key)
+                        LOG.debug(f"   发现嵌套蓝图合并顶点节点: {node.name} (蓝图: {nested_tree.name})")
+
                 elif node.bl_idname == _NODE_TYPE_SHADER_REPLACE:
                     if node_key not in existing_sr_keys:
                         self.shader_replace_nodes.append(node)
                         existing_sr_keys.add(node_key)
                         LOG.debug(f"   🔧 发现嵌套蓝图着色器替换节点: {node.name} (蓝图: {nested_tree.name})")
+
+    def _integrate_merge_weld_nodes(self):
+        """收集「合并顶点」节点的焊接组，写入 BlueprintExportHelper 运行时状态。
+
+        在链执行、DrawCallModel 构建之后运行：节点上挂的是 Object_Info 的原始名/虚拟名，
+        需要按处理链换算成实际 Blender 物体名（重命名/同名复制之后），再统一用
+        draw_call_model.get_blender_obj_name() 归一化，导出层才能按名字匹配 SubMeshModel。
+        """
+        BlueprintExportHelper.clear_merge_weld_groups()
+
+        weld_nodes = list(getattr(self, "merge_weld_nodes", []) or [])
+        if not weld_nodes:
+            return
+
+        draw_call_name_index: Dict[str, str] = {}
+        for draw_call in self.ordered_draw_obj_data_model_list:
+            try:
+                blender_name = draw_call.get_blender_obj_name()
+            except Exception:
+                blender_name = ""
+            if not blender_name:
+                blender_name = (
+                    getattr(draw_call, "source_obj_name", "")
+                    or getattr(draw_call, "obj_name", "")
+                )
+            if not blender_name:
+                continue
+            for alias in (
+                blender_name,
+                getattr(draw_call, "source_obj_name", ""),
+                getattr(draw_call, "obj_name", ""),
+            ):
+                if alias:
+                    draw_call_name_index.setdefault(alias, blender_name)
+
+        groups = []
+        for node in weld_nodes:
+            candidates = self._collect_merge_weld_object_candidates(node)
+            if not candidates:
+                LOG.info(f"   合并顶点节点 '{node.name}' 未连接任何物体，跳过")
+                continue
+
+            object_names = set()
+            for candidate in candidates:
+                resolved_name = draw_call_name_index.get(candidate)
+                if not resolved_name and candidate in bpy.data.objects:
+                    resolved_name = candidate
+                if resolved_name:
+                    object_names.add(resolved_name)
+
+            if not object_names:
+                LOG.info(f"   合并顶点节点 '{node.name}' 的连接物体不在本次导出中，跳过")
+                continue
+
+            try:
+                weld_distance = float(getattr(node, "weld_distance", 1e-6))
+            except (TypeError, ValueError):
+                weld_distance = 1e-6
+
+            groups.append({
+                "node_key": _get_node_unique_key(node),
+                "object_names": object_names,
+                "weld_distance": weld_distance,
+            })
+            LOG.info(
+                f"   合并顶点节点 '{node.name}': {len(object_names)} 个物体, "
+                f"阈值 {weld_distance} ({', '.join(sorted(object_names))})"
+            )
+
+        BlueprintExportHelper.set_merge_weld_groups(groups)
+        LOG.info(f"   合并顶点焊接组: {len(groups)} 个")
+
+    @staticmethod
+    def _collect_merge_weld_object_candidates(node: bpy.types.Node) -> Set[str]:
+        """递归解析节点输入链接，收集上游 Object_Info 的物体名（原始名 + 虚拟名）。"""
+        names: Set[str] = set()
+        visited: Set[str] = set()
+
+        def walk(current_node):
+            node_key = _get_node_unique_key(current_node)
+            if node_key in visited:
+                return
+            visited.add(node_key)
+
+            if getattr(current_node, "bl_idname", "") == _NODE_TYPE_OBJECT_INFO:
+                object_name = getattr(current_node, "object_name", "")
+                if object_name:
+                    names.add(object_name)
+                try:
+                    virtual_name = ObjectPrefixHelper.build_virtual_object_name_for_node(current_node, strict=True)
+                except Exception:
+                    virtual_name = ""
+                if virtual_name:
+                    names.add(virtual_name)
+                return
+
+            for input_socket in getattr(current_node, "inputs", []):
+                if not input_socket.is_linked:
+                    continue
+                for link in input_socket.links:
+                    if link.from_node:
+                        walk(link.from_node)
+
+        walk(node)
+        return names
 
     def _resolve_nested_blueprint_collect(self, nest_node: bpy.types.Node, visited: Optional[Set[str]] = None):
         if visited is None:
@@ -864,6 +996,8 @@ class BluePrintModel:
         self._process_shader_replace_nodes()
 
         self._build_draw_call_models_from_chains()
+
+        self._integrate_merge_weld_nodes()
 
         self._output_debug_info_to_text_editor()
 
@@ -1743,6 +1877,15 @@ class BluePrintModel:
             debug_lines.append(f"顶点组处理节点数: {len(self.vertex_group_process_nodes)}")
 
         debug_lines.append(f"多文件导出节点数: {len(self.multi_file_export_nodes)}")
+        debug_lines.append(f"合并顶点节点数: {len(self.merge_weld_nodes)}")
+        merge_weld_groups = BlueprintExportHelper.get_merge_weld_groups()
+        for merge_group in merge_weld_groups:
+            merge_object_names = sorted(merge_group.get("object_names") or [])
+            debug_lines.append(
+                f"   - 焊接组 {merge_group.get('node_key', '')}: "
+                f"{len(merge_object_names)} 个物体 {merge_object_names}, "
+                f"阈值 {merge_group.get('weld_distance', '')}"
+            )
 
         try:
             from .node_rename import SSMTNode_Object_Rename
