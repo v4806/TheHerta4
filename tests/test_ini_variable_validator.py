@@ -44,6 +44,36 @@ class AnalyzeIniTextTests(unittest.TestCase):
         self.assertEqual(report["undeclared"], {})
         self.assertIn("$tmp", report["local_declared"])
 
+    def test_pool_sections_declare_their_variables(self):
+        # 池：[PoolFoo] 段头即声明，读写形态是 $PoolFoo[index]；不登记就会把
+        # 每次池访问误报成「引用未声明」（菲欧妮实测 2 个池 × 3 个 deform 段）。
+        text = "\n".join([
+            "[PoolZZMISlotOfKey_G0]",
+            "pool_size = 4",
+            "pool_index_type = fifo",
+            "[TextureOverride_VB_x_Position]",
+            "if $PoolZZMISlotOfKey_G0[$zz_ms_pose_key_0] == 0",
+            "\t$PoolZZMISlotOfKey_G0[$zz_ms_pose_key_0] = 1",
+            "endif",
+        ])
+
+        report = validator.analyze_ini_text(text)
+
+        self.assertNotIn("$PoolZZMISlotOfKey_G0", report["undeclared"])
+        self.assertIn("$PoolZZMISlotOfKey_G0", report["declared"])
+        # 池段只声明它自己，不会连带放过别的变量
+        self.assertIn("$zz_ms_pose_key_0", report["undeclared"])
+
+    def test_pool_variable_without_its_section_is_still_reported(self):
+        text = "\n".join([
+            "[TextureOverride_VB_x_Position]",
+            "$PoolMissing_G0[1] = 1",
+        ])
+
+        report = validator.analyze_ini_text(text)
+
+        self.assertIn("$PoolMissing_G0", report["undeclared"])
+
     def test_comment_only_mentions_do_not_count(self):
         text = "\n".join([
             "[Constants]",

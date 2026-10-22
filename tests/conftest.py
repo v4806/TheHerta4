@@ -32,7 +32,11 @@ if _REPO_ROOT not in sys.path:
 # "TheHerta4"，与真实目录名不符，从仓库根目录跑会崩在相对 import。
 _ROOT_PACKAGE_NAMES = {
     "TheHerta4",
-    os.path.basename(os.path.dirname(os.path.abspath(__file__))),
+    # 仓库根目录名（= 根包名）。原来写的是 basename(dirname(__file__))，算出来的
+    # 却是 "tests"：把测试目录本身注册成 __path__=[] 的 stub，恰好遮住本文件第二
+    # 段垫片要用的真命名空间包 ⇒ from tests.<module> import 全部 ModuleNotFoundError。
+    # 根包名只能从 _REPO_ROOT 取。
+    os.path.basename(_REPO_ROOT),
     # pytest 9 的 Package.setup 会把根目录的 ``__init__.py`` 以顶层名
     # "__init__" 交给 importlib（实测），也要用同一个 stub 拦住。
     "__init__",

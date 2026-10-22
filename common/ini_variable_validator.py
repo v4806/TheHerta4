@@ -59,6 +59,12 @@ _VAR_TOKEN_RE = re.compile(r"\$[A-Za-z_][A-Za-z0-9_]*")
 _GLOBAL_DECL_RE = re.compile(r"^\s*global(?:\s+persist)?\s+(\$[A-Za-z_][A-Za-z0-9_]*)")
 _LOCAL_DECL_RE = re.compile(r"^\s*local\s+(\$[A-Za-z_][A-Za-z0-9_]*)")
 _SECTION_RE = re.compile(r"^\s*\[(.+?)\]\s*$")
+# 池：[PoolFoo] 段头即声明，变量形态是 $PoolFoo[index]（整段名带 Pool 前缀，
+# 不剥前缀）。实证：K 盘的 3Dmigoto/Zmd/Core/EFMI/SpatialIdentification.ini 里
+# [PoolSpatialIdentity_SpatialIds] 对应
+# $PoolSpatialIdentity_SpatialIds[$draw_call_instance_id]。池值按段过期、天然
+# 跨段可读，不需要 global；不登记就会把每次池读写误报成「引用未声明」。
+_POOL_SECTION_RE = re.compile(r"^\s*\[(Pool[A-Za-z0-9_]+)\]\s*$")
 
 
 def _strip_comment(line: str) -> str:
@@ -90,6 +96,8 @@ def analyze_ini_text(text: str) -> dict:
         body = _strip_comment(raw_line)
         if not body.strip():
             continue
+        for pool_name in _POOL_SECTION_RE.findall(body):
+            declared.add("$" + pool_name)
         for name in _GLOBAL_DECL_RE.findall(body):
             declared.add(name)
             global_counts[name] = global_counts.get(name, 0) + 1

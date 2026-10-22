@@ -48,3 +48,9 @@ variants/
 # 根目录 _verify/：跨显卡排查期的一次性验证脚本（v1_slide.py 等，全仓零引用，
 # 不属于任何功能改动；需要留档时用 git add -f 单独强加）
 _verify/
+
+# notes/：himi family / cross-group palette 调试线的工作台（FrameAnalysis 抓帧 buf、
+# 一次性 .mjs 脚本、着色器变体与定案 md；22 项全仓零引用、从未入库，
+# 其中 family_x.py 与已就位的 common/himi_family_x.py 逐字节相同。
+# 需要留档某一份时用 git add -f 单独强加）
+notes/
