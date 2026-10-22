@@ -78,6 +78,18 @@ class SubMeshModel:
     unique_first_loop_indices:numpy.ndarray = field(init=False,repr=False,default=None)
     object_export_context_map:dict = field(init=False,repr=False,default_factory=dict)
 
+    # 接缝焊接：每个 DrawCall 在 join 后 mesh 中的 loop 区间 / 索引区间（按它把顶点归回物体）
+    drawcall_loop_ranges:list = field(init=False, default_factory=list)
+    # 接缝焊接配置（导出器从「接缝焊接」后处理节点读取后注入；None = 不焊接）
+    # 必须是 init 字段：导出器在构造时按关键字注入（ui/universal/export_helper.py:61），
+    # 写成 init=False 会让 dataclass 生成的 __init__ 不认这个关键字，所有导出直接 TypeError。
+    seam_weld_config:dict = field(default=None, repr=False)
+    # 焊接：焊后 mesh 顶点 -> 原物体 id / 导出顶点池行归属
+    weld_vertex_owner_map:numpy.ndarray = field(init=False, default=None, repr=False)
+    weld_pool_owner_rows:dict = field(init=False, default_factory=dict, repr=False)
+    weld_bucket_by_cache_key:dict = field(init=False, default_factory=dict, repr=False)
+    seam_weld_index_recount_applied:bool = field(init=False, default=False)
+
     def __post_init__(self):
 
         # 因为列表里的每个DrawCallModel的draw_ib,first_index,index_count都是一样的，所以直接取第一个就行了
@@ -287,6 +299,18 @@ class SubMeshModel:
                 cache_key_to_candidate_names.setdefault(cache_key, set()).update(
                     self._build_drawcall_candidate_names(draw_call_model)
                 )
+                # 接缝焊接：复用几何的 DrawCall 指向首次记录的同一段 loop 区间
+                cached_geometry_record = cache_key_to_geometry_record.get(cache_key) or {}
+                self.drawcall_loop_ranges.append(
+                    {
+                        "draw_call": draw_call_model,
+                        "loop_start": int(cached_geometry_record.get("loop_start", 0) or 0),
+                        "loop_count": int(cached_geometry_record.get("loop_count", 0) or 0),
+                        "index_offset": int(cached_offset),
+                        "cache_key": cache_key,
+                        "reused": True,
+                    }
+                )
                 reuse_count += 1
                 print(f"  ♻️复用: '{blender_obj_name}' (原始: {original_name}) → offset={cached_offset}, vertices={cached_vertex_count}, indices={cached_index_count}")
                 continue
@@ -338,6 +362,16 @@ class SubMeshModel:
                 "d3d11_game_type": self.d3d11_game_type,
                 "preferred_source_name": self._resolve_preferred_source_name(source_obj, draw_call_model),
             }
+            self.drawcall_loop_ranges.append(
+                {
+                    "draw_call": draw_call_model,
+                    "loop_start": int(loop_offset),
+                    "loop_count": int(loop_count),
+                    "index_offset": int(draw_call_model.index_offset),
+                    "cache_key": cache_key,
+                    "reused": False,
+                }
+            )
 
             index_offset += draw_call_model.index_count
             self.vertex_count += draw_call_model.vertex_count
@@ -417,6 +451,11 @@ class SubMeshModel:
         if not merged_obj_uses_preprocessed_copy:
             merged_obj_name = "TEMP_SUBMESH_MERGED_" + self.unique_str
             ObjUtils.rename_object(submesh_merged_obj, merged_obj_name)
+
+        # 接缝焊接（「接缝焊接」节点有分组时才执行）：紧接在 join 之后、任何
+        # normalize / 骨骼预处理 / 缓冲构建之前完成，等价于用户手动流程
+        # 「导出前先把物体合并焊好，再点导出」——后续数据都基于焊好的 mesh。
+        self._weld_group_seams_if_enabled(submesh_merged_obj, cache_key_to_geometry_record)
 
         if need_normalize:
             normalize_start = perf_counter()
@@ -519,6 +558,15 @@ class SubMeshModel:
         self.index_vertex_id_dict = obj_buffer_result.index_loop_id_dict
         self.unique_first_loop_indices = obj_buffer_result.unique_first_loop_indices
         self.shape_key_buffer_dict = obj_buffer_result.shape_key_buffer_dict
+        # 接缝焊接：用「焊后每个顶点上的原物体 id」算本物体在导出顶点池里的行集合
+        if self.weld_vertex_owner_map is not None:
+            try:
+                self.weld_pool_owner_rows = self._build_weld_pool_owner_rows(
+                    submesh_merged_obj
+                )
+            except Exception as exc:  # noqa: BLE001 - 不允许让导出失败
+                self.weld_pool_owner_rows = {}
+                self._warn_weld(f"焊后顶点池归属计算失败，形态键范围退回导出上下文: {exc}")
         self.object_export_context_map = self._build_object_export_context_map(
             cache_key_to_geometry_record=cache_key_to_geometry_record,
             cache_key_to_candidate_names=cache_key_to_candidate_names,
@@ -1021,11 +1069,206 @@ class SubMeshModel:
                 "preferred_source_name": geometry_record.get("preferred_source_name", ""),
             }
 
+            # 接缝焊接：本物体在导出顶点池里的行集合（供直出形态键取顶点范围）
+            weld_rows = (self.weld_pool_owner_rows or {}).get(cache_key)
+            if weld_rows is not None and len(weld_rows):
+                context["weld_vertex_rows"] = numpy.asarray(weld_rows, dtype=numpy.int64)
+
             for candidate_name in cache_key_to_candidate_names.get(cache_key, set()):
                 if candidate_name:
                     object_export_context_map.setdefault(candidate_name, context)
 
         return object_export_context_map
+
+    def _weld_group_seams_if_enabled(self, merged_obj, cache_key_to_geometry_record=None):
+        """按「接缝焊接」节点的分组，在 join 后的临时 mesh 上焊接**缝合边**顶点。
+
+        用户 2026-10-22 最终拍板：焊接只认用户手动标记的缝合边（seam edge），
+        位置合并交给 Blender 原生 ``bmesh.ops.remove_doubles``；没有缝合边标记就不焊
+        （warning 提示去编辑模式标记缝合边）。
+
+        只在 ``seam_weld_config`` 非空（导出器已确认开关开启且节点有分组）时执行；
+        否则立即返回，mesh 与导出产物与改动前完全一致。
+
+        焊接会让三角形退化成线 / 与其它面重复，``bmesh`` 会直接删掉这些面（用户
+        2026-10-22 拍板：允许删，不为了保面数而跳过焊接）。因此焊接成功后必须按 mesh
+        实际面数重算每个 draw 段的 ``index_count`` / ``index_offset``，并同步每个物体的
+        焊后 loop 区间（``cache_key_to_geometry_record`` 供形态键帧表使用）。
+        """
+        config = self.seam_weld_config
+        if not config or not (config.get("groups") or []):
+            return None
+        try:
+            from .group_weld_mesh import build_mesh_vertex_ranges, weld_submesh_mesh
+            from .group_weld import DEFAULT_WELD_THRESHOLD
+        except Exception as exc:  # 导入失败不允许让导出失败
+            self._warn_weld(f"焊接模块导入失败，跳过焊接: {exc}")
+            return None
+
+        mesh = getattr(merged_obj, "data", None)
+        if mesh is None:
+            self._warn_weld("合并物体没有 mesh 数据，跳过焊接")
+            return None
+        try:
+            ranges = build_mesh_vertex_ranges(self.drawcall_loop_ranges, mesh)
+        except Exception as exc:
+            self._warn_weld(f"物体顶点区间解析失败，跳过焊接: {exc}")
+            return None
+        if len(ranges) < 2:
+            self._warn_weld("本子网格不足 2 个导出物体，跳过焊接")
+            return None
+
+        try:
+            threshold = float(config.get("threshold", DEFAULT_WELD_THRESHOLD))
+        except (TypeError, ValueError):
+            threshold = DEFAULT_WELD_THRESHOLD
+
+        # 只用于状态栏文本 / 计时，不进 build_step_plan 的清单（不改 done/total）。
+        TimerUtils.start_stage("接缝顶点焊接")
+        try:
+            stats = weld_submesh_mesh(
+                merged_obj,
+                ranges,
+                config.get("groups") or [],
+                threshold=threshold,
+            )
+        except Exception as exc:  # 焊接任何异常都不允许让导出失败
+            stats = {"applied": False, "reason": f"焊接异常: {exc}"}
+        finally:
+            TimerUtils.end_stage("接缝顶点焊接")
+
+        if stats.get("applied"):
+            # Blender 侧几何数同步为焊后顶点数
+            self.vertex_count = int(stats.get("after_vertex_count", self.vertex_count))
+            self._apply_weld_index_segments(
+                stats, ranges, cache_key_to_geometry_record
+            )
+            try:
+                from ..utils.log_utils import LOG
+
+                LOG.info(
+                    f"[接缝焊接] 子网格 {self.unique_str}: {stats.get('message', '')}"
+                )
+            except Exception:
+                pass
+        else:
+            self._warn_weld(f"跳过焊接（{stats.get('reason', '未知原因')}）")
+        return stats
+
+    def _apply_weld_index_segments(self, stats, ranges, cache_key_to_geometry_record=None):
+        """把焊后重算的索引区间写回 drawcall / 子网格 / 形态键 loop 区间。
+
+        - 每个原物体仍占自己的 draw 段（段数不变）；某物体面被全部删光时段宽设为 0；
+        - ``index_offset`` 按原物体顺序累计；
+        - ``self.index_count`` = 各段之和 = 焊后 ``ib`` 长度；
+        - 每个物体的焊后 loop 区间同步进 ``drawcall_loop_ranges`` 与
+          ``cache_key_to_geometry_record``（形态键帧表 / 导出上下文按它切物体范围）。
+        """
+        segments = list(stats.get("index_segments") or [])
+        if not segments:
+            return False
+        entry_by_bucket = {
+            int(entry.get("bucket", -1)): entry for entry in (ranges or [])
+        }
+        draw_call_bucket: dict = {}
+        total_index_count = 0
+        for segment in segments:
+            bucket = int(segment.get("bucket", -1))
+            index_count = int(segment.get("index_count", 0) or 0)
+            index_offset = int(segment.get("index_offset", 0) or 0)
+            total_index_count += index_count
+            entry = entry_by_bucket.get(bucket) or {}
+            for draw_call in entry.get("draw_calls") or []:
+                draw_call.index_count = index_count
+                draw_call.index_offset = index_offset
+                draw_call_bucket[id(draw_call)] = bucket
+
+        # 记录 cache_key → 原物体 bucket（形态键按焊后顶点归属算池行时用）
+        self.weld_bucket_by_cache_key = {}
+        for record in self.drawcall_loop_ranges:
+            bucket = draw_call_bucket.get(id(record.get("draw_call")))
+            cache_key = record.get("cache_key")
+            if bucket is not None and cache_key is not None:
+                self.weld_bucket_by_cache_key[cache_key] = int(bucket)
+
+        vertex_owner_map = stats.get("vertex_owner_map")
+        self.weld_vertex_owner_map = (
+            numpy.asarray(vertex_owner_map, dtype=numpy.int64)
+            if vertex_owner_map is not None
+            else None
+        )
+
+        segment_by_bucket = {
+            int(segment.get("bucket", -1)): segment for segment in segments
+        }
+        for record in self.drawcall_loop_ranges:
+            bucket = draw_call_bucket.get(id(record.get("draw_call")))
+            segment = segment_by_bucket.get(bucket) if bucket is not None else None
+            if not segment:
+                continue
+            loop_start = int(segment.get("loop_start", 0) or 0)
+            loop_count = int(segment.get("loop_count", 0) or 0)
+            record["loop_start"] = loop_start
+            record["loop_count"] = loop_count
+            record["index_offset"] = int(segment.get("index_offset", 0) or 0)
+            cache_key = record.get("cache_key")
+            if cache_key_to_geometry_record is not None and cache_key in cache_key_to_geometry_record:
+                geometry_record = cache_key_to_geometry_record.get(cache_key) or {}
+                geometry_record["loop_start"] = loop_start
+                geometry_record["loop_count"] = loop_count
+
+        self.index_count = int(total_index_count)
+        self.seam_weld_index_recount_applied = True
+        return True
+
+    def _build_weld_pool_owner_rows(self, merged_obj) -> dict:
+        """焊后顶点池行号 → 原物体 bucket（用焊后 mesh 顶点上的原物体 id）。
+
+        每行导出顶点池行对应 mesh 的一个 loop（``unique_first_loop_indices``）；该 loop
+        的顶点在焊后带「原物体 id」，据此把每一行归到某个原物体。返回
+        ``{cache_key: numpy.ndarray(行号升序)}``，只包含本子网格里匹配到的 cache_key。
+        """
+        owner_map = self.weld_vertex_owner_map
+        if owner_map is None or self.unique_first_loop_indices is None:
+            return {}
+        mesh = getattr(merged_obj, "data", None)
+        loops = getattr(mesh, "loops", None) if mesh is not None else None
+        if loops is None:
+            return {}
+        loop_count = int(len(loops))
+        if loop_count <= 0:
+            return {}
+        loop_vertex = numpy.empty(loop_count, dtype=numpy.int32)
+        try:
+            loops.foreach_get("vertex_index", loop_vertex)
+        except (AttributeError, TypeError, RuntimeError, ValueError):
+            loop_vertex = numpy.asarray(
+                [int(loop.vertex_index) for loop in loops], dtype=numpy.int32
+            )
+        first_loops = numpy.asarray(self.unique_first_loop_indices, dtype=numpy.int64)
+        first_loops = first_loops[(first_loops >= 0) & (first_loops < loop_count)]
+        if first_loops.size == 0:
+            return {}
+        row_vertex = loop_vertex[first_loops].astype(numpy.int64)
+        valid = (row_vertex >= 0) & (row_vertex < int(owner_map.size))
+        row_owner = numpy.full(int(first_loops.size), -1, dtype=numpy.int64)
+        row_owner[valid] = owner_map[row_vertex[valid]]
+
+        rows_by_bucket: dict = {}
+        for cache_key, bucket in (self.weld_bucket_by_cache_key or {}).items():
+            rows = numpy.flatnonzero(row_owner == int(bucket)).astype(numpy.int64)
+            if rows.size:
+                rows_by_bucket[cache_key] = rows
+        return rows_by_bucket
+
+    def _warn_weld(self, message: str) -> None:
+        """接缝焊接的 warning（不中断导出）。"""
+        try:
+            from ..utils.log_utils import LOG
+
+            LOG.warning(f"⚠️ [接缝焊接] 子网格 {self.unique_str}: {message}")
+        except Exception:
+            print(f"[接缝焊接] 子网格 {self.unique_str}: {message}")
 
     def _should_duplicate_source_for_merge(self, source_obj: bpy.types.Object) -> bool:
         if source_obj is None:

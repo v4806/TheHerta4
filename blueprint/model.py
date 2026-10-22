@@ -40,6 +40,7 @@ _SINGLE_INSTANCE_POSTPROCESS_LABELS = {
     "SSMTNode_PostProcess_MultiFile": "多文件配置",
     "SSMTNode_PostProcess_PSBinding": "PS绑定",
     "SSMTNode_PostProcess_ResourceMerge": "资源合并",
+    "SSMTNode_PostProcess_SeamWeld": "接缝焊接",
     "SSMTNode_PostProcess_ShapeKey": "形态键配置",
     "SSMTNode_PostProcess_ShapeKeyExt": "形态键扩展配置",
     "SSMTNode_PostProcess_SliderPanel": "滑块面板",

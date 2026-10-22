@@ -8,11 +8,23 @@ import os
 
 
 class DrawIBExportBase:
-    def __init__(self, blueprint_model: BluePrintModel, combine_ib: bool = False):
+    def __init__(
+        self,
+        blueprint_model: BluePrintModel,
+        combine_ib: bool = False,
+        weld_by_group: bool = False,
+    ):
         self.blueprint_model = blueprint_model
+        # weld_by_group：导出期在 SubMeshModel 内部真正焊接接缝顶点（仅 ZZMI 开启，
+        # 见 common/group_weld_mesh.py）。默认关闭 = 与改动前行为完全一致。
+        # ZZMI 在自己的 __init__ 里先设 ``self.weld_by_group_enabled``（不经过
+        # ExportUnity 的签名，避免影响既有子类/测试桩），这里统一取值。
+        if not weld_by_group:
+            weld_by_group = bool(getattr(self, "weld_by_group_enabled", False))
         self.drawib_model_list: list[DrawIBModel] = ExportHelper.parse_drawib_model_list_from_blueprint_model(
             blueprint_model=blueprint_model,
             combine_ib=combine_ib,
+            weld_by_group=weld_by_group,
         )
 
     def generate_buffer_files(self, output_folder: str):
