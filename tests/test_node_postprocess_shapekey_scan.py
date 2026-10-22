@@ -115,12 +115,18 @@ _install_module(
     ),
 )
 
-_helper_state = {"collect_connected_start_nodes": lambda _tree: [], "blueprint_model": None}
+_helper_state = {
+    "collect_connected_start_nodes": lambda _tree: [],
+    "blueprint_model": None,
+    # 蓝图模型消费只在直出模式生效（见 node_postprocess_shapekey._direct_export_runtime_active）。
+    "direct_export_active": False,
+}
 _install_module(
     f"{PKG}.blueprint.export_helper",
     BlueprintExportHelper=types.SimpleNamespace(
         collect_connected_start_nodes=lambda tree: _helper_state["collect_connected_start_nodes"](tree),
         get_current_blueprint_model=lambda: _helper_state["blueprint_model"],
+        is_direct_export_active=lambda: _helper_state["direct_export_active"],
         _resolve_shapekey_object_in_scene=lambda name: _fake_bpy.data.objects.get(name),
     ),
 )
@@ -191,6 +197,24 @@ class _RelocatingCollection(list):
         del self[index]
 
 
+def _processing_chain_model():
+    """只通过处理链别名指向 Body 的蓝图模型（消费这类模型的代码要求直出模式）"""
+    return types.SimpleNamespace(
+        processing_chains=[
+            types.SimpleNamespace(
+                is_valid=True,
+                reached_output=True,
+                object_name="LOD0.hash-0.Body_chain1_copy",
+                original_object_name="Body",
+                virtual_object_name="LOD0.hash-0.Body_chain1_copy",
+                export_object_name_override="",
+                rename_history=[],
+                get_export_object_name=lambda: "LOD0.hash-0.Body_chain1_copy",
+            )
+        ]
+    )
+
+
 class NodePostprocessShapeKeyScanTests(unittest.TestCase):
     """测试形态键后处理扫描节点：收集和变量映射管理"""
 
@@ -199,24 +223,13 @@ class NodePostprocessShapeKeyScanTests(unittest.TestCase):
         _fake_bpy.data.objects.clear()
         _helper_state["collect_connected_start_nodes"] = lambda _tree: []
         _helper_state["blueprint_model"] = None
+        _helper_state["direct_export_active"] = False
 
     def test_collect_blueprint_shape_key_names_uses_processing_chain_aliases(self):
-        """测试 collect_blueprint_shape_key_names 使用处理链别名收集形态键名"""
+        """直出模式下 collect_blueprint_shape_key_names 使用处理链别名收集形态键名"""
         _fake_bpy.data.objects["Body"] = _FakeObject("Body", "Smile", "Blink")
-        _helper_state["blueprint_model"] = types.SimpleNamespace(
-            processing_chains=[
-                types.SimpleNamespace(
-                    is_valid=True,
-                    reached_output=True,
-                    object_name="LOD0.hash-0.Body_chain1_copy",
-                    original_object_name="Body",
-                    virtual_object_name="LOD0.hash-0.Body_chain1_copy",
-                    export_object_name_override="",
-                    rename_history=[],
-                    get_export_object_name=lambda: "LOD0.hash-0.Body_chain1_copy",
-                )
-            ]
-        )
+        _helper_state["blueprint_model"] = _processing_chain_model()
+        _helper_state["direct_export_active"] = True
 
         node = module.SSMTNode_PostProcess_ShapeKey()
         node.id_data = object()
@@ -224,6 +237,28 @@ class NodePostprocessShapeKeyScanTests(unittest.TestCase):
         result = node.collect_blueprint_shape_key_names()
 
         self.assertEqual(result, ["Blink", "Smile"])
+
+    def test_collect_blueprint_shape_key_names_ignores_model_outside_direct_export(self):
+        """非直出模式不消费蓝图模型：处理链别名不进形态键名集合"""
+        _fake_bpy.data.objects["Body"] = _FakeObject("Body", "Smile", "Blink")
+        _helper_state["blueprint_model"] = _processing_chain_model()
+        _helper_state["direct_export_active"] = False
+
+        node = module.SSMTNode_PostProcess_ShapeKey()
+        node.id_data = object()
+
+        self.assertEqual(node.collect_blueprint_shape_key_names(), [])
+
+    def test_collect_blueprint_shape_key_names_collects_model_in_direct_export(self):
+        """直出模式消费蓝图模型：处理链别名进入形态键名集合"""
+        _fake_bpy.data.objects["Body"] = _FakeObject("Body", "Smile", "Blink")
+        _helper_state["blueprint_model"] = _processing_chain_model()
+        _helper_state["direct_export_active"] = True
+
+        node = module.SSMTNode_PostProcess_ShapeKey()
+        node.id_data = object()
+
+        self.assertEqual(node.collect_blueprint_shape_key_names(), ["Blink", "Smile"])
 
     def test_ensure_shape_key_variable_map_rebuilds_items_from_current_scan(self):
         """测试 ensure_shape_key_variable_map 从当前扫描重建变量映射条目"""
