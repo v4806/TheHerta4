@@ -495,6 +495,8 @@ VGMap 也不改变导入结果**；复选框开启时仍传预生成结果（失
     **修复**：① 新增 `_merged_so_space_palette_ib(group_plan, target_ib, consumer_ib)`——池路线返回 `group_plan["so_owner_ib"]`（空则回落 `target_ib`），非池路线仍返回 `consumer_ib or target_ib`；② `_append_merged_target_slot_guards` 的重放 `vs-t0`、③ `_append_merged_skin_cs_sections` 的 `cs-t2` 都改用它（两处注释原本写的就是正确意图）；④ `_merged_deform_conv_component_ids(...)` 新增 `palette_owner_ib` 参数，候选集合 ② 分支（原 = target 的组件）改按 so_owner 的组件推导——否则 C1/C2 段不会补跑 `Conv_C0`，「先算自己会绑的那份换算」不成立。
     **证据**：组 3 合成夹具（target `a23aa8a3` 3 行 stub、carrier `b20f90ea` 真实几何、`so_owner_ib = b20f90ea` = C1）产物里 6 处重放 `vs-t0` 全为 `ResourceZZPaletteConv_C1_s1/_s2`、皮肤 `cs-t2` 同、三段 deform 各自 bind 前都先 `run = CustomShaderZZMSPaletteConv_C1_s<k>`；`target` 有真实几何（`so_owner == target`）与直连/非池四种配置的 vb/ib/skeleton/stdout sha256 与修改前**逐字节相同**。
     **回归**：`tests/test_zzmi_palette_conv_ordering.py` 新增 `ZZMIPaletteConvSoOwnerSpaceTests` 七例（6 处重放 / 皮肤 cs-t2 / 每段 Conv 顺序 / 候选集合跟随 owner / target 有真几何时保持 target 空间）；把修复点变异回 target 空间时该文件 5~6 例变红。用户实机确认：手改这三处（6 处重放与 `cs-t2` 换成 `Conv_C0`、C1/C2 段补 `run = Conv_C0`）后角色不再插地。
+16. **2026-10-27 死物清理（写而不读的滞后副本 / 孤源着色器 / 零调用函数）**：删掉 `ResourceZZPaletteLag_*` 上一帧副本机制（6 段资源声明 + 每帧 12 条 `= copy`，全仓**零读取**——跨组换算已改走拆分绘制路线，源件由它自己的渲染段用自身 cb1 单独绘制）、零引用的 `ZZMI_MERGED_SKELETON_OCC_SLOT_BASE`，以及 `common/zzmi_cross_group_palette.py` 里零调用、无 `__all__` 导出的 `palette_dependencies`。
+    **同步删除**：生产零引用、永不进 `res/` 的孤源着色器 `Toolset/zzmi_merged_skeleton_attach_calibrated.hlsl`（185 行）与其校准公式用例 `test_calibrated_shader_implements_rigid_calibration`；`test_calibrated_shader_is_copied_only_when_enabled` 保留 attach/skin 复制正向覆盖并更名 `test_attach_and_skin_shaders_are_copied`。
 
 ## 8. 验收标准
 

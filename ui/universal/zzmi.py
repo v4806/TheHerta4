@@ -228,8 +228,6 @@ ZZMI_STUB_PREFIX_ROWS = 3
 ZZMI_MERGED_SKELETON_SLOTS: tuple[int, ...] = (1, 2)
 # 出现次回绕上限：occ 自增到该值即回绕为槽位起点（1/2 循环）。
 ZZMI_MERGED_SKELETON_OCC_WRAP = len(ZZMI_MERGED_SKELETON_SLOTS) + 1
-# 计数器出现在 if 条件前必须能在顶层解析出的下限（槽位起点）。
-ZZMI_MERGED_SKELETON_OCC_SLOT_BASE = ZZMI_MERGED_SKELETON_SLOTS[0]
 
 # ---------------------------------------------------------------------------
 # 到达标记的**消费点谓词**（主症①b「谓词非单调」修复，2026-09-17）
@@ -2308,24 +2306,6 @@ class ExportZZMI(ExportUnity):
         """该部件该槽的 palette 持久副本资源名。"""
         return f"ResourceZZPalette_{draw_ib}_s{slot}"
 
-    @staticmethod
-    def _merged_palette_lag_name(draw_ib: str, slot: int) -> str:
-        """该部件该槽的 **上一帧** palette 副本资源名（跨组校准专用）。
-
-        用户 2026-10-10 指出的自洽性问题：deform 段手里的 `ResourceZZCb1_G*`
-        必然是**上一帧**的对象变换（渲染 draw 才写、deform 排在帧内最前），
-        而 palette 捕获是**当帧**的 ⇒ 跨组换算拿的是
-        `C(上一帧) × palette(当帧)`，把源部件当帧的骨摆进了**上一帧的宿主对象
-        空间**，这正是「运动时错位、静止正常」。修法：跨组 attach 一律读这份
-        **滞后副本**，让 `C` 与 palette 同帧（都是上一帧），结果 = 源部件上一帧
-        的合法摆放（一致的一帧延迟，而不是两种空间的混合）。
-
-        滞后副本在每次主捕获**之前**从主副本拷出（此时主副本还装着上一帧的值）；
-        F7（宿主渲染段同帧重算）会先把主副本的当帧值刷进滞后副本，再跑同一套
-        attach ⇒ 那条路径仍是**当帧**精确。
-        """
-        return f"ResourceZZPaletteLag_{draw_ib}_s{slot}"
-
     def _merged_seen_arrived_condition(self, component_id: int, slot: int) -> str:
         """消费点谓词：「本部件**本帧**已在槽 <slot> 出现过」（`>= 1`，帧内单调）。
 
@@ -4186,11 +4166,6 @@ class ExportZZMI(ExportUnity):
 
         def emit_capture(target_slot: int, indent: str = "    ") -> None:
             """把当帧 palette 落到 <target_slot>，SO 别名只由 SO owner 重捕获。"""
-            # 先把**上一帧**的值留一份给跨组校准（此刻主副本还是上一帧的内容）。
-            section.append(
-                f"{indent}{self._merged_palette_lag_name(draw_ib, target_slot)} = "
-                f"copy {self._merged_palette_name(draw_ib, target_slot)}"
-            )
             section.append(
                 f"{indent}{self._merged_palette_name(draw_ib, target_slot)} = "
                 "copy vs-t0 unless_null"
@@ -7106,15 +7081,6 @@ class ExportZZMI(ExportUnity):
             for slot in slots:
                 section.append(
                     f"[{self._merged_palette_name(component['draw_ib'], slot)}]"
-                )
-                section.append("type = Buffer")
-                section.append("stride = 48")
-                section.append(f"array = {component['vg_count']}")
-                section.new_line()
-                # 上一帧副本（跨组校准专用，见 _merged_palette_lag_name）：
-                # 声明与主副本完全一致（同为 `copy` 目标，视图格式同样由源决定）。
-                section.append(
-                    f"[{self._merged_palette_lag_name(component['draw_ib'], slot)}]"
                 )
                 section.append("type = Buffer")
                 section.append("stride = 48")

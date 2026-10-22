@@ -1695,49 +1695,18 @@ class ZZMICrossGroupAttachTests(unittest.TestCase):
         # 单条：同一 DrawIB 的多条子网格共用一个渲染段对象，不重复追加
         self.assertEqual(text.count("copy vs-cb1 unless_null"), 1)
 
-    def test_calibrated_shader_is_copied_only_when_enabled(self):
-        """校准版 CS 已不再进 mod 的 res/（拆分绘制路线不需要校准）。"""
+    def test_attach_and_skin_shaders_are_copied(self):
+        """合并骨架的 attach CS 与蒙皮 CS 无条件复制进 mod 的 res/。"""
         exporter = _make_exporter([], merged_vgmap=True)
         res_dir = Path(_FAKE_MOD_FOLDER) / "res"
         with self._switch(False):
             exporter._copy_merged_skeleton_shader_to_mod()
         self.assertTrue((res_dir / "zzmi_merged_skeleton_attach.hlsl").is_file())
-        self.assertFalse(
-            (res_dir / "zzmi_merged_skeleton_attach_calibrated.hlsl").is_file()
-        )
+        self.assertTrue((res_dir / "zzmi_merged_skin.hlsl").is_file())
         with self._switch(True):
             exporter._copy_merged_skeleton_shader_to_mod()
-        self.assertFalse(
-            (res_dir / "zzmi_merged_skeleton_attach_calibrated.hlsl").is_file()
-        )
-
-    def test_calibrated_shader_implements_rigid_calibration(self):
-        """校准公式（刚体）：C_rot = Rd·Rsᵀ、C_t = Rd·(t_src − t_dst)、M' = C·M。
-
-        与 2026-08-25 被删除的那版逐项一致（那版公式本身正确，失败在 cb1 数据源
-        与 [Present] 时序）。同时必须保留兜底：cb1 形态无效 ⇒ 直拷。
-        """
-        shader = (
-            REPO_ROOT / "Toolset" / "zzmi_merged_skeleton_attach_calibrated.hlsl"
-        ).read_text(encoding="utf-8")
-        # 常量缓冲槽（**不是** SRV）：cs-cb1/cs-cb2
-        self.assertIn("cbuffer ZZCb1Src : register(b1)", shader)
-        self.assertIn("cbuffer ZZCb1Dst : register(b2)", shader)
-        # 校准公式
-        self.assertIn("float3x3 c_rot = mul(Rd, transpose(Rs));", shader)
-        self.assertIn("float3 c_t = mul(Rd, t_src - t_dst);", shader)
-        self.assertIn("float3x3 rm_out = mul(c_rot, rm);", shader)
-        self.assertIn("float3 tm_out = mul(c_rot, tm) + c_t;", shader)
-        # 直拷兜底 + 与直拷版一致的接口/守卫
-        self.assertIn("bool zz_cb1_valid(", shader)
-        self.assertIn("Buffer<float4> src_palette : register(t0);", shader)
-        self.assertIn("Buffer<uint4> vg_map : register(t1);", shader)
-        self.assertIn("uint slot = vg_map[bone_index].x;", shader)
-        self.assertIn(
-            f"[numthreads({_zzmi_module.ExportZZMI.MERGED_SKELETON_ATTACH_THREADS}, 1, 1)]",
-            shader,
-        )
-        self.assertIn("merged_count /= 3u", shader)
+        self.assertTrue((res_dir / "zzmi_merged_skeleton_attach.hlsl").is_file())
+        self.assertTrue((res_dir / "zzmi_merged_skin.hlsl").is_file())
 
 
 class ZZSIMissingPartsGuardTests(unittest.TestCase):

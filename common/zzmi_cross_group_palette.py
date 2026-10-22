@@ -309,49 +309,6 @@ def build_private_remap(component: dict) -> dict[int, int]:
     return remap
 
 
-def slot_owner_ids(profile: dict, slots) -> set[int]:
-    """池槽位落在哪些合并部件的范围内。"""
-    owners = set()
-    ranges = [
-        (component["vg_offset"], component["vg_offset"] + component["vg_count"],
-         component["component_id"])
-        for component in merged_components(profile)
-    ]
-    for slot in {int(value) for value in slots}:
-        for start, end, component_id in ranges:
-            if start <= slot < end:
-                owners.add(component_id)
-                break
-        else:
-            raise ZZMICrossGroupPaletteError(
-                "骨骼编号 " + str(slot) + " 不属于任何合并部件。"
-            )
-    return owners
-
-
-def anchor_chain_ids(profile: dict, component_id: int) -> list[int]:
-    """``component_id`` 自己，加上它的锚点祖先，一直到根。"""
-    by_id = {component["component_id"]: component for component in profile["components"]}
-    chain = [int(component_id)]
-    current = by_id[int(component_id)]
-    while current["parent_component_id"] != current["component_id"]:
-        current = by_id[current["parent_component_id"]]
-        chain.append(current["component_id"])
-    return chain
-
-
-def palette_dependencies(profile: dict, component_id: int, foreign_slots) -> set[int]:
-    """``component_id`` 的归一表要读哪些部件的表。
-
-    即外来骨的属主，以及画图部件与这些属主的锚点链上的全部部件。
-    """
-    dependencies = set(anchor_chain_ids(profile, component_id))
-    for owner_id in slot_owner_ids(profile, foreign_slots):
-        dependencies.update(anchor_chain_ids(profile, owner_id))
-    dependencies.discard(int(component_id))
-    return dependencies
-
-
 # ---------------------------------------------------------------------------
 # 运行期表（直接写进 mod 的 ini）
 # ---------------------------------------------------------------------------

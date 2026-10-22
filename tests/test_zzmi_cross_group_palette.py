@@ -261,14 +261,6 @@ class ProfileContractTest(unittest.TestCase):
             if offset <= canonical < offset + count:
                 self.assertEqual(slot, canonical)
 
-    def test_palette_dependencies_include_owner_and_chain(self):
-        profile = self._profile()
-        child = cgp.merged_components(profile)[1]
-        foreign = [slot for slot in range(8)]
-        dependencies = cgp.palette_dependencies(profile, child["component_id"], foreign)
-        self.assertIn(0, dependencies)
-        self.assertNotIn(child["component_id"], dependencies)
-
 
 class RuntimeShaderTest(unittest.TestCase):
     def test_shader_sources_match_component_table_layout(self):
