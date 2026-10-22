@@ -17,6 +17,7 @@ import os
 import struct
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -112,12 +113,45 @@ def _dxt5_dds(width, height, alpha_block, color_blocks):
     return _dds_header(b"DXT5", width, height) + alpha_block + b"".join(color_blocks)
 
 
+# 2048² 法线图构造：DXT1 实心块（每块 16 像素索引全 0 -> 解码为该块 c0 颜色）
+# (128,128,255) 是平坦法线底色；下面两块灰度与底色几乎相同，但 RGB 方向完全相反。
+NORMAL_FLAT = _bc1_block(0x8C1F, 0x0000, [0] * 16)  # 解码 (140,130,255)，灰度 147
+NORMAL_TILT = _bc1_block(0x847E, 0x0000, [0] * 16)  # 解码 (132,142,247)，灰度 150
+NORMAL_DIR_A = 0xB33F  # (181,101,255)，灰度 142
+NORMAL_DIR_B = 0x4CDF  # (74,154,255)，灰度 141~142
+
+
+def _bc1_solid_blocks(block_rows, block_cols, c0_grid, c1_grid=None):
+    """按块生成 DXT1 数据：每块 16 像素都用索引 0（即该块 c0 的颜色）。"""
+    c0 = np.asarray(c0_grid, dtype=np.uint16)
+    c1 = np.zeros_like(c0) if c1_grid is None else np.asarray(c1_grid, dtype=np.uint16)
+    raw = np.zeros((block_rows, block_cols, 8), dtype=np.uint8)
+    raw[:, :, 0] = (c0 & 0xFF).astype(np.uint8)
+    raw[:, :, 1] = (c0 >> 8).astype(np.uint8)
+    raw[:, :, 2] = (c1 & 0xFF).astype(np.uint8)
+    raw[:, :, 3] = (c1 >> 8).astype(np.uint8)
+    return raw.tobytes()
+
+
+def _normal_map_2048(patch_color, patch_blocks=154, c1_value=0):
+    """2048×2048 法线图：左侧 patch_blocks 列块（约 30% 面积）换成 patch_color。"""
+    blocks = np.full((512, 512), NORMAL_BASE_C0, dtype=np.uint16)
+    blocks[:, :patch_blocks] = np.uint16(patch_color)
+    c1 = np.full((512, 512), c1_value, dtype=np.uint16)
+    return _dds_header(b"DXT1", 2048, 2048) + _bc1_solid_blocks(512, 512, blocks, c1)
+
+
+NORMAL_BASE_C0 = 0x841F  # 解码 (132,130,255)，法线图平坦底色
+
 # 灰 170（0xFFFF -> 索引2 = 170,170,170）
 GREY = _bc1_block(0xFFFF, 0x0000, [2] * 16)
 # 微变灰（0xF7DE -> 索引2 = 164,170,164），灰度 167 vs 170 -> 相似度约 98.8%
 NEAR_GREY = _bc1_block(0xF7DE, 0x0000, [2] * 16)
 # 红（0xF800 -> 索引2 = 170,0,0），灰度 51 vs 170 -> 相似度约 53.3%
 RED = _bc1_block(0xF800, 0x0000, [2] * 16)
+# 蓝 (0,0,255) / 绿 (0,255,0)：用于"形状相同但颜色不同"的色块维度测试
+BLUE = _bc1_block(0x001F, 0x0000, [0] * 16)
+GREEN = _bc1_block(0x07E0, 0x0000, [0] * 16)
 
 # DXT5 opaque alpha：a0=255 > a1=0 -> 索引 0 -> 255（全不透明）
 OPAQUE_ALPHA = bytes([255, 0]) + bytes(6)
@@ -203,16 +237,38 @@ class SimilarityDedupNodeTests(unittest.TestCase):
         self.assertTrue(b.exists())
         self.assertIn("Textures/b.dds", content)
 
-    def test_low_threshold_merges_different_colors(self):
-        """阈值 50：相似度约 53% 的明显不同图也判为重复（阈值确实参与判定）。"""
+    def test_low_threshold_merges_patch_variant(self):
+        """阈值 50：局部色块差异（综合相似度约 75%）会被判为重复，证明阈值确实参与判定。"""
+        # 8×8 = 2×2 个 DXT1 块：A 全灰，B 右上角一块是红色（25% 面积）
+        a = self._write("a.dds", _dxt1_dds(8, 8, [GREY, GREY, GREY, GREY]))
+        b = self._write("b.dds", _dxt1_dds(8, 8, [GREY, RED, GREY, GREY]))
+        self._run(self._node(threshold=50),
+                  [("ResourceA", "Textures/a.dds"),
+                   ("ResourceB", "Textures/b.dds")])
+        self.assertTrue(a.exists())
+        self.assertFalse(b.exists())
+
+    def test_stricter_threshold_keeps_patch_variant(self):
+        """阈值 80：同一对局部色块差异图（约 75%）不再合并。"""
+        a = self._write("a.dds", _dxt1_dds(8, 8, [GREY, GREY, GREY, GREY]))
+        b = self._write("b.dds", _dxt1_dds(8, 8, [GREY, RED, GREY, GREY]))
+        content = self._run(self._node(threshold=80),
+                            [("ResourceA", "Textures/a.dds"),
+                             ("ResourceB", "Textures/b.dds")])
+        self.assertTrue(a.exists())
+        self.assertTrue(b.exists())
+        self.assertIn("Textures/b.dds", content)
+
+    def test_different_colors_not_merged_even_at_low_threshold(self):
+        """颜色明显不同（灰 vs 红）：即使阈值降到 50 也不合并（三维取 min 更保守）。"""
         a = self._write("a.dds", _dxt1_dds(4, 4, [GREY]))
         b = self._write("b.dds", _dxt1_dds(4, 4, [RED]))
         content = self._run(self._node(threshold=50),
                             [("ResourceA", "Textures/a.dds"),
                              ("ResourceB", "Textures/b.dds")])
         self.assertTrue(a.exists())
-        self.assertFalse(b.exists())
-        self.assertNotIn("Textures/b.dds", content)
+        self.assertTrue(b.exists())
+        self.assertIn("Textures/b.dds", content)
 
     def test_default_threshold_keeps_different_colors(self):
         """默认阈值 90：相似度约 53% 的图不合并。"""
@@ -359,6 +415,185 @@ class SimilarityDedupNodeTests(unittest.TestCase):
         feature = ResourceMergeNode._similarity_feature(pixels)
         self.assertEqual(feature.shape, (4, 4))
         self.assertTrue(np.allclose(feature, 76.0))  # 255*77>>8
+
+
+class SimilarityFeatureDimensionTests(unittest.TestCase):
+    """三维相似度（色块 / 轮廓 / 色差）与法线贴图误判回归。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="similarity_dims_")
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.tmp, True))
+        self.textures = Path(self.tmp) / "Textures"
+        self.textures.mkdir()
+        self.ini = Path(self.tmp) / "Workspace.ini"
+        self.addCleanup(self._pop_progress_stub)
+
+    def _pop_progress_stub(self):
+        package = sys.modules[f"{PKG}.blueprint"]
+        if hasattr(package, "export_progress"):
+            delattr(package, "export_progress")
+        sys.modules.pop(f"{PKG}.blueprint.export_progress", None)
+
+    def _write(self, name, data):
+        path = self.textures / name
+        path.write_bytes(data)
+        return path
+
+    def _run(self, node, resources):
+        self.ini.write_text(_simple_ini(resources), encoding="utf-8")
+        node.process_ini_file(str(self.ini), self.tmp)
+        return self.ini.read_text(encoding="utf-8")
+
+    def _node(self, enabled=True, threshold=90):
+        node = ResourceMergeNode()
+        node.use_similarity_dedup = enabled
+        node.similarity_threshold = threshold
+        return node
+
+    def _scores(self, data_a, data_b):
+        pixels_a = dds_pixel.decode_dds_rgba8(data_a)
+        pixels_b = dds_pixel.decode_dds_rgba8(data_b)
+        self.assertIsNotNone(pixels_a)
+        self.assertIsNotNone(pixels_b)
+        scores = ResourceMergeNode._similarity_scores(
+            ResourceMergeNode._similarity_features(pixels_a),
+            ResourceMergeNode._similarity_features(pixels_b),
+        )
+        self.assertIsNotNone(scores)
+        return scores
+
+    # -- 法线贴图误判回归（2048²，用户实测 98.03% 误合并的场景）------------
+    def test_normal_map_2048_different_directions_not_merged(self):
+        """两张平坦底色相同、细节法线方向相反的 2048 法线图，在 98% 阈值下不合并。"""
+        data_a = _normal_map_2048(NORMAL_DIR_A)
+        data_b = _normal_map_2048(NORMAL_DIR_B)
+        a = self._write("NormalMap_aaa.dds", data_a)
+        b = self._write("NormalMap_bbb.dds", data_b)
+        content = self._run(self._node(threshold=98),
+                            [("ResourceA", "Textures/NormalMap_aaa.dds"),
+                             ("ResourceB", "Textures/NormalMap_bbb.dds")])
+        self.assertTrue(a.exists())
+        self.assertTrue(b.exists(), "内容不同的法线图不得被相似度去重删除")
+        self.assertIn("Textures/NormalMap_bbb.dds", content)
+
+        # 旧算法（32×32 灰度平均差）确实会把这两张图判成 ≥98% —— 误删根因
+        pixels_a = dds_pixel.decode_dds_rgba8(data_a)
+        pixels_b = dds_pixel.decode_dds_rgba8(data_b)
+        gray_a = ResourceMergeNode._similarity_feature(pixels_a)
+        gray_b = ResourceMergeNode._similarity_feature(pixels_b)
+        legacy_similarity = 1.0 - float(np.mean(np.abs(gray_a - gray_b))) / 255.0
+        self.assertGreaterEqual(legacy_similarity, 0.98,
+                                f"旧灰度口径应误判为相似（实测 {legacy_similarity*100:.2f}%）")
+
+        block, contour, color = self._scores(data_a, data_b)
+        self.assertGreaterEqual(contour, 0.98, "灰度轮廓几乎一致（轮廓维度看不出问题）")
+        self.assertLess(color, 0.98, "RGB 色差维度必须单独否决")
+        self.assertLess(min(block, contour, color), 0.98)
+
+    def test_identical_normal_maps_merge_2048(self):
+        """内容完全相同的 2048 法线图（压缩字节不同、解码像素相同）-> 合并。"""
+        data_a = _normal_map_2048(NORMAL_DIR_A)
+        data_b = _normal_map_2048(NORMAL_DIR_A, c1_value=1)  # 字节不同，像素相同
+        self.assertNotEqual(data_a, data_b)
+        a = self._write("NormalMap_same_a.dds", data_a)
+        b = self._write("NormalMap_same_b.dds", data_b)
+        content = self._run(self._node(threshold=98),
+                            [("ResourceA", "Textures/NormalMap_same_a.dds"),
+                             ("ResourceB", "Textures/NormalMap_same_b.dds")])
+        self.assertTrue(a.exists())
+        self.assertFalse(b.exists(), "内容相同的法线图应被合并删除")
+        self.assertNotIn("Textures/NormalMap_same_b.dds", content)
+        self.assertEqual(content.count("Textures/NormalMap_same_a.dds"), 2)
+
+        block, contour, color = self._scores(data_a, data_b)
+        for name, value in (("色块", block), ("轮廓", contour), ("色差", color)):
+            self.assertAlmostEqual(value, 1.0, places=6, msg=f"{name}相似度应为 1.0")
+
+    # -- 三个维度各自能否单独否决 -----------------------------------------
+    def test_color_block_difference_not_merged(self):
+        """形状/位置相同、只换配色（灰+红 -> 蓝+绿）：色块维度否决，不合并。"""
+        data_a = _dxt1_dds(8, 8, [GREY, RED, RED, GREY])
+        data_b = _dxt1_dds(8, 8, [BLUE, GREEN, GREEN, BLUE])
+        a = self._write("palette_a.dds", data_a)
+        b = self._write("palette_b.dds", data_b)
+        content = self._run(self._node(threshold=90),
+                            [("ResourceA", "Textures/palette_a.dds"),
+                             ("ResourceB", "Textures/palette_b.dds")])
+        self.assertTrue(a.exists())
+        self.assertTrue(b.exists())
+        self.assertIn("Textures/palette_b.dds", content)
+        block, _contour, _color = self._scores(data_a, data_b)
+        self.assertLess(block, 0.9, "颜色分布明显不同，色块相似度必须低")
+
+    def test_contour_difference_not_merged(self):
+        """同色不同结构（竖条纹 -> 横条纹）：轮廓维度下降，不合并。"""
+        data_a = _dxt1_dds(8, 8, [GREY, RED, GREY, RED])   # 竖条纹
+        data_b = _dxt1_dds(8, 8, [GREY, GREY, RED, RED])   # 横条纹
+        a = self._write("stripe_a.dds", data_a)
+        b = self._write("stripe_b.dds", data_b)
+        content = self._run(self._node(threshold=90),
+                            [("ResourceA", "Textures/stripe_a.dds"),
+                             ("ResourceB", "Textures/stripe_b.dds")])
+        self.assertTrue(a.exists())
+        self.assertTrue(b.exists())
+        self.assertIn("Textures/stripe_b.dds", content)
+        block, contour, _color = self._scores(data_a, data_b)
+        self.assertAlmostEqual(block, 1.0, places=6, msg="两张图颜色分布相同")
+        self.assertLess(contour, 0.95, "边界方向不同，轮廓相似度必须下降")
+
+    def test_color_diff_dimension_alone_not_merged(self):
+        """灰度几乎相同、仅 RGB 轻微不同的图：色差维度单独否决，98% 不合并、90% 合并。"""
+        data_a = _dxt1_dds(4, 4, [NORMAL_FLAT])  # 解码 (140,130,255)
+        data_b = _dxt1_dds(4, 4, [NORMAL_TILT])  # 解码 (156,121,255)
+        a = self._write("rgb_a.dds", data_a)
+        b = self._write("rgb_b.dds", data_b)
+
+        # 灰度几乎相同（差 3，旧口径约 98.8%，仍 ≥98% -> 会被误合并）
+        gray_a = ResourceMergeNode._similarity_feature(dds_pixel.decode_dds_rgba8(data_a))
+        gray_b = ResourceMergeNode._similarity_feature(dds_pixel.decode_dds_rgba8(data_b))
+        legacy_similarity = 1.0 - float(np.mean(np.abs(gray_a - gray_b))) / 255.0
+        self.assertGreaterEqual(legacy_similarity, 0.98,
+                                "两张图灰度几乎相同，旧口径会判为相似")
+
+        content = self._run(self._node(threshold=98),
+                            [("ResourceA", "Textures/rgb_a.dds"),
+                             ("ResourceB", "Textures/rgb_b.dds")])
+        self.assertTrue(a.exists())
+        self.assertTrue(b.exists(), "RGB 色差约 3.7%，98% 阈值下不得合并")
+        self.assertIn("Textures/rgb_b.dds", content)
+        block, contour, color = self._scores(data_a, data_b)
+        self.assertGreaterEqual(block, 0.99, "颜色分布落在同一 bin，色块维度看不出问题")
+        self.assertGreaterEqual(contour, 0.99, "两张都是平坦图，轮廓维度看不出问题")
+        self.assertLess(color, 0.98, "色差维度必须低于 98%")
+
+        # 同一对图在 90% 阈值下仍可合并（色差约 96.3%，阈值语义不变）
+        self._run(self._node(threshold=90),
+                  [("ResourceA", "Textures/rgb_a.dds"),
+                   ("ResourceB", "Textures/rgb_b.dds")])
+        self.assertTrue(a.exists())
+        self.assertFalse(b.exists())
+        self.assertEqual(self.ini.read_text(encoding="utf-8").count("Textures/rgb_a.dds"), 2)
+
+    # -- 性能 ------------------------------------------------------------
+    def test_2048_feature_extraction_performance(self):
+        """2048×2048 单张：解码 + 三维特征提取 < 1.5 秒。"""
+        data = _normal_map_2048(NORMAL_DIR_A)
+        start = time.perf_counter()
+        pixels = dds_pixel.decode_dds_rgba8(data)
+        decode_seconds = time.perf_counter() - start
+        self.assertIsNotNone(pixels)
+        start = time.perf_counter()
+        features = ResourceMergeNode._similarity_features(pixels)
+        feature_seconds = time.perf_counter() - start
+        self.assertIsNotNone(features)
+        self.assertIn("thumb", features)
+        print(
+            f"[perf] 2048x2048 DDS: 解码 {decode_seconds * 1000:.1f} ms, "
+            f"特征提取 {feature_seconds * 1000:.1f} ms, "
+            f"合计 {(decode_seconds + feature_seconds) * 1000:.1f} ms"
+        )
+        self.assertLess(feature_seconds, 1.5)
+        self.assertLess(decode_seconds + feature_seconds, 1.5)
 
 
 if __name__ == "__main__":

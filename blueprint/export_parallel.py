@@ -42,6 +42,32 @@ class ParallelExportError(RuntimeError):
     pass
 
 
+def _call_runtime_recorder(method_name: str, *args) -> None:
+    """调用 helper 上的导出期登记方法；helper 缺该方法或实现抛错时静默跳过。
+
+    登记只是给后处理节点用的附加信息：helper 可能来自局部升级的旧文件、测试桩或裁剪环境，
+    缺方法或抛异常都不得让本轮导出失败。本函数刻意留在本模块内 —— tests 会把
+    blueprint.export_helper 整体替换成桩对象，跨模块导入这个兜底函数会直接 ImportError。
+    """
+    recorder = getattr(BlueprintExportHelper, method_name, None)
+    if not callable(recorder):
+        return
+    try:
+        recorder(*args)
+    except Exception:
+        pass
+
+
+def _run_exporter(exporter, method_name: str = "export"):
+    """登记当前导出器后再执行导出方法。
+
+    后处理节点在导出结束之后才运行，需要从运行时缓存拿导出器反查 DrawIB / ini 路径；
+    这里只写入、不清理（清理由下一次导出的 reset_direct_export_runtime_state 负责）。
+    """
+    _call_runtime_recorder("set_current_exporter", exporter)
+    getattr(exporter, method_name)()
+
+
 class ExportRoundExecutor:
     """导出轮次执行器，管理单次导出的完整生命周期（前处理→蓝图解析→导出→清理）"""
 
@@ -73,6 +99,9 @@ class ExportRoundExecutor:
 
             TimerUtils.start_stage("蓝图解析")
             blueprint_model = cls._build_blueprint_model(tree)
+            # 导出期缓存：后处理节点在导出结束**之后**才执行，需要本轮的蓝图模型
+            # 反查「选中的物体属于哪个 DrawIB」。这里只写入不清理（见 _run_exporter 注释）。
+            _call_runtime_recorder("set_current_blueprint_model", blueprint_model)
             TimerUtils.end_stage("蓝图解析")
 
             if round_plan.get("generate_ini"):
@@ -129,53 +158,53 @@ class ExportRoundExecutor:
     @staticmethod
     def export_with_ini(blueprint_model):
         if GlobalConfig.logic_name in (LogicName.EFMI, LogicName.HTMI):
-            ExportEFMI(blueprint_model=blueprint_model).export()
+            _run_exporter(ExportEFMI(blueprint_model=blueprint_model))
         elif GlobalConfig.logic_name == LogicName.GIMI:
-            ExportGIMI(blueprint_model=blueprint_model).export()
+            _run_exporter(ExportGIMI(blueprint_model=blueprint_model))
         elif GlobalConfig.logic_name == LogicName.HIMI:
-            ExportHIMI(blueprint_model=blueprint_model).export()
+            _run_exporter(ExportHIMI(blueprint_model=blueprint_model))
         elif GlobalConfig.logic_name == LogicName.IdentityV:
-            ExportIdentityV(blueprint_model=blueprint_model).export()
+            _run_exporter(ExportIdentityV(blueprint_model=blueprint_model))
         elif GlobalConfig.logic_name == LogicName.SRMI:
-            ExportSRMI(blueprint_model=blueprint_model).export()
+            _run_exporter(ExportSRMI(blueprint_model=blueprint_model))
         elif GlobalConfig.logic_name == LogicName.ZZMIDX12:
             from ..ui.universal.zzmidx12 import ExportZZMIDX12
-            ExportZZMIDX12(blueprint_model=blueprint_model).export()
+            _run_exporter(ExportZZMIDX12(blueprint_model=blueprint_model))
         elif LogicName.is_zzmi_family(GlobalConfig.logic_name):
-            ExportZZMI(blueprint_model=blueprint_model).export()
+            _run_exporter(ExportZZMI(blueprint_model=blueprint_model))
         elif GlobalConfig.logic_name == LogicName.WWMI:
-            ExportWWMI(blueprint_model=blueprint_model).export()
+            _run_exporter(ExportWWMI(blueprint_model=blueprint_model))
         elif GlobalConfig.logic_name == LogicName.SnowBreak:
-            ExportSnowBreak(blueprint_model=blueprint_model).export()
+            _run_exporter(ExportSnowBreak(blueprint_model=blueprint_model))
         elif GlobalConfig.logic_name == LogicName.YYSLS:
-            ExportYYSLS(blueprint_model=blueprint_model).export()
+            _run_exporter(ExportYYSLS(blueprint_model=blueprint_model))
         elif GlobalConfig.logic_name in (LogicName.Naraka, LogicName.NarakaM, LogicName.GF2, LogicName.AILIMIT):
-            ExportUnity(blueprint_model=blueprint_model).export()
+            _run_exporter(ExportUnity(blueprint_model=blueprint_model))
         else:
             _raise_for_unknown_logic_name()
 
     @staticmethod
     def export_buffers_only(blueprint_model):
         if GlobalConfig.logic_name in (LogicName.EFMI, LogicName.HTMI):
-            ExportEFMI(blueprint_model=blueprint_model).export_buffers_only()
+            _run_exporter(ExportEFMI(blueprint_model=blueprint_model), "export_buffers_only")
         elif GlobalConfig.logic_name == LogicName.GIMI:
-            ExportGIMI(blueprint_model=blueprint_model).export_buffers_only()
+            _run_exporter(ExportGIMI(blueprint_model=blueprint_model), "export_buffers_only")
         elif GlobalConfig.logic_name == LogicName.HIMI:
-            ExportHIMI(blueprint_model=blueprint_model).export_buffers_only()
+            _run_exporter(ExportHIMI(blueprint_model=blueprint_model), "export_buffers_only")
         elif GlobalConfig.logic_name == LogicName.IdentityV:
-            ExportIdentityV(blueprint_model=blueprint_model).export_buffers_only()
+            _run_exporter(ExportIdentityV(blueprint_model=blueprint_model), "export_buffers_only")
         elif GlobalConfig.logic_name == LogicName.SRMI:
-            ExportSRMI(blueprint_model=blueprint_model).export_buffers_only()
+            _run_exporter(ExportSRMI(blueprint_model=blueprint_model), "export_buffers_only")
         elif LogicName.is_zzmi_family(GlobalConfig.logic_name):
-            ExportZZMI(blueprint_model=blueprint_model).export_buffers_only()
+            _run_exporter(ExportZZMI(blueprint_model=blueprint_model), "export_buffers_only")
         elif GlobalConfig.logic_name == LogicName.WWMI:
-            ExportWWMI(blueprint_model=blueprint_model).export_buffers_only()
+            _run_exporter(ExportWWMI(blueprint_model=blueprint_model), "export_buffers_only")
         elif GlobalConfig.logic_name == LogicName.SnowBreak:
-            ExportSnowBreak(blueprint_model=blueprint_model).export_buffers_only()
+            _run_exporter(ExportSnowBreak(blueprint_model=blueprint_model), "export_buffers_only")
         elif GlobalConfig.logic_name == LogicName.YYSLS:
-            ExportYYSLS(blueprint_model=blueprint_model).export_buffers_only()
+            _run_exporter(ExportYYSLS(blueprint_model=blueprint_model), "export_buffers_only")
         elif GlobalConfig.logic_name in (LogicName.Naraka, LogicName.NarakaM, LogicName.GF2, LogicName.AILIMIT):
-            ExportUnity(blueprint_model=blueprint_model).export_buffers_only()
+            _run_exporter(ExportUnity(blueprint_model=blueprint_model), "export_buffers_only")
         else:
             _raise_for_unknown_logic_name()
 
@@ -467,9 +496,27 @@ def _parse_manifest_argument(argv: list[str]) -> str:
     return ""
 
 
+def _clear_export_section_registry() -> None:
+    """worker 进程内清空 DrawIB→ini 段登记表（与其它导出入口保持一致）。
+
+    登记表由 ``common/export_section_registry.py`` 提供，可能尚未落地（精简加载 /
+    测试桩），因此软导入：拿不到模块或清理失败都只留一条提示，绝不让并行导出失败。
+    """
+    try:
+        from ..common import export_section_registry as _section_registry
+    except Exception:
+        return
+    try:
+        _section_registry.clear()
+    except Exception as error:
+        print(f"⚠️ 清理导出段登记表失败（已忽略）: {error}")
+
 def _run_worker(manifest_path: str):
     with open(manifest_path, "r", encoding="utf-8") as file:
         manifest = json.load(file)
+
+    # worker 与主进程内存隔离：这里再清一次，保证后处理节点只看到本次导出的 ini 段。
+    _clear_export_section_registry()
 
     result = {
         "status": "error",

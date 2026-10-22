@@ -38,6 +38,22 @@ class DirectExportError(RuntimeError):
     pass
 
 
+def _call_runtime_recorder(method_name: str, *args) -> None:
+    """调用 helper 上的导出期登记方法；helper 缺该方法或实现抛错时静默跳过。
+
+    登记只是给后处理节点用的附加信息：helper 可能来自局部升级的旧文件、测试桩或裁剪环境，
+    缺方法或抛异常都不得让本轮导出失败。本函数刻意留在本模块内 —— tests 会把
+    blueprint.export_helper 整体替换成桩对象，跨模块导入这个兜底函数会直接 ImportError。
+    """
+    recorder = getattr(BlueprintExportHelper, method_name, None)
+    if not callable(recorder):
+        return
+    try:
+        recorder(*args)
+    except Exception:
+        pass
+
+
 def _raise_for_unknown_logic_name() -> None:
     raise DirectExportError(
         f"当前 logic_name='{GlobalConfig.logic_name}' 未加载或不受支持，无法执行直出。"
@@ -472,7 +488,10 @@ class DirectExportSession:
 
     def _build_blueprint_model(self):
         BluePrintModel.clear_object_name_mapping()
-        return BluePrintModel(tree=self.tree, context=self.context)
+        model = BluePrintModel(tree=self.tree, context=self.context)
+        # 导出期缓存：后处理节点在导出结束之后才执行，需要据此反查 DrawIB（只写不清）。
+        _call_runtime_recorder("set_current_blueprint_model", model)
+        return model
 
     def _build_exporter(self, blueprint_model, preserve_shape_key_mix: bool | None = None):
         if preserve_shape_key_mix is None:
@@ -743,6 +762,13 @@ class DirectExportSession:
             elif has_shapekey:
                 LOG.info("Direct ShapeKey: skipped standard slot export; generating direct resources from Meshes0000 and preprocess records")
 
+            # 附加形态键轮次（_run_standard_shapekey_rounds → execute_round）会把运行时缓存里的
+            # 蓝图模型覆盖成轮次模型；后处理阶段要的是基态模型，这里再登记一次。
+            _call_runtime_recorder(
+                "set_current_blueprint_model",
+                self.shapekey_source_blueprint_model or self.base_blueprint_model,
+            )
+
             try:
                 keys = [
                     _node_progress_key(getattr(node, "id_data", None), node)
@@ -863,11 +889,15 @@ def execute_direct_export(context, tree):
     previous_runtime_tree_name = BlueprintExportHelper.runtime_blueprint_tree_name
     BlueprintExportHelper.set_runtime_blueprint_tree(tree)
     GlobalKeyCountHelper.initialize()
+    # 直出运行时开关：后处理在 session.run() 内部执行，所以整个会话期间都置真，
+    # 结束后（异常也）复位，让普通 / 后台 / 并行导出看到的一直是「不是直出」。
+    BlueprintExportHelper.set_direct_export_active(True)
     try:
         refresh_blueprint_sync_state(tree=tree, context=context, include_all_blueprints=True)
         session = DirectExportSession(context=context, tree=tree)
         session.run()
     finally:
+        BlueprintExportHelper.set_direct_export_active(False)
         BlueprintExportHelper.runtime_blueprint_tree_name = previous_runtime_tree_name
 
 

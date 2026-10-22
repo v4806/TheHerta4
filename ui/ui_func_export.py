@@ -156,10 +156,10 @@ def compose_background_progress_text(text: str, progress_bar: str) -> str:
     """把文本进度条插到「后台导出：」前缀之后、步骤文本之前。
 
     ``session.progress_text()`` 产出 ``后台导出：13/32 前处理-恢复非镜像｜树/节点``，
-    ``_update_progress_bar()`` 产出 ``[██████░░] 40%``。状态栏布局要求进度条在
+    ``_update_progress_bar()`` 产出 ``▏██████──▕ 40%``。状态栏布局要求进度条在
     前缀之后、步骤文本之前：:
 
-        后台导出：[██████░░] 40% 13/32 前处理-恢复非镜像｜树/节点
+        后台导出：▏██████──▕ 40% 13/32 前处理-恢复非镜像｜树/节点
 
     进度条为空（准备 / 加载工程 / 完成等没有百分比的阶段）时原样返回 ``text``；
     ``text`` 不是标准进度文案（如「后台导出完成」）时也不插入，避免拼出怪文本。
@@ -217,7 +217,7 @@ class _BackgroundExportMixin:
         self._sync_node_highlight(session)
         text = session.progress_text()
         progress_bar = self._update_progress_bar(context, session)
-        # 布局：后台导出：[██░░] 40% 13/32 阶段｜节点 —— 进度条插在前缀之后、步骤文本之前。
+        # 布局：后台导出：▏██──▕ 40% 13/32 阶段｜节点 —— 进度条插在前缀之后、步骤文本之前。
         push_progress_header(compose_background_progress_text(text, progress_bar), context)
 
         if status == "running":
@@ -371,7 +371,7 @@ class _BackgroundExportMixin:
 
         原生条固定 ``progress_begin(0, 100)`` + ``progress_update(int(percent))``：
         总步数是 worker 动态上报的（20+ 个阶段），用固定 0~100 刻度才不会在
-        total 变化时错位。文本条（``[████░░] 40%``）**总是**返回并拼到 header 上
+        total 变化时错位。文本条（``▏████──▕ 40%``）**总是**返回并拼到 header 上
         （弹出窗口遮挡状态栏时也能看到进度）；``done/total`` 步数由
         ``progress_text`` 单独显示。
 
@@ -722,6 +722,22 @@ class _BackgroundExportMixin:
             pass
 
 
+def _clear_export_section_registry() -> None:
+    """导出开始前清空 DrawIB→ini 段登记表（条件后处理节点依赖它做门控）。
+
+    登记表由 ``common/export_section_registry.py`` 提供，可能尚未落地（精简加载 /
+    测试桩），因此用软导入：拿不到模块或清理失败都只留一条提示，绝不让导出失败。
+    """
+    try:
+        from ..common import export_section_registry as _section_registry
+    except Exception:
+        return
+    try:
+        _section_registry.clear()
+    except Exception as error:
+        print(f"⚠️ 清理导出段登记表失败（已忽略）: {error}")
+
+
 class SSMTGenerateModBlueprint(_BackgroundExportMixin, bpy.types.Operator):
     """根据蓝图架构生成 Mod 文件的主导出 Blender 算子"""
     bl_idname = "ssmt.generate_mod_blueprint"
@@ -822,6 +838,8 @@ class SSMTGenerateModBlueprint(_BackgroundExportMixin, bpy.types.Operator):
         # 立即反馈：会话启动里要先把工程存成 480MB 快照（数秒）再起子进程，
         # 这段时间主进程没有任何进度文本 —— 先写状态栏，避免"点了导出十几秒没反应"。
         push_progress_header("后台导出：正在保存工程快照…", context)
+        # 后台导出入口：主进程侧先清掉上一次残留的 ini 段登记（worker 进程内另有一次清理）。
+        _clear_export_section_registry()
         try:
             session = self._create_background_session(tree)
             started = session.start()
@@ -1136,6 +1154,8 @@ class SSMTGenerateModBlueprint(_BackgroundExportMixin, bpy.types.Operator):
 
         BlueprintExportHelper.set_runtime_blueprint_tree(tree)
         BlueprintExportHelper.reset_direct_export_runtime_state(clear_postprocess_caches=True)
+        # 导出开始：清空上一次导出残留的 ini 段登记，条件后处理节点只应看到本次导出的段。
+        _clear_export_section_registry()
         TimerUtils.end_stage("蓝图验证")
 
         LOG.start_collecting()

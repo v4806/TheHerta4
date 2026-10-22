@@ -38,6 +38,12 @@ class SSMTNode_PostProcess_ResourceMerge(SSMTNode_PostProcess_Base):
         subtype='PERCENTAGE',
     )  # type: ignore
 
+    clean_unreferenced_textures: bpy.props.BoolProperty(
+        name="清理未引用贴图",
+        description="勾选后，导出结束前删除 Textures 目录里没有被任何 ini Resource 段引用的 .dds 贴图（清理旧导出的残留孤儿文件）；只处理贴图目录里的 .dds，不动 .buf 和其它目录",
+        default=False,
+    )  # type: ignore
+
     def draw_buttons(self, context, layout):
         layout.label(text="计算DDS贴图文件MD5哈希值", icon='FILE_CACHE')
         layout.label(text="合并内容相同的DDS资源引用")
@@ -53,6 +59,10 @@ class SSMTNode_PostProcess_ResourceMerge(SSMTNode_PostProcess_Base):
         if getattr(self, "use_similarity_dedup", False):
             layout.prop(self, "similarity_threshold", slider=True)
             layout.label(text="相似度 ≥ 阈值即视为同一张图并合并", icon='INFO')
+        layout.separator()
+        layout.prop(self, "clean_unreferenced_textures", icon='TRASH')
+        if getattr(self, "clean_unreferenced_textures", False):
+            layout.label(text="清理未被 ini 引用的孤儿 .dds", icon='INFO')
         layout.separator()
         layout.label(text="执行前会自动备份ini文件", icon='BACK')
 
@@ -187,10 +197,17 @@ class SSMTNode_PostProcess_ResourceMerge(SSMTNode_PostProcess_Base):
             print("[ResourceMerge] 在路径中未找到任何.ini文件，跳过")
             return
 
+        # 先完成所有 ini 的引用合并，再统一清理孤儿贴图：多 ini 时任一 ini 引用即保留
+        referenced_paths = set()
         for ini_file in ini_files:
-            self.process_ini_file(ini_file, mod_export_path)
+            ini_references = self.process_ini_file(ini_file, mod_export_path)
+            if ini_references:
+                referenced_paths.update(ini_references)
 
         print("[ResourceMerge] 资源引用合并完成！")
+
+        if getattr(self, "clean_unreferenced_textures", False):
+            self._orphan_texture_cleanup_phase(mod_export_path, referenced_paths)
 
     def process_ini_file(self, ini_file, mod_export_path):
         print(f"[ResourceMerge] 正在处理ini文件: {ini_file}")
@@ -267,11 +284,17 @@ class SSMTNode_PostProcess_ResourceMerge(SSMTNode_PostProcess_Base):
         print(f"[ResourceMerge] 扫描完成: {len(file_hash_to_first_ref)} 个唯一资源, {len(files_to_delete)} 个重复文件待删除")
 
         modified = False
+        referenced_paths = set()
         for entry in resource_entries:
             original_filename = entry["filename"]
             primary_filename = self._resolve_primary_filename(
                 entry, file_hash_to_first_ref, pixel_primary_filename
             )
+            # 收集最终 ini 里仍被引用的路径（改写前后的名字都算，供孤儿贴图清理使用）
+            for filename in (original_filename, primary_filename):
+                resolved = self._resolve_mod_local_path(mod_export_path, filename)
+                if resolved is not None:
+                    referenced_paths.add(self._normalize_cleanup_path(resolved))
             if original_filename == primary_filename:
                 continue
             match = entry["match"]
@@ -296,6 +319,8 @@ class SSMTNode_PostProcess_ResourceMerge(SSMTNode_PostProcess_Base):
                 print(f"[ResourceMerge] 已删除重复文件: {display_name}")
             except OSError as e:
                 print(f"[ResourceMerge] 删除文件失败 {file_path}: {e}")
+
+        return referenced_paths
 
     @staticmethod
     def _resolve_primary_filename(entry, file_hash_to_first_ref, pixel_primary_filename):
@@ -411,12 +436,19 @@ class SSMTNode_PostProcess_ResourceMerge(SSMTNode_PostProcess_Base):
     def _similarity_threshold_value(self):
         return self._clamp_similarity_threshold(getattr(self, "similarity_threshold", 90))
 
-    @staticmethod
-    def _similarity_feature(pixels, grid=32):
-        """RGBA8 像素图 -> 约 grid×grid 灰度块均值特征（numpy，4K 图也快）。
+    # ---- 相似度特征（色块 / 轮廓 / 色差 三维综合）-------------------------
+    SIMILARITY_GRID = 64            # 缩略图边长（小图按实际尺寸）
+    SIMILARITY_HIST_BINS = 16       # 每通道直方图 bin 数
+    SIMILARITY_HEAVY_DIFF = 32      # 单像素任一通道差 > 32 视为"明显不同"
+    NORMAL_MAP_EXTRA_STRICTNESS = 0.01  # 法线贴图额外严格 1 个百分点
 
-        缩略方式为均值池化：按行/列等分切块，用 np.add.reduceat 求块内和再除以块面积，
-        不需要 Pillow、不做逐像素 Python 循环。整图灰度用整数权重 77/150/29（≈BT.601）。
+    @staticmethod
+    def _similarity_pool(pixels, grid):
+        """RGBA8 像素图 -> grid×grid RGB 均值池化缩略图（float64, H×W×3）。
+
+        按行/列等分切块，用 np.add.reduceat 求块内和再除以块面积，不做逐像素 Python
+        循环，2048²/4K 图也在毫秒级。RGB 三通道分别池化：法线图的方向差异体现在
+        RGB，先转灰度会把相反方向（如 158,98 vs 128,128）的差异抹平。
         """
         import numpy as np
 
@@ -425,26 +457,134 @@ class SSMTNode_PostProcess_ResourceMerge(SSMTNode_PostProcess_Base):
         height, width = int(pixels.shape[0]), int(pixels.shape[1])
         if height <= 0 or width <= 0:
             return None
-        # uint16 足够：255*(77+150+29)=65280 < 65535，无溢出
-        rgb = pixels[:, :, :3].astype(np.uint16)
-        gray = (
+        out_h = min(int(grid), height)
+        out_w = min(int(grid), width)
+        if out_h <= 0 or out_w <= 0:
+            return None
+        row_edges = (np.arange(out_h + 1, dtype=np.int64) * height // out_h).astype(np.intp)
+        col_edges = (np.arange(out_w + 1, dtype=np.int64) * width // out_w).astype(np.intp)
+        counts = np.outer(np.diff(row_edges), np.diff(col_edges)).astype(np.float64)
+
+        rgb = pixels[:, :, :3]
+        pooled = np.empty((out_h, out_w, 3), dtype=np.float64)
+        # 列块很宽时才升到 uint32（255*宽 ≤ 65535 用 uint16，省一半内存）；行和用 uint32 防溢出
+        source_dtype = np.uint16 if int(np.max(np.diff(col_edges))) * 255 <= 65535 else np.uint32
+        for channel in range(3):
+            source = rgb[:, :, channel].astype(source_dtype)
+            col_sums = np.add.reduceat(source, col_edges[:-1], axis=1).astype(np.uint32)
+            block_sums = np.add.reduceat(col_sums, row_edges[:-1], axis=0)
+            pooled[:, :, channel] = block_sums.astype(np.float64) / counts
+        return pooled
+
+    @staticmethod
+    def _pooled_gray(thumb):
+        """RGB 缩略图 -> 灰度缩略图（uint16，BT.601 整数权重 77/150/29）。"""
+        import numpy as np
+
+        rgb = np.rint(np.clip(thumb, 0.0, 255.0)).astype(np.uint16)
+        return (
             rgb[:, :, 0] * np.uint16(77)
             + rgb[:, :, 1] * np.uint16(150)
             + rgb[:, :, 2] * np.uint16(29)
         ) >> 8
 
-        out_h = min(int(grid), height)
-        out_w = min(int(grid), width)
-        row_edges = (np.arange(out_h + 1, dtype=np.int64) * height // out_h).astype(np.intp)
-        col_edges = (np.arange(out_w + 1, dtype=np.int64) * width // out_w).astype(np.intp)
+    @classmethod
+    def _similarity_feature(cls, pixels, grid=32):
+        """RGBA8 -> 约 grid×grid 灰度缩略特征（兼容旧接口）。
 
-        # 先按列池化（宽块高度很小，必要时升到 uint32 防溢出），再按行池化
-        max_col_block = int(np.max(np.diff(col_edges)))
-        source = gray if max_col_block * 255 <= 65535 else gray.astype(np.uint32)
-        col_sums = np.add.reduceat(source, col_edges[:-1], axis=1).astype(np.uint32)
-        block_sums = np.add.reduceat(col_sums, row_edges[:-1], axis=0)
-        counts = np.outer(np.diff(row_edges), np.diff(col_edges)).astype(np.float64)
-        return block_sums.astype(np.float64) / counts
+        先 RGB 均值池化再按 BT.601 整数权重转灰度；均匀图与旧的"先灰度再池化"
+        结果完全一致，小图（< grid）按实际尺寸输出。
+        """
+        thumb = cls._similarity_pool(pixels, grid)
+        if thumb is None:
+            return None
+        return cls._pooled_gray(thumb).astype("float64")
+
+    @classmethod
+    def _similarity_features(cls, pixels, grid=None):
+        """RGBA8 -> 三维特征包 {thumb, hist, edges}；无法提取时返回 None。
+
+        - thumb: RGB 均值池化缩略图（色差维度用）
+        - hist:  每通道 16 bins 归一化直方图（色块/颜色分布维度用）
+        - edges: 灰度缩略图的梯度幅值图，截断到 0~255（轮廓维度用）
+        """
+        import numpy as np
+
+        if grid is None:
+            grid = cls.SIMILARITY_GRID
+        thumb = cls._similarity_pool(pixels, grid)
+        if thumb is None:
+            return None
+        gray = cls._pooled_gray(thumb).astype(np.float64)
+
+        # 色块：每通道归一化直方图（只在缩略图上统计，抗重采样噪声）
+        bins = int(cls.SIMILARITY_HIST_BINS)
+        hist = np.zeros((3, bins), dtype=np.float64)
+        for channel in range(3):
+            values = np.clip(thumb[:, :, channel], 0.0, 255.0)
+            counts, _ = np.histogram(values, bins=bins, range=(0.0, 255.0))
+            total = float(counts.sum())
+            hist[channel] = counts / total if total > 0.0 else 0.0
+
+        # 轮廓：中心差分梯度幅值（与色差同为 0~255 尺度）
+        if gray.shape[0] >= 2 and gray.shape[1] >= 2:
+            grad_y, grad_x = np.gradient(gray)
+            edges = np.clip(np.hypot(grad_x, grad_y), 0.0, 255.0)
+        else:
+            edges = np.zeros_like(gray)
+
+        return {"thumb": thumb, "hist": hist, "edges": edges}
+
+    @classmethod
+    def _similarity_scores(cls, feat_a, feat_b):
+        """两张图的三维相似度 (色块, 轮廓, 色差)，各 0~1；形状不一致返回 None。"""
+        import numpy as np
+
+        thumb_a, thumb_b = feat_a.get("thumb"), feat_b.get("thumb")
+        hist_a, hist_b = feat_a.get("hist"), feat_b.get("hist")
+        edges_a, edges_b = feat_a.get("edges"), feat_b.get("edges")
+        if thumb_a is None or thumb_b is None or thumb_a.shape != thumb_b.shape:
+            return None
+        if hist_a is None or hist_b is None or hist_a.shape != hist_b.shape:
+            return None
+        if edges_a is None or edges_b is None or edges_a.shape != edges_b.shape:
+            return None
+
+        # 色块：每通道直方图半 L1 距离（0=完全重叠，1=完全不重叠），三通道取均值
+        overlap = 0.5 * np.abs(hist_a - hist_b).sum(axis=1)
+        block_score = 1.0 - float(np.mean(overlap))
+
+        # 轮廓：梯度幅值图平均绝对差 / 255
+        contour_score = 1.0 - float(np.mean(np.abs(edges_a - edges_b))) / 255.0
+
+        # 色差：RGB 三通道逐像素平均绝对差 / 255；再用"明显不同像素占比"兜底，
+        # 防止大面积轻微差异被平均值摊薄（法线方向不同时单通道差往往远大于灰度差）。
+        channel_diff = np.abs(thumb_a - thumb_b)
+        pixel_diff = channel_diff.mean(axis=2)
+        color_score = 1.0 - float(np.mean(pixel_diff)) / 255.0
+        heavy_ratio = float(
+            np.count_nonzero(channel_diff.max(axis=2) > cls.SIMILARITY_HEAVY_DIFF)
+        ) / float(pixel_diff.size)
+        color_score = min(color_score, 1.0 - heavy_ratio)
+
+        return (
+            max(0.0, min(1.0, block_score)),
+            max(0.0, min(1.0, contour_score)),
+            max(0.0, min(1.0, color_score)),
+        )
+
+    @staticmethod
+    def _looks_like_normal_map(filename):
+        """按文件名判断是否法线贴图（法线图对方向差异最敏感，阈值额外 +1 个百分点）。"""
+        name = os.path.basename(str(filename or "")).lower()
+        return "normal" in name or "法线" in name
+
+    def _similarity_required_ratio(self, threshold, filename, other_filename):
+        """本次比较实际使用的相似度门槛（0~1）：用户阈值 + 法线贴图补偿。"""
+        ratio = threshold / 100.0
+        if self._looks_like_normal_map(filename) or self._looks_like_normal_map(other_filename):
+            ratio = min(1.0, ratio + self.NORMAL_MAP_EXTRA_STRICTNESS)
+        return ratio
 
     @staticmethod
     def _report_similarity_progress(done, total):
@@ -457,7 +597,13 @@ class SSMTNode_PostProcess_ResourceMerge(SSMTNode_PostProcess_Base):
             pass
 
     def _similarity_dedup_phase(self, resource_entries, files_to_delete, pixel_primary_filename):
-        """相似度去重：同尺寸 DDS 的 32×32 灰度特征相似度 ≥ 阈值即视为同一张图。"""
+        """相似度去重：同尺寸 DDS 的三维相似度（色块/轮廓/色差）均 ≥ 阈值才合并。
+
+        综合相似度取三项最小值：加权平均会让"色块/轮廓都还高"掩盖色差维度的巨大差异，
+        而法线贴图内容不同时往往正是某个通道方向完全不同；取 min 最保守，任一维度不达标
+        就不合并（符合"宁可少合并，也不误删贴图"的诉求）。
+        法线贴图（文件名含 NormalMap）额外严格 1 个百分点，滑条百分比语义不变。
+        """
         try:
             from ..common import dds_pixel
             import numpy as np
@@ -466,7 +612,6 @@ class SSMTNode_PostProcess_ResourceMerge(SSMTNode_PostProcess_Base):
             return
 
         threshold = self._similarity_threshold_value()
-        ratio = threshold / 100.0
 
         # 候选：MD5 扫描成功、且未被 MD5 / 像素级去重合并掉的文件
         candidates = {}
@@ -483,7 +628,7 @@ class SSMTNode_PostProcess_ResourceMerge(SSMTNode_PostProcess_Base):
         if total < 2:
             return
 
-        representatives = {}  # dims -> [(norm_path, feature, entry)]
+        representatives = {}  # dims -> [(norm_path, features, entry)]
         matched = 0
         skipped = 0
         done = 0
@@ -508,19 +653,31 @@ class SSMTNode_PostProcess_ResourceMerge(SSMTNode_PostProcess_Base):
                     skipped += 1
                     print(f"[ResourceMerge] 相似度去重: 跳过无法解码的 {os.path.basename(norm_path)}（{dds_pixel.last_error}）")
                 else:
-                    feature = self._similarity_feature(pixels)
-                    if feature is None:
+                    features = self._similarity_features(pixels)
+                    if features is None:
                         skipped += 1
                         print(f"[ResourceMerge] 相似度去重: 跳过无法生成特征的 {os.path.basename(norm_path)}")
                     else:
                         duplicate_of = None
                         similarity = 0.0
-                        for rep_path, rep_feature, rep_entry in representatives.setdefault(dims, []):
-                            if rep_feature.shape != feature.shape:
+                        block_score = contour_score = color_score = 0.0
+                        required = threshold / 100.0
+                        for rep_path, rep_features, rep_entry in representatives.setdefault(dims, []):
+                            scores = self._similarity_scores(rep_features, features)
+                            if scores is None:
                                 continue
-                            similarity = 1.0 - float(np.mean(np.abs(rep_feature - feature))) / 255.0
-                            if similarity >= ratio:
+                            rep_block, rep_contour, rep_color = scores
+                            rep_similarity = min(rep_block, rep_contour, rep_color)
+                            rep_required = self._similarity_required_ratio(
+                                threshold, entry["filename"], rep_entry["filename"]
+                            )
+                            if rep_similarity >= rep_required:
                                 duplicate_of = rep_entry
+                                similarity = rep_similarity
+                                block_score, contour_score, color_score = (
+                                    rep_block, rep_contour, rep_color
+                                )
+                                required = rep_required
                                 break
                         if duplicate_of is not None:
                             matched += 1
@@ -535,10 +692,12 @@ class SSMTNode_PostProcess_ResourceMerge(SSMTNode_PostProcess_Base):
                             print(
                                 f"[ResourceMerge]   相似重复! {os.path.basename(norm_path)} "
                                 f"与 {os.path.basename(duplicate_of['file_path'])} 相似度 "
-                                f"{similarity * 100:.2f}%（阈值 {threshold}%），合并"
+                                f"{similarity * 100:.2f}%（色块 {block_score * 100:.2f}% / "
+                                f"轮廓 {contour_score * 100:.2f}% / 色差 {color_score * 100:.2f}%，"
+                                f"阈值 {required * 100:.2f}%），合并"
                             )
                         else:
-                            representatives[dims].append((norm_path, feature, entry))
+                            representatives[dims].append((norm_path, features, entry))
 
             done += 1
             if done % 8 == 0 or done == total:
@@ -546,9 +705,94 @@ class SSMTNode_PostProcess_ResourceMerge(SSMTNode_PostProcess_Base):
 
         if matched or skipped:
             print(
-                f"[ResourceMerge] 相似度去重完成（阈值 {threshold}%）: 合并 {matched} 个, "
+                f"[ResourceMerge] 相似度去重完成（阈值 {threshold}%）：合并 {matched} 个, "
                 f"无法解码跳过 {skipped} 个"
             )
+
+    # ------------------------------------------------------------------
+    # 清理未引用贴图（所有去重阶段之后执行：只清理 Textures 目录里的孤儿 .dds）
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _normalize_cleanup_path(path):
+        """清理阶段的路径比较口径：Windows 不区分大小写，/ 与 \\ 统一。"""
+        return os.path.normcase(os.path.normpath(os.path.abspath(str(path or ""))))
+
+    @staticmethod
+    def _report_cleanup_progress(done, total):
+        """只更新进度文本（不推动百分比）；同步导出 / 单测没有进度模块时静默。"""
+        try:
+            from . import export_progress
+
+            export_progress.report_stage(f"资源合并：清理未引用贴图 {done}/{total}")
+        except Exception:
+            pass
+
+    def _orphan_texture_cleanup_phase(self, mod_export_path, referenced_paths):
+        """删除 Textures 目录里没有被任何 ini Resource 段引用的 .dds 孤儿文件。
+
+        只扫 Textures 这一层、只删常规 .dds 文件；删除前用 _resolve_mod_local_path
+        重新确认目标仍在 mod 根内，失败静默跳过。
+        """
+        textures_dir = os.path.join(mod_export_path, "Textures")
+        normalized_refs = {self._normalize_cleanup_path(path) for path in (referenced_paths or ())}
+        try:
+            dir_entries = list(os.scandir(textures_dir))
+        except OSError:
+            print("[ResourceMerge] 清理未引用贴图: 0 个")
+            return
+
+        orphan_candidates = []
+        for dir_entry in dir_entries:
+            if not self._is_dds_filename(dir_entry.name):
+                continue
+            try:
+                if not dir_entry.is_file(follow_symlinks=False):
+                    continue
+            except OSError:
+                continue
+            # 解析结果同时确认文件仍在 mod 根内（Textures 是指向根外的符号链接时也跳过）
+            resolved = self._resolve_mod_local_path(
+                mod_export_path, os.path.join("Textures", dir_entry.name)
+            )
+            if resolved is None:
+                continue
+            if self._normalize_cleanup_path(resolved) in normalized_refs:
+                continue
+            orphan_candidates.append(resolved)
+
+        total = len(orphan_candidates)
+        if total == 0:
+            print("[ResourceMerge] 清理未引用贴图: 0 个")
+            return
+
+        root = os.path.realpath(os.path.abspath(mod_export_path))
+        cleaned = 0
+        done = 0
+        for file_path in orphan_candidates:
+            try:
+                relative = os.path.relpath(file_path, root)
+            except ValueError:
+                relative = os.path.basename(file_path)
+            checked = self._resolve_mod_local_path(mod_export_path, relative)
+            if checked is None or os.path.normcase(checked) != os.path.normcase(file_path):
+                done += 1
+                self._report_cleanup_progress(done, total)
+                continue
+            try:
+                if os.path.islink(checked) or not os.path.isfile(checked):
+                    done += 1
+                    self._report_cleanup_progress(done, total)
+                    continue
+                os.remove(checked)
+                cleaned += 1
+                print(f"[ResourceMerge] 已删除未引用贴图: {os.path.basename(checked)}")
+            except OSError:
+                pass
+            done += 1
+            if done % 8 == 0 or done == total:
+                self._report_cleanup_progress(done, total)
+
+        print(f"[ResourceMerge] 清理未引用贴图: {cleaned} 个")
 
 
 classes = (
