@@ -14,16 +14,29 @@ except ImportError:  # pragma: no cover - 仅 tests/ 里按文件路径加载本
     import sys as _sys
 
     _REGISTRY_MODULE_NAME = "theherta4_export_section_registry"
-    _section_registry = _sys.modules.get(_REGISTRY_MODULE_NAME)
-    if _section_registry is None:
-        _registry_spec = _importlib_util.spec_from_file_location(
-            _REGISTRY_MODULE_NAME,
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "export_section_registry.py"),
-        )
-        _section_registry = _importlib_util.module_from_spec(_registry_spec)
-        _sys.modules[_REGISTRY_MODULE_NAME] = _section_registry
-        _registry_spec.loader.exec_module(_section_registry)
+    try:
+        _section_registry = _sys.modules.get(_REGISTRY_MODULE_NAME)
+        if _section_registry is None:
+            _registry_spec = _importlib_util.spec_from_file_location(
+                _REGISTRY_MODULE_NAME,
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "export_section_registry.py"),
+            )
+            _section_registry = _importlib_util.module_from_spec(_registry_spec)
+            _sys.modules[_REGISTRY_MODULE_NAME] = _section_registry
+            _registry_spec.loader.exec_module(_section_registry)
+    except Exception:  # pragma: no cover - 兜底加载再失败也只让登记失效，不能让 ini 生成 import 失败
+        _sys.modules.pop(_REGISTRY_MODULE_NAME, None)
+        _section_registry = None
 
+
+def _current_draw_ib_snapshot() -> str:
+    """快照当前 draw_ib 上下文；登记表不可用或读取失败时返回空字符串（登记只是附加信息）。"""
+    if _section_registry is None:
+        return ""
+    try:
+        return _section_registry.current_draw_ib()
+    except Exception:
+        return ""
 
 
 class M_SectionType:
@@ -77,7 +90,7 @@ class M_IniSection:
         self.SectionLineList = []
         # 构造时快照当前 draw_ib 上下文（导出器用 export_section_registry.draw_ib_context 包裹），
         # 用于导出后按 draw_ib 反查本节的所有段；没有上下文时为空字符串。
-        self.owner_draw_ib:str = _section_registry.current_draw_ib()
+        self.owner_draw_ib:str = _current_draw_ib_snapshot()
     
     def empty(self)->bool:
         '''
