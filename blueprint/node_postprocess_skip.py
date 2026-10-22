@@ -68,6 +68,26 @@ from .node_postprocess_base import SSMTNode_PostProcess_Base
 NODE_IDNAME = "SSMTNode_PostProcess_Skip"
 NODE_LABEL = "跳过"
 
+def _log_info(message):
+    """走 ``utils/log_utils`` 的 LOG；导入不可用（独立加载 / 测试）时退回 print。"""
+    try:
+        from ..utils.log_utils import LOG
+    except Exception:
+        print(message)
+        return
+    LOG.info(message)
+
+
+def _log_warning(message):
+    """warn 级别版本（中文文案与语义与原来的 print 一致）。"""
+    try:
+        from ..utils.log_utils import LOG
+    except Exception:
+        print(message)
+        return
+    LOG.warning(message)
+
+
 #: 本节点追加块的标记行；``node_postprocess_base`` 用它的前缀识别「自动追加尾段」。
 SKIP_BLOCK_MARKER = "; --- AUTO-APPENDED SKIP BLOCK ---"
 SKIP_BLOCK_MARKER_PREFIX = "; --- AUTO-APPENDED SKIP "
@@ -293,10 +313,14 @@ def _section_ranges(lines):
     return ranges
 
 
-def _delete_sections(content, section_names):
+def _delete_sections(content, section_names, protected=None):
     """删除 ``content`` 中段名属于 ``section_names`` 的**整个段**。
 
-    返回 ``(new_content, deleted_section_names)``：
+    ``protected`` 是 :func:``_collect_cross_ib_shared_names`` 的结果：命中的段名
+    **仍被其它 draw_ib 登记**（跨 IB 共用），一律保留不删，避免删掉别的 IB 依赖
+    的 ``CrossIBPresent`` / ``CrossIBShaderOverride`` / ``CrossIBTextureOverride``。
+
+    返回 ``(new_content, deleted_section_names, preserved_names)``：
 
     - 段名比较**忽略大小写**、必须整段名精确相等（不做前缀 / 关键词匹配）；
     - 只删真实存在于文本里的段；不存在的段名不报错、不计入结果；
@@ -305,7 +329,7 @@ def _delete_sections(content, section_names):
     """
     text = str(content or "")
     if not text:
-        return text, []
+        return text, [], []
 
     wanted = set()
     for name in section_names or ():
@@ -313,13 +337,21 @@ def _delete_sections(content, section_names):
         if key:
             wanted.add(key)
     if not wanted:
-        return text, []
+        return text, [], []
 
+    shared = protected or {}
     lines = text.splitlines(keepends=True)
     drop_indexes = set()
     deleted_names = []
+    preserved_names = []
     for name, header_index, body_start, body_end in _section_ranges(lines):
-        if name.casefold() not in wanted:
+        key = name.casefold()
+        if key not in wanted:
+            continue
+        if key in shared:
+            # 同名段仍被删除范围之外的 draw_ib 登记（跨 IB 共用）：保留。
+            if name not in preserved_names:
+                preserved_names.append(name)
             continue
         end = body_end
         while end > body_start and not lines[end - 1].strip():
@@ -329,14 +361,14 @@ def _delete_sections(content, section_names):
         deleted_names.append(name)
 
     if not deleted_names:
-        return text, []
+        return text, [], preserved_names
 
     kept = "".join(line for index, line in enumerate(lines) if index not in drop_indexes)
     if not kept.strip():
-        return "", deleted_names
+        return "", deleted_names, preserved_names
     if not kept.endswith(("\n", "\r")):
         kept += "\r\n" if "\r\n" in text else "\n"
-    return kept, deleted_names
+    return kept, deleted_names, preserved_names
 
 
 def _strip_skip_block(content):
@@ -436,6 +468,141 @@ def _get_section_registry():
         return None
     return export_section_registry
 
+#: 「跨 IB 共用」段类型（``common/m_ini_builder.M_SectionType`` 里同名字段的
+#: 小写形式）：这几种段在设计上就是被多个 draw_ib 共享的，删同名段时必须先确认
+#: 归属，否则删掉当前 IB 的那一份会连带毁掉别的 IB 的绘制。
+_CROSS_IB_SECTION_TYPES = (
+    "crossibpresent",
+    "crossibshaderoverride",
+    "crossibtextureoverride",
+)
+
+#: 登记表不可用时的退化说明（写进摘要，避免用户以为跨 IB 保护生效了）。
+_REGISTRY_UNAVAILABLE_NOTE = (
+    "导出段登记表不可用 -> 删除范围退化为「按段名全文删除」，跨 IB 共用段可能被误删"
+)
+
+
+def _collect_cross_ib_shared_names(section_names, keep_draw_ibs):
+    """查出「同名段是否仍被本次删除范围之外的 draw_ib 登记」。
+
+    返回 ``{段名casefold: 记录}``，记录形如
+    ``{"name": 原始段名, "owners": [其它 draw_ib...], "unowned_cross_ib": bool}``：
+
+    - ``owners`` 非空：这段仍被其它 draw_ib 登记（跨 IB 共用），保留；
+    - ``unowned_cross_ib`` 为真：段类型是 ``CrossIB*`` 但登记里没有归属 IB，
+      保守保留（宁可少删，不可误删）。
+
+    登记表不可用时返回 ``None``（调用方据此退化成「按段名删除」的旧行为，
+    并在摘要里说明这一退化）。``keep_draw_ibs`` 为本次选中的 draw_ib 集合。
+    """
+    wanted = {
+        str(name or "").strip().casefold()
+        for name in section_names or ()
+        if str(name or "").strip()
+    }
+    if not wanted:
+        return {}
+    registry = _get_section_registry()
+    if registry is None:
+        return None
+    try:
+        tables = registry.get_all() or {}
+    except Exception:
+        return None
+    if not isinstance(tables, dict):
+        return None
+
+    keep = {
+        str(value or "").strip().casefold()
+        for value in keep_draw_ibs or ()
+        if str(value or "").strip()
+    }
+    shared = {}
+    for entries in tables.values():
+        for entry in entries or ():
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name") or "").strip()
+            key = name.casefold()
+            if not key or key not in wanted or key in shared:
+                continue
+            owner = str(entry.get("draw_ib") or "").strip()
+            if owner and owner.casefold() in keep:
+                # 属于本次要删的 IB：可以删（同名段如果还有别的登记，后面的
+                # 条目会被这一轮的循环继续检查）。
+                continue
+            if owner:
+                shared[key] = {
+                    "name": name,
+                    "owners": [owner],
+                    "unowned_cross_ib": False,
+                }
+            elif str(entry.get("type") or "").strip().casefold() in _CROSS_IB_SECTION_TYPES:
+                shared[key] = {"name": name, "owners": [], "unowned_cross_ib": True}
+    return shared
+
+
+def _describe_cross_ib_shared(shared):
+    """把跨 IB 共用段记录压成一行可读提示；没有记录时返回空串。"""
+    if not shared:
+        return ""
+    parts = []
+    for key in sorted(shared):
+        info = shared[key] or {}
+        name = str(info.get("name") or key)
+        owners = [str(owner) for owner in (info.get("owners") or []) if str(owner)]
+        if owners:
+            parts.append(f"{name}（仍被 {'、'.join(owners)} 登记）")
+        else:
+            parts.append(f"{name}（跨 IB 共用段，登记里没有归属 IB）")
+    return "、".join(parts)
+
+
+def _find_sibling_ini_sections(target_ini, section_names):
+    """在目标 ini **同目录的其它配置表**里找同名段，返回 ``[(文件名, [段名...])]``。
+
+    只用于提示：multifile 分文件里有同名段时，本节点只会改写 ``target_ini``，
+    分文件保持原样（它有自己的导出与后处理链），结果交给用户判断。
+    """
+    wanted = {
+        str(name or "").strip().casefold()
+        for name in section_names or ()
+        if str(name or "").strip()
+    }
+    if not wanted or not target_ini:
+        return []
+    try:
+        target_abs = os.path.abspath(target_ini)
+        directory = os.path.dirname(target_abs)
+        filenames = sorted(os.listdir(directory))
+    except (OSError, ValueError):
+        return []
+
+    hints = []
+    for filename in filenames:
+        if not str(filename).casefold().endswith(".ini"):
+            continue
+        path = os.path.join(directory, filename)
+        try:
+            if os.path.abspath(path) == target_abs or not os.path.isfile(path):
+                continue
+            with open(path, "rb") as handle:
+                text = handle.read().decode("utf-8-sig", errors="replace")
+        except (OSError, ValueError):
+            continue
+        found = []
+        for raw_line in text.splitlines():
+            header = _SECTION_HEADER_RE.match(str(raw_line or "").strip())
+            if not header:
+                continue
+            name = header.group(1).strip()
+            if name.casefold() in wanted and name not in found:
+                found.append(name)
+        if found:
+            hints.append((str(filename), found))
+    return hints
+
 
 # --------------------------------------------------------------------------- #
 # 节点数据
@@ -522,7 +689,7 @@ class SSMTNode_PostProcess_Skip(SSMTNode_PostProcess_Base):
             get_blueprint_model = getattr(BlueprintExportHelper, "get_current_blueprint_model", None)
             model = get_blueprint_model() if callable(get_blueprint_model) else None
         except Exception as exc:
-            print(f"跳过部件：读取本次导出的蓝图模型失败（{exc}），跳过")
+            _log_warning(f"跳过部件：读取本次导出的蓝图模型失败（{exc}），跳过")
             return None, set(), set()
 
         if model is None:
@@ -531,7 +698,7 @@ class SSMTNode_PostProcess_Skip(SSMTNode_PostProcess_Base):
         try:
             from .node_postprocess_condition import _collect_target_section_names
         except Exception as exc:
-            print(f"跳过部件：无法加载条件判断节点的圈定实现（{exc}），跳过")
+            _log_warning(f"跳过部件：无法加载条件判断节点的圈定实现（{exc}），跳过")
             return model, set(), set()
 
         draw_ibs, target_names = _collect_target_section_names(model, selected_names, target_ini)
@@ -542,21 +709,21 @@ class SSMTNode_PostProcess_Skip(SSMTNode_PostProcess_Base):
 
         target_ini, error_message = SSMTNode_PostProcess_CommentCleanup._find_target_ini_file(mod_export_path)
         if not target_ini:
-            print(f"跳过部件：{error_message or '未找到目标配置表'}")
+            _log_warning(f"跳过部件：{error_message or '未找到目标配置表'}")
             return False
 
         selected_names = self._selected_part_names()
         if not selected_names:
-            print("跳过部件：节点未选择任何部件，跳过")
+            _log_info("跳过部件：节点未选择任何部件，跳过")
             return True
 
         # ---- 结构化圈定（与条件判断节点同一套机制） ----
         model, draw_ibs, target_names = self._collect_targets(selected_names, target_ini)
         if model is None:
-            print("跳过部件：未获取到本次导出的蓝图模型（导出期段登记不可用），跳过")
+            _log_warning("跳过部件：未获取到本次导出的蓝图模型（导出期段登记不可用），跳过")
             return True
         if not draw_ibs:
-            print("跳过部件：选定的部件未匹配到任何 DrawIB（物体名与导出对象不一致），跳过")
+            _log_warning("跳过部件：选定的部件未匹配到任何 DrawIB（物体名与导出对象不一致），跳过")
             return True
         # 导出期段登记里没有这些 DrawIB 的段**不再早退**：这类 IB 是游戏原生绘制、
         # 不在本 mod 的接管范围里，没有段可删；用户既然把它加进跳过列表，就应当
@@ -568,14 +735,14 @@ class SSMTNode_PostProcess_Skip(SSMTNode_PostProcess_Base):
             with open(target_ini, "rb") as handle:
                 raw_bytes = handle.read()
         except OSError as exc:
-            print(f"跳过部件：读取配置表失败 {target_ini}: {exc}")
+            _log_warning(f"跳过部件：读取配置表失败 {target_ini}: {exc}")
             return False
 
         has_bom = raw_bytes.startswith(b"\xef\xbb\xbf")
         try:
             content = raw_bytes.decode("utf-8-sig")
         except UnicodeDecodeError as exc:
-            print(f"跳过部件：配置表不是 UTF-8，跳过 {target_ini}: {exc}")
+            _log_warning(f"跳过部件：配置表不是 UTF-8，跳过 {target_ini}: {exc}")
             return False
 
         # ---- 删除 + 追加 ----
@@ -587,12 +754,23 @@ class SSMTNode_PostProcess_Skip(SSMTNode_PostProcess_Base):
         if not entries:
             entries = _hash_only_entries(draw_ibs)
             if entries:
-                print("跳过部件：物体名里没有可完整解析的 <hash>-<indexCount>-<firstIndex>，回退为只 hash 的跳过段")
+                _log_warning(
+                    "跳过部件：物体名里没有可完整解析的 <hash>-<indexCount>-<firstIndex>，"
+                    "回退为只 hash 的跳过段"
+                )
         entry_list = ", ".join(_format_skip_entry(entry) for entry in entries)
+
+        # 跨 IB 共用段保护：删同名段前先确认它是否仍被本次删除范围之外的 draw_ib 登记。
+        # CrossIBPresent / CrossIBShaderOverride / CrossIBTextureOverride 这类段在设计上
+        # 就由多个 IB 共享，删掉当前 IB 那一份会连带毁掉别的 IB 的绘制。
+        shared_sections = _collect_cross_ib_shared_names(target_names, draw_ibs)
+        registry_note = "" if shared_sections is not None else _REGISTRY_UNAVAILABLE_NOTE
 
         # 先剥掉本节点上一次追加的块：否则第二次执行会把旧跳过段当成目标段重复删 / 计数。
         stripped_content = _strip_skip_block(content)
-        updated, deleted_names = _delete_sections(stripped_content, target_names)
+        updated, deleted_names, preserved_names = _delete_sections(
+            stripped_content, target_names, shared_sections
+        )
         updated = _append_skip_block(updated, entries)
 
         written = updated != content
@@ -607,7 +785,7 @@ class SSMTNode_PostProcess_Skip(SSMTNode_PostProcess_Base):
                 ) as handle:
                     handle.write(updated)
             except (OSError, UnicodeError) as exc:
-                print(f"跳过部件：写入配置表失败 {target_ini}: {exc}")
+                _log_warning(f"跳过部件：写入配置表失败 {target_ini}: {exc}")
                 return False
 
         # ---- 登记新段：让链上后面的条件判断节点能圈到跳过段并给它加条件 ----
@@ -623,7 +801,35 @@ class SSMTNode_PostProcess_Skip(SSMTNode_PostProcess_Base):
                         ini_path=target_ini,
                     )
                 except Exception as exc:
-                    print(f"跳过部件：登记导出段失败（{exc}）")
+                    _log_warning(f"跳过部件：登记导出段失败（{exc}）")
+
+        # ---- 提示：跨 IB 共用段被保留 / 分文件里也有同名段 ----
+        if shared_sections is None:
+            _log_warning(f"跳过部件：{_REGISTRY_UNAVAILABLE_NOTE}")
+        elif registry is None and not target_names:
+            _log_warning(
+                "跳过部件：导出段登记表不可用 -> 无法确认这些 IB 在配置表里有哪些段，"
+                "本次只追加跳过段、不删除任何段（跨 IB 共用段不会被误删）"
+            )
+        if preserved_names:
+            preserved_detail = _describe_cross_ib_shared(
+                {
+                    name.casefold(): shared_sections.get(name.casefold(), {})
+                    for name in preserved_names
+                }
+            )
+            _log_warning(
+                f"跳过部件：{len(preserved_names)} 个同名段仍被其它 draw_ib 登记（跨 IB 共用），"
+                f"已保留不删：{preserved_detail}"
+            )
+        for sibling_name, sibling_sections in _find_sibling_ini_sections(
+            target_ini, target_names
+        ):
+            _log_info(
+                f"跳过部件：同目录的分文件 {sibling_name} 里也有同名段"
+                f"（{'、'.join(sibling_sections)}）；本节点只处理 "
+                f"{os.path.basename(target_ini)}，分文件未改动"
+            )
 
         # ---- 日志：区分「有导出段（删段+追加）」与「无导出段（只追加）」 ----
         ib_list = ", ".join(sorted(str(value) for value in draw_ibs))
@@ -635,14 +841,35 @@ class SSMTNode_PostProcess_Skip(SSMTNode_PostProcess_Base):
                 f"删除段 {len(deleted_names)} 个（{'、'.join(deleted_names)}）；"
                 f"新增跳过段 {len(entries)} 个（{entry_list}）{suffix} -> {target_ini}"
             )
-        else:
+        elif preserved_names:
             message = (
                 f"跳过部件：选中 {len(selected_names)} 个部件、圈定 IB {len(draw_ibs)} 个"
                 f"（{ib_list}）；"
-                f"这些 IB 不在本次导出中（无段可删），只追加跳过段 {len(entries)} 个"
+                f"同名段全部被跨 IB 共用保护拦下、未删除；"
+                f"新增跳过段 {len(entries)} 个（{entry_list}）{suffix} -> {target_ini}"
+            )
+        else:
+            no_section_reason = (
+                "导出段登记表不可用，无法确认这些 IB 的段（无段可删）"
+                if registry is None
+                else "这些 IB 不在本次导出中（无段可删）"
+            )
+            message = (
+                f"跳过部件：选中 {len(selected_names)} 个部件、圈定 IB {len(draw_ibs)} 个"
+                f"（{ib_list}）；"
+                f"{no_section_reason}，只追加跳过段 {len(entries)} 个"
                 f"（{entry_list}）{suffix} -> {target_ini}"
             )
-        print(message)
+        notes = []
+        if registry_note:
+            notes.append(registry_note)
+        if preserved_names:
+            notes.append(
+                f"跨 IB 共用保护保留 {len(preserved_names)} 段（{'、'.join(preserved_names)}）"
+            )
+        if notes:
+            message = f"{message}；{'；'.join(notes)}"
+        _log_info(message)
         try:
             from . import export_progress
             if deleted_names:

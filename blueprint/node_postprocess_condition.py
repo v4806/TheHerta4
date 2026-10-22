@@ -95,7 +95,11 @@ from .node_postprocess_base import SSMTNode_PostProcess_Base
 
 # 复用 skip 节点的段头解析口径（``[SectionName]``），保持两个节点的分节理解一致。
 # skip 只 import base，不存在循环依赖。
-from .node_postprocess_skip import _SECTION_HEADER_RE, _strip_runtime_suffixes
+from .node_postprocess_skip import (
+    _SECTION_HEADER_RE,
+    _find_sibling_ini_sections,
+    _strip_runtime_suffixes,
+)
 
 
 NODE_IDNAME = "SSMTNode_PostProcess_Condition"
@@ -116,6 +120,45 @@ _OBJECT_LOD_PREFIX_RE = re.compile(r"^LOD\d+[.]", re.IGNORECASE)
 _OBJECT_HASH_PREFIX_RE = re.compile(r"^[0-9a-fA-F]{8}")
 #: 兜底：物体名中夹着的 8 位 hash，要求前后是分隔符（``-`` / ``_`` / ``.`` / 行尾）。
 _OBJECT_HASH_FALLBACK_RE = re.compile(r"(?<![0-9a-fA-F])([0-9a-fA-F]{8})(?=[-_.]|$)")
+
+
+class ConditionApplyError(RuntimeError):
+    """配置表结构不允许安全改写时抛出：调用方必须报错并**拒绝写入**。
+
+    典型场景：目标 ini 没有 [Present] 段，而唯一能插入新段的位置落在「自动追加
+    尾块」里 —— 那样插进去的复位行下次导出会被整块重写掉，等于门控变量永不
+    复位、部件效果永久消失。宁可拒绝也不静默放过。
+    """
+
+
+def _log_info(message):
+    """走 utils/log_utils 的 LOG；导入不可用（独立加载 / 测试）时退回 print。"""
+    try:
+        from ..utils.log_utils import LOG
+    except Exception:
+        print(message)
+        return
+    LOG.info(message)
+
+
+def _log_warning(message):
+    """warn 级别版本（中文文案与语义与原来的 print 一致）。"""
+    try:
+        from ..utils.log_utils import LOG
+    except Exception:
+        print(message)
+        return
+    LOG.warning(message)
+
+
+def _log_error(message):
+    """error 级别版本：用于本节点放弃改写（返回 False）的位置。"""
+    try:
+        from ..utils.log_utils import LOG
+    except Exception:
+        print(message)
+        return
+    LOG.error(message)
 
 
 # --------------------------------------------------------------------------- #
@@ -890,6 +933,33 @@ def _insert_detect_blocks(lines, ns, detect_section_names, newline):
     return lines, len(replacements)
 
 
+def _auto_appended_tail_index(lines):
+    """返回「自动追加尾块」第一行的索引；没有尾块时返回 ``None``。
+
+    尾块内容每次导出都会被生成它的节点整块剥离重写，因此**不能**把本节点的
+    复位行插进尾块里（下次导出会被抹掉）。判定口径复用
+    ``node_postprocess_base.SSMTNode_PostProcess_Base.is_known_auto_appended_marker``。
+    """
+    for index, line in enumerate(lines):
+        if SSMTNode_PostProcess_Base.is_known_auto_appended_marker(str(line or "")):
+            return index
+    return None
+
+
+def _present_insert_index(lines):
+    """给新建的 ``[Present]`` 段选插入点（返回行索引，永远落在尾块之外）。
+
+    优先接在最后一个段之后；一旦越过自动追加尾块的起始行，就收敛到尾块之前 ——
+    段头一旦落在尾块标记之后，新的 ``[Present]`` 会连带复位行一起被下次导出重写掉。
+    """
+    sections = _find_sections(lines)
+    candidate = sections[-1][3] if sections else 0
+    tail_index = _auto_appended_tail_index(lines)
+    if tail_index is None:
+        return candidate
+    return min(candidate, tail_index)
+
+
 def _ensure_present_reset(lines, ns, newline):
     """在 ``[Present]`` 段末尾插入「锁存 + 清零」两行（幂等）。
 
@@ -898,7 +968,13 @@ def _ensure_present_reset(lines, ns, newline):
     门控一律用 ``cond_active``（帧内恒定），避免检测段与目标段 draw 顺序不同
     造成的半生效；代价是失效滞后 1 帧，视觉不可感知。
 
-    没有 Present 段时返回 ``(lines, False)``（由调用方在摘要里提示）。
+    这两行是**必要条件**：没有它们门控变量永不复位，部件效果会永久消失。所以
+    配置表没有 ``[Present]`` 段时就地新建一个（位置见 :func:`_present_insert_index`）；
+    若 ``[Present]`` 本身落在自动追加尾块里（插进去的复位行下次导出必被抹掉），
+    则不做任何改写并返回 ``tail_blocked``，由调用方报错并拒绝写入。
+
+    返回 ``(new_lines, status)``，``status`` 取 ``existing``（复用已有段）／
+    ``created``（新建段）／``tail_blocked``（无安全位置、未改写）。
     """
     marker_line = f"{COND_MARKER_PREFIX}{ns}:present@@{newline}"
     post_line = (
@@ -906,19 +982,31 @@ def _ensure_present_reset(lines, ns, newline):
         f"post $cond_{ns}_cond_frame = 0{newline}"
     )
 
+    tail_index = _auto_appended_tail_index(lines)
     for name, header_index, body_start, body_end in _find_sections(lines):
         if str(name or "").strip().casefold() != "present":
             continue
+        if tail_index is not None and header_index >= tail_index:
+            # 唯一的 [Present] 在自动追加尾块里：复位行写进去等于没写。
+            return lines, "tail_blocked"
         last = _last_non_empty_index(lines, body_start, body_end)
         if last is None:
             insert_at = body_start
         else:
             insert_at = last + 1
             lines[last] = _ensure_newline(lines[last], newline)
+        if tail_index is not None and insert_at > tail_index:
+            # 段体末尾落在尾块之后时收敛到尾块之前，保证连跑两次落点一致。
+            insert_at = tail_index
         lines[header_index] = _ensure_newline(lines[header_index], newline)
         lines[insert_at:insert_at] = [marker_line, post_line]
-        return lines, True
-    return lines, False
+        return lines, "existing"
+
+    insert_at = _present_insert_index(lines)
+    if insert_at > 0:
+        lines[insert_at - 1] = _ensure_newline(lines[insert_at - 1], newline)
+    lines[insert_at:insert_at] = [f"[Present]{newline}", marker_line, post_line]
+    return lines, "created"
 
 
 def _apply_condition(content, ns, target_names, detect_hash, index_count="", detect_section_names=None):
@@ -931,7 +1019,11 @@ def _apply_condition(content, ns, target_names, detect_hash, index_count="", det
 
     返回 ``(updated_text, stats)``，``stats`` 含 ``wrapped`` / ``skipped`` /
     ``check`` / ``detect`` / ``global_var`` / ``present`` 六个字段
-    （``check`` 表示生成了独立检测段，``detect`` 表示段内置位的段数）。
+    （``check`` 表示生成了独立检测段，``detect`` 表示段内置位的段数，
+    ``present`` 为 ``existing`` / ``created``）。
+
+    配置表结构不允许安全改写（唯一的 ``[Present]`` 落在自动追加尾块里）时抛
+    :class:`ConditionApplyError`：调用方必须报错并**放弃写入**，不许静默放过。
     """
     text = str(content or "")
     newline = "\r\n" if "\r\n" in text else "\n"
@@ -969,7 +1061,14 @@ def _apply_condition(content, ns, target_names, detect_hash, index_count="", det
         stats["check"] = False
     else:
         lines, stats["check"] = _ensure_check_section(lines, ns, detect_hash, index_count, newline)
-    lines, stats["present"] = _ensure_present_reset(lines, ns, newline)
+    lines, present_status = _ensure_present_reset(lines, ns, newline)
+    if present_status == "tail_blocked":
+        raise ConditionApplyError(
+            "唯一的 [Present] 段落在「自动追加块」内部（标记行之后）：写进去的每帧"
+            "复位行下次导出会被整块重写掉，等于门控变量永不复位、部件效果永久"
+            "消失。拒绝改写，请先把 [Present] 段移到自动追加块之前再执行本节点。"
+        )
+    stats["present"] = present_status
     return "".join(lines), stats
 
 
@@ -1082,37 +1181,37 @@ class SSMTNode_PostProcess_Condition(SSMTNode_PostProcess_Base):
 
         target_ini, error_message = SSMTNode_PostProcess_CommentCleanup._find_target_ini_file(mod_export_path)
         if not target_ini:
-            print(f"条件判断：{error_message or '未找到目标配置表'}")
+            _log_error(f"条件判断：{error_message or '未找到目标配置表'}")
             return False
 
         object_names = self._selected_object_names()
         if not object_names:
-            print("条件判断：节点未选择任何物体，跳过")
+            _log_info("条件判断：节点未选择任何物体，跳过")
             return True
 
         detect_hash = str(self.condition_hash or "").strip() or str(self.check_hash or "").strip()
         if not detect_hash:
-            print("条件判断：未填写哈希值（「哈希值」与「备用哈希值」都为空），跳过")
+            _log_warning("条件判断：未填写哈希值（「哈希值」与「备用哈希值」都为空），跳过")
             return True
 
         raw_index_count = str(self.condition_index_count or "").strip()
         index_count = _safe_index_count(raw_index_count)
         if raw_index_count and index_count is None:
-            print(f"条件判断：IndexCount「{raw_index_count}」不是正整数，已忽略")
+            _log_warning(f"条件判断：IndexCount「{raw_index_count}」不是正整数，已忽略")
 
         ns = self._namespace()
         try:
             with open(target_ini, "rb") as handle:
                 raw_bytes = handle.read()
         except OSError as exc:
-            print(f"条件判断：读取配置表失败 {target_ini}: {exc}")
+            _log_error(f"条件判断：读取配置表失败 {target_ini}: {exc}")
             return False
 
         has_bom = raw_bytes.startswith(b"\xef\xbb\xbf")
         try:
             content = raw_bytes.decode("utf-8-sig")
         except UnicodeDecodeError as exc:
-            print(f"条件判断：配置表不是 UTF-8，跳过 {target_ini}: {exc}")
+            _log_error(f"条件判断：配置表不是 UTF-8，跳过 {target_ini}: {exc}")
             return False
 
         # ---- 结构化定位层：本次导出的蓝图模型 -> draw_ib -> 导出期登记的段名 ----
@@ -1123,31 +1222,46 @@ class SSMTNode_PostProcess_Condition(SSMTNode_PostProcess_Base):
             get_blueprint_model = getattr(BlueprintExportHelper, "get_current_blueprint_model", None)
             model = get_blueprint_model() if callable(get_blueprint_model) else None
         except Exception as exc:
-            print(f"条件判断：读取本次导出的蓝图模型失败（{exc}），跳过")
+            _log_warning(f"条件判断：读取本次导出的蓝图模型失败（{exc}），跳过")
             return True
 
         if model is None:
-            print("条件判断：未获取到本次导出的蓝图模型（导出期段登记不可用），跳过")
+            _log_warning("条件判断：未获取到本次导出的蓝图模型（导出期段登记不可用），跳过")
             return True
 
         draw_ibs, target_names = _collect_target_section_names(model, object_names, target_ini)
         if not draw_ibs:
-            print("条件判断：选定的物体未匹配到任何 DrawIB（物体名与导出对象不一致），跳过")
+            _log_warning("条件判断：选定的物体未匹配到任何 DrawIB（物体名与导出对象不一致），跳过")
             return True
         if not target_names:
-            print(
+            _log_warning(
                 f"条件判断：导出期段登记里没有这些 DrawIB 的段（IB: {sorted(draw_ibs)}），跳过"
             )
             return True
 
-        updated, stats = _apply_condition(
-            content,
-            ns,
-            target_names,
-            detect_hash,
-            index_count,
-            _collect_detect_section_names(detect_hash, target_ini),
-        )
+        # 同目录的分文件（multifile）里也可能有同名段：本节点只处理目标 ini，
+        # 分文件走自己的导出与后处理链，这里只提示不处理。
+        for sibling_name, sibling_sections in _find_sibling_ini_sections(
+            target_ini, target_names
+        ):
+            _log_info(
+                f"条件判断：同目录的分文件 {sibling_name} 里也有同名段"
+                f"（{'、'.join(sibling_sections)}）；本节点只处理 "
+                f"{os.path.basename(target_ini)}，分文件未改动"
+            )
+
+        try:
+            updated, stats = _apply_condition(
+                content,
+                ns,
+                target_names,
+                detect_hash,
+                index_count,
+                _collect_detect_section_names(detect_hash, target_ini),
+            )
+        except ConditionApplyError as exc:
+            _log_error(f"条件判断：{exc} -> {target_ini}")
+            return False
         written = updated != content
         if written:
             self._create_cumulative_backup(target_ini, mod_export_path)
@@ -1160,19 +1274,30 @@ class SSMTNode_PostProcess_Condition(SSMTNode_PostProcess_Base):
                 ) as handle:
                     handle.write(updated)
             except (OSError, UnicodeError) as exc:
-                print(f"条件判断：写入配置表失败 {target_ini}: {exc}")
+                _log_error(f"条件判断：写入配置表失败 {target_ini}: {exc}")
                 return False
 
         if stats.get("wrapped", 0) <= 0:
-            print(
+            _log_info(
                 f"条件判断：目标段没有可门控的内容（IB: {', '.join(sorted(draw_ibs))}；"
                 f"登记段 {len(target_names)} 个）"
                 f"{'；已清除本节点旧标记' if written else ''} -> {target_ini}"
             )
             return True
 
-        if not stats.get("present", False):
-            print("条件判断：配置表没有 [Present] 段，无法每帧复位（变量会保持上一次的值）")
+        present_text = ""
+        if stats.get("present") == "created":
+            present_text = "；配置表原本没有 [Present] 段，已新建并写入两行每帧复位"
+            _log_info(
+                f"条件判断：配置表没有 [Present] 段，已在 {target_ini} 里新建该段并写入"
+                "锁存 + 清零两行（缺这两行门控变量永不复位，部件效果会永久消失）"
+            )
+        elif stats.get("present") != "existing":
+            present_text = "；未能写入每帧复位行"
+            _log_warning(
+                f"条件判断：未能写入每帧复位行（present={stats.get('present')}），"
+                "门控变量不会自动复位，请检查配置表结构"
+            )
 
         if stats.get("detect", 0) > 0:
             detect_text = (
@@ -1182,11 +1307,12 @@ class SSMTNode_PostProcess_Condition(SSMTNode_PostProcess_Base):
         else:
             detect_text = f"独立检测段（检测 hash {detect_hash} 未被本 mod 接管）"
 
-        print(
+        _log_info(
             f"条件判断：门控 {stats['wrapped']} 个段（跳过 {stats['skipped']} 个无内容段），"
             f"检测方式：{detect_text}；"
             f"IB {len(draw_ibs)} 个（{', '.join(sorted(draw_ibs))}）/ "
             f"登记段 {len(target_names)} 个 / 物体 {len(object_names)} 个"
+            f"{present_text}"
             f"{'' if written else '（配置表已是最新，未改写）'} -> {target_ini}"
         )
         try:
