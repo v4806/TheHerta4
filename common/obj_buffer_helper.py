@@ -8,7 +8,11 @@ from ..utils.format_utils import FormatUtils
 from ..utils.vertexgroup_utils import VertexGroupUtils
 from ..utils.timer_utils import TimerUtils
 from ..utils.tbn_codec import TBNCodec
-from ..utils.color_attribute_utils import read_color_attribute_data, sample_color_attribute_to_loops
+from ..utils.color_attribute_utils import (
+    encode_color_for_unorm_target,
+    read_color_attribute_data,
+    sample_color_attribute_to_loops,
+)
 from ..utils.ssmt_error_utils import SSMTErrorUtils, Fatal
 from .logic_name import LogicName
 from .global_config import GlobalConfig
@@ -378,7 +382,14 @@ class ObjBufferHelper:
             elif d3d11_element.Format == 'R8G8B8A8_SNORM':
                 result = FormatUtils.convert_4x_float32_to_r8g8b8a8_snorm(result)
             elif d3d11_element.Format == 'R8G8B8A8_UNORM':
-                result = FormatUtils.convert_4x_float32_to_r8g8b8a8_unorm(result)
+                # 8bit UNORM 颜色流里游戏存的是 sRGB 编码后的字节，而 FLOAT_COLOR 层装的是
+                # 线性值：混合类型 join 时 Blender 会把 BYTE_COLOR 提升成 FLOAT_COLOR 并把
+                # sRGB 128 变成线性 0.21586，直接 ×255 量化就写成 55（实测 body.skin 变了色）。
+                # 所以按存储类型先编码回 sRGB 再量化；BYTE_COLOR 层本来就对，原样通过。
+                # 有符号与非颜色分支（SNORM、16bit、法线存 UV）不受影响。
+                result = FormatUtils.convert_4x_float32_to_r8g8b8a8_unorm(
+                    encode_color_for_unorm_target(color_data, result)
+                )
 
             return result
         return None

@@ -199,6 +199,94 @@ class ObjBufferHelperColorTests(unittest.TestCase):
         np.testing.assert_array_equal(result, expected)
 
 
+    def test_parse_color_encodes_promoted_float_color_back_to_srgb_bytes(self):
+        """复现 body.skin 变色：混合类型 join 后 BYTE_COLOR 的 128 变成线性 0.21586050。
+
+        128 是 sRGB 字节，它的线性值是 0.21586050；旧实现直接 ×255 量化成 55。
+        游戏里那还是同一份顶点色，所以导出必须回到 128。
+        """
+        linear_value = 0.21586050
+        mesh = DummyMesh(
+            vertex_indices=[0, 1],
+            color_attr=DummyColorAttribute(
+                name="COLOR",
+                domain="CORNER",
+                data_type="FLOAT_COLOR",
+                records=[
+                    (linear_value, linear_value, linear_value, 1.0),
+                    (linear_value, linear_value, linear_value, 1.0),
+                ],
+            ),
+        )
+        element = types.SimpleNamespace(Format="R8G8B8A8_UNORM")
+
+        result = ObjBufferHelper._parse_color(mesh, len(mesh.loops), "COLOR", element)
+
+        np.testing.assert_array_equal(
+            result,
+            np.array([[128, 128, 128, 255], [128, 128, 128, 255]], dtype=np.uint8),
+        )
+
+    def test_parse_color_leaves_float_color_alpha_unencoded(self):
+        """alpha 是遮罩不是颜色：FLOAT_COLOR 的 0.25 要写成 64，不能被当成线性颜色编码。"""
+        mesh = DummyMesh(
+            vertex_indices=[0],
+            color_attr=DummyColorAttribute(
+                name="COLOR",
+                domain="CORNER",
+                data_type="FLOAT_COLOR",
+                records=[(0.0, 0.0, 0.0, 0.25)],
+            ),
+        )
+        element = types.SimpleNamespace(Format="R8G8B8A8_UNORM")
+
+        result = ObjBufferHelper._parse_color(mesh, len(mesh.loops), "COLOR", element)
+
+        np.testing.assert_array_equal(result, np.array([[0, 0, 0, 64]], dtype=np.uint8))
+
+    def test_parse_color_keeps_byte_color_bytes_identical(self):
+        """BYTE_COLOR 层就是游戏原始 8bit 数据：导出后必须逐字节不变，128 还是 128。"""
+        mesh = DummyMesh(
+            vertex_indices=[0],
+            color_attr=DummyColorAttribute(
+                name="COLOR",
+                domain="CORNER",
+                data_type="BYTE_COLOR",
+                records=[(128 / 255, 128 / 255, 128 / 255, 1.0)],
+            ),
+        )
+        element = types.SimpleNamespace(Format="R8G8B8A8_UNORM")
+
+        result = ObjBufferHelper._parse_color(mesh, len(mesh.loops), "COLOR", element)
+
+        np.testing.assert_array_equal(result, np.array([[128, 128, 128, 255]], dtype=np.uint8))
+
+
+    def test_parse_color_round_trips_every_promoted_byte_value(self):
+        """join 的提升是 sRGB→线性，导出必须正好是它的逆：8bit 全部 256 个值逐值回原。"""
+        byte_values = np.arange(256, dtype=np.float32) / 255.0
+        promoted_linear = np.where(
+            byte_values <= 0.04045,
+            byte_values / 12.92,
+            ((byte_values + 0.055) / 1.055) ** 2.4,
+        ).astype(np.float32)
+        mesh = DummyMesh(
+            vertex_indices=list(range(256)),
+            color_attr=DummyColorAttribute(
+                name="COLOR",
+                domain="CORNER",
+                data_type="FLOAT_COLOR",
+                records=[(float(value), float(value), float(value), 1.0) for value in promoted_linear],
+            ),
+        )
+        element = types.SimpleNamespace(Format="R8G8B8A8_UNORM")
+
+        result = ObjBufferHelper._parse_color(mesh, len(mesh.loops), "COLOR", element)
+
+        np.testing.assert_array_equal(result[:, 0], np.arange(256, dtype=np.uint8))
+        np.testing.assert_array_equal(result[:, 3], np.full(256, 255, dtype=np.uint8))
+
+
 class ObjBufferHelperBlendIndicesTests(unittest.TestCase):
     @staticmethod
     def _element(fmt, byte_width):

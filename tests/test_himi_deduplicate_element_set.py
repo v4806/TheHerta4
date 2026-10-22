@@ -154,6 +154,7 @@ _install_module(f"{PKG_HELPER}.utils.timer_utils", TimerUtils=types.SimpleNamesp
 _install_module(f"{PKG_HELPER}.utils.tbn_codec", TBNCodec=types.SimpleNamespace())
 _install_module(
     f"{PKG_HELPER}.utils.color_attribute_utils",
+    encode_color_for_unorm_target=lambda rgba_data, values: values,
     read_color_attribute_data=lambda *args, **kwargs: None,
     sample_color_attribute_to_loops=lambda *args, **kwargs: None,
 )

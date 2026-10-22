@@ -55,6 +55,7 @@ _install_module(f"{PKG}.utils.timer_utils", TimerUtils=types.SimpleNamespace())
 _install_module(f"{PKG}.utils.tbn_codec", TBNCodec=types.SimpleNamespace())
 _install_module(
     f"{PKG}.utils.color_attribute_utils",
+    encode_color_for_unorm_target=lambda *args, **kwargs: None,
     read_color_attribute_data=lambda *args, **kwargs: None,
     sample_color_attribute_to_loops=lambda *args, **kwargs: None,
 )
