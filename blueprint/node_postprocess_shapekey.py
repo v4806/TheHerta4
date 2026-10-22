@@ -79,6 +79,55 @@ try:
 except Exception:
     _section_registry = None
 
+
+def _direct_export_runtime_active() -> bool:
+    '''
+    当前是否处于直出（direct export）执行期。
+
+    形态键后处理的段登记与蓝图模型消费**只在直出模式生效**：普通 / 后台 / 并行导出的
+    形态键行为必须与「导出段登记表」引入之前完全一致。
+
+    判定 fail-safe：摸不到开关（老代码、测试桩、导入异常、开关自身抛异常）时一律返回
+    False，即不登记、不消费，退化回改动前的行为。
+    '''
+    try:
+        from .export_helper import BlueprintExportHelper
+    except Exception:
+        return False
+    probe = getattr(BlueprintExportHelper, "is_direct_export_active", None)
+    if not callable(probe):
+        return False
+    try:
+        return bool(probe())
+    except Exception:
+        return False
+
+
+def _register_direct_export_sections(section_names, draw_ib, ini_path) -> int:
+    '''
+    把直出刚生成的形态键段登记到 「条件判断」后处理用的导出段登记表。
+
+    只在直出模式生效（见 _direct_export_runtime_active）；登记表本身是按
+    (段名, 段类型, draw_ib) 增量追加且自动去重，重复调用安全；任何异常都静默跳过 ——
+    登记只是导出后的附加信息，绝不能影响导出结果。
+
+    返回成功登记的段数量（非直出或登记表不可用时为 0）。
+    '''
+    if not _direct_export_runtime_active():
+        return 0
+    if _section_registry is None:
+        return 0
+    registered = 0
+    try:
+        ini_abs = os.path.abspath(ini_path)
+        for name in section_names:
+            _section_registry.register_section(name, draw_ib=draw_ib, ini_path=ini_abs)
+            registered += 1
+    except Exception:
+        pass
+    return registered
+
+
 # 形态键权重同步 CS：文件与 anim CS 同在 res/ 下，内容固定（无 per-hash 注入），
 # 每份 mod 只复制一次。
 WEIGHT_SYNC_SHADER_NAME = "shapekey_weight_sync.hlsl"
@@ -376,8 +425,11 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
             seen_names.add(clean_name)
             yield clean_name
 
-        get_blueprint_model = getattr(BlueprintExportHelper, "get_current_blueprint_model", None)
-        blueprint_model = get_blueprint_model() if callable(get_blueprint_model) else None
+        # 蓝图模型只在直出模式消费：非直出时保持改动前的行为（只用下面的节点连接兜底）。
+        blueprint_model = None
+        if _direct_export_runtime_active():
+            get_blueprint_model = getattr(BlueprintExportHelper, "get_current_blueprint_model", None)
+            blueprint_model = get_blueprint_model() if callable(get_blueprint_model) else None
         processing_chains = getattr(blueprint_model, "processing_chains", []) if blueprint_model is not None else []
         if processing_chains:
             for chain in processing_chains:
@@ -3634,21 +3686,13 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                     hash_weight_counts[h] = len(hash_unique_names)
 
                     # 登记本 hash 刚生成的两类段（裸段名，不含方括号），让「条件判断」
-                    # 后处理能按 draw_ib 把形态键段一起门控。登记表是追加语义且自动去重，
-                    # 不同分支重复调用安全；登记失败只静默跳过，绝不能影响导出结果。
-                    if _section_registry is not None:
-                        try:
-                            for _register_name in (
-                                f"CustomShader_{h}_Anim",
-                                f"CustomShaderShapeKeyWeightSync_{h}",
-                            ):
-                                _section_registry.register_section(
-                                    _register_name,
-                                    draw_ib=h.split("-")[0],
-                                    ini_path=os.path.abspath(target_ini_file),
-                                )
-                        except Exception:
-                            pass
+                    # 后处理能按 draw_ib 把形态键段一起门控。只在直出模式生效；
+                    # 登记表是追加语义且自动去重，不同分支重复调用安全。
+                    _register_direct_export_sections(
+                        (f"CustomShader_{h}_Anim", f"CustomShaderShapeKeyWeightSync_{h}"),
+                        draw_ib=h.split("-")[0],
+                        ini_path=target_ini_file,
+                    )
 
             new_resource_lines = []
             generated_section_names = set()

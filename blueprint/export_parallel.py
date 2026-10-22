@@ -480,9 +480,27 @@ def _parse_manifest_argument(argv: list[str]) -> str:
     return ""
 
 
+def _clear_export_section_registry() -> None:
+    """worker 进程内清空 DrawIB→ini 段登记表（与其它导出入口保持一致）。
+
+    登记表由 ``common/export_section_registry.py`` 提供，可能尚未落地（精简加载 /
+    测试桩），因此软导入：拿不到模块或清理失败都只留一条提示，绝不让并行导出失败。
+    """
+    try:
+        from ..common import export_section_registry as _section_registry
+    except Exception:
+        return
+    try:
+        _section_registry.clear()
+    except Exception as error:
+        print(f"⚠️ 清理导出段登记表失败（已忽略）: {error}")
+
 def _run_worker(manifest_path: str):
     with open(manifest_path, "r", encoding="utf-8") as file:
         manifest = json.load(file)
+
+    # worker 与主进程内存隔离：这里再清一次，保证后处理节点只看到本次导出的 ini 段。
+    _clear_export_section_registry()
 
     result = {
         "status": "error",

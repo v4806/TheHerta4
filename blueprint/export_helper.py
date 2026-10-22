@@ -48,6 +48,12 @@ class BlueprintExportHelper:
     _current_blueprint_model = None
     _current_exporter = None
 
+    # 直出（direct export）运行时开关：只有 ``blueprint/direct_export.py`` 的直出入口
+    # 会把它置真，普通 / 后台 / 并行导出全程为假。
+    # 形态键后处理用它把「按 draw_ib 登记段 + 消费蓝图模型」限定在直出模式，
+    # 保证其它导出模式的形态键行为与开关引入前完全一致。
+    _direct_export_active = False
+
     MAX_EXPORT_COUNT_LIMIT = 1000
     BLUEPRINT_NONE_IDENTIFIER = "__NONE__"
     BLUEPRINT_NONE_ENUM_NUMBER = 0
@@ -524,11 +530,26 @@ class BlueprintExportHelper:
         BlueprintExportHelper._current_exporter = None
 
     @staticmethod
+    def set_direct_export_active(enabled: bool):
+        """置位/复位「当前正在直出」开关（只有直出入口会调）。"""
+        BlueprintExportHelper._direct_export_active = bool(enabled)
+
+    @staticmethod
+    def is_direct_export_active() -> bool:
+        """当前是否处于直出执行期；未置位（普通/后台/并行导出、导出结束后）为 False。"""
+        return bool(BlueprintExportHelper._direct_export_active)
+
+    @staticmethod
+    def clear_direct_export_active():
+        BlueprintExportHelper._direct_export_active = False
+
+    @staticmethod
     def reset_direct_export_runtime_state(clear_postprocess_caches: bool = False):
         # 蓝图模型 / 导出器缓存只在导出开始时清空：后处理在导出结束后才运行，
         # 提前清理会让后处理节点读不到本次导出的上下文。
         BlueprintExportHelper.clear_current_blueprint_model()
         BlueprintExportHelper.clear_current_exporter()
+        BlueprintExportHelper.clear_direct_export_active()
         BlueprintExportHelper.clear_runtime_shapekey_buffer_names()
         BlueprintExportHelper.set_preserve_current_shapekey_mix_for_export(False)
         BlueprintExportHelper.set_suppress_shapekey_resource_export(False)

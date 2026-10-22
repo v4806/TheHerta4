@@ -872,11 +872,15 @@ def execute_direct_export(context, tree):
     previous_runtime_tree_name = BlueprintExportHelper.runtime_blueprint_tree_name
     BlueprintExportHelper.set_runtime_blueprint_tree(tree)
     GlobalKeyCountHelper.initialize()
+    # 直出运行时开关：后处理在 session.run() 内部执行，所以整个会话期间都置真，
+    # 结束后（异常也）复位，让普通 / 后台 / 并行导出看到的一直是「不是直出」。
+    BlueprintExportHelper.set_direct_export_active(True)
     try:
         refresh_blueprint_sync_state(tree=tree, context=context, include_all_blueprints=True)
         session = DirectExportSession(context=context, tree=tree)
         session.run()
     finally:
+        BlueprintExportHelper.set_direct_export_active(False)
         BlueprintExportHelper.runtime_blueprint_tree_name = previous_runtime_tree_name
 
 

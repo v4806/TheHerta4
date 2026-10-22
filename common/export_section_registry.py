@@ -13,8 +13,13 @@
   都是**贴图** hash，段名匹配必然漏段。
 
 所以改成「导出的时候就记下来」：``M_IniBuilder`` 写盘前把本节所有段
-（段名 + 段类型 + 构造该段时的 draw_ib 上下文）整批提交到本模块的登记表，
+（段名 + 段类型 + 构造该段时的 draw_ib 上下文）登记到本模块的登记表，
 后处理节点再按 draw_ib 反查。
+
+登记语义是**按 (段名, 段类型, draw_ib) 去重的增量追加（upsert）**，不是整批覆盖：
+同一个进程里一次导出可能写多轮（``ExportRoundExecutor`` 每轮新建 ``M_IniBuilder``
+再写盘，EFMI / Unity 系一轮还会写多份 ini），整批覆盖会让后一轮把前一轮登记的段
+整片吞掉，后处理就查不到了。
 
 生命周期
 --------
@@ -22,7 +27,7 @@
 2. **导出期写**：导出器用 :func:`draw_ib_context` 包住「构造 + 提交某个 draw_ib 段」的代码，
    ``M_IniSection`` 在构造时快照当前 draw_ib（``M_IniSection.owner_draw_ib``）；
    ``M_IniBuilder.save_to_file`` / ``save_to_file_not_reorder`` 写盘前调用
-   :func:`commit_ini` 整批登记；
+   :func:`commit_ini` 增量登记（只增不减，见下）；
 3. **后处理期读**：条件判断节点调用 :func:`get_sections_for_draw_ib` /
    :func:`get_sections_for_draw_ibs` 反查出该 draw_ib 的全部段；
 4. 导出结束**不**自动清理（后处理还要用），下一次导出开头再 :func:`clear`。
@@ -162,14 +167,26 @@ def register_section(
 
 
 def commit_ini(ini_path: str, sections) -> None:
-    """整批覆盖某个 ini 的登记。
+    """把某个 ini 这一轮产出的段增量登记进登记表（upsert，幂等，只增不减）。
 
     ``sections`` 为 ``[(section_name, section_type, draw_ib), ...]``，按给定顺序登记，
-    并**整批替换**该 ``ini_path`` 原来的全部登记（多轮导出只保留最后一次）。
-    传空列表表示「这个 ini 没有段」，等价于清掉该 ini 的登记。
+    去重键是 ``(段名, 段类型, draw_ib)``：
+
+    - 已存在的键不重复追加（同一轮里重复提交安全，幂等）；
+    - 新键追加到该 ini 已有登记之后，``index`` 按该 ini 内的登记顺序递增；
+    - **不清除**该 ini 里上一轮登记的段。一个进程里多轮执行导出时（每轮新建
+      ``M_IniBuilder`` 再写盘，EFMI / Unity 系一轮还会写多份 ini），只有「只增不减」
+      才不会让后一轮把前一轮登记的段整片吞掉。
+
+    也就是说本函数只做加法，减法只由 :func:`clear`（每次导出开头调用）负责；
+    传空列表 / 全是畸形条目时不产生任何登记，也不会清掉该 ini 已有的段。
+
+    段名 / 段类型 / draw_ib 都按字符串处理：``None``、空串等一律丢弃，``sections``
+    里的空条目、非序列条目也只是跳过而不抛异常 —— 登记是附加品，坏数据绝不能
+    毁掉整次导出。
 
     空 ini_path 时回退到 :func:`get_current_ini`；仍然为空、或 ``sections`` 不是
-    list/tuple 时静默忽略（不动已有登记，避免垃圾数据误清表）。
+    list/tuple 时静默忽略。
     """
     ini = _normalize_ini_path(ini_path) or _CURRENT_INI
     if not ini:
@@ -177,10 +194,10 @@ def commit_ini(ini_path: str, sections) -> None:
     if not isinstance(sections, (list, tuple)):
         return
 
-    entries = []
+    candidates = []
     seen = set()
     for item in sections:
-        if not item:
+        if not item or isinstance(item, (str, bytes)):
             continue
         try:
             name = _text(item[0])
@@ -194,12 +211,19 @@ def commit_ini(ini_path: str, sections) -> None:
         if key in seen:
             continue
         seen.add(key)
-        entries.append(_make_entry(name, section_type, owner, len(entries)))
+        candidates.append(key)
+    if not candidates:
+        return
 
-    if entries:
-        _TABLES[ini] = entries
-    else:
-        _TABLES.pop(ini, None)
+    table = _TABLES.setdefault(ini, [])
+    # 已有登记同样参与去重：多轮写入时同一段只保留首次登记那一条。
+    known = {(entry["name"], entry["type"], entry["draw_ib"]) for entry in table}
+    for key in candidates:
+        if key in known:
+            continue
+        known.add(key)
+        name, section_type, owner = key
+        table.append(_make_entry(name, section_type, owner, len(table)))
 
 
 def get_sections_for_draw_ib(draw_ib: str, ini_path: str = "") -> list[dict]:

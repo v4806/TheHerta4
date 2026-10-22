@@ -155,19 +155,34 @@ class M_IniBuilder:
            只按段名关键词匹配必然漏掉它们。
 
         同一 (段名, 段类型, draw_ib) 由 commit_ini 去重，这里只负责按顺序收集。
+
+        段名 / 段行只有字符串才看得懂：``None``、数字、非字符串的 ``SectionLineList``
+        一律跳过（登记是附加品，畸形数据绝不能把导出打断 —— ``re.match`` 碰到非字符串
+        会直接抛 TypeError）。
         '''
         entries = []
         for section in self.ini_section_list:
             names = []
-            if section.SectionName:
-                names.append(section.SectionName)
-            for line in section.SectionLineList or []:
-                m = re.match(r"^\s*\[([^\]]+)\]\s*$", line or "")
-                if m:
-                    names.append(m.group(1).strip())
+            section_name = getattr(section, "SectionName", "")
+            if isinstance(section_name, str) and section_name:
+                names.append(section_name)
+            section_lines = getattr(section, "SectionLineList", None)
+            if isinstance(section_lines, (list, tuple)):
+                for line in section_lines:
+                    if not isinstance(line, str):
+                        continue
+                    m = re.match(r"^\s*\[([^\]]+)\]\s*$", line)
+                    if m:
+                        names.append(m.group(1).strip())
             for name in names:
                 # getattr 兜底：tests/ 里有与 M_IniSection 同 API 的假段对象会被塞进真 builder。
-                entries.append((name, section.SectionType, getattr(section, "owner_draw_ib", "")))
+                entries.append(
+                    (
+                        name,
+                        getattr(section, "SectionType", ""),
+                        getattr(section, "owner_draw_ib", ""),
+                    )
+                )
         return entries
 
     @staticmethod
@@ -233,10 +248,14 @@ class M_IniBuilder:
         self.line_list.append("\n;sha256=" + sha256 + "\n\n") 
 
 
-        # 写盘前把本节所有段整批登记到导出段登记表（供条件判断节点按 draw_ib 反查）。
-        # 注意：sha256 相同、跳过写文件时同样要登记 —— 内容没变不代表这次导出的 draw_ib 归属没变，
-        # 而登记表用的是整批覆盖语义，漏登记会让后处理查到上一轮甚至空的数据。
-        _section_registry.commit_ini(config_ini_path, self._collect_section_entries())
+        # 写盘前把本节所有段登记到导出段登记表（供条件判断节点按 draw_ib 反查）。
+        # - sha256 相同、跳过写文件时同样要登记：内容没变不代表这次导出的 draw_ib 归属没变。
+        # - 登记表是「按 (段名, 段类型, draw_ib) 增量追加」，多轮写同一个 ini 不会互相吞段。
+        # - 登记失败只静默跳过：它只是导出后的附加信息，绝不能反过来让导出失败。
+        try:
+            _section_registry.commit_ini(config_ini_path, self._collect_section_entries())
+        except Exception:
+            pass
 
         # Read ini and find sha256, if not same then write ini, if same do nothing.
         ini_sha256 = self.get_sha256_from_ini(config_ini_path)
@@ -318,10 +337,14 @@ class M_IniBuilder:
         self.line_list.append("\n;sha256=" + sha256 + "\n\n") 
 
 
-        # 写盘前把本节所有段整批登记到导出段登记表（供条件判断节点按 draw_ib 反查）。
-        # 注意：sha256 相同、跳过写文件时同样要登记 —— 内容没变不代表这次导出的 draw_ib 归属没变，
-        # 而登记表用的是整批覆盖语义，漏登记会让后处理查到上一轮甚至空的数据。
-        _section_registry.commit_ini(config_ini_path, self._collect_section_entries())
+        # 写盘前把本节所有段登记到导出段登记表（供条件判断节点按 draw_ib 反查）。
+        # - sha256 相同、跳过写文件时同样要登记：内容没变不代表这次导出的 draw_ib 归属没变。
+        # - 登记表是「按 (段名, 段类型, draw_ib) 增量追加」，多轮写同一个 ini 不会互相吞段。
+        # - 登记失败只静默跳过：它只是导出后的附加信息，绝不能反过来让导出失败。
+        try:
+            _section_registry.commit_ini(config_ini_path, self._collect_section_entries())
+        except Exception:
+            pass
 
         # Read ini and find sha256, if not same then write ini, if same do nothing.
         ini_sha256 = self.get_sha256_from_ini(config_ini_path)
