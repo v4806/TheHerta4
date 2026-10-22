@@ -72,6 +72,13 @@ except ImportError:  # pragma: no cover
     _ini_scope_spec = _importlib_util.spec_from_file_location(
         "ssmt_ini_scope_fallback", _INI_SCOPE_PATH
     )
+    if _ini_scope_spec is None or not os.path.isfile(_INI_SCOPE_PATH):
+        # 缺 blueprint/ini_scope.py（发行包漏收录 / 单独检出本文件）时，
+        # 这里必须给出说得出话的 ImportError，而不是 module_from_spec(None) 的
+        # AttributeError——后者在日志里看不出到底缺了什么。
+        raise ImportError(
+            f"本节点依赖 blueprint/ini_scope.py，但未找到: {_INI_SCOPE_PATH}"
+        )
     ini_scope = _importlib_util.module_from_spec(_ini_scope_spec)
     _ini_scope_spec.loader.exec_module(ini_scope)
 
@@ -190,17 +197,37 @@ def _part_names_equal(left, right):
     return left_match.group("base").casefold() == right_match.group("base").casefold()
 
 
+def _ib_key_same_hash(left, right):
+    """两个 IB 键是否指向同一条 IB（只比 8 位 hash）。
+
+    完整键（``hash-数字-数字``）里的 count / first_index 会随重新导出、合并子网格、
+    拆分子网格变化，而 IB 还是同一条；这里拿它当硬判定会把目标静默跳过（一个
+    材质参数都不注入，实机上就是贴图不亮）。任一侧取不到 hash 时按相容处理。
+    """
+    if not left or not right:
+        return True
+    left_hex = left.get("hex")
+    right_hex = right.get("hex")
+    if left_hex and right_hex:
+        return left_hex == right_hex
+    return True
+
+
 def _unit_matches_target(mesh_name, target_scope, target_part, section_scope=None):
-    """绘制单元的 mesh 名是否就是这个目标物体（IB 键 + 部件名双重校验）。
+    """绘制单元的 mesh 名是否就是这个目标物体（IB hash + 部件名双重校验）。
 
     ``target_scope`` 是目标物体名的 IB 键（:func:`ini_scope.mesh_ib_key` 口径，
     与材质转资源 pro 的 ``_ib_key_from_name`` 一致）；``section_scope`` 是段名的
     IB 键，用来排除同名部件落在别的 IB 段里的情况。
+
+    IB 键只比 8 位 hash：count / first_index 是导出期快照，同一部件重新导出就会变；
+    真正区分「是不是这个部件」靠 :func:`_part_names_equal`（``右手.001`` 与
+    ``右乳球.001`` 依旧不会被混为一谈）。
     """
     mesh_scope = ini_scope.mesh_ib_key(mesh_name)
-    if section_scope is not None and not ini_scope.ib_key_matches(section_scope, mesh_scope):
+    if section_scope is not None and not _ib_key_same_hash(section_scope, mesh_scope):
         return False
-    if not ini_scope.ib_key_matches(target_scope, mesh_scope):
+    if not _ib_key_same_hash(target_scope, mesh_scope):
         return False
     if not target_part:
         # 物体名里取不到部件名（只有 IB 键）时无法再细分，只能按 IB 判定。
@@ -345,20 +372,6 @@ def _absorb_reset_block(lines, position):
     return position
 
 
-def _else_branch_endif(lines, else_index):
-    """``else`` 行所属 ``if`` 块的 ``endif`` 行号；找不到返回 ``None``。"""
-    depth = 0
-    for index in range(else_index - 1, -1, -1):
-        kind = ini_scope.classify_line(str(lines[index]).strip())
-        if kind == "endif":
-            depth += 1
-        elif kind == "if":
-            if depth == 0:
-                return ini_scope.find_block_end(lines, index)
-            depth -= 1
-    return None
-
-
 #: 资源别名清空行（材质转资源写的 ``Resource\RabbitFX\Glowmap = ref null`` / ``= null``）。
 _RESET_SLOT_NULL_RE = re.compile(
     r"^resource\\[^=\s]+\\[^=\s]+\s*=\s*(?:ref\s+)?null\s*$", re.IGNORECASE
@@ -427,23 +440,21 @@ def _unit_edit_scope(lines, unit):
     止 = 单元内容末尾；单元是 chain 内**最后一个**兄弟（末尾正好是 ``endif``）时
     包含该 ``endif`` —— 复位块插在它**之前**，留在条件块内（实机要求：不要写到
     ``endif`` 之外造成块外重复）。中间的兄弟单元止于下一个 ``; [mesh:...]``，
-    区间互不重叠。因 ``else`` 截断时扩到所属 ``if`` 的 ``endif``。
+    区间互不重叠。
+
+    被 ``else`` 截断的单元（then 分支的最后一个兄弟）止于 ``else`` 行**本身**：
+    复位块写在 then 分支末尾、``else`` 之前。不能顺着扩到所属 ``if`` 的 ``endif``
+    —— 那会把 else 分支整个包进本单元的可写范围，复位块落到另一支的参数块中间，
+    那一支物体的贴图静默全灭（同一个 if/else 里两支各有目标时必现）。
 
     止之后紧邻的本节点旧复位块会被吸收进范围，保证重跑幂等。
     """
     start = int(unit["start"])
     end = int(unit["end"])
     chain = tuple(unit.get("chain") or ())
-    end_line = str(lines[end]).strip() if 0 <= end < len(lines) else ""
     if chain:
         endif_index = chain[-1][1]
-        if 0 <= endif_index < len(lines) and (
-            end == endif_index or ini_scope.is_else_line(end_line)
-        ):
-            return start, _absorb_reset_block(lines, endif_index + 1)
-    elif end < len(lines) and ini_scope.is_else_line(end_line):
-        endif_index = _else_branch_endif(lines, end)
-        if endif_index is not None:
+        if 0 <= endif_index < len(lines) and end == endif_index:
             return start, _absorb_reset_block(lines, endif_index + 1)
     return start, _absorb_reset_block(lines, end)
 

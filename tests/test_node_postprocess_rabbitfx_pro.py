@@ -1612,6 +1612,75 @@ class RabbitFXProTests(unittest.TestCase):
         self.assertIn(pro._PARAM_BEGIN, content)
         self.assertNotIn(pro._RESET_BEGIN, content)
 
+    def test_if_else_branches_each_keep_their_own_params_and_reset(self):
+        """同一个 ``if/else`` 两支各有目标：各自的参数与复位都留在自己那一支里。
+
+        被 ``else`` 截断的单元（then 分支的最后一个兄弟）一旦把可写范围扩到所属
+        ``if`` 的 ``endif``，else 分支就被整个包进来：复位块落进另一支的参数块中间，
+        排在该支 ``run``/``drawindexed`` **之前** —— 那一支物体的 RabbitFX 贴图静默
+        全灭（无任何告警），末兄弟的复位块还会跑到 ``endif`` 之外。
+        """
+        section = (
+            f"[{SHARED_IB_SECTION}]\n"
+            "hash = c209c22b\n"
+            "if $swapkey4 == 0\n"
+            f"    ; [mesh:{SHARED_IB_TARGET}]\n"
+            "    Resource\\RabbitFX\\Glowmap = ref Resource_Glowmap_1\n"
+            "    run = CommandList\\RabbitFX\\Run\n"
+            "    drawindexed = 100, 0, 0\n"
+            "else\n"
+            f"    ; [mesh:{SHARED_IB_NEAR}]\n"
+            "    Resource\\RabbitFX\\Glowmap = ref Resource_Glowmap_2\n"
+            "    run = CommandList\\RabbitFX\\Run\n"
+            "    drawindexed = 200, 0, 0\n"
+            "endif\n"
+        )
+        _write_ini(self.ini_path, section)
+        node = _make_node(
+            target_items=[
+                _item(_fake_object(SHARED_IB_TARGET)),
+                _item(_fake_object(SHARED_IB_NEAR)),
+            ]
+        )
+
+        node.execute_postprocess(self.export_dir)
+        content = _read_ini(self.ini_path)
+
+        self.assertEqual(content.count(pro._PARAM_BEGIN), 2, content)
+        self.assertEqual(content.count(pro._RESET_BEGIN), 2, content)
+        else_index = content.index("else")
+        endif_index = content.index("endif")
+
+        # then 分支：参数在 run 之前，复位块在 draw 之后、``else`` 之前。
+        then_segment = content[:else_index]
+        self.assertEqual(then_segment.count(pro._PARAM_BEGIN), 1, then_segment)
+        self.assertEqual(then_segment.count(pro._RESET_BEGIN), 1, then_segment)
+        self.assertLess(
+            then_segment.index(pro._PARAM_BEGIN),
+            then_segment.index("run = CommandList\\RabbitFX\\Run"),
+        )
+        self.assertLess(
+            then_segment.index("drawindexed = 100, 0, 0"),
+            then_segment.index(pro._RESET_BEGIN),
+        )
+
+        # else 分支：同样自带一套，且不越出 ``endif``。
+        else_segment = content[else_index:endif_index]
+        self.assertEqual(else_segment.count(pro._PARAM_BEGIN), 1, else_segment)
+        self.assertEqual(else_segment.count(pro._RESET_BEGIN), 1, else_segment)
+        self.assertLess(
+            else_segment.index(pro._PARAM_BEGIN),
+            else_segment.index("run = CommandList\\RabbitFX\\Run"),
+        )
+        self.assertLess(
+            else_segment.index("drawindexed = 200, 0, 0"),
+            else_segment.index(pro._RESET_BEGIN),
+        )
+
+        # 重跑幂等：不累积、不漂移。
+        node.execute_postprocess(self.export_dir)
+        self.assertEqual(_read_ini(self.ini_path), content)
+
 
 if __name__ == "__main__":
     unittest.main()
