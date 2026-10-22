@@ -25,12 +25,19 @@ class ExportHelper:
         }
 
     @staticmethod
-    def parse_submesh_model_list_from_blueprint_model(blueprint_model:BluePrintModel) -> list[SubMeshModel]:
+    def parse_submesh_model_list_from_blueprint_model(
+        blueprint_model:BluePrintModel,
+        seam_weld_config=None,
+    ) -> list[SubMeshModel]:
         '''
         从蓝图中解析出一个Submesh Model列表
         如果是Submesh可以直接导出的游戏，例如EFMI，则调用处拿到后直接导出
         如果是Submesh需要组合成DrawIB级别再导出，例如米游、Unity系列游戏，则调用处拿到后再进行整合
         这样拆分流程更加清晰，逻辑更容易理解
+
+        seam_weld_config：接缝焊接节点配置（None = 不焊接）。非空时每个 SubMeshModel
+        会在 join 之后、生成导出缓冲之前，在临时 mesh 上真正焊接接缝顶点
+        （见 common/group_weld_mesh.py）。
         '''
         submesh_model_list:list[SubMeshModel] = []
         source_obj_unique_str_count = ExportHelper._build_source_obj_unique_str_count(blueprint_model)
@@ -55,20 +62,54 @@ class ExportHelper:
                 drawcall_model_list=draw_call_model_list,
                 source_obj_unique_str_count=source_obj_unique_str_count,
                 has_multi_file_export_nodes=has_multi_file_export_nodes,
+                seam_weld_config=seam_weld_config,
             )
             submesh_model_list.append(submesh_model)
         
         return submesh_model_list
 
     @staticmethod
-    def parse_drawib_model_list_from_blueprint_model(blueprint_model:BluePrintModel,combine_ib:bool) -> list[DrawIBModel]:
+    def parse_drawib_model_list_from_blueprint_model(
+        blueprint_model:BluePrintModel,
+        combine_ib:bool,
+        weld_by_group:bool = False,
+    ) -> list[DrawIBModel]:
         '''
         从蓝图中解析出一个DrawIB Model列表
         适用于米游、Unity等等常见的需要将多个SubMesh组合成一个DrawIB进行导出的游戏
+
+        weld_by_group=True 时（仅 ZZMI 开启），读取蓝图里的「接缝焊接」后处理节点配置，
+        传给 SubMeshModel 在 join 之后真正焊接接缝顶点（mesh 层焊接，
+        见 common/group_weld_mesh.py）；没有该节点 = 不焊接，失败时自动回退。
         '''
         reset_datatype_override_log()
 
-        submesh_model_list = ExportHelper.parse_submesh_model_list_from_blueprint_model(blueprint_model)
+        seam_weld_config = None
+        if weld_by_group:
+            try:
+                from ...common.group_weld_apply import collect_seam_weld_config
+
+                seam_weld_config = collect_seam_weld_config(blueprint_model)
+            except Exception as exc:
+                try:
+                    from ...utils.log_utils import LOG
+
+                    LOG.warning(
+                        f"⚠️ [接缝焊接] 读取接缝焊接节点配置失败，本次不焊接: {exc}"
+                    )
+                except Exception:
+                    pass
+                seam_weld_config = None
+            if seam_weld_config is not None and not (
+                seam_weld_config.get("groups") or []
+            ):
+                # 节点存在但没配任何组 = 不焊接（零行为变化）。
+                seam_weld_config = None
+
+        submesh_model_list = ExportHelper.parse_submesh_model_list_from_blueprint_model(
+            blueprint_model,
+            seam_weld_config=seam_weld_config,
+        )
         return ExportHelper.parse_drawib_model_list_from_submesh_model_list(
             submesh_model_list=submesh_model_list,
             combine_ib=combine_ib,
@@ -90,6 +131,7 @@ class ExportHelper:
             draw_ib_submesh_model_list_dict[draw_ib] = tmp_submesh_model_list
 
         # 随后直接用SubmeshModelList来初始化DrawIBModel
+        # （接缝焊接已在各个 SubMeshModel 内部完成，这里只做组装）
         for draw_ib, submesh_model_list in draw_ib_submesh_model_list_dict.items():
             drawib_model = DrawIBModel(submesh_model_list=submesh_model_list, combine_ib=combine_ib)
             drawib_model_list.append(drawib_model)
