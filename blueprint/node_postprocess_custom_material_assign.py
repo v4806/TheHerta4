@@ -2407,10 +2407,19 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
         """返回段内属于本节点指定部件的 mesh 注释名称。"""
         names = []
         seen = set()
+        dropped = []
         for mesh_name in ini_scope.section_mesh_names(lines):
             if mesh_name in seen:
                 continue
             if not self._mesh_in_section_ib_scope(mesh_name):
+                # 段 IB 与 mesh 键不一致：按名字本可命中的部件也不再用（否则会把
+                # 别的 IB 的同名绘制单元当成目标），但必须留下可见提示，
+                # 否则整段静默不产出材质行，实机上看起来像节点没生效。
+                if self.find_object_by_mesh_name(
+                    mesh_name,
+                    object_filter=self._is_custom_target,
+                ) is not None:
+                    dropped.append(mesh_name)
                 continue
             obj = self.find_object_by_mesh_name(
                 mesh_name,
@@ -2420,7 +2429,30 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
                 continue
             seen.add(mesh_name)
             names.append(mesh_name)
+        self._warn_ib_scope_skipped(dropped)
         return names
+
+    def _warn_ib_scope_skipped(self, mesh_names):
+        """段 IB 键与 mesh 键不一致而跳过的部件，各自提示一次。"""
+        if not mesh_names:
+            return
+        warned = getattr(self, "_ib_scope_warned", None)
+        if warned is None:
+            warned = set()
+            try:
+                self._ib_scope_warned = warned
+            except Exception:
+                warned = set()
+        scope = getattr(self, "_section_ib_scope", None)
+        for mesh_name in mesh_names:
+            if mesh_name in warned:
+                continue
+            warned.add(mesh_name)
+            print(
+                f"[材质转资源] 段 IB 键({scope}) 与 mesh 键"
+                f"({ini_scope.mesh_ib_key(mesh_name)}) 不一致，已跳过 {mesh_name}"
+                "（该部件保持游戏原生贴图）"
+            )
 
     def _capture_section_default_resources(self, lines):
         """捕获第一条 mesh 注释之前作为默认值的 Resource/ps-t 赋值与 run。"""
@@ -2812,6 +2844,22 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
             self._warn_skip_if_split("if 块内 mesh 之前有不可安全复制的命令")
             return None
 
+        # 单元区间必须首尾相接：``iter_draw_units`` 的第 5 条边界会让「单元内已经
+        # 画过之后新开的同深度 if」成为新的范围起点，此时按「下一个单元起点」切片
+        # 会把那个独立条件块（里面可能还有别的 mesh / 非目标绘制）并进前一个单元，
+        # 拆完非目标绘制就落到目标之后了。遇到任何间隙一律放弃拆分。
+        for position, unit in enumerate(units):
+            limit = (
+                unit_starts[position + 1]
+                if position + 1 < len(unit_starts)
+                else len(body)
+            )
+            if int(unit["end"]) < limit:
+                self._warn_skip_if_split(
+                    "mesh 单元之间还有独立条件块或游离命令"
+                )
+                return None
+
         non_target_block = [block_lines[0], *preamble]
         target_block = [block_lines[0], *preamble]
         for position, unit in enumerate(units):
@@ -2837,7 +2885,7 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
             try:
                 self._if_split_warned = warned
             except Exception:
-                return
+                warned = set()
         if reason in warned:
             return
         warned.add(reason)
