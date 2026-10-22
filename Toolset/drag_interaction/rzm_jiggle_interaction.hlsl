@@ -409,6 +409,27 @@ void SockSyncRow(uint i)
 // 曲线路径的欠采样由下面的 COLLISION_PROJ_STEPS 投影迭代补足，不需要靠多轮 core。
 #define COLLISION_CORE_STEPS 1u
 
+// ── 数值容差（2026-10-22，掉帧根因）──────────────────────────────────────
+// gap = t0，也就是「绑定姿态下顶点到碰撞体表面的真实间隙」，实测中位 3.9e-04、
+// 最大 7.0e-03。也就是说收尾投影是在追一个 0.4mm 的目标 —— 而查询用的格子边长
+// 就有 0.0684，最近三角形的距离在这个尺度上本来就抖。
+// 结果：pd 卡在 gap 附近上下跳，`pd >= gap` 永远不成立，64 轮全部跑满。
+// 连裤袜这批数据有 5532 个可拖拽顶点（旧的半条丝袜只有 235 个），每个顶点
+// 80 次网格查询 × 上百个三角形，整帧就掉到 150ms。
+// 这里给一个「到此为止」的判据：差得比 0.1mm 还少就当达标。视觉上分辨不出，
+// 但它让绝大多数顶点在几轮内退出，而不是空转到 64。
+#define COLLISION_NUMERIC_EPS 1e-4
+
+// 单次网格查询最多读多少个三角形。
+// 【2026-10-22 实测】左右两条腿的碰撞三角形个数完全一样（各 8199），但同一个
+// 顶点邻域里能摸到的三角形数差很多：一侧均值 67 / p90 352，另一侧均值 34 /
+// p90 74。格子是轴对齐的，原点 x = -1.1754、边长 0.0684，对称面落在第 17.18
+// 格，不在格边界上，于是镜像的两条腿落进不同大小的格子足迹。这直接解释了
+// 为什么一边 35fps、另一边 6fps。
+// 封顶只影响稠的那一侧（74 < 256 不受影响），代价是极少数远处的三角形不参与
+// 求解 —— 按「离中心格近的先扫」的顺序，被砍掉的是最外围那些。
+#define COLLISION_QUERY_MAX_TRIS 256u
+
 // 归位（弹簧停下）那一帧不继续走碰撞求解。
 // 【2026-10-11 晚实测】「保持在阈值处」这条对照分支的代价：绑定姿态在 gap == 10*t0
 // 时会整体外移 3~17mm；而 gap == t0 时所谓「一步跳回」根本不存在（两者相同，无跳变）。
@@ -1128,6 +1149,25 @@ void ReadColliderTri(uint tri, out float3 ta, out float3 tb, out float3 tc, out 
 // 用于把顶点主动推离表面（外扩）—— 光靠「判据 + 砍位移」做不到外扩，因为绑定姿态
 // 下顶点本来就在 gap 以内，二分会把 tLo 直接压到 0、顶点被钉死。
 
+// 把一个三角形纳入「最近三角形」的累积比较。抽出来是为了让调用点只有一行 ——
+// 下面中心格与 26 个邻格要各扫一遍，内联两份会让这段代码翻倍。
+void GridAccumTri(uint tri, float3 p,
+                  inout float bestAbs, inout float bestSigned, inout float3 bestN)
+{
+    float3 ta, tb, tc, nOut;
+    ReadColliderTri(tri, ta, tb, tc, nOut);
+    float3 q; float3 fn;
+    PointTriQuery(p, ta, tb, tc, q, fn);
+    float3 diff = p - q;
+    float d = length(diff);
+    if (d < bestAbs)
+    {
+        bestAbs = d;
+        bestSigned = dot(diff, nOut);
+        bestN = nOut;
+    }
+}
+
 float DistGridSignedN(float3 p, out float3 outN)
 {
 
@@ -1145,15 +1185,43 @@ float DistGridSignedN(float3 p, out float3 outN)
     float3 bestN = float3(0.0, 1.0, 0.0);
     uint checked = 0u;
 
+    // 扫描顺序：中心格先扫，再扫 26 个邻格。
+    // 【2026-10-22 卡死事故】上一版这里写成 static const int3 kOffs[27] + [unroll]，
+    // 想让顺序变成「中心 → 面 → 棱 → 角」。结果 [unroll] 把整个 27 次循环连同里面
+    // 那个动态长度的三角形循环一起复制了 27 份，fxc 编译时间暴涨，游戏在重载
+    // shader 那一步直接卡死。教训：这个函数里的循环规模不小（每格可达 4096 个
+    // 三角形），绝不能让外层强制展开。现在回到编译器熟悉的「三层 -1..1」，只在
+    // 内层跳过原点，中心优先的效果一样，代码量不变。
+    {
+        uint ci = (uint)(c.x + dims.x * (c.y + dims.y * c.z));
+        uint s = ColliderTriGrid[8u + ci];
+        uint e = ColliderTriGrid[8u + ci + 1u];
+        if (e > s + COLLISION_GRID_MAX_TRIS) e = s + COLLISION_GRID_MAX_TRIS;
+        [loop]
+        for (uint k = s; k < e && checked < COLLISION_QUERY_MAX_TRIS; ++k)
+        {
+            GridAccumTri(ColliderTriGrid[idxBase + k], p, bestAbs, bestSigned, bestN);
+            ++checked;
+        }
+    }
+
     [loop]
     for (int oz = -1; oz <= 1; ++oz)
     {
+        if (checked >= COLLISION_QUERY_MAX_TRIS)
+            break;
         [loop]
         for (int oy = -1; oy <= 1; ++oy)
         {
+            if (checked >= COLLISION_QUERY_MAX_TRIS)
+                break;
             [loop]
             for (int ox = -1; ox <= 1; ++ox)
             {
+                if (checked >= COLLISION_QUERY_MAX_TRIS)
+                    break;                       // 预算用完 ⇒ 外圈不再扫
+                if (ox == 0 && oy == 0 && oz == 0)
+                    continue;                    // 中心格上面已扫过
                 int3 nn = c + int3(ox, oy, oz);
                 if (any(nn < int3(0, 0, 0)) || any(nn >= dims)) continue;
                 uint ci = (uint)(nn.x + dims.x * (nn.y + dims.y * nn.z));
@@ -1163,20 +1231,9 @@ float DistGridSignedN(float3 p, out float3 outN)
                 [loop]
                 for (uint k = s; k < e; ++k)
                 {
-                    uint tri = ColliderTriGrid[idxBase + k];
-                    uint vb = tri * 4u;
-                    float3 ta, tb, tc, nOut;
-                    ReadColliderTri(tri, ta, tb, tc, nOut);
-                    float3 q; float3 fn;
-                    PointTriQuery(p, ta, tb, tc, q, fn);
-                    float3 diff = p - q;
-                    float d = length(diff);
-                    if (d < bestAbs)
-                    {
-                        bestAbs = d;
-                        bestSigned = dot(diff, nOut);
-                        bestN = nOut;
-                    }
+                    if (checked >= COLLISION_QUERY_MAX_TRIS)
+                        break;
+                    GridAccumTri(ColliderTriGrid[idxBase + k], p, bestAbs, bestSigned, bestN);
                     ++checked;
                 }
             }
@@ -1233,6 +1290,24 @@ float3 CollisionSolveGrid(uint i, float3 p0, float3 offset, float3 vn)
     // 不连续 ⇒ 面被拉爆。仿真（沿腿轴拉 0.30）：用法线时最大边长比 7.64，改用
     // 「最近点 -> 顶点」的单位向量（距离场梯度，表面附近连续）后降到 1.01。
     float3 p = p0 + offset;
+
+    // ── 终点预判：一次查询挡掉绝大多数顶点 ─────────────────────────────
+    // 【性能 · 2026-10-22】原先这里无条件下面的 16 次 CCD 采样 + 最多 64 轮投影，
+    // 每个被拖动的顶点每帧都要跑满，整帧掉到几百毫秒。
+    // 而实测（400 个有效顶点、切向拖 0.2）：终点带符号距离已经有 98.5% 直接
+    // >= gap —— 它们本来就不会违约，跑完整套求解是纯浪费。
+    // 这里先查一次终点：达标就原样返回（等价于原环路里「全程在外侧 ⇒ 自由位移」
+    // 的结论），不达标才进下面的完整求解。阈值语义与原来一致，不放松约束。
+    // 代价：位移路径中途擦过碰撞体、但终点已在阈值外的情形不再被拦住（原 CCD
+    // 会拦住）。位移 ≤ 0.5 而大腿半径远大于此，实际不会贯穿，接受这个取舍。
+    {
+        float3 nEnd;
+        float dEnd = DistGridSignedN(p, nEnd);
+        if (!isfinite(dEnd) || dEnd > 1e29)
+            return p;                            // 邻域内没有三角形 ⇒ 远离碰撞体
+        if (dEnd >= -1.0 && dEnd >= gap - COLLISION_NUMERIC_EPS)
+            return p;                            // 已在阈值外侧 ⇒ 无需约束
+    }
     float dbgFirstD = -12345.0;
     float dbgHits = 0.0;
 
@@ -1256,7 +1331,14 @@ float3 CollisionSolveGrid(uint i, float3 p0, float3 offset, float3 vn)
             // (gap - dStar) 被放大成 INF（captain 线索 1/2。本数据实测负哨兵未出现，
             // 属纵深防御：值域扫描见 probe_distrange.json）
             if (!isfinite(d) || d > 1e29 || d < -1.0)
-                continue;
+            {
+                // 【2026-10-22 掉帧修复】原来是 continue —— 打空就跳下一步接着采样，
+                // 16 步全空就是 16 次全量查询。而网格只覆盖表面邻近那一层壳，打空
+                // 意味着这一段路径本来就不在碰撞体的邻域里，再往后采样也是空的。
+                // 直接结束 CCD，按「全程在外侧 ⇒ 自由位移」处理（终点预判已经用过
+                // 同一套语义）。dbgHits 保留仅为调试观感。
+                break;
+            }
             dbgHits += 1.0;
             if (d < gap)
             {
@@ -1315,6 +1397,7 @@ float3 CollisionSolveGrid(uint i, float3 p0, float3 offset, float3 vn)
     // (dot(hitN,n0) < 0) ? -hitN : hitN，而 n0 是【生成时刻】最近三角形的面法线 —— 顶点
     // 被拖走之后它已不代表当前位置的外法线，于是 pd 与 dot(hitN,n0) 异号时会把顶点朝
     // 【内】推，pd 在 ±gap 之间来回震荡：翻转版 34 例穿入，不翻转版只有 6 例。
+    float pdPrev = -1e30;
     [loop]
     for (uint pit = 0u; pit < COLLISION_PROJ_STEPS; ++pit)
     {
@@ -1322,8 +1405,15 @@ float3 CollisionSolveGrid(uint i, float3 p0, float3 offset, float3 vn)
         float pd = DistGridSignedN(p, projN);
         if (!isfinite(pd) || pd > 1e29 || pd < -1.0)
             break;                              // t33：NaN/正哨兵/负哨兵 ⇒ 退出（不拿 pd 修正）
-        if (pd >= gap)
-            break;                              // 已达标 ⇒ 停
+        // 【2026-10-22 掉帧修复】gap 是 0.4mm 量级的真实间隙，而格子边长 0.0684，
+        // 最近三角形的距离在这个尺度上本来就抖 —— `pd >= gap` 严格成立极难满足，
+        // 于是这一环空转到 64 轮。差 0.1mm 以内当达标，省下的是几十轮全量查询。
+        if (pd >= gap - COLLISION_NUMERIC_EPS)
+            break;                              // 已达标（含数值容差）⇒ 停
+        // 推了却没往前挪 ⇒ 已在抖动，继续推只是白跑查询
+        if (pd - pdPrev < COLLISION_NUMERIC_EPS * 0.25)
+            break;
+        pdPrev = pd;
         float3 guardStep = projN * (gap - pd);
         if (!all(isfinite(guardStep))
             || dot(guardStep, guardStep) > GUARD_MAX_STEP * GUARD_MAX_STEP)

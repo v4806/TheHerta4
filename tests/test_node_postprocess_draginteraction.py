@@ -5121,6 +5121,25 @@ class DragCollisionTests(unittest.TestCase):
         self.assertNotIn("DRAG_ALONG_FACE_NORMAL", shader)
         self.assertNotIn("COLLISION_HOLD_AT_THRESHOLD", shader)
 
+    def test_shader_collision_perf_guards(self):
+        """碰撞求解的性能守卫不得回归（2026-10-22 拖拽掉帧问题的修复面）。"""
+        shader = (REPO_ROOT / "Toolset" / "drag_interaction" / "rzm_jiggle_interaction.hlsl").read_text(encoding="utf-8")
+        # 收尾投影的达标容差：gap 是 0.4mm 量级的真实间隙，严格 `pd >= gap` 会让绝大多数
+        # 顶点空转到 COLLISION_PROJ_STEPS 上限（实测单侧掉到 6fps）。
+        self.assertIn("#define COLLISION_NUMERIC_EPS", shader)
+        self.assertIn("pd >= gap - COLLISION_NUMERIC_EPS", shader)
+        # 终点预判：一次查询挡掉 98.5% 不会违约的顶点。
+        self.assertIn("dEnd >= gap - COLLISION_NUMERIC_EPS", shader)
+        # 单次网格查询的三角形预算：两条腿的格子足迹不对称，稠的一侧必须封顶。
+        self.assertIn("#define COLLISION_QUERY_MAX_TRIS", shader)
+        # 最近三角形累积抽成函数，中心格与邻格复用同一段比较逻辑。
+        self.assertIn("void GridAccumTri(", shader)
+        # 中心格先扫：三层 -1..1 里显式跳过原点（等价于「中心优先」，
+        # 但不会像 static 偏移表 + [unroll] 那样把内层动态循环复制 27 份 ——
+        # 那样 fxc 编译时间暴涨，游戏重载 shader 时直接卡死）。
+        self.assertIn("if (ox == 0 && oy == 0 && oz == 0)", shader)
+        self.assertIn("checked < COLLISION_QUERY_MAX_TRIS", shader)
+
     # ---- 端到端烘焙 ----
 
     def test_write_collision_resources_end_to_end(self):

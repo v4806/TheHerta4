@@ -3398,7 +3398,8 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
 
     def _bake_collider_tri_grid(self, positions, triangles, collider_mask,
                                 vertex_normals=None, cell_size=0.0,
-                                max_per_cell=4096, reach=0.6, min_cell=0.0):
+                                max_per_cell=4096, reach=0.6, min_cell=0.0,
+                                shell_cells=1):
         """把碰撞体三角形装进均匀网格，供运行时「动态最近距离」查询。
 
         为什么必须动态查询：绑定姿态下最近的 K 个三角形只覆盖顶点附近的一小片
@@ -3425,6 +3426,14 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         决定查询够得着多远（27 邻域覆盖 ±cell）。max_per_cell 是每格索引上限，
         默认 4096 等于不截断 —— 截断会让「最近的三角形恰好被丢掉」，查询拿到次近
         的三角形，符号判断随之出错。
+
+        shell_cells 是「表面壳」的厚度，单位是格。只按三角形自身 AABB 登记时，
+        三角形只落在紧贴自己的那几格里，整个网格只有薄薄一层有数据（实测非空格
+        409/74,052 = 0.55%）；运行时查询是当前格 ±1，于是有效半径只有 ±cell
+        （≈0.068），顶点离开表面 0.10 之后就开始大量查空。这里把登记范围向外
+        多铺 shell_cells 格，有效半径变成 ±(1+shell_cells)×cell，壳外那几格也能
+        找到最近三角形。代价是每格三角形数 ×(2·shell_cells+1)³，所以登记改成
+        「全收 → 按中心距离排序 → 截断」，保证被 max_per_cell 砍掉的永远是远的。
         """
         empty_meta = {"bmin": (0.0, 0.0, 0.0), "cell": 0.0,
                       "dims": (0, 0, 0), "cell_count": 0}
@@ -3493,8 +3502,11 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         # ⇒ 陷进大腿 0.285 却被放行。这里向外各扩 reach（默认 0.6，大于
         # maxOffset 的 0.5 默认上限）。shader 侧另有 clamp 兜底。
         bmin = tri_lo.min(axis=0) - h - reach
-        lo = np.floor((tri_lo - bmin) / h).astype(np.int64)
-        hi = np.floor((tri_hi - bmin) / h).astype(np.int64)
+        # 登记范围按 shell_cells 格外扩（见 docstring 的 shell_cells 说明）。
+        # lo 不能取负（bmin 已经留了 h 余量，扩完正常也在 0 以上，clamp 只是兜底）。
+        pad = int(max(shell_cells, 0))
+        lo = np.maximum(np.floor((tri_lo - bmin) / h).astype(np.int64) - pad, 0)
+        hi = np.floor((tri_hi - bmin) / h).astype(np.int64) + pad
         span_max = hi.max(axis=0)
         dims = np.maximum(span_max + 2 + int(np.ceil(reach / h)) * 2, 1).astype(np.int64)
         cell_count = int(dims[0] * dims[1] * dims[2])
@@ -3524,8 +3536,11 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                         cell = buckets.get(key)
                         if cell is None:
                             buckets[key] = [t]
-                        elif len(cell) < int(max_per_cell):
+                        else:
+                            # 先全收、不在这里截断 —— 下面的排序才知道谁近谁远，
+                            # 边收边砍会按三角形索引顺序丢掉近的、留下远的。
                             cell.append(t)
+        mp = int(max_per_cell)
         for key, cell in buckets.items():
             if len(cell) < 2:
                 continue
@@ -3535,7 +3550,10 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             cc = bmin + (np.array([kx, ky, kz], dtype=np.float64) + 0.5) * h
             arr = np.asarray(cell, dtype=np.int64)
             dd = np.einsum("cd,cd->c", tri_c[arr] - cc, tri_c[arr] - cc)
-            buckets[key] = arr[np.argsort(dd, kind="stable")].tolist()
+            order = np.argsort(dd, kind="stable")
+            if mp > 0 and len(order) > mp:
+                order = order[:mp]
+            buckets[key] = arr[order].tolist()
 
         offsets = np.zeros(cell_count + 1, dtype=np.uint32)
         flat = []
