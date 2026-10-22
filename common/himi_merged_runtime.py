@@ -340,9 +340,11 @@ class HIMIResourceDecl:
 
     @property
     def byte_width(self) -> int:
-        """声明的字节数（合并骨架 = 槽位数 × 48）。"""
+        """声明的字节数（合并骨架 = 槽位数 × 48；物体矩阵表 = 表项数 × 16）。"""
         if self.kind == "merged_skeleton":
             return int(self.slots) * MERGED_SKELETON_STRIDE
+        if self.kind == "object_matrix":
+            return int(self.array) * 16
         return int(self.array) * int(self.stride or 0)
 
     def ini_fields(self) -> dict:
@@ -466,6 +468,40 @@ def validate_resource_decl(decl: HIMIResourceDecl) -> None:
             )
         return
 
+    if decl.kind == "object_matrix":
+        if decl.ini_type != OBJECT_MATRIX_INI_TYPE:
+            raise HIMIResourceDeclError(
+                f"A1: {decl.name} 的 type 必须是 {OBJECT_MATRIX_INI_TYPE}（它要被 CS 当 UAV 写）"
+            )
+        if decl.ini_format != OBJECT_MATRIX_INI_FORMAT:
+            raise HIMIResourceDeclError(
+                f"A1: {decl.name} 必须声明 format = {OBJECT_MATRIX_INI_FORMAT}"
+            )
+        if decl.stride:
+            raise HIMIResourceDeclError(
+                f"A3: {decl.name} 绝不能声明 stride（会改成结构化视图 → 跨显卡未定义区）"
+            )
+        expected = int(decl.slots) * OBJECT_MATRIX_ELEMENTS_PER_FAMILY
+        if int(decl.array) != expected:
+            raise HIMIResourceDeclError(
+                f"A1: {decl.name} 的 array 必须是 3 × 族数（{expected}），实际 {int(decl.array)}"
+            )
+        if "shader_resource" not in (decl.bind_flags or ""):
+            raise HIMIResourceDeclError(
+                f"{decl.name} 的 bind_flags 必须含 shader_resource（宿主族那笔要把它当 SRV 读回）"
+            )
+        if "unordered_access" not in (decl.bind_flags or ""):
+            raise HIMIResourceDeclError(
+                f"{decl.name} 的 bind_flags 必须含 unordered_access（各族那笔要当 UAV 写）"
+            )
+        if int(decl.slots) <= 0:
+            raise HIMIResourceDeclError(f"{decl.name} 的族数必须为正，实际 {decl.slots}")
+        if decl.filename:
+            raise HIMIResourceDeclError(
+                f"{decl.name} 是每帧运行期表，绝不能带 filename（表内容每帧被 CS 重写）"
+            )
+        return
+
     raise HIMIResourceDeclError(f"未知资源形态 kind={decl.kind!r}")
 
 
@@ -532,6 +568,138 @@ def attach_section_name(family: str) -> str:
     return ATTACH_SECTION_PREFIX + str(family or "").strip()
 
 
+#: 每族 vs-cb3 副本的命名前缀（``copy vs-cb3`` 的目标，**不是**源）。
+#:
+#: 该族的物体矩阵就在这族自己那笔 deform draw 的 vs-cb3 前 8 行里（行 0..2 = 3×3 线性、
+#: 行 3 = 平移、行 4..7 = 前 4 行的逆），所以**运行期**就能算出 X_f = M_base⁻¹·M_f，
+#: 不必再用抓帧烘死的常量（t74 把烘死的 X_f 降级为兜底）。
+#:
+#: 资源段**只写 ``[<name>]`` 一行、不写 type/stride**：``copy vs-cb3`` 出来的常量缓冲
+#: 尺寸与布局由源视图决定（本仓 ZZMI 的 ``copy vs-cb1`` 同一先例），自己声明 type 只会
+#: 让 3DMigoto 按声明造一份尺寸不符的缓冲。
+CB3_CAPTURE_PREFIX = "ResourceHI3Cb3_"
+#: attach CS 里 cb3 副本的绑定寄存器（``cs-cb1`` ⇄ ``cbuffer … : register(b1)``）。
+CB3_CAPTURE_REGISTER = "cs-cb1"
+
+
+def cb3_capture_resource_name(family: str) -> str:
+    """``ResourceHI3Cb3_<fam>``：该族当帧 vs-cb3 的副本（copy 的**目标**）。"""
+    return CB3_CAPTURE_PREFIX + str(family or "").strip()
+
+
+def cb3_capture_copy_line(family: str) -> str:
+    """``ResourceHI3Cb3_<fam> = copy vs-cb3 unless_null``（LHS 是目标；写反会把空副本盖上去）。"""
+    return f"{cb3_capture_resource_name(family)} = copy vs-cb3 unless_null"
+
+
+def cb3_capture_ini_lines(family: str) -> list[str]:
+    """cb3 副本的资源段体：段名 + 一行 ``;`` 注释（**不许**写 type/format/stride）。
+
+    尺寸与布局由 ``copy vs-cb3`` 的源视图决定（ZZMI 的 ``copy vs-cb1`` 先例同款）；写了
+    ``type``/``stride`` 反而会按声明去解释这份拷贝。注释不是装饰：产物导出自检
+    :func:`ui.universal.himi.product_ini_section_problems` 会判「段内既无属性也无注释」= 被截断。
+    """
+    return [
+        f"[{cb3_capture_resource_name(family)}]",
+        "; 尺寸/布局由 copy vs-cb3 的源视图决定：不声明 type/format/stride",
+    ]
+
+
+def cb3_capture_reference_line(family: str) -> str:
+    """attach 段里的 ``cs-cb1 = ref <cb3 副本>`` 行。"""
+    return f"{CB3_CAPTURE_REGISTER} = ref {cb3_capture_resource_name(family)}"
+
+
+#: u1 上的**族级物体矩阵表**（attach CS 运行期实时算 X 的中间表）。
+#:
+#: 为什么需要它：一台宿主族的 vs-cb3 只给得出 M_base，而 ``S = X_f·(P·Q⁻¹)`` 里的
+#: ``X_f = M_base⁻¹·M_f`` 需要**别的族**自己的 M_f。每族的 attach CS 只见到自己那一笔
+#: deform draw 的 cb3 ⇒ 让它顺手把「校验过的物体矩阵」写进这张表，宿主族那笔再读回来。
+#: draw 顺序（实测 log.txt：70a4da3e → 宿主 2c706fbd → b35cfc6c → def0c0ae → 694025c6）
+#: ⇒ 宿主读到的永远是**上一帧**各族写下的值，与「合并 draw 用上一帧的槽」同一口径。
+OBJECT_MATRIX_RESOURCE_PREFIX = "ResourceHI3ObjectMatrix_role_"
+OBJECT_MATRIX_INI_TYPE = "RWBuffer"
+OBJECT_MATRIX_INI_FORMAT = "R32G32B32A32_FLOAT"
+OBJECT_MATRIX_INI_BIND_FLAGS = "shader_resource unordered_access"
+#: 每族在表里占 3 个 float4（= 一张 3×4 矩阵，布局见 :func:`object_matrix_table_rows`）。
+OBJECT_MATRIX_ELEMENTS_PER_FAMILY = 3
+#: attach CS 里物体矩阵表的绑定寄存器。
+OBJECT_MATRIX_REGISTER = "cs-u1"
+
+
+def object_matrix_resource_name(role_key: str) -> str:
+    """``ResourceHI3ObjectMatrix_role_<role_key>``（角色级：一张表装本角色全部族）。"""
+    return OBJECT_MATRIX_RESOURCE_PREFIX + str(role_key or "").strip()
+
+
+def object_matrix_table_slots(family_count: int) -> int:
+    """表的 float4 表项数 = 3 × 族数（5 族 ⇒ 15）。"""
+    return int(family_count or 0) * OBJECT_MATRIX_ELEMENTS_PER_FAMILY
+
+
+def object_matrix_table_index(family_index: int) -> int:
+    """第 f 族在表里的起始表项（= f × 3）。"""
+    return int(family_index or 0) * OBJECT_MATRIX_ELEMENTS_PER_FAMILY
+
+
+def build_object_matrix_decl(role_key: str, family_count: int) -> HIMIResourceDecl:
+    """族级物体矩阵表声明（typed RWBuffer、array = 3 × 族数、**无 filename** ⇒ 运行期表）。"""
+    count = int(family_count or 0)
+    decl = HIMIResourceDecl(
+        name=object_matrix_resource_name(role_key),
+        kind="object_matrix",
+        ini_type=OBJECT_MATRIX_INI_TYPE,
+        ini_format=OBJECT_MATRIX_INI_FORMAT,
+        array=object_matrix_table_slots(count),
+        stride=0,
+        bind_flags=OBJECT_MATRIX_INI_BIND_FLAGS,
+        filename="",
+        slots=count,
+    )
+    validate_resource_decl(decl)
+    return decl
+
+
+def object_matrix_ini_lines(role_key: str, family_count: int) -> list[str]:
+    """物体矩阵表的 ``[Resource…]`` 段体。"""
+    return build_object_matrix_decl(role_key, family_count).ini_lines()
+
+
+def object_matrix_reference_line(role_key: str) -> str:
+    """attach 段里的 ``cs-u1 = ref <物体矩阵表>`` 行。"""
+    return f"{OBJECT_MATRIX_REGISTER} = ref {object_matrix_resource_name(role_key)}"
+
+
+def object_matrix_table_rows(matrix) -> list:
+    """3×4 行主序矩阵 ⇒ 表里那 3 个 float4（**布局的唯一实现**，CS 侧逐字对应）。
+
+    布局（``(r0.xyz, r3.x) / (r1.xyz, r3.y) / (r2.xyz, r3.z)``）：表项 i 就是矩阵第 i 行
+    逐字 —— 第 i 行的 `.w` 正是平移行 `r3` 的第 i 个分量，所以 12 个数一个不浪费、
+    也没有第二套下标约定可写错。
+    """
+    values = [float(v) for v in matrix]
+    if len(values) != 12:
+        raise HIMIResourceDeclError(f"物体矩阵必须是 12 个数（3×4 行主序），实际 {len(values)}")
+    return [
+        values[0:4],
+        values[4:8],
+        values[8:12],
+    ]
+
+
+def object_matrix_from_table_rows(rows) -> list:
+    """表里那 3 个 float4 ⇒ 12 个 float（:func:`object_matrix_table_rows` 的逆）。"""
+    flat = []
+    for row in rows or []:
+        values = [float(v) for v in row]
+        if len(values) != 4:
+            raise HIMIResourceDeclError(f"物体矩阵表项必须是 4 个数，实际 {len(values)}")
+        flat.extend(values)
+    if len(flat) != 12:
+        raise HIMIResourceDeclError(f"物体矩阵表项必须是 3 个 float4，实际 {len(flat) // 4}")
+    return flat
+
+
 #: 每族 attach CS 文件名前缀（落在 ``<mod>/res/`` 下）。
 FAMILY_ATTACH_HLSL_PREFIX = "himi_attach_"
 #: 每族 attach CS 里的目标基址宏名（**接口**：导出侧写它、CS 读它）。
@@ -569,18 +737,34 @@ def build_family_palette_decl(family: str, slot_count: int) -> HIMIResourceDecl:
     return build_palette_decl(family_palette_name(family), int(slot_count or 0))
 
 
+def render_attach_render_capture_lines(family: str) -> list[str]:
+    """**渲染（LOD0）段**里该族要追加的两行：**①捕获 cb3 → ②run**（顺序不可换）。
+
+    * ① ``ResourceHI3Cb3_<fam> = copy vs-cb3 unless_null`` —— 该族当帧物体矩阵的来源。
+    * ② ``run = CustomShaderHI3MergedSkeletonAttach_<fam>`` —— 必须**紧跟在 ① 之后**
+      （否则 CS 里的 cb3 副本还是上一族/上一帧的那份）。
+
+    为什么渲染段也要捕：**deform（non-indexed）draw 的 vs-cb3 只有 368 B / 23 个 float4，
+    rows 0..7 不是物体矩阵**（实测 w 列不为 0 ⇒ ``himi_object_matrix_valid()`` 恒假），
+    只有 indexed 的渲染 draw 才绑着 **160 B / 10 个 float4**、rows 0..7 = 物体矩阵 + 其逆
+    （实测 57/60 通过判据、残差 7.1e-06）。采集点放错位置 ⇒ 运行期 X 永不生效。
+    """
+    return [cb3_capture_copy_line(family), f"run = {attach_section_name(family)}"]
+
+
 def render_attach_capture_lines(family: str) -> list[str]:
-    """deform VB 段里该族要追加的两行：**①捕获 → ②run**（t51 §4.2 ①③，顺序不可换）。
+    """deform VB 段里该族要追加的三行：**①捕获 palette → ②捕获 cb3 → ③run**（顺序不可换）。
 
     * ① ``ResourceHI3PaletteFam_<fam> = copy vs-t0 unless_null`` —— LHS 是**目标**
       （3DMigoto 赋值式；写反会把空副本写进游戏当帧 palette，见模块头）。
-    * ② ``run = CustomShaderHI3MergedSkeletonAttach_<fam>`` —— 幂等，且必须排在
-      ``vs-t0 = <骨架>`` 重绑之前（否则会捕到刚绑上的骨架）。
+    * ② ③ 与 :func:`render_attach_render_capture_lines` **同源**（同一份文本，不另写一遍）：
+      ② ``ResourceHI3Cb3_<fam> = copy vs-cb3 unless_null``、③ ``run = …Attach_<fam>``。
+      run 必须排在 ``vs-t0 = <骨架>`` 重绑之前（否则会捕到刚绑上的骨架），也必须紧跟 ②
+      之后（否则 CS 里的 cb3 副本还是上一族/上一帧的那份）。
     """
-    return [
-        f"{family_palette_name(family)} = copy vs-t0 unless_null",
-        f"run = {attach_section_name(family)}",
-    ]
+    return [f"{family_palette_name(family)} = copy vs-t0 unless_null"] + list(
+        render_attach_render_capture_lines(family)
+    )
 
 
 def render_attach_section_lines(
@@ -590,6 +774,7 @@ def render_attach_section_lines(
     slots: int,
     skeleton_name: str,
     hlsl_path: str = "",
+    object_matrix_name: str = "",
 ) -> list[str]:
     """``[CustomShaderHI3MergedSkeletonAttach_<fam>]`` 段体（**模组侧参考实现**的形状）。
 
@@ -619,16 +804,29 @@ def render_attach_section_lines(
         raise HIMIResourceDeclError(f"{family}: attach 段的基址不能为负（{base}）")
     path = str(hlsl_path or "").strip() or family_attach_hlsl_path(family)
     dispatch = max(1, -(-slots // 64))
-    return [
+    lines = [
         f"[{attach_section_name(family)}]",
         "flags = optimization_level3 all_resources_bound skip_validation",
         f"cs = {path}",
         f"cs-t0 = ref {family_palette_name(family)}",
         attach_range_reference_line(family),  # 【F5】本族身份（base/span 权威来源，见 ATTACH_RANGE_* 段）
-        f"cs-u0 = ref {skeleton_name}",
-        f"Dispatch = {dispatch}, 1, 1",
-        "cs-u0 = null",
+        # t74：族级物体矩阵的**运行期来源**（cs-cb1 ⇄ cbuffer … : register(b1)）
+        cb3_capture_reference_line(family),
     ]
+    matrix_name = str(object_matrix_name or "").strip()
+    if matrix_name:
+        # 每族都在自己那笔里写自己那段，宿主族那笔读回别的族写下的段
+        lines.append(f"{OBJECT_MATRIX_REGISTER} = ref {matrix_name}")
+    lines.extend(
+        [
+            f"cs-u0 = ref {skeleton_name}",
+            f"Dispatch = {dispatch}, 1, 1",
+            "cs-u0 = null",
+        ]
+    )
+    if matrix_name:
+        lines.append(f"{OBJECT_MATRIX_REGISTER} = null")
+    return lines
 
 
 def build_palette_decl(name: str, slot_count: int, filename: str = "") -> HIMIResourceDecl:
@@ -2517,17 +2715,39 @@ ATTACH_RANGE_RESOURCE_PREFIX = "ResourceHI3AttachRange_"
 ATTACH_RANGE_INI_FORMAT = "R32G32B32A32_FLOAT"
 #: 落盘文件名后缀（与 VB/IB 同一个缓冲目录）。
 ATTACH_RANGE_BASENAME_SUFFIX = "-AttachRange.buf"
-#: 【t39 / t44】载荷 = 4 个 typed float4 = 64 B：
-#:   ``[0]`` 头部 ``(base, span, version, magic)``；``[1..3]`` = **palette 侧要复合的因子**
-#:   （t44 起 = ``Q_f⁻¹``：把「提取帧世界」映到「当前世界」；t39–t43 曾存 ``Q_f``，方向是反的）。
-#: 为什么扩到 64 B（而不是另开资源）：因子与 ``base/span`` **必须同源同报** ——
-#: 它们都由「本次导出的 plan + 该族的 palette 缓存」推导，分两个资源就会有两种真相；
-#: 而且 CS 只需要多读 3 个 float4，不新增绑定槽（``cs-t1`` 不变）。
-ATTACH_RANGE_BYTES = 64
+#: 载荷布局（typed float4 数组，**8 个 float4 = 128 B**）：
+#:   ``[0]``   头部 ``(base, span, version, magic)``（**形状与语义都不动**）；
+#:   ``[1..3]`` = **palette 侧要复合的因子**（t44 起 = ``Q_f⁻¹``：把「提取帧世界」映到「当前世界」；
+#:              t39–t43 曾存 ``Q_f``，方向是反的）；
+#:   ``[4..6]`` = **族级物体矩阵** ``X_f = M_base⁻¹ · M_f``（t74 新增，3×4 行主序）；
+#:              **t74 起降级为兜底**：主路径是 attach CS 运行期从本族 vs-cb3 实时算出 X，
+#:              只有 cb3 副本拿不到/校验不过时才用它（它仍是「当前导出这一次」的 X，不是随机数）；
+#:   ``[7]``    = ``(asuint own_index, asuint base_index, 0, 0)`` —— 本族/宿主族在物体矩阵表里的序号。
+#: ``X_f`` 修的是「合并后几何全在宿主族那一笔 draw 里渲染 ⇒ 只有 ``M_base``」这条偏差：
+#: 写进合并骨架的必须是 ``S = X_f ∘ P_f ∘ Q_f⁻¹``，游戏侧 ``M_base · S · (Q_f·v)`` 才等于真值
+#: ``M_f · P_f · v``（实测残差从 1.0–3.8 游戏单位掉到 ~1e-16）。
+#: 为什么与 base/span/Q 同资源（而不是另开一个）：三者都由「本次导出的 plan + 该族的
+#: palette 缓存 + 该族的 vs-cb3」推导，分资源就会有两种真相；而且 CS 只多读 3 个 float4，
+#: 不新增绑定槽（``cs-t1`` 不变）。**ver 字段保持 3**（头部形状按需求"保持原样"）：
+#: ``X`` 是否可用由「12 个数里至少一个非零」判定，与 ``Q`` 的判定同款（见 decode / CS）。
+ATTACH_RANGE_BYTES = 128
+#: ``[4..6]`` 的起始字节偏移 = ``ATTACH_RANGE_HEADER_BYTES + 48``（= ``Q`` 那 3 个 float4 之后）。
+ATTACH_RANGE_X_OFFSET = 64
+#: ``X_f`` 的字节数（3×4 float32）。
+ATTACH_RANGE_FAMILY_X_BYTES = 48
+#: ``[7]`` 的起始字节偏移（= ``X_f`` 之后）：``(asuint own_index, asuint base_index, 0, 0)``。
+#:
+#: 为什么把族索引塞进载荷（而不是靠槽位数/基址反推）：CS 运行期算 X 需要知道「本族在
+#: 物体矩阵表里占哪一段」和「宿主族占哪一段」，这两个量只有导出侧知道（族的次序由
+#: ``plan.family_ranges`` 决定），而槽位数与基址都不是族序号（实测 5 族的 base 是
+#: 0/184/202/273/292，无法反推 0..4）。
+ATTACH_RANGE_INDICES_OFFSET = 112
+#: 版本 4 = 载荷带 ``[7]`` 的族索引（X 改为运行期从 vs-cb3 实时计算，烘死的 X_f 降级为兜底）；
 #: 版本 3 = 载荷带 ``Q_f⁻¹``（t44 共同空间取反修复：palette 侧 `P·Q⁻¹` + 顶点侧 `Q·v`）；
 #: 版本 2 = 载荷带 ``Q_f``（t39–t43，**方向取反**，语义已废弃）；版本 1 = 16 B（无因子）。
-#: CS 的版本门取 ``>= 3u``：旧产物（v1/v2）一律不复合 ⇒ 退回"不校准"，绝不半校准。
-ATTACH_RANGE_VERSION = 3
+#: CS 的版本门取 ``>= 3u`` 做 Q 校准、``>= 4u`` 才启用运行期 X 选择：旧产物（v1/v2）一律
+#: 不复合、v3 一律用烘死的 `X_f` ⇒ 退回"不校准"/"照旧"，绝不半校准。
+ATTACH_RANGE_VERSION = 4
 #: 头部长度（前 4 个 u32）—— 兼容 v1 的 16 B 载荷。
 ATTACH_RANGE_HEADER_BYTES = 16
 #: 身份魔数（0x48494D52 = "HIMR"）：它是**有限** float，``asuint`` 逐位还原不会碰到 NaN。
@@ -2544,21 +2764,38 @@ def attach_range_resource_name(family: str) -> str:
 
 
 def attach_range_basename(family: str) -> str:
-    """``<fam>-AttachRange.buf``（64 B：头部 base/span/version/magic + ``Q_f`` 3×4）。"""
+    """``<fam>-AttachRange.buf``（128 B：头部 + ``Q_f⁻¹`` 3×4 + ``X_f`` 3×4 + 族索引 4×u32）。"""
     return f"{str(family or '').strip()}{ATTACH_RANGE_BASENAME_SUFFIX}"
 
 
 def attach_range_payload(
-    base: int, span: int, *, placement=None, version: int = ATTACH_RANGE_VERSION
+    base: int,
+    span: int,
+    *,
+    placement=None,
+    family_x=None,
+    indices=None,
+    version: int = ATTACH_RANGE_VERSION,
 ) -> bytes:
-    """身份载荷 = 头部 ``(base, span, version, magic)`` + 可选 ``Q_f``（3×4 = 12 float）。
+    """身份载荷 = 头部 ``(base, span, version, magic)`` + ``Q_f⁻¹``（``[1..3]``）+ ``X_f``（``[4..6]``）。
 
-    * ``placement=None`` ⇒ 只写头部 + 12 个 0.0 的 Q 槽（**保留 v1 语义**：CS 不做校准）；
-    * ``placement`` 给 12 个数（行主序 3×4）⇒ 写进 ``[1..3]`` 三个 float4。
+    * ``placement=None`` ⇒ ``[1..3]`` 写 12 个 0.0（**保留 v1 语义**：CS 不做 Q 校准）；
+    * ``placement`` 给 12 个数（行主序 3×4）⇒ 写进 ``[1..3]`` 三个 float4；
+    * ``family_x`` 给 12 个数（行主序 3×4）⇒ 写进 ``[4..6]`` 三个 float4；``None`` ⇒ 12 个 0.0
+      （= 未校准，CS 跳过 X 左乘 ⇒ 逐字节等价旧行为）。
 
-    纯数据、无副作用：导出侧按 ``plan.family_ranges`` + 该族 palette 缓存生成，
+    * ``indices`` 给 ``(own_index, base_index)`` ⇒ 写进 ``[7]``（本族/宿主族在物体矩阵表里的
+      序号，CS 运行期算 X 唯一需要的额外信息）；``None`` ⇒ 16 个 0 字节（旧行为）。
+
+    长度**恒为 ``ATTACH_RANGE_BYTES``（128）**：ini 侧是 typed Buffer（``format = R32G32B32A32_FLOAT``、
+    **无 ``array=``**），资源长度只能由文件字节数体现 ⇒ 「族数 × 128」是 ini/CS/解码三方共同的
+    同步点（见 :func:`verify_attach_range_files`）。
+
+    纯数据、无副作用：导出侧按 ``plan.family_ranges`` + 该族 palette 缓存 + vs-cb3 生成，
     测试与复算脚本直接读它比对（「产物级复算证据」的入口之一）。
     """
+    import struct as _struct
+
     base = int(base)
     span = int(span)
     if base < 0 or span < 0:
@@ -2567,48 +2804,86 @@ def attach_range_payload(
         value.to_bytes(4, "little")
         for value in (base, span, int(version), ATTACH_RANGE_MAGIC)
     )
-    if placement is None:
-        return header + b"\x00" * (ATTACH_RANGE_BYTES - ATTACH_RANGE_HEADER_BYTES)
-    values = [float(v) for v in placement]
-    if len(values) != 12:
-        raise HIMIResourceDeclError(
-            f"族级摆放必须是 12 个数（3×4 行主序），实际 {len(values)}"
-        )
+    blocks = []
+    for name, source in (("族级摆放 Q_f⁻¹", placement), ("族级物体矩阵 X_f", family_x)):
+        if source is None:
+            blocks.append(b"\x00" * 48)
+            continue
+        values = [float(v) for v in source]
+        if len(values) != 12:
+            raise HIMIResourceDeclError(
+                f"{name} 必须是 12 个数（3×4 行主序），实际 {len(values)}"
+            )
+        blocks.append(_struct.pack("<12f", *values))
+    if indices is None:
+        index_row = b"\x00" * 16
+    else:
+        own_index, base_index = (int(indices[0]), int(indices[1]))
+        if own_index < 0 or base_index < 0:
+            raise HIMIResourceDeclError(
+                f"族索引不接受负值（own={own_index}, base={base_index}）"
+            )
+        index_row = _struct.pack("<4I", own_index, base_index, 0, 0)
+    payload = header + blocks[0] + blocks[1] + index_row
+    assert len(payload) == ATTACH_RANGE_BYTES, len(payload)
+    return payload
+
+
+def _decode_block(raw: bytes, offset: int) -> list:
     import struct as _struct
 
-    return header + _struct.pack("<12f", *values)
+    if len(raw) < offset + 48:
+        return []
+    return list(_struct.unpack("<12f", raw[offset : offset + 48]))
 
 
 def decode_attach_range_payload(payload: bytes) -> dict:
-    """把身份载荷解回 ``{"base","span","version","magic","ok","has_placement","placement"}``。
+    """把身份载荷解回 ``{"base","span","version","magic","ok","has_placement","placement",
+    "has_family_x","family_x","own_index","base_index","has_indices"}``。
 
-    兼容三种形态：v1 的 16 B（无 Q）、v2 的 64 B（带 Q）、以及其它长度（``ok=False``）。
-    ``has_placement`` 只在 ``version >= 2`` **且** Q 的 12 个数里至少有一个非零时为真
-    （全零 = 生成侧没给摆放 ⇒ 语义等同 v1）。
+    兼容四种形态：v1 的 16 B（无 Q）、v2/v3 的 64 B（带 Q）、112 B（带 Q + ``X_f``）、
+    **128 B（带 Q + ``X_f`` + 族索引）**，以及其它长度（``ok=False``）。``has_placement`` 只在
+    ``version >= 2`` **且** Q 的 12 个数里至少有一个非零时为真（全零 = 生成侧没给摆放 ⇒
+    语义等同 v1）；``has_family_x`` 只由「12 个数里至少一个非零」判定（与 CS 的
+    ``x_calibrated`` 同一判据，不看 version）；``has_indices`` 只由「``[7]`` 存在且
+    ``base_index`` 非全零」判定（与 CS 的 ``version >= 4u`` 门配合）。
     """
     import struct as _struct
 
     raw = bytes(payload or b"")
-    if len(raw) not in (ATTACH_RANGE_HEADER_BYTES, ATTACH_RANGE_BYTES):
-        return {
-            "base": -1, "span": -1, "version": -1, "magic": -1,
-            "ok": False, "has_placement": False, "placement": [],
-        }
+    empty = {
+        "base": -1, "span": -1, "version": -1, "magic": -1,
+        "ok": False, "has_placement": False, "placement": [],
+        "has_family_x": False, "family_x": [],
+        "own_index": -1, "base_index": -1, "has_indices": False,
+    }
+    if len(raw) not in (ATTACH_RANGE_HEADER_BYTES, 64, 112, ATTACH_RANGE_BYTES):
+        return empty
     values = [
         int.from_bytes(raw[index * 4 : index * 4 + 4], "little") for index in range(4)
     ]
-    placement = []
-    if len(raw) == ATTACH_RANGE_BYTES:
-        placement = list(_struct.unpack("<12f", raw[ATTACH_RANGE_HEADER_BYTES:]))
-    has_placement = bool(values[2] >= 2 and placement and any(v != 0.0 for v in placement))
+    placement = _decode_block(raw, ATTACH_RANGE_HEADER_BYTES)
+    family_x = _decode_block(raw, ATTACH_RANGE_X_OFFSET)
+    own_index, base_index = -1, -1
+    if len(raw) >= ATTACH_RANGE_INDICES_OFFSET + 16:
+        own_index, base_index = _struct.unpack(
+            "<2I", raw[ATTACH_RANGE_INDICES_OFFSET : ATTACH_RANGE_INDICES_OFFSET + 8]
+        )
     return {
         "base": values[0],
         "span": values[1],
         "version": values[2],
         "magic": values[3],
         "ok": values[3] == ATTACH_RANGE_MAGIC,
-        "has_placement": has_placement,
+        "has_placement": bool(values[2] >= 2 and placement and any(v != 0.0 for v in placement)),
         "placement": placement,
+        "has_family_x": bool(family_x and any(v != 0.0 for v in family_x)),
+        "family_x": family_x,
+        "own_index": int(own_index),
+        "base_index": int(base_index),
+        # 全零的 [7] 与「族 0 / 宿主 0」在数值上不可分 ⇒ 判据只能是「有这一行 **且** 版本 >= 4」，
+        # CS 侧同样用 version 门（asuint(attach_range.z) >= 4u）而不是看数值。
+        "has_indices": bool(values[2] >= 4 and len(raw) >= ATTACH_RANGE_INDICES_OFFSET + 16),
     }
 
 
@@ -2803,15 +3078,22 @@ def attach_write_target(
     return target
 
 
-def publish_attach_ranges(ranges, folder_path: str, *, placements=None) -> dict:
+def publish_attach_ranges(
+    ranges, folder_path: str, *, placements=None, family_xs=None, indices=None
+) -> dict:
     """把每族的身份载荷写进 mod 缓冲目录（幂等；返回 ``{"ok","written","files","message"}``）。
 
-    ``placements``：``{family: 12 个 float（Q_f，行主序 3×4）}``（t39 族级校准）。
-    给了 ⇒ 载荷 64 B（头部 + Q_f）；没给 ⇒ 只写 16 B 头部（**v1 语义**：CS 不做校准）。
+    ``placements``：``{family: 12 个 float（Q_f⁻¹，行主序 3×4）}``（t39 族级校准）。
+    ``family_xs``：``{family: 12 个 float（X_f = M_base⁻¹·M_f，行主序 3×4）}``（t39-X 物体矩阵；
+    t74 起是**兜底**值，主路径由 CS 运行期从 vs-cb3 现算）。
+    ``indices``：``{family: (own_index, base_index)}`` —— 本族/宿主族在物体矩阵表里的序号。
+    载荷长度**恒为** ``ATTACH_RANGE_BYTES``（128 B = 头部 + Q_f⁻¹ + X_f + 族索引）：
+    没给对应因子 ⇒ 那 48 B 写零（CS 跳过那一步，**语义等价旧行为**，不是静默乱写）。
 
     缺任何一族的文件都会让该族 CS 的 ``cs-t1`` 绑空 ⇒ 退回冻结表（不是静默乱写），
     但导出侧另有**文件存在性硬门**（``ui/universal/himi.py::verify_attach_range_references``）
-    把它拦在产物落盘那一步；该硬门同时核对**长度**（v2 必须是 64 B）。
+    把它拦在产物落盘那一步；该硬门同时核对**长度**（必须是 128 B —— 64/112 B 的旧载荷会让
+    CS 读到 ``himi_attach_range[4..7]`` 之外 ⇒ 宁可 Fatal 也不产出半校准的产物）。
     """
     folder = str(folder_path or "")
     if not folder:
@@ -2825,6 +3107,8 @@ def publish_attach_ranges(ranges, folder_path: str, *, placements=None) -> dict:
     if not ranges:
         return {"ok": True, "written": False, "files": [], "message": "没有家族区间，无需身份资源"}
     placements = dict(placements or {})
+    family_xs = dict(family_xs or {})
+    indices = dict(indices or {})
     try:
         os.makedirs(folder, exist_ok=True)
     except OSError as exc:
@@ -2840,7 +3124,11 @@ def publish_attach_ranges(ranges, folder_path: str, *, placements=None) -> dict:
             if span <= 0:
                 continue  # 借位族没有自己的块 ⇒ 不发身份资源（与「不发 attach 段」同源）
             payload = attach_range_payload(
-                int(info.get("base", 0) or 0), span, placement=placements.get(str(family))
+                int(info.get("base", 0) or 0),
+                span,
+                placement=placements.get(str(family)),
+                family_x=family_xs.get(str(family)),
+                indices=indices.get(str(family)),
             )
             path = os.path.join(folder, attach_range_basename(family))
             files.append(path)
@@ -2859,15 +3147,114 @@ def publish_attach_ranges(ranges, folder_path: str, *, placements=None) -> dict:
     except OSError as exc:
         return {"ok": False, "written": False, "files": files, "message": str(exc)}
     calibrated = len([1 for family in placements if str(family) in ranges])
+    matrixed = len([1 for family in family_xs if str(family) in ranges])
+    indexed = len([1 for family in indices if str(family) in ranges])
     return {
         "ok": True,
         "written": written > 0,
         "files": files,
         "message": (
             f"已写出 {len(files)} 个家族身份资源（重写 {written} 个；"
-            f"其中 {calibrated} 个带族级摆放 Q_f / {ATTACH_RANGE_BYTES} B）"
+            f"其中 {calibrated} 个带族级摆放 Q_f⁻¹、{matrixed} 个带族级物体矩阵 X_f（兜底）、"
+            f"{indexed} 个带物体矩阵表索引 / {ATTACH_RANGE_BYTES} B）"
         ),
     }
+
+
+def verify_attach_range_files(
+    folder_path: str, ranges, *, placements=None, family_xs=None, indices=None
+) -> list:
+    """【A3 四方同步】核对**已落盘**的身份资源与「族区间 / Q_f⁻¹ / X_f / 族索引 / 128 B」逐项一致。
+
+    四方 = ① 文件字节数（ini 侧是 typed Buffer、**没有 ``array=``**，资源长度只能由
+    字节数体现 ⇒「族数 × 128」就是 ini 与 CS 之间的同步点）② 解码出的 base/span/族索引
+    ③ 解码出的 Q_f⁻¹ ④ 解码出的 X_f。比较一律用 ``struct.pack("<12f")`` 的**字节相等**
+    （发布侧本来就是 float32 ⇒ 逐字节可比，不受 float64 期望值的舍入影响）。
+
+    返回问题清单（空 = 通过）；借位族（``slots <= 0``）不发文件、也不检查。
+    """
+    import struct as _struct
+
+    folder = str(folder_path or "")
+    ranges = dict(ranges or {})
+    placements = dict(placements or {})
+    family_xs = dict(family_xs or {})
+    indices = dict(indices or {})
+    problems: list = []
+    expected_bytes = 0
+    counted = 0
+    for family, info in sorted(
+        ranges.items(), key=lambda item: (int(dict(item[1]).get("base", 0)), str(item[0]))
+    ):
+        info = dict(info or {})
+        span = int(info.get("slots", 0) or 0)
+        if span <= 0:
+            continue
+        counted += 1
+        expected_bytes += ATTACH_RANGE_BYTES
+        path = os.path.join(folder, attach_range_basename(family))
+        if not os.path.isfile(path):
+            problems.append(f"{family}: 身份资源文件不存在（{path}）")
+            continue
+        try:
+            with open(path, "rb") as handle:
+                raw = handle.read()
+        except OSError as exc:
+            problems.append(f"{family}: 身份资源无法读取（{exc}）")
+            continue
+        if len(raw) != ATTACH_RANGE_BYTES:
+            problems.append(
+                f"{family}: 载荷长度 {len(raw)} B ≠ {ATTACH_RANGE_BYTES} B"
+                "（8 个 float4：头部 + Q_f⁻¹ + X_f + 族索引）"
+            )
+            continue
+        decoded = decode_attach_range_payload(raw)
+        if not decoded.get("ok"):
+            problems.append(f"{family}: 载荷魔数不符（magic={decoded.get('magic')}）")
+        if int(decoded.get("base", -1)) != int(info.get("base", 0) or 0):
+            problems.append(
+                f"{family}: 载荷 base {decoded.get('base')} ≠ 族区间 base {info.get('base')}"
+            )
+        if int(decoded.get("span", -1)) != span:
+            problems.append(f"{family}: 载荷 span {decoded.get('span')} ≠ 族区间 slots {span}")
+        for label, key, expected in (
+            ("Q_f⁻¹", "placement", placements.get(str(family))),
+            ("X_f", "family_x", family_xs.get(str(family))),
+        ):
+            if expected is None:
+                continue
+            got = list(decoded.get(key) or [])
+            want = [float(v) for v in expected]
+            if len(got) != 12 or len(want) != 12:
+                problems.append(f"{family}: {label} 不是 12 个数（载荷 {len(got)}、期望 {len(want)}）")
+                continue
+            if _struct.pack("<12f", *got) != _struct.pack("<12f", *want):
+                problems.append(f"{family}: 载荷里的 {label} 与发布值**逐字节不等**")
+        expected_indices = indices.get(str(family))
+        if expected_indices is not None:
+            want_own, want_base = (int(expected_indices[0]), int(expected_indices[1]))
+            if (int(decoded.get("own_index", -1)), int(decoded.get("base_index", -1))) != (
+                want_own,
+                want_base,
+            ):
+                problems.append(
+                    f"{family}: 载荷里的族索引 "
+                    f"(own={decoded.get('own_index')}, base={decoded.get('base_index')}) "
+                    f"≠ 发布值 (own={want_own}, base={want_base})"
+                )
+    total = 0
+    for family, info in ranges.items():
+        if int(dict(info or {}).get("slots", 0) or 0) <= 0:
+            continue
+        try:
+            total += os.path.getsize(os.path.join(folder, attach_range_basename(family)))
+        except OSError:
+            pass
+    if total != expected_bytes:
+        problems.append(
+            f"身份资源总字节数 {total} ≠ {counted} 族 × {ATTACH_RANGE_BYTES} B（= {expected_bytes}）"
+        )
+    return problems
 
 
 # 说明：`import re` 放在**文件末尾**（而不是顶部）是为了不改动 t43 锚点护栏引用的行号 ——
@@ -2964,6 +3351,66 @@ def compose_rows_from_model(model: dict, src_rows, placement_rows):
             row.append(float("nan"))
         out.append(row)
     return out
+
+
+# --------------------------------------------------------------------------- #
+# 【t39-X】CS 左乘 X_f 的**可执行镜像**（与上面 P∘Q 同一套做法：文本门 + 数值门同源）
+# --------------------------------------------------------------------------- #
+#
+# 为什么必须有（T40-F3 的教训）：X 块是**对三条结果行的再复合**（`out_i = X_i ∘ out_i`），
+# 它不在 `_ATTACH_COMPOSE_LINE` 的匹配范围里 ⇒ 只加文本探针挡得住「整块被删」，
+# 挡不住「某一行被写坏」（少一个 `dt` 项、平移项漏掉、点积次序被换）。
+# 把三条表达式解析成模型，再与 `mat3x4_compose(x_rows, out_rows)` 逐元素对齐，才算对交付物
+# 有数值覆盖。
+ATTACH_X_CORRECT = "correct"   # out_i = X_i ∘ out_i（A_X·A_out，t_X + A_X·t_out）
+ATTACH_X_UNKNOWN = "unknown"   # 解析不出来（判据按失败处理）
+
+#: 逐行的左乘表达式正则（行号用 ``(?P<i>)`` 捕获；d0/d1/d2 = out 的三列，dt = out 的平移列）。
+_ATTACH_X_LINE = re.compile(
+    r"out(?P<i>[0-2])\s*=\s*float4\(\s*dot\(\s*xa(?P=i)\s*,\s*d0\s*\)\s*,"
+    r"\s*dot\(\s*xa(?P=i)\s*,\s*d1\s*\)\s*,\s*dot\(\s*xa(?P=i)\s*,\s*d2\s*\)\s*,"
+    r"\s*dot\(\s*xa(?P=i)\s*,\s*dt\s*\)\s*\+\s*attach_x(?P=i)\.w\s*\)\s*;",
+    re.S,
+)
+
+
+def attach_x_model_from_hlsl(text: str) -> dict:
+    """把 CS 里的 `out = X_f ∘ out` 表达式解析成模型：`{"ok","rows","modes","problems"}`。
+
+    `modes[i]` 目前只有 `correct` / `unknown` 两态（与 P∘Q 的三态不同：
+    左乘的平移项只有一种正确写法）；三行没有全部解析出来 ⇒ `ok=False` + problems 非空。
+    """
+    code = re.sub(r"/\*.*?\*/", "", str(text or ""), flags=re.S)
+    code = re.sub(r"//[^\n]*", "", code)
+    modes: dict = {}
+    problems: list = []
+    for match in _ATTACH_X_LINE.finditer(code):
+        modes[int(match.group("i"))] = ATTACH_X_CORRECT
+    if sorted(modes) != [0, 1, 2]:
+        problems.append(f"三行 X 左乘表达式没有全部找到（只解析到 {sorted(modes)}）")
+    return {"ok": not problems, "rows": sorted(modes), "modes": modes, "problems": problems}
+
+
+def compose_x_rows_from_model(model: dict, out_rows, x_rows):
+    """按**从 CS 文本解析出来的模型**算 `S = X ∘ out`（3×4 ∘ 3×4，列向量约定）。
+
+    `out_rows` = 已经复合过 Q_f⁻¹ 的 P（= `compose_rows_from_model` 的输出），
+    `x_rows` = X_f（行主序 3×4）。返回 3 行 4 列；`correct` 模型与
+    `mat3x4_compose(x_rows, out_rows)` 逐元素相等。
+    """
+    out = [[float(v) for v in row] for row in out_rows]
+    x = [[float(v) for v in row] for row in x_rows]
+    modes = dict(model.get("modes") or {})
+    result = []
+    for i in range(3):
+        row = [sum(x[i][k] * out[k][j] for k in range(3)) for j in range(3)]
+        mode = modes.get(i, ATTACH_X_UNKNOWN)
+        if mode == ATTACH_X_CORRECT:
+            row.append(sum(x[i][k] * out[k][3] for k in range(3)) + x[i][3])
+        else:
+            row.append(float("nan"))
+        result.append(row)
+    return result
 
 
 # 说明：`import math as _math` 与 `import re` 一样放在文件末尾，避免让 t43 锚点引用的行号漂移。

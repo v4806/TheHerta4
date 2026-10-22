@@ -139,10 +139,16 @@ _install_module(f"{PKG}.ui.universal.drawib_export_base", DrawIBExportBase=_Fake
 _runtime = _load_real_module(f"{PKG}.common.himi_merged_runtime", RUNTIME_REL)
 _contract = sys.modules[f"{PKG}.common.himi_merged_contract"]
 _skeleton = sys.modules[f"{PKG}.common.himi_skeleton"]
+#: 【t39-X】himi.py 在方法里延迟 import 它（fake 包的 common.__path__ 是空的 ⇒ 必须先登记）。
+_family_x = _load_real_module(f"{PKG}.common.himi_family_x", "common/himi_family_x.py")
 _unity = _load_real_module(f"{PKG}.ui.universal.unity", "ui/universal/unity.py")
 _himi_exporter = _load_real_module(f"{PKG}.ui.universal.himi", EXPORTER_REL)
 #: 【t66】按组名解析槽号的那个模块（`VertexGroupUtils.resolve_group_slot`）。
-#: 它 `from mathutils import Vector`（Blender 自带模块）⇒ 先给一个最小替身（本模块只用到类型）。
+#: 它顶层 `import bpy`（只在函数体里用）与 `from mathutils import Vector`（Blender 自带模块）
+#: ⇒ 先给最小替身（被测的 resolve_group_slot / get_blendweights_blendindices_v3 是纯函数，
+#: 不需要真 bpy）。没有这一步，本机（无 Blender）整个模块在收集期就 ImportError。
+if "bpy" not in sys.modules and importlib.util.find_spec("bpy") is None:
+    _install_module("bpy")
 if "mathutils" not in sys.modules:
     class _FakeVector(tuple):
         def __new__(cls, values=(0.0, 0.0, 0.0)):
@@ -2120,9 +2126,18 @@ class HIMIExporterWiringTests(HIMIMergedRuntimeBase):
             attach_name = f"[CustomShaderHI3MergedSkeletonAttach_{fam}]"
             self.assertEqual(lines.count(attach_name), 1, f"{fam}: attach 段必须恰好一次")
             start = lines.index(attach_name)
-            # 【t4/F5】段体多一行 `cs-t1 = ref ResourceHI3AttachRange_<fam>`（8 行，见
+            # 【t39-X/t74】段体 = 段名 + [flags, cs, cs-t0, cs-t1, cs-cb1, cs-u0, Dispatch,
+            # cs-u0 = null] = 9 行；发布物体矩阵表时再加 `cs-u1 = ref …` 与段末
+            # `cs-u1 = null` = 11 行（形状见
             # HIMIAttachResourceTests::test_attach_section_matches_the_mod_reference_shape）。
-            attach = lines[start : start + 8]
+            # 按「下一个 section 起点」切段，避免固定行数把 Dispatch / 解绑行切掉。
+            end = start + 1
+            while end < len(lines) and not lines[end].startswith("["):
+                end += 1
+            attach = lines[start:end]
+            # 段尾的空行（``new_line()``）不属于段体，否则 ``attach[-1]`` 是 ``''``。
+            while attach and not attach[-1].strip():
+                attach.pop()
             self.assertEqual(attach[0], attach_name)
             # 【t75 口径变更】用户要求「这个着色器需要合并成一个」⇒ 每族的段都引用**同一个**
             # `./res/himi_attach.hlsl`，不再有逐族的 `himi_attach_<fam>.hlsl`。
@@ -2141,7 +2156,13 @@ class HIMIExporterWiringTests(HIMIMergedRuntimeBase):
             self.assertIn(f"cs-t0 = ref ResourceHI3PaletteFam_{fam}", attach, "t0 = 本族当帧副本")
             self.assertIn(f"cs-u0 = ref {resource_name}", attach, "u0 = 合并骨架")
             self.assertIn(f"Dispatch = {max(1, -(-slots // 64))}, 1, 1", attach, "Dispatch = ceil(槽数/64)")
-            self.assertEqual(attach[-1], "cs-u0 = null", "段末必须解绑 u0")
+            self.assertIn("cs-u0 = null", attach, "段内必须解绑 u0")
+            if any(line.startswith(f"{_runtime.OBJECT_MATRIX_REGISTER} = ref ") for line in attach):
+                self.assertEqual(
+                    attach[-1],
+                    f"{_runtime.OBJECT_MATRIX_REGISTER} = null",
+                    "发布 cs-u1 后必须在段末解绑（不留悬挂引用）",
+                )
             self.assertNotIn("x1", "\n".join(attach), "不得用 ini 参数纹理传参（fork 相关）")
         # 声明与段的数量必须等于「有专属块的族数」（不多不少，也不给借位族发段）
         self.assertEqual(text.count("[ResourceHI3PaletteFam_"), len(wanted))
@@ -3443,12 +3464,22 @@ class HIMIAttachResourceTests(unittest.TestCase):
             "捕获行的 LHS 必须是**目标**（家族副本）",
         )
         self.assertFalse(lines[0].startswith("copy vs-t0"), "旧契约的写反方向必须被拒绝")
-        self.assertEqual(lines[1], "run = CustomShaderHI3MergedSkeletonAttach_2c706fbd")
+        # 【t74】捕获行现在是两行（palette 的 vs-t0 + 本族物体矩阵的 vs-cb3），run 仍在最后且紧邻。
+        self.assertEqual(len(lines), 3)
+        self.assertEqual(
+            lines[1], "ResourceHI3Cb3_2c706fbd = copy vs-cb3 unless_null"
+        )
+        self.assertEqual(lines[2], "run = CustomShaderHI3MergedSkeletonAttach_2c706fbd")
         self.assertIn("copy vs-t0", lines[0])
         self.assertLess(
             lines.index(next(line for line in lines if "copy vs-t0" in line)),
             lines.index(next(line for line in lines if line.startswith("run = "))),
             "顺序必须是 ①捕获 → ②run",
+        )
+        self.assertLess(
+            lines.index(next(line for line in lines if "copy vs-cb3" in line)),
+            lines.index(next(line for line in lines if line.startswith("run = "))),
+            "cb3 副本必须在 run 之前（run 里才有 cs-cb1 = ref）",
         )
 
     def test_family_palette_decl_is_the_palette_shape(self):
@@ -3476,11 +3507,17 @@ class HIMIAttachResourceTests(unittest.TestCase):
         每族一个 CS 文件，``cs = ./res/himi_attach_<fam>.hlsl``。
 
         【t4/F5 变更（唯一一处既有断言被改写，理由见 reports/himi-merge/51-fix-implementation.md）】
-        段体**多一行** ``cs-t1 = ref ResourceHI3AttachRange_<fam>``（= 本族 16 字节身份资源：
-        ``(base, span, version, magic)``，由导出侧按 ``plan.family_ranges`` 生成）。
+        段体**多一行** ``cs-t1 = ref ResourceHI3AttachRange_<fam>``（= 本族身份资源：
+        ``(base, span, version, magic)`` + ``Q_f⁻¹`` + ``X_f``（128 B），由导出侧按 ``plan.family_ranges`` 生成）。
         旧断言写的是「HIMI 不需要 cs-t1（那要一份不存在的资源）」—— 现在那份资源**确实存在**
         且是 F5 的唯一实质修法：只有它能让「本族 span 上界」独立于查表键（否则恒真），
         副本维度大于本族 span 时就会写进下一族的块（报告 50 §1.2 入口 ①）。
+
+        【t39-X/t74 口径】段体又多一行 ``cs-cb1 = ref ResourceHI3Cb3_<fam>``` ——
+        该族六根物体矩阵的运行期来源（``cbuffer … : register(b1)``）。段体现在 **9 行**：
+        ``[段名, flags, cs, cs-t0, cs-t1, cs-cb1, cs-u0, Dispatch, cs-u0 = null]``。
+        传了 ``object_matrix_name`` 时再多 2 行（``cs-u1 = ref …`` 与段末 ``cs-u1 = null``）
+        ⇒ **11 行**（导出侧总是传，见 ui/universal/himi.py:3610-3616；本用例不传）。
         """
         lines = _runtime.render_attach_section_lines(
             "2c706fbd",
@@ -3488,7 +3525,12 @@ class HIMIAttachResourceTests(unittest.TestCase):
             slots=184,
             skeleton_name="ResourceHI3MergedSkeleton_role_x",
         )
-        self.assertEqual(len(lines), 8)
+        self.assertEqual(
+            len(lines),
+            9,
+            "段体 9 行：[段名, flags, cs, cs-t0, cs-t1, cs-cb1, cs-u0, Dispatch, cs-u0 = null]",
+        )
+        self.assertIn("cs-cb1 = ref ResourceHI3Cb3_2c706fbd", lines, "cb1 = 该族物体矩阵来源")
         self.assertEqual(lines[0], "[CustomShaderHI3MergedSkeletonAttach_2c706fbd]")
         self.assertIn("flags = optimization_level3 all_resources_bound skip_validation", lines)
         self.assertEqual(
@@ -4384,7 +4426,8 @@ class HIMIAttachRangeIdentityTests(unittest.TestCase):
         self.assertNotEqual(
             _runtime.attach_range_payload(184, 18), _runtime.attach_range_payload(202, 71)
         )
-        # 身份资源是 typed 16 B（与合并骨架同款：写 format、**不加** stride）
+        # 身份资源是 typed（与合并骨架同款：写 format、**不加** stride）；
+        # 长度由文件字节数决定 = 128 B（头部 + Q_f⁻¹ + X_f + 族索引，没有 array= 行）。
         lines = _runtime.attach_range_ini_lines("694025c6", "Meshes/694025c6-AttachRange.buf")
         self.assertEqual(lines[0], "[ResourceHI3AttachRange_694025c6]")
         self.assertIn("type = Buffer", lines)
@@ -4744,6 +4787,95 @@ class HIMIVertexGroupNameResolutionTests(unittest.TestCase):
         self.assertEqual(
             [list(row) for row in list(i_new.values())[0]],
             [list(row) for row in list(i_old.values())[0]],
+        )
+
+
+class HIMILocalZeroSlotMappingTests(unittest.TestCase):
+    """【局部 0 ⇒ 族基址】把「非宿主族的局部下标 0」钉死在族基址上。
+
+    现场报障的形态是「合并 Blend 里同一个局部组号 0 有时写成 base、有时写成 0」。
+    resolve_group_slot 按组名取值，组名恒为全局槽的十进制写法 ⇒ local 0 与
+    local k 走**同一条规则**（int(vg.name) = base + local），不存在「0 被当成没有骨骼」。
+    本组用例把这条规则钉在单测层，并给出两态（不传名单 = 老口径，正是会把 0 写成 0 的那条路）。
+    """
+
+    #: 游戏侧固定槽位布局（合并骨架 343 槽）：(族, base, span)。
+    FAMILIES = (
+        ("2c706fbd", 0, 184),
+        ("694025c6", 184, 18),
+        ("70a4da3e", 202, 71),
+        ("b35cfc6c", 273, 19),
+        ("def0c0ae", 292, 51),
+    )
+
+    _fake_mesh = staticmethod(HIMIVertexGroupNameResolutionTests._fake_mesh)
+
+    def _first_row(self, mesh, names):
+        _weights, indices = _vertexgroup.VertexGroupUtils.get_blendweights_blendindices_v3(
+            mesh=mesh, normalize_weights=False, vertex_group_names=names
+        )
+        return [int(value) for value in list(indices.values())[0][0]]
+
+    def test_local_zero_maps_to_family_base_TWO_STATE(self):
+        """非宿主族局部 0：按名 ⇒ base；不传名单（老口径）⇒ 0（= 报障形态）。"""
+        mesh = self._fake_mesh([[(0, 1.0)]])
+        self.assertEqual(
+            self._first_row(mesh, ["202"])[0], 202, "局部 0 必须落到族基址 202"
+        )
+        self.assertEqual(
+            self._first_row(mesh, None)[0],
+            0,
+            "不传名单 = 列表序号口径 ⇒ 0（这正是会被读成宿主槽 0 的那条路）",
+        )
+
+    def test_every_family_slice_maps_base_plus_local_including_zero(self):
+        """整段族切片：local k ⇒ base + k（k = 0 与 k = span-1 同规则），宿主族基址 0 也成立。"""
+        for family, base, span in self.FAMILIES:
+            names = [str(base + local) for local in range(span)]
+            mesh = self._fake_mesh([[(local, 1.0)] for local in range(span)])
+            _weights, indices = _vertexgroup.VertexGroupUtils.get_blendweights_blendindices_v3(
+                mesh=mesh, normalize_weights=False, vertex_group_names=names
+            )
+            rows = list(indices.values())[0]
+            got = [int(rows[local][0]) for local in range(span)]
+            self.assertEqual(
+                got, [base + local for local in range(span)], family + ": local k ⇒ base + k"
+            )
+            self.assertEqual(got[0], base, family + ": 局部 0 ⇒ 族基址")
+            self.assertEqual(
+                len(set(got)), span, family + ": 不得折叠成同一槽（" + str(span) + " 个槽互不相同）"
+            )
+
+    def test_host_family_is_byte_equivalent_to_old_behaviour(self):
+        """宿主族（base = 0、组名 = str(序号)）⇒ 与老口径逐值相同（本次改动零影响）。"""
+        names = [str(index) for index in range(6)]
+        mesh = self._fake_mesh(
+            [[(0, 1.0)], [(1, 0.25), (5, 0.75)], [(3, 0.5), (4, 0.5)]]
+        )
+        new_rows = list(
+            _vertexgroup.VertexGroupUtils.get_blendweights_blendindices_v3(
+                mesh=mesh, normalize_weights=False, vertex_group_names=names
+            )[1].values()
+        )[0]
+        old_rows = list(
+            _vertexgroup.VertexGroupUtils.get_blendweights_blendindices_v3(
+                mesh=mesh, normalize_weights=False
+            )[1].values()
+        )[0]
+        self.assertEqual(
+            [[int(value) for value in row] for row in new_rows],
+            [[int(value) for value in row] for row in old_rows],
+        )
+
+    def test_out_of_list_group_index_keeps_legacy_strategy(self):
+        """越界下标（超出名单长度 / 名单外的组）仍按既有策略回退序号，不抛错、不静默归零。"""
+        resolve = _vertexgroup.VertexGroupUtils.resolve_group_slot
+        self.assertEqual(resolve(["202", "203"], 7), 7, "名单长度外 ⇒ 回退序号")
+        self.assertEqual(resolve([], 0), 0, "空名单 ⇒ 回退序号（不是缺失值 0）")
+        self.assertEqual(resolve(None, 273), 273, "没有名单 ⇒ 回退序号")
+        self.assertEqual(resolve(["202", " 203 "], 1), 203, "名字两端空白不改变解析")
+        self.assertEqual(
+            resolve(["202", "Bone"], 1), 1, "非十进制名 ⇒ 回退序号（其它游戏的形态）"
         )
 
 
@@ -5445,7 +5577,15 @@ class HIMIFamilyCalibrationTests(unittest.TestCase):
         q = self._matrix(41, 1.6, (1.0, -0.5, 0.25))
         payload = _runtime.attach_range_payload(184, 18, placement=q)
         self.assertEqual(len(payload), _runtime.ATTACH_RANGE_BYTES)
-        self.assertEqual(_runtime.ATTACH_RANGE_BYTES, 64)
+        # 【t74】112 → 128 B：头部 + Q_f⁻¹ 3×4 + X_f 3×4 + 族索引 [7]（CS 读 [4..7]）。
+        self.assertEqual(_runtime.ATTACH_RANGE_BYTES, 128)
+        self.assertEqual(
+            _runtime.ATTACH_RANGE_BYTES, _runtime.ATTACH_RANGE_HEADER_BYTES + 48 + 48 + 16
+        )
+        self.assertEqual(len(payload[16:64]), 48)
+        self.assertEqual(len(payload[64:112]), 48)
+        self.assertEqual(_runtime.ATTACH_RANGE_INDICES_OFFSET, 112)
+        self.assertEqual(len(payload[112:128]), 16)
         decoded = _runtime.decode_attach_range_payload(payload)
         self.assertTrue(decoded["ok"])
         self.assertTrue(decoded["has_placement"])

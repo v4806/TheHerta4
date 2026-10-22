@@ -1956,6 +1956,37 @@ cd E:\代码\TheHerta4 ; .\.venv\Scripts\python.exe -m pytest -q
 ② **二分定位**（先只加捕获与标志、不加重跑；再加一处重跑；逐步上）；
 ③ 每步给出「预期现象 + 失败回退」。
 
+### 13.18 t74：合并骨骼残余错位的真根因 —— **cb3 采集点错，运行期 X 一次都没生效过**（2026-10-22，实机验收通过）
+
+**现象**：运行期 X（t39-X）落地后仍然错位（用户：「怪怪的，还是错位的。我 F 8提取了一下」）。
+
+**真根因**（抓帧 `FrameAnalysis-2026-10-22-133713` 实测，判据 = CS 自己的列映射 + `himi_object_matrix_valid()`）：
+
+| 观测对象 | 实测 | 含义 |
+| --- | --- | --- |
+| deform（non-indexed）draw 的 `vs-cb3` | **368 B / 23 个 float4**，rows 0..7 的 `r3.w = 0` | 不是物体矩阵 + 其逆 ⇒ 校验恒假 |
+| render（indexed）draw 的 `vs-cb3` | **160 B / 10 个 float4**，rows 0..7 = 物体矩阵 + 其逆（列口径） | 57/60 通过，残差 7.1e-06 |
+| 抓帧里 12 笔 non-indexed draw | VertexCount 19895 / 3363 / 3789 / 1816 / 1496 … | **正是模组 VB 段挂的那些** |
+
+生成器当时只把 `ResourceHI3Cb3_<fam> = copy vs-cb3 unless_null` 放进 5 个 deform（VB）段 ⇒ 每一笔采集都落在 368 B 布局上 ⇒ `himi_object_matrix_valid()` 恒假 ⇒ **运行期 X 从未生效，一直在用导出期烘死的 X**。
+
+**为什么烘死不行：X 会跨帧漂移。** 9 月 23 日抓帧的烘死值 vs 10 月 22 日 live 值：694025c6 155.797° → **175.415°**（`|ΔX|max` 0.356）、70a4da3e 26.669° → **11.080°**（0.359）、b35cfc6c 179.125° → **172.897°**（0.405）、def0c0ae 151.308° → **149.814°**（0.283）；宿主族恒等。
+**本节同时作废两条我方此前的错误结论**：「X 恒定」与「运行期 X ≡ 烘死 X」——它们只用了几帧**同帧内**的一致性（同族逐 draw 确实逐位相同），跨帧一比即被推翻。
+
+**修法**
+
+1. **采集点**：**每一个** `run = CustomShaderHI3MergedSkeletonAttach_<fam>` 站点（共 17 个 = 5 deform + 12 render）之前都插本族 cb3 副本；两行同源于 `common/himi_merged_runtime.py:740` `render_attach_render_capture_lines`，不另拼文本。
+2. **CS 三态**（**任何分支都不 return**，draw 仍无条件执行）：(a) `own == base` ⇒ 单位阵；(b) 采集有效 ⇒ **先把本族三行写进物体矩阵表**，再读宿主族的行算 `X = M_base⁻¹·M_own`；(c) 采集无效 ⇒ 只读表里 own + base 两段算，表空才退回载荷里的烘死 X。**采集无效时绝不写表** —— 否则 deform 段那笔会把 render 段刚写好的好值覆盖成垃圾。
+
+**验收证据（离线，可复跑）**
+
+- `tools/himi_family_x_oracle.py` ⇒ **ORACLE PASS**：A1 矩阵元 3.343e-08 / 端到端世界 8.207e-08 / A2 反向护栏 5.3617；新增 Oct-22 三态自检三路逐位一致（采集有效 == 直接 cb3、无效 + 表非空 == 同值、无效 + 空表 == 载荷逐位）。
+- `pytest tests/test_himi_family_x.py tests/test_himi_merged_runtime.py` ⇒ **232 passed / 26 subtests passed**（另 2 条既存环境失败：`HIMIRealDumpEndToEndTests::test_real_role_end_to_end`、`HIMICacheOnlyOracleTests::test_real_dump_missing_target_none_is_not_authoritative`，与本次无关）。
+- 文本硬门：生成的 ini 里 run 站点 17 个、`copy vs-cb3 unless_null` 17 行、每站点上一非空行 == 本族副本；探针变异删写表 / 删读表 / 把兜底 X 提前，各让 13 条测试变红。
+- **实机：用户验收通过。**
+
+**遗留（已知边界）**：deform pass 早于 render pass ⇒ 合并 draw 消费的 X 必然是**上一帧 render** 写下的（天然 1 帧滞后）；某族当帧没有 render draw 时表可能整帧为空而退回烘死 X（符合设计）。
+
 ## 14. 附：本次新增/引用的证据与工具
 
 | 路径 | 说明 |

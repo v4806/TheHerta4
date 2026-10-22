@@ -78,6 +78,7 @@ from ...common.himi_merged_contract import (
 from ...utils.json_utils import JsonUtils
 from ...common.himi_skeleton import (
     HIMI_COMPONENT_MAP_BASENAME,
+    HIMI_MERGED_SKELETON_METADATA_FILE,
     HIMI_STUB_MARKER,
     HIMIStubDrawCall,
     HIMI_STUB_TRIANGLE_VERTICES,
@@ -100,6 +101,29 @@ _LOG_PREFIX = "[HIMI骨骼合并]"
 _STUB_LOG_PREFIX = "[HIMI站位]"
 #: 本环境无法取证的清单（计划书 §11 V1/V2/V3 + §7.4 R3）；导出时打印，绝不静默。
 UNVERIFIED_IN_GAME = himi_runtime.UNVERIFIED_IN_GAME
+
+
+def _himi_buffer_byte_size(payload) -> int:
+    """缓冲载荷的**字节数**（``bytes``/``bytearray`` 直接量长；numpy 数组用 ``nbytes``）。
+
+    ``category_buffer_dict`` 的值既可能是 bytes，也可能是 numpy 视图（基类在别处用
+    ``payload.tobytes()``）⇒ 宿主族判定必须两条都吃，否则会把「数组」误判成 0 字节。
+    """
+    if payload is None:
+        return 0
+    if isinstance(payload, (bytes, bytearray)):
+        return len(payload)
+    nbytes = getattr(payload, "nbytes", None)
+    if nbytes is not None:
+        try:
+            return int(nbytes)
+        except (TypeError, ValueError):
+            return 0
+    try:
+        return len(payload)
+    except TypeError:
+        return 0
+
 
 # --------------------------------------------------------------------------- #
 # t75：**单个**合并 attach CS（5 个族共用一份）+ `cs =` 引用硬门
@@ -137,6 +161,96 @@ MERGED_ATTACH_BASE_TABLE_LINES = (
     "    else if (source_slots == 71u) { base_slot = 202u; }   // 70a4da3e",
     "    else if (source_slots == 19u) { base_slot = 273u; }   // b35cfc6c",
     "    else if (source_slots == 51u) { base_slot = 292u; }   // def0c0ae",
+)
+#: 【t74】运行期 X 的文本探针：`(HLSL 片段, 缺它时的报错)`。
+#: 缺失任意一条都必须让 `merged_attach_hlsl_problems` 报错（测试用删行变异逐条证红）——
+#: 这几行合起来才是「X 由运行期 cb3 算」这件事本身：少 cbuffer 就取不到本族物体矩阵，
+#: 少 u1 表就没有宿主族 M_base 可读，少选择分支就退化成抓帧常量。
+HIMI_RUNTIME_X_PROBES = (
+    (
+        "cbuffer himi_object_cb : register(b1)",
+        "【t74】缺 cbuffer himi_object_cb : register(b1)（cs-cb1 = 本族 vs-cb3 的副本）",
+    ),
+    (
+        "float4 himi_obj_rows[8];",
+        "【t74】cbuffer 必须按 8 行 float4 读 vs-cb3（行 0..3 = 物体矩阵，行 4..7 = 其逆）",
+    ),
+    (
+        "RWBuffer<float4> himi_object_matrix : register(u1);",
+        "【t74】缺物体矩阵表声明（RWBuffer<float4> himi_object_matrix : register(u1);）——"
+        "没有它宿主族读不到 M_base，X 只能取抓帧常量",
+    ),
+    (
+        "HimiAffine himi_cb3_affine()",
+        "【t74】缺「把本族 vs-cb3 行 0..3 收成 Affine」的函数定义（HimiAffine himi_cb3_affine()）",
+    ),
+    (
+        "himi_cb3_affine();",
+        "【t74】缺「把本族 vs-cb3 行 0..3 收成 Affine」的读取（himi_cb3_affine()）",
+    ),
+    (
+        "HimiAffine himi_cb3_inverse_affine()",
+        "【t74】缺 vs-cb3 行 4..7 的函数定义（HimiAffine himi_cb3_inverse_affine()）——"
+        "校验物体矩阵必须核对自洽性，否则会把错口径的行当成物体矩阵",
+    ),
+    (
+        "himi_cb3_inverse_affine()",
+        "【t74】缺 vs-cb3 行 4..7 的读取（himi_cb3_inverse_affine()）——"
+        "校验物体矩阵必须核对自洽性，否则会把错口径的行当成物体矩阵",
+    ),
+    (
+        "if (asuint(attach_range.z) >= 4u)",
+        "【t74】缺版本门（if (asuint(attach_range.z) >= 4u)）——旧产物（v3）必须逐字节走老路径",
+    ),
+    (
+        "bool himi_object_matrix_valid()",
+        "【t74】缺物体矩阵校验（himi_object_matrix_valid()：齐次 w、|det|、行 4..7 与行 0..3 互逆）",
+    ),
+    (
+        "himi_affine_inverse(m_base)",
+        "【t74】缺 M_base⁻¹（himi_affine_inverse(m_base)）——没有逆就只能按宿主族摆放",
+    ),
+    (
+        "himi_affine_mul(himi_affine_inverse(m_base), own_object)",
+        "【t74】缺 X = M_base⁻¹·M_own 的合成（himi_affine_mul(himi_affine_inverse(m_base), own_object)）",
+    ),
+    (
+        "uint own_index = asuint(himi_attach_range[7].x);",
+        "【t74】缺本族索引（uint own_index = asuint(himi_attach_range[7].x);）——"
+        "载荷 [7].x 是导出期写死的族序号",
+    ),
+    (
+        "uint base_index = asuint(himi_attach_range[7].y);",
+        "【t74】缺宿主族索引（uint base_index = asuint(himi_attach_range[7].y);）",
+    ),
+    (
+        "if (own_index == base_index)",
+        "【t74】缺宿主族分支（if (own_index == base_index) ⇒ X = 单位阵）",
+    ),
+    (
+        "himi_object_matrix[own_row + 0u] = own_object.r0;",
+        "【t74】缺「把本族校验通过的物体矩阵写进 u1 表」——"
+        "不写的话宿主族永远读不到任何 M_base，X 无法实时算出",
+    ),
+    (
+        "float4 base0 = himi_object_matrix[base_row + 0u];",
+        "【t74】缺宿主族行的读回（float4 base0/1/2 = himi_object_matrix[base_row + 0/1/2u]）",
+    ),
+    (
+        "float4 own0 = himi_object_matrix[own_row + 0u];",
+        "【t74】缺「采集无效时读表里本族那段」的回退（float4 own0/1/2 = himi_object_matrix[own_row + 0/1/2u]）——"
+        "deform 段那 368 B 的 cb3 不是物体矩阵，这时只能退回上一帧 render 写下的好值",
+    ),
+    (
+        "else if (object_in_range)",
+        "【t74】缺「采集无效时的回退分支」（else if (object_in_range)）——"
+        "采集失败就直接用烘死 X，等于运行期 X 从未生效",
+    ),
+    (
+        "if (own_ready && base_ready)",
+        "【t74】回退分支必须要求表里 own/base 两段都非全零（if (own_ready && base_ready)）——"
+        "任一段空就乘进去会得到垃圾 X",
+    ),
 )
 #: `cs =` 行的解析（3DMigoto 的 ini 键名大小写不敏感，故用 IGNORECASE）。
 #: 值允许为空（``cs =``）—— 那是一条**坏的**引用，必须被抓到而不是被跳过，
@@ -223,6 +337,138 @@ def merged_attach_hlsl_text(decl=None) -> str:
     lines.append("// （ini: RWBuffer + format = R32G32B32A32_FLOAT + array = 3 × 槽位数 + bind_flags）")
     lines.append(decl.hlsl_declaration())
     lines.append("")
+    lines.append("// ---- 【t74】族级物体矩阵 X_f 的运行期来源（不再只靠抓帧烘死的常量）----")
+    lines.append("// cs-cb1 = ref ResourceHI3Cb3_<fam>（ini: **只有段名一行**，不写 type/stride ——")
+    lines.append("//   尺寸与布局由 copy vs-cb3 的源视图决定；同一先例见本仓 ZZMI 的 copy vs-cb1）")
+    lines.append("// 该族那一笔 deform draw 的 vs-cb3 前 8 行 = 它的物体矩阵：")
+    lines.append("//   行 0..2 = 3×3 线性（**行向量**约定）、行 3 = 平移（w ≈ 1）、行 4..7 = 前 4 行的逆")
+    lines.append("//   （行 4..7 是游戏自己算好的，用来交叉校验我们读到的口径对不对）。")
+    lines.append("cbuffer himi_object_cb : register(b1)")
+    lines.append("{")
+    lines.append("    float4 himi_obj_rows[8];")
+    lines.append("};")
+    lines.append("// cs-u1 = ref ResourceHI3ObjectMatrix_role_<role>")
+    lines.append("// （ini: RWBuffer + format = R32G32B32A32_FLOAT + array = 3 × 族数")
+    lines.append("//   + bind_flags = shader_resource unordered_access）")
+    lines.append("// 表的**唯一**布局：第 f 族占 [f*3 + 0..2]，表项 i = 该族 3×4 矩阵第 i 行**逐字**")
+    lines.append("// ⇒ (r0.xyz, r3.x) / (r1.xyz, r3.y) / (r2.xyz, r3.z)：第 i 行的 .w 正是平移行 r3 的")
+    lines.append("// 第 i 个分量，12 个数一个不浪费、也没有第二套下标约定可写错。全零 = 尚未写入。")
+    lines.append("RWBuffer<float4> himi_object_matrix : register(u1);")
+    lines.append("")
+    lines.append("// 3×4 仿射（列向量约定，行主序存三行；.w = 平移分量）。结构与乘法照 ZZMI 参考插件")
+    lines.append("// （.dsh-tmp/loyaltools/common/zzmi_merged_skeleton.py:493-557，HLSL 里已验证可行）。")
+    lines.append("struct HimiAffine")
+    lines.append("{")
+    lines.append("    float4 r0;")
+    lines.append("    float4 r1;")
+    lines.append("    float4 r2;")
+    lines.append("};")
+    lines.append("")
+    lines.append("HimiAffine himi_affine_identity()")
+    lines.append("{")
+    lines.append("    HimiAffine m;")
+    lines.append("    m.r0 = float4(1.0, 0.0, 0.0, 0.0);")
+    lines.append("    m.r1 = float4(0.0, 1.0, 0.0, 0.0);")
+    lines.append("    m.r2 = float4(0.0, 0.0, 1.0, 0.0);")
+    lines.append("    return m;")
+    lines.append("}")
+    lines.append("")
+    lines.append("float4 himi_affine_mul_row(float4 row, HimiAffine b)")
+    lines.append("{")
+    lines.append("    return row.x * b.r0 + row.y * b.r1 + row.z * b.r2 + float4(0.0, 0.0, 0.0, row.w);")
+    lines.append("}")
+    lines.append("")
+    lines.append("HimiAffine himi_affine_mul(HimiAffine a, HimiAffine b)")
+    lines.append("{")
+    lines.append("    HimiAffine m;")
+    lines.append("    m.r0 = himi_affine_mul_row(a.r0, b);")
+    lines.append("    m.r1 = himi_affine_mul_row(a.r1, b);")
+    lines.append("    m.r2 = himi_affine_mul_row(a.r2, b);")
+    lines.append("    return m;")
+    lines.append("}")
+    lines.append("")
+    lines.append("// 余子式求逆（照参考插件的写法）：|det| 太小 ⇒ 返回单位阵（调用方另有校验门）")
+    lines.append("HimiAffine himi_affine_inverse(HimiAffine m)")
+    lines.append("{")
+    lines.append("    float3 a = m.r0.xyz;")
+    lines.append("    float3 b = m.r1.xyz;")
+    lines.append("    float3 c = m.r2.xyz;")
+    lines.append("    float3 c0 = cross(b, c);")
+    lines.append("    float3 c1 = cross(c, a);")
+    lines.append("    float3 c2 = cross(a, b);")
+    lines.append("    float det = dot(a, c0);")
+    lines.append("    HimiAffine r = himi_affine_identity();")
+    lines.append("    if (abs(det) >= 1e-20)")
+    lines.append("    {")
+    lines.append("        float inv_det = 1.0 / det;")
+    lines.append("        float3 i0 = float3(c0.x, c1.x, c2.x) * inv_det;")
+    lines.append("        float3 i1 = float3(c0.y, c1.y, c2.y) * inv_det;")
+    lines.append("        float3 i2 = float3(c0.z, c1.z, c2.z) * inv_det;")
+    lines.append("        float3 t = float3(m.r0.w, m.r1.w, m.r2.w);")
+    lines.append("        r.r0 = float4(i0, -dot(i0, t));")
+    lines.append("        r.r1 = float4(i1, -dot(i1, t));")
+    lines.append("        r.r2 = float4(i2, -dot(i2, t));")
+    lines.append("    }")
+    lines.append("    return r;")
+    lines.append("}")
+    lines.append("")
+    lines.append("// cb3 行 0..3 → 列向量口径 3×4（与 common/himi_family_x.py::_col_t 同一映射：")
+    lines.append("// 结果行 i = (行0[i], 行1[i], 行2[i], 行3[i])）")
+    lines.append("HimiAffine himi_cb3_affine()")
+    lines.append("{")
+    lines.append("    HimiAffine m;")
+    lines.append("    m.r0 = float4(himi_obj_rows[0].x, himi_obj_rows[1].x, himi_obj_rows[2].x, himi_obj_rows[3].x);")
+    lines.append("    m.r1 = float4(himi_obj_rows[0].y, himi_obj_rows[1].y, himi_obj_rows[2].y, himi_obj_rows[3].y);")
+    lines.append("    m.r2 = float4(himi_obj_rows[0].z, himi_obj_rows[1].z, himi_obj_rows[2].z, himi_obj_rows[3].z);")
+    lines.append("    return m;")
+    lines.append("}")
+    lines.append("")
+    lines.append("// cb3 行 4..7 → 游戏自己算好的那份逆（同一映射）")
+    lines.append("HimiAffine himi_cb3_inverse_affine()")
+    lines.append("{")
+    lines.append("    HimiAffine m;")
+    lines.append("    m.r0 = float4(himi_obj_rows[4].x, himi_obj_rows[5].x, himi_obj_rows[6].x, himi_obj_rows[7].x);")
+    lines.append("    m.r1 = float4(himi_obj_rows[4].y, himi_obj_rows[5].y, himi_obj_rows[6].y, himi_obj_rows[7].y);")
+    lines.append("    m.r2 = float4(himi_obj_rows[4].z, himi_obj_rows[5].z, himi_obj_rows[6].z, himi_obj_rows[7].z);")
+    lines.append("    return m;")
+    lines.append("}")
+    lines.append("")
+    lines.append("float himi_affine_max_diff(HimiAffine a, HimiAffine b)")
+    lines.append("{")
+    lines.append("    float4 d0 = abs(a.r0 - b.r0);")
+    lines.append("    float4 d1 = abs(a.r1 - b.r1);")
+    lines.append("    float4 d2 = abs(a.r2 - b.r2);")
+    lines.append("    float diff = max(max(max(d0.x, d0.y), max(d0.z, d0.w)),")
+    lines.append("                     max(max(d1.x, d1.y), max(d1.z, d1.w)));")
+    lines.append("    return max(diff, max(max(d2.x, d2.y), max(d2.z, d2.w)));")
+    lines.append("}")
+    lines.append("")
+    lines.append("// cb3 副本是否可信。判据与 common/himi_family_x.py::object_matrix_from_registers 同一套")
+    lines.append("// （残差容差放大到 1e-2：副本内容的精度由 copy vs-cb3 的源视图决定）：")
+    lines.append("//   ① 行 0..2/4..6 的 .w ≈ 0、行 3/7 的 .w ≈ 1（齐次行形状）；")
+    lines.append("//   ② |det3(行 0..2.xyz)| ≥ 1e-6（可逆，否则 M_base⁻¹ 无意义）；")
+    lines.append("//   ③ 行 0..3 与行 4..7 互为逆（compose 回单位阵，残差 ≤ 1e-2）。")
+    lines.append("// ③ 同时挡住「cb3 绑空/全零」与「cb3 里是别的族的矩阵」两种失败 ⇒ 各失败都退回载荷 X。")
+    lines.append("bool himi_object_matrix_valid()")
+    lines.append("{")
+    lines.append("    if (abs(himi_obj_rows[0].w) > 1e-3 || abs(himi_obj_rows[1].w) > 1e-3")
+    lines.append("        || abs(himi_obj_rows[2].w) > 1e-3 || abs(himi_obj_rows[3].w - 1.0) > 1e-3")
+    lines.append("        || abs(himi_obj_rows[4].w) > 1e-3 || abs(himi_obj_rows[5].w) > 1e-3")
+    lines.append("        || abs(himi_obj_rows[6].w) > 1e-3 || abs(himi_obj_rows[7].w - 1.0) > 1e-3)")
+    lines.append("    {")
+    lines.append("        return false;")
+    lines.append("    }")
+    lines.append("    float3 la = himi_obj_rows[0].xyz;")
+    lines.append("    float3 lb = himi_obj_rows[1].xyz;")
+    lines.append("    float3 lc = himi_obj_rows[2].xyz;")
+    lines.append("    if (abs(dot(la, cross(lb, lc))) < 1e-6)")
+    lines.append("    {")
+    lines.append("        return false;")
+    lines.append("    }")
+    lines.append("    HimiAffine product = himi_affine_mul(himi_cb3_affine(), himi_cb3_inverse_affine());")
+    lines.append("    return himi_affine_max_diff(product, himi_affine_identity()) <= 1e-2;")
+    lines.append("}")
+    lines.append("")
     lines.append("[numthreads(64, 1, 1)]")
     lines.append("void main(uint3 dispatch_id : SV_DispatchThreadID)")
     lines.append("{")
@@ -304,7 +550,7 @@ def merged_attach_hlsl_text(decl=None) -> str:
     lines.append("    //  顶点侧已先把本族绑定位置搬进共同空间 v' = Q_f·v）")
     lines.append("    // ⇒ 同一族的骨 × 同一族的顶点 **逐值不变**（P·Q⁻¹·Q·v = P·v），")
     lines.append("    // 而跨族借用别人的骨时，顶点会先被搬进**共同空间**再被借出族的 palette 映出去。")
-    lines.append("    // 因子与 base/span 同源同报（同一个 cs-t1 载荷，64 B），版本 < 3 或因子全零 ⇒ 不校准。")
+    lines.append("    // 因子与 base/span 同源同报（同一个 cs-t1 载荷，128 B），版本 < 3 或因子全零 ⇒ 不校准。")
     lines.append("    float4 placement0 = himi_attach_range[1];")
     lines.append("    float4 placement1 = himi_attach_range[2];")
     lines.append("    float4 placement2 = himi_attach_range[3];")
@@ -334,6 +580,129 @@ def merged_attach_hlsl_text(decl=None) -> str:
     lines.append("                      dot(src1.xyz, placement_t) + src1.w);")
     lines.append("        out2 = float4(dot(src2.xyz, qc0), dot(src2.xyz, qc1), dot(src2.xyz, qc2),")
     lines.append("                      dot(src2.xyz, placement_t) + src2.w);")
+    lines.append("    }")
+    lines.append("    // 【t39-X 族级物体矩阵】合并几何整块落在**宿主族**的一笔 draw 里 ⇒ 那一刻只有")
+    lines.append("    // 宿主族的对象矩阵 M_base；而各族真值是 world = M_f·(P_f·v) ⇒ 必须再左乘")
+    lines.append("    // X_f = M_base⁻¹·M_f：")
+    lines.append("    //     S = X_f ∘ (P_f ∘ Q_f⁻¹)")
+    lines.append("    // 【t74 X 的来源】主路径 = **运行期从本族 vs-cb3 实时算**（下面的选择块）；载荷")
+    lines.append("    // [4..6] 是导出期烘死的同一份 X_f，只在 cb3 拿不到/校验不过时兜底。")
+    lines.append("    // X 与 Q 是**两个独立开关**：X 的 12 个数全零 ⇒ 不左乘（逐字节等价旧行为）；")
+    lines.append("    // 宿主族自己的 X 是单位阵（非零 ⇒ 会施加，但数值恒等）。")
+    lines.append("    float4 attach_x0 = himi_attach_range[4];")
+    lines.append("    float4 attach_x1 = himi_attach_range[5];")
+    lines.append("    float4 attach_x2 = himi_attach_range[6];")
+    lines.append("")
+    lines.append("    // 【t74 运行期 X】只在载荷版本 ≥ 4（= 带 [7] 族索引）时启用，旧产物（v3）逐字节照旧。")
+    lines.append("    // 三态，顺序即优先级，**任何分支都不 return** —— draw 必须无条件执行，分支只决定「写什么矩阵」：")
+    lines.append("    //   (a) own_index == base_index ⇒ X = 单位阵（不读表、不依赖采集）；")
+    lines.append("    //   (b) 采集有效 ⇒ **先**把本族三行写进表（表只由这条路径填起来）、**再**读宿主族三行：")
+    lines.append("    //       非全零 ⇒ X = M_base⁻¹·M_own；全零（非常首帧）⇒ 保留载荷兜底 X；")
+    lines.append("    //   (c) 采集无效 ⇒ 读表里 own + base 两段（上一帧写下的好值）：都非全零 ⇒ X = M_base⁻¹·M_own，")
+    lines.append("    //       否则保留兜底 X。**采集无效时绝不写表** —— 那会把表里已有的好值覆盖成垃圾。")
+    lines.append("    if (asuint(attach_range.z) >= 4u)")
+    lines.append("    {")
+    lines.append("        uint own_index = asuint(himi_attach_range[7].x);")
+    lines.append("        uint base_index = asuint(himi_attach_range[7].y);")
+    lines.append("        HimiAffine own_object = himi_cb3_affine();")
+    lines.append("        bool object_valid = himi_object_matrix_valid();")
+    lines.append("        // 表长由 ini 的 array=（3 × 族数）决定：越界的族索引一律不碰表，防 OOB 读写")
+    lines.append("        uint object_elements = 0u;")
+    lines.append("        himi_object_matrix.GetDimensions(object_elements);")
+    lines.append("        uint last_row = object_elements >= 3u ? (object_elements - 3u) / 3u : 0u;")
+    lines.append("        bool object_in_range = object_elements >= 3u")
+    lines.append("            && own_index <= last_row && base_index <= last_row;")
+    lines.append("        if (object_valid && object_in_range)")
+    lines.append("        {")
+    lines.append("            // (b) 写表：把本族**校验通过**的物体矩阵写进自己那一段（宿主族那笔随后读回来）。")
+    lines.append("            // 每族只在自己那笔里写自己那段 ⇒ 同一 dispatch 内不存在读写竞争。")
+    lines.append("            uint own_row = own_index * 3u;")
+    lines.append("            himi_object_matrix[own_row + 0u] = own_object.r0;")
+    lines.append("            himi_object_matrix[own_row + 1u] = own_object.r1;")
+    lines.append("            himi_object_matrix[own_row + 2u] = own_object.r2;")
+    lines.append("        }")
+    lines.append("        if (own_index == base_index)")
+    lines.append("        {")
+    lines.append("            // (a) 宿主族：X 恒为单位阵（不能读回自己那段：那是上一帧它自己写的 M_base）")
+    lines.append("            attach_x0 = float4(1.0, 0.0, 0.0, 0.0);")
+    lines.append("            attach_x1 = float4(0.0, 1.0, 0.0, 0.0);")
+    lines.append("            attach_x2 = float4(0.0, 0.0, 1.0, 0.0);")
+    lines.append("        }")
+    lines.append("        else if (object_valid && object_in_range)")
+    lines.append("        {")
+    lines.append("            // (b) 采集有效：M_own 就是本次 dispatch 的 cb3（刚写进表的那份）")
+    lines.append("            uint base_row = base_index * 3u;")
+    lines.append("            float4 base0 = himi_object_matrix[base_row + 0u];")
+    lines.append("            float4 base1 = himi_object_matrix[base_row + 1u];")
+    lines.append("            float4 base2 = himi_object_matrix[base_row + 2u];")
+    lines.append("            // 宿主族那一段全零 = 本帧还没写过（首次进游戏 / 刚重载）⇒ 保留兜底 X")
+    lines.append("            if (base0.x != 0.0 || base0.y != 0.0 || base0.z != 0.0 || base0.w != 0.0")
+    lines.append("                || base1.x != 0.0 || base1.y != 0.0 || base1.z != 0.0 || base1.w != 0.0")
+    lines.append("                || base2.x != 0.0 || base2.y != 0.0 || base2.z != 0.0 || base2.w != 0.0)")
+    lines.append("            {")
+    lines.append("                HimiAffine m_base;")
+    lines.append("                m_base.r0 = base0;")
+    lines.append("                m_base.r1 = base1;")
+    lines.append("                m_base.r2 = base2;")
+    lines.append("                HimiAffine x_rows = himi_affine_mul(himi_affine_inverse(m_base), own_object);")
+    lines.append("                attach_x0 = x_rows.r0;")
+    lines.append("                attach_x1 = x_rows.r1;")
+    lines.append("                attach_x2 = x_rows.r2;")
+    lines.append("            }")
+    lines.append("        }")
+    lines.append("        else if (object_in_range)")
+    lines.append("        {")
+    lines.append("            // (c) 采集无效：拿不到可信的 M_own ⇒ 只能读表里**上一帧**写下的 own + base 两段。")
+    lines.append("            // 这里绝不写表：写了就把表里已有的好值覆盖成垃圾（下一帧也一起坏掉）。")
+    lines.append("            uint own_row = own_index * 3u;")
+    lines.append("            float4 own0 = himi_object_matrix[own_row + 0u];")
+    lines.append("            float4 own1 = himi_object_matrix[own_row + 1u];")
+    lines.append("            float4 own2 = himi_object_matrix[own_row + 2u];")
+    lines.append("            uint base_row = base_index * 3u;")
+    lines.append("            float4 base0 = himi_object_matrix[base_row + 0u];")
+    lines.append("            float4 base1 = himi_object_matrix[base_row + 1u];")
+    lines.append("            float4 base2 = himi_object_matrix[base_row + 2u];")
+    lines.append("            // 两段都非全零才够算：任一段空 ⇒ 表还没被写过 ⇒ 保留兜底 X")
+    lines.append("            bool own_ready = (own0.x != 0.0 || own0.y != 0.0 || own0.z != 0.0 || own0.w != 0.0")
+    lines.append("                || own1.x != 0.0 || own1.y != 0.0 || own1.z != 0.0 || own1.w != 0.0")
+    lines.append("                || own2.x != 0.0 || own2.y != 0.0 || own2.z != 0.0 || own2.w != 0.0);")
+    lines.append("            bool base_ready = (base0.x != 0.0 || base0.y != 0.0 || base0.z != 0.0 || base0.w != 0.0")
+    lines.append("                || base1.x != 0.0 || base1.y != 0.0 || base1.z != 0.0 || base1.w != 0.0")
+    lines.append("                || base2.x != 0.0 || base2.y != 0.0 || base2.z != 0.0 || base2.w != 0.0);")
+    lines.append("            if (own_ready && base_ready)")
+    lines.append("            {")
+    lines.append("                HimiAffine m_base;")
+    lines.append("                m_base.r0 = base0;")
+    lines.append("                m_base.r1 = base1;")
+    lines.append("                m_base.r2 = base2;")
+    lines.append("                HimiAffine m_own;")
+    lines.append("                m_own.r0 = own0;")
+    lines.append("                m_own.r1 = own1;")
+    lines.append("                m_own.r2 = own2;")
+    lines.append("                HimiAffine x_rows = himi_affine_mul(himi_affine_inverse(m_base), m_own);")
+    lines.append("                attach_x0 = x_rows.r0;")
+    lines.append("                attach_x1 = x_rows.r1;")
+    lines.append("                attach_x2 = x_rows.r2;")
+    lines.append("            }")
+    lines.append("        }")
+    lines.append("    }")
+    lines.append("    bool x_calibrated = (attach_x0.x != 0.0 || attach_x0.y != 0.0 || attach_x0.z != 0.0")
+    lines.append("        || attach_x0.w != 0.0 || attach_x1.x != 0.0 || attach_x1.y != 0.0")
+    lines.append("        || attach_x1.z != 0.0 || attach_x1.w != 0.0 || attach_x2.x != 0.0")
+    lines.append("        || attach_x2.y != 0.0 || attach_x2.z != 0.0 || attach_x2.w != 0.0);")
+    lines.append("    if (x_calibrated)")
+    lines.append("    {")
+    lines.append("        // 左乘：把 out（= P∘Q⁻¹，3×4 行主序）先拆成三列 + 平移列，再逐行点积（列向量约定）。")
+    lines.append("        float3 xa0 = float3(attach_x0.x, attach_x0.y, attach_x0.z);")
+    lines.append("        float3 xa1 = float3(attach_x1.x, attach_x1.y, attach_x1.z);")
+    lines.append("        float3 xa2 = float3(attach_x2.x, attach_x2.y, attach_x2.z);")
+    lines.append("        float3 d0 = float3(out0.x, out1.x, out2.x);")
+    lines.append("        float3 d1 = float3(out0.y, out1.y, out2.y);")
+    lines.append("        float3 d2 = float3(out0.z, out1.z, out2.z);")
+    lines.append("        float3 dt = float3(out0.w, out1.w, out2.w);")
+    lines.append("        out0 = float4(dot(xa0, d0), dot(xa0, d1), dot(xa0, d2), dot(xa0, dt) + attach_x0.w);")
+    lines.append("        out1 = float4(dot(xa1, d0), dot(xa1, d1), dot(xa1, d2), dot(xa1, dt) + attach_x1.w);")
+    lines.append("        out2 = float4(dot(xa2, d0), dot(xa2, d1), dot(xa2, d2), dot(xa2, dt) + attach_x2.w);")
     lines.append("    }")
     lines.append(f"    {skeleton_name}[dst + 0u] = out0;")
     lines.append(f"    {skeleton_name}[dst + 1u] = out1;")
@@ -471,6 +840,83 @@ def merged_attach_hlsl_problems(text: str) -> list:
                 f"【t41/T40-F3】出现了旧写法 `placement{index}.www`"
                 "（= `(p_i0+p_i1+p_i2)·t_i`，会把盘绕项算错，实测差 3.010439）"
             )
+    # ---- 【t39-X】族级物体矩阵 X_f 的左乘（A4 的三条锚点：删任意一条都必须报错）----
+    x_read_tokens = ("himi_attach_range[4]", "himi_attach_range[5]", "himi_attach_range[6]")
+    if not all(token in code for token in x_read_tokens):
+        problems.append(
+            "缺【t39-X】族级物体矩阵的读取（attach_x0/1/2 = himi_attach_range[4..6]）——"
+            "合并在宿主族的一笔 draw 里渲染，缺这一项时每个族都会按**宿主族的对象矩阵**摆放"
+        )
+    if "float3 d0 = float3(out0.x, out1.x, out2.x);" not in code:
+        problems.append(
+            "缺【t39-X】左乘前的列拆分（float3 d0/d1/d2 = out 的三列、dt = out 的平移列）"
+        )
+    if "out0 = float4(dot(xa0, d0), dot(xa0, d1), dot(xa0, d2), dot(xa0, dt) + attach_x0.w);" not in code:
+        problems.append(
+            "缺【t39-X】S = X∘(P∘Q⁻¹) 的左乘（线性部分 A_X·A_out + 平移 A_X·t_out + t_X）"
+        )
+    if "float3 xa0 = float3(attach_x0.x, attach_x0.y, attach_x0.z);" not in code:
+        problems.append("【t39-X】缺 `float3 xa0/xa1/xa2 = attach_x{0,1,2}.xyz`（X 行的线性部分）")
+    # ---- 【t74】运行期 X：本族 vs-cb3 → u1 物体矩阵表 → X 选择（每一条都能被删行变异证红）----
+    for probe, message in HIMI_RUNTIME_X_PROBES:
+        if _strip_hlsl_comments(probe).strip() not in code:
+            problems.append(message)
+    # 兜底 X 必须先于选择块读入：变异成「先烘死 X 再判断」会让每族都按抓帧常量摆放，
+    # 而所有“采集有效/无效”分支的探针都还在 ⇒ 只能靠位置关系抓出来。
+    baked_decl = _strip_hlsl_comments("float4 attach_x0 = himi_attach_range[4];").strip()
+    version_gate = _strip_hlsl_comments("if (asuint(attach_range.z) >= 4u)").strip()
+    if code.count(baked_decl) != 1:
+        problems.append(
+            "【t74】兜底 X 必须**恰好一次**读入（float4 attach_x0/1/2 = himi_attach_range[4..6]），"
+            f"实际出现 {code.count(baked_decl)} 次"
+        )
+    else:
+        gate_index = code.find(version_gate)
+        # 版本门本身缺失时已由探针报出；这里只判位置关系。
+        if gate_index >= 0 and code.index(baked_decl) > gate_index:
+            problems.append(
+                "【t74】兜底 X 必须在运行期选择块**之前**读入：否则 (b)/(c) 分支还没算完就已被抓帧常量定死"
+            )
+    # (b) 的写表必须三行齐全、且发生在选择分支**之前**：只写一两行、或写进 (a) 分支里，
+    # 宿主族就读不到本族的 M_base（探针只查「第一行在不在」，行数与位置只能靠这里抓）。
+    write_rows = (
+        "himi_object_matrix[own_row + 0u] = own_object.r0;",
+        "himi_object_matrix[own_row + 1u] = own_object.r1;",
+        "himi_object_matrix[own_row + 2u] = own_object.r2;",
+    )
+    identity_branch = _strip_hlsl_comments("if (own_index == base_index)").strip()
+    for row in write_rows:
+        token = _strip_hlsl_comments(row).strip()
+        count = code.count(token)
+        if count != 1:
+            problems.append(
+                "【t74】(b) 写表必须恰好一次且三行齐全（" + token + "），实际出现 "
+                + str(count) + " 次 —— 少写一行宿主族只读到半截物体矩阵"
+            )
+        elif identity_branch in code and code.index(token) > code.index(identity_branch):
+            problems.append(
+                "【t74】(b) 写表必须在 (a) own==base 分支**之前**：写进分支里时"
+                "采集有效但 own==base 的那些帧永远填不了表"
+            )
+    # (c) 必须把 own 段三行读回来：少一行等于采集无效时拿不到本族矩阵，只能退回抓帧常量。
+    # base 段的读回行在 (b)/(c) 各出现一次，所以这里只钉 own。
+    for row in (
+        "float4 own0 = himi_object_matrix[own_row + 0u];",
+        "float4 own1 = himi_object_matrix[own_row + 1u];",
+        "float4 own2 = himi_object_matrix[own_row + 2u];",
+    ):
+        token = _strip_hlsl_comments(row).strip()
+        count = code.count(token)
+        if count != 1:
+            problems.append(
+                "【t74】(c) 采集无效时必须读回表里本族的三行（" + token + "），实际出现 "
+                + str(count) + " 次"
+            )
+    # 与 P∘Q 同款：把表达式**解析成模型**（himi_runtime.attach_x_model_from_hlsl），
+    # 文本一被写坏（少一行、平移项漏掉）这里就报错，同一份模型在测试里与 mat3x4_compose 数值对齐。
+    x_model = himi_runtime.attach_x_model_from_hlsl(text)
+    for problem in x_model.get("problems") or ():
+        problems.append("【t39-X】" + str(problem))
     return problems
 
 
@@ -815,7 +1261,7 @@ def verify_attach_range_references(ini_text: str, mod_root: str) -> list:
                 f"[{name}] 的 filename 引用的文件不存在（{candidate}）"
             )
             continue
-        # 【t39】长度硬门：v2 的身份载荷必须带 Q_f（64 B）。16 B 的旧载荷在 CS 里
+        # 【t39】长度硬门：v2 的身份载荷必须带 Q_f（64 B；t74 起为 128 B）。16 B 的旧载荷在 CS 里
         # 会被版本门挡掉（不做校准）——那意味着**顶点侧校准了、palette 侧没校准**，
         # 两者必须同源同报 ⇒ 宁可 Fatal，也不产出半校准的产物。
         try:
@@ -826,8 +1272,9 @@ def verify_attach_range_references(ini_text: str, mod_root: str) -> list:
         if size != himi_runtime.ATTACH_RANGE_BYTES:
             problems.append(
                 f"[{name}] 的身份载荷长度是 {size} B，而 v{himi_runtime.ATTACH_RANGE_VERSION}"
-                f" 要求 {himi_runtime.ATTACH_RANGE_BYTES} B（头部 + Q_f 3×4）⇒ "
-                "顶点侧已校准而 palette 侧不会校准（或反之），必须重新导出"
+                f" 要求 {himi_runtime.ATTACH_RANGE_BYTES} B"
+                "（头部 + Q_f⁻¹ 3×4 + X_f 3×4 + 族索引 [7]）⇒ "
+                "CS 读不到 X_f / 族索引（短载荷会让 himi_attach_range[4..7] 越界），必须重新导出"
             )
     return problems
 
@@ -1739,6 +2186,22 @@ class ExportHIMI(ExportUnity):
                     + "；".join(placement_problems[:6])
                     + ("；…" if len(placement_problems) > 6 else "")
                 )
+            elif placements:
+                # 【t39-X】族级物体矩阵 `X_f = M_base⁻¹·M_f`：合并后整块只在**宿主族一笔 draw**
+                # 里渲染，缺了它各族就按宿主族摆放（实测偏差 1.0~3.8 游戏单位）。三态：
+                #   * 全部族都有合法 X_f ⇒ 校准（正常路径）；
+                #   * **部分**缺失/不合法 ⇒ `Fatal` 并**指名缺哪族、为什么** —— 这次的证据
+                #     是抓帧 vs-cb3 的对象矩阵，缺一族的成因是确定的，半校准比不校准更坏；
+                #   * 一个都没有（老工作空间没有抓帧）⇒ `_himi_family_x` 里大声警告、不校准，
+                #     导入/导出照常（CS 读到全零 X ⇒ 跳过左乘，与旧行为逐字节等价）。
+                self._himi_family_x()
+                family_x_problems = list(getattr(self, "_himi_family_x_problems", []) or [])
+                if family_x_problems:
+                    raise Fatal(
+                        "族级物体矩阵（t39-X）只拿到一部分族的 X_f（半校准的产物比不校准更坏）："
+                        + "；".join(family_x_problems[:6])
+                        + ("；…" if len(family_x_problems) > 6 else "")
+                    )
         snapshot = plan.contract_snapshot(
             checkbox_enabled=bool(GlobalProterties.import_merged_vgmap())
         )
@@ -2063,12 +2526,44 @@ class ExportHIMI(ExportUnity):
             print(f"{_LOG_PREFIX} {result.get('message')} → {result.get('path')}")
         return result
 
+    def _himi_family_index_map(self, plan=None) -> dict:
+        """【t74】``{family: (own_index, base_index)}``：物体矩阵表（``cs-u1``）里的族序号。
+
+        索引空间**唯一** = :meth:`himi_family_range_items` 的次序（= 发 ini 段的次序），
+        导出侧写载荷 ``[7] = (own, base)`` 与运行期 CS 读它必须是同一套，否则每族会拿别族的
+        M 去算 X。宿主族判不出来 / 不在参与族里 ⇒ 返回 ``{}``：载荷 [7] 全零、CS 的运行期
+        分支退化为「X = 单位阵」，而此时 ``_himi_family_x`` 也必然一个 X 都给不出（同一判据），
+        单位阵与「不左乘」数值等价 ⇒ 与旧产物逐字节一致。
+
+        序号为什么不用 ``plan.family_ranges`` 的下标：借位族（``own_block=False``）不发段、也不写表，
+        但它在 ``family_ranges`` 里占一个键 —— 用它的下标当族序号会让表里出现永远全零的空段。
+        """
+        if plan is None:
+            plan = self.himi_merged_runtime_plan()
+        families = [str(family) for family, _info in (self.himi_family_range_items() or [])]
+        if not families:
+            return {}
+        try:
+            host = self._himi_host_family(plan)
+        except Exception:  # noqa: BLE001 - 族索引是可选增强：宿主族判不出来就关掉运行期分支，
+            # 不能让它把整笔身份资源发布拖红（载荷里的兜底 X_f 仍然正确）。
+            return {}
+        host_family = str(host.get("family") or "") if isinstance(host, dict) and host.get("ok") else ""
+        if host_family not in families:
+            return {}
+        base_index = families.index(host_family)
+        return {family: (index, base_index) for index, family in enumerate(families)}
+
     def _himi_publish_attach_ranges(self, plan, folder_name: str) -> dict:
-        """【F5 + t39】把每族的身份资源（64 B = base/span/ver/magic + ``Q_f``）写进 mod 缓冲目录。
+        """【F5 + t39 + t39-X + t74】把每族的身份资源（128 B = base/span/ver/magic + ``Q_f⁻¹`` + ``X_f`` + 族索引）写进 mod 缓冲目录。
 
         身份资源缺失时 CS 会**退回冻结表**（= 今天的行为，不是静默乱写），但那样 F5 的
         保护就没了 ⇒ 另有文件存在性硬门 :func:`verify_attach_range_references` 在产物落盘
         那一步把它拦死（与 `cs =` 的硬门同款，不降级为 warning）。
+
+        发布成功后还会用**同一组** ``ranges / placements / family_xs / indices`` 调
+        :func:`_himi_verify_attach_range_sync` 复核落盘字节（族数 × 128 B 的四方同步）⇒
+        任何一族不一致即 ``Fatal``，不留「CS 读到的 X_f 与计划不符」的产物。
         """
         folder_path = GlobalConfig.path_generatemod_buffer_folder()
         if folder_name and os.path.basename(os.path.normpath(folder_path)) != folder_name:
@@ -2077,21 +2572,54 @@ class ExportHIMI(ExportUnity):
                 "不一致；ini 的 filename 会指到不存在的路径。",
                 warning=True,
             )
+        ranges = getattr(plan, "family_ranges", None) or {}
+        palette_factors = {}
+        family_xs = {}
         try:
             # 【t44 共同空间取反修复】**载荷存的是 palette 侧要复合的那个因子** = `Q_f⁻¹`
             # （CS 里读出来直接做 `P_f[b] ∘ factor`）。顶点侧用 `Q_f` 本身（`_himi_calibrate_bind_positions`）。
             # 两侧同源同报：都来自同一个 `self._himi_family_placements()`。
-            palette_factors = {}
             for family, matrix in (self._himi_family_placements() or {}).items():
                 palette_factors[family] = himi_runtime.mat3x4_inverse(matrix)
+            # 【t39-X】族级物体矩阵 X_f：载荷 [4..6] = X_f 的 3×4 行；CS 在算完 `P_f ∘ Q_f⁻¹`
+            # 之后对三条结果行各做一次左乘（X 全零 ⇒ CS 跳过，等价旧行为）。契约钩子已保证
+            # 到这里要么全有、要么全无（部分缺失在更早的 `_himi_enforce_contract` 里 Fatal 中止）。
+            try:
+                family_xs = self._himi_family_x()
+                self._himi_publish_family_x_record()
+            except Exception as exc:  # noqa: BLE001 - X_f 只是可选增强（载荷 [4..6] 是兜底），
+                # 算不出来就把整笔身份资源发布一起拖红没有意义：Q_f⁻¹ 与 base/span 仍然要写。
+                family_xs = {}
+                self._himi_notify(f"族级物体矩阵 X_f 计算失败（{exc}）⇒ 不校准", warning=True)
+            # 【t74】族索引：``[7] = (own, base)``，运行期 CS 靠它决定「读表里哪一段当 M_base」。
+            # 与 u1 表的 array=（3 × 族数）同源（= ``himi_family_range_items`` 的次序）。
+            family_indices = self._himi_family_index_map(plan)
+            if family_xs and not family_indices:
+                # 兜底 X 还在、但族索引拿不到 ⇒ 运行期分支不启用。不是错误（载荷兜底照样正确），
+                # 但必须说清：否则用户会以为「已经实时计算」，实际仍在用抓帧常量。
+                self._himi_notify(
+                    "族索引不可用（宿主族判定失败或本次没有可发段的族）⇒ 物体矩阵表（cs-u1）"
+                    "不启用，X_f 退回导出期烘死的载荷兜底（与旧产物逐字节等价）。",
+                    warning=True,
+                )
             result = himi_runtime.publish_attach_ranges(
-                getattr(plan, "family_ranges", None) or {},
+                ranges,
                 folder_path,
                 placements=palette_factors,
+                family_xs=family_xs,
+                indices=family_indices,
             )
         except Exception as exc:  # noqa: BLE001 - 同上：导出通道不得被本模块异常打断
             result = {"ok": False, "written": False, "files": [], "message": f"身份资源发布异常：{exc}"}
         self._himi_attach_range_result = result
+        if result.get("ok"):
+            # 【t39-X/t74 硬门】写出去还不够：**落盘字节**必须与「族区间 / Q_f⁻¹ / X_f / 族索引 /
+            # 128 B」五方一致（`verify_attach_range_files`）。这里用**同一组** ranges/placements/family_xs/indices
+            # 复核，所以文件缺失、被截断、或某族的 Q/X 与发布值不等都会在导出期被拦下 ——
+            # 而不是留一个 CS 读不到 X_f 的产物（那比不校准更坏，与 :1826 的分级同款）。
+            self._himi_verify_attach_range_sync(
+                folder_path, ranges, palette_factors, family_xs, family_indices
+            )
         if not result.get("ok"):
             self._himi_notify(
                 f"家族身份资源未能写入 mod（{result.get('message')}）；"
@@ -2101,6 +2629,39 @@ class ExportHIMI(ExportUnity):
         elif result.get("written"):
             print(f"{_LOG_PREFIX} {result.get('message')} → {folder_path}")
         return result
+
+    def _himi_verify_attach_range_sync(
+        self, folder_path: str, ranges, placements, family_xs, indices=None
+    ) -> list:
+        """【t39-X 硬门】核对**已落盘**的身份资源与「族区间 / Q_f⁻¹ / X_f / 族索引 / 128 B」一致。
+
+        导出期唯一的调用点就是 :func:`_himi_publish_attach_ranges`（发布 ``ok`` 之后、用同一组
+        输入复核），因此这条判据不再只活在 oracle / 单测里：文件缺失、被截断、或某族的 Q_f⁻¹ /
+        ``X_f`` 与发布值**逐字节不等**都会在这里被拦下 —— 分级与 :1826 的「半校准比不校准更坏」
+        同款（``Fatal`` 中止导出），而不是留一个 CS 读不到正确 X_f 的产物。
+
+        返回问题清单（空 = 通过）；``Fatal`` 的局部 import 与 :2108 的既有硬门同款（模块顶部
+        不得新增 import —— fake-包单测按文件路径加载本模块，顶部 import 会在收集期炸）。
+        """
+        from ...utils.format_utils import Fatal
+
+        problems = list(
+            himi_runtime.verify_attach_range_files(
+                folder_path,
+                ranges,
+                placements=placements,
+                family_xs=family_xs,
+                indices=indices,
+            )
+            or []
+        )
+        if problems:
+            raise Fatal(
+                "族级身份资源（t39-X/t74）与发布计划不一致（族数 × 128 B 的四方同步失败）："
+                + "；".join(problems[:6])
+                + ("；…" if len(problems) > 6 else "")
+            )
+        return problems
 
     def himi_attach_range_result(self) -> dict:
         """本次导出的身份资源落盘结果（``{"ok","written","files","message"}``）。"""
@@ -2162,6 +2723,172 @@ class ExportHIMI(ExportUnity):
         if problems:
             print(f"{_LOG_PREFIX} 族级校准：{len(problems)} 个族的摆放不可得 ⇒ 本次导出不做校准")
         return self._himi_placements_cache
+
+    def _himi_host_family(self, plan) -> dict:
+        """【t39-X】宿主族 = **合并几何整块落在哪一族**（需求②：由代码判定，绝不硬编码）。
+
+        判据（唯一）：Position 缓冲字节数最大的那个族。合并骨架的顶点全部落在宿主族的
+        ``<draw_ib>-Position.buf`` 里（``generate_buffer_files`` 按 ``drawib_model.draw_ib`` 落盘），
+        其余族只剩骨架占位行 ⇒ 字节数差距是量级级的（实测 1366904 B vs 132~396 B）。
+        并列时取字典序第一个（``himi_family_x.pick_host_family``）。
+
+        证据优先用**本次导出**的内存缓冲（``drawib_model.category_buffer_dict`` 在
+        ``DrawIBModel.__post_init__`` 里就装配好了，早于任何写盘）；内存里没有任何 Position 时
+        （离线/纯 ini 重建）退回**产物 mod 的 Meshes 目录**。两条路都只认「参与合并的族」
+        （``himi_family_range_items`` 的族集），避免把无关族算进来。
+        """
+        # 【t39-X】延迟 import：`tests/test_himi_stub_objects.py` 等 fake 包前言用 `__path__=[]` 的替身包
+        # 按文件路径加载本模块，模块级 import 会让那些既有测试在**收集期**就 ImportError。
+        from ...common import himi_family_x
+
+        allowed = set()
+        for family, _info in (self.himi_family_range_items() or []):
+            allowed.add(str(family))
+        source = "本次导出的内存 Position 缓冲"
+        sizes = {}
+        for drawib_model in (getattr(self, "drawib_model_list", None) or []):
+            family = str(getattr(drawib_model, "draw_ib", "") or "")
+            if not family or (allowed and family not in allowed):
+                continue
+            buffers = getattr(drawib_model, "category_buffer_dict", None) or {}
+            size = _himi_buffer_byte_size(buffers.get("Position"))
+            if size > sizes.get(family, 0):
+                sizes[family] = size
+        if not any(size > 0 for size in sizes.values()):
+            mod_root = himi_family_x.resolve_mod_root(GlobalConfig.path_workspace_folder())
+            sizes = {}
+            for family, size in (himi_family_x.position_buffer_sizes(mod_root) or {}).items():
+                if allowed and str(family) not in allowed:
+                    continue
+                sizes[str(family)] = int(size or 0)
+            source = f"产物 mod 的 Meshes 目录（{mod_root}）"
+        picked = himi_family_x.pick_host_family(sizes)
+        if not picked.get("ok"):
+            return {"ok": False, "family": "", "size": 0, "source": source,
+                    "note": picked.get("note") or "没有任何族的 Position 缓冲可用于判定宿主族"}
+        return {"ok": True, "family": str(picked.get("family") or ""),
+                "size": int(sizes.get(str(picked.get("family") or ""), 0) or 0), "source": source,
+                "note": picked.get("note") or ""}
+
+    def _himi_family_x_none(self, reason: str) -> dict:
+        """【t39-X】「一个族都没有 X_f」= 第三态：**不校准 + 大声警告**，绝不中止。
+
+        老工作空间没有抓帧、宿主族判不出来、抓帧里没有任何一族有合法对象矩阵 —— 这些都算
+        「全无」。CS 读到全零 X ⇒ 跳过左乘 ⇒ 与旧行为**逐字节等价**（产物仍可用，只是各族
+        仍按宿主族摆放，实测偏差 1.0~3.8 游戏单位）。
+        """
+        self._himi_family_x_skipped = [str(reason or "没有任何一族能给出合法 X_f")]
+        self._himi_family_x_problems = []
+        self._himi_family_x_cache = {}
+        self._himi_notify(
+            "族级物体矩阵（t39-X）：" + str(reason or "没有任何一族能给出合法 X_f")
+            + " ⇒ 本次导出**不做 X_f 校准**（CS 里 X 全零 ⇒ 跳过左乘，与旧行为逐字节等价）；"
+            "产物仍可用，只是各族仍按宿主族摆放。",
+            warning=True,
+        )
+        return {}
+
+    def _himi_family_x(self) -> dict:
+        """【t39-X】``{family: 12 float}``：X_f = M_base⁻¹ · M_f（抓帧 vs-cb3 的对象矩阵）。
+
+        三态（与 ``_himi_family_placements`` 同款）：
+          * **全部**参与族都有合法 X_f ⇒ 返回全部（= 校准）；
+          * **部分**缺失/不合法（0 < 有 X 的族 < 参与族）⇒ ``_himi_family_x_problems`` 非空、
+            缓存清空（契约钩子据此 Fatal 并**指名缺哪族、为什么**）；
+          * **一个都没有**（老工作空间没有抓帧 / 宿主族判不出来）⇒ ``_himi_family_x_skipped``
+            非空 + 大声警告，**不校准**。
+        """
+        from ...common import himi_family_x
+
+        cached = getattr(self, "_himi_family_x_cache", None)
+        if cached is not None:
+            return cached
+        self._himi_family_x_cache = {}
+        self._himi_family_x_problems = []
+        self._himi_family_x_skipped = []
+        self._himi_family_x_record = {}
+        if not bool(GlobalProterties.import_merged_vgmap()):
+            return {}
+        plan = self.himi_merged_runtime_plan()
+        if not getattr(plan, "has_rebinds", False):
+            return {}
+        allowed = set()
+        for family, _info in (self.himi_family_range_items() or []):
+            allowed.add(str(family))
+        if not allowed:
+            return {}
+        host = self._himi_host_family(plan)
+        if not host.get("ok"):
+            return self._himi_family_x_none("宿主族判定失败：" + str(host.get("note") or ""))
+        host_family = str(host.get("family") or "")
+        if host_family not in allowed:
+            return self._himi_family_x_none(
+                f"宿主族 {host_family} 不在本次合并的族里（{len(allowed)} 族）"
+            )
+        participants = himi_family_x.participants_from_plan(plan)
+        family_bares = {}
+        for family in sorted(allowed):
+            bare = str(participants.get(family) or "").strip()
+            if bare:
+                family_bares[family] = bare
+        if not family_bares:
+            return self._himi_family_x_none("没有任何参与族能给出部件名")
+        record = himi_family_x.compute_family_x(
+            GlobalConfig.path_workspace_folder(),
+            host_family=host_family,
+            family_bares=family_bares,
+            host_evidence=str(host.get("note") or ""),
+        )
+        self._himi_family_x_record = record or {}
+        problems = list((record or {}).get("problems") or [])
+        families = dict((record or {}).get("x") or {})
+        if not families:
+            # 【一个都没有】= 第三态：不校准 + 大声警告（老工作空间没有抓帧就是这条路）。
+            return self._himi_family_x_none(
+                "；".join(problems[:4]) if problems else "抓帧里没有任何一族有合法对象矩阵"
+            )
+        if problems:
+            # 【部分】= 半校准比不校准更坏 ⇒ 契约钩子据此 Fatal 并指名缺哪族、为什么。
+            self._himi_family_x_problems = problems
+            return {}
+        missing = sorted(set(allowed) - set(families))
+        if missing:
+            self._himi_family_x_problems = [
+                f"{family}: 没有可用的 X_f（抓帧 vs-cb3 里没有合法对象矩阵）" for family in missing
+            ]
+            return {}
+        self._himi_family_x_cache = families
+        print(
+            f"{_LOG_PREFIX} 族级物体矩阵：{len(families)} 族"
+            f"（宿主 {host_family}；来源 {(record or {}).get('source_frame') or '抓帧'}）"
+        )
+        return self._himi_family_x_cache
+    def _himi_publish_family_x_record(self) -> dict:
+        """【t39-X】把 X_f 的审计记录写进 ``Config/HIMIMergedSkeleton.json`` 顶层 ``FamilyX``。
+
+        纯数据层记录（来源帧目录名、每族所用 draw/来源文件、对偶命中数与最大残差、是否单位阵），
+        供审计；写不进去只警告（绝不让记录失败拖垮导出）。
+        """
+        from ...common import himi_family_x
+
+        record = getattr(self, "_himi_family_x_record", None) or {}
+        if not record:
+            return {"ok": False, "path": "", "note": "没有 X_f 记录（本次导出没有做族级物体矩阵）"}
+        host = self._himi_host_family(self.himi_merged_runtime_plan())
+        audit = himi_family_x.family_x_audit_record(
+            record,
+            host_evidence=str(host.get("note") or ""),
+            mod_root=himi_family_x.resolve_mod_root(GlobalConfig.path_workspace_folder()),
+        )
+        path = os.path.join(
+            GlobalConfig.path_workspace_folder(), "Config", HIMI_MERGED_SKELETON_METADATA_FILE
+        )
+        result = himi_family_x.write_family_x_record(path, audit)
+        if not result.get("ok"):
+            self._himi_notify(
+                "族级物体矩阵记录写入失败：" + str(result.get("note") or ""), warning=True
+            )
+        return result
 
     def _himi_vertex_family_index(self) -> dict:
         """``{family: set((x,y,z) 量化)}``：逐行判「**顶点自己**属于哪个族」（t41/T40-F2）。
@@ -2300,7 +3027,7 @@ class ExportHIMI(ExportUnity):
                 "message": "族级摆放不可得 ⇒ 顶点侧未校准（导出侧硬门会 Fatal）",
             }
         # 【t44 共同空间取反修复】顶点侧用 **Q_f 本身**（不是它的逆）：把本族绑定位置搬进
-        # 「提取帧世界」这个共同空间；palette 侧再写 `P_f[b] · Q_f⁻¹`（见 CS 生成器与 64 B 载荷）。
+        # 「提取帧世界」这个共同空间；palette 侧再写 `P_f[b] · Q_f⁻¹`（见 CS 生成器与 128 B 载荷）。
         # 同族行 `P·Q⁻¹·(Q·v) = P·v` 逐值不变；跨族行 `P_g·Q_g⁻¹·(Q_f·v_f)` —— 顶点先被搬进共同
         # 空间、再被**借出族**的 palette 映到当前世界（这才是"借别人的骨"的正确语义）。
         factors = {}
@@ -2763,7 +3490,7 @@ class ExportHIMI(ExportUnity):
         为什么放在这里：`Meshes/<draw_ib>-Position.buf` 就是在本方法里落盘的
         （``ui/universal/drawib_export_base.py::generate_buffer_files`` 的
         ``category_buffer_dict`` 循环），**改在这里就不会动基类**；
-        且它发生在任何 ini 写盘之前，与 palette 侧（attach CS 的 64 B 载荷）同源同报。
+        且它发生在任何 ini 写盘之前，与 palette 侧（attach CS 的 128 B 载荷）同源同报。
         """
         self._himi_calibrate_bind_positions()
         # 【t49 / t47 方案 A+C】旁写 <fam>-BlendOrigin.buf + 越界引用计数（只新增文件/日志）
@@ -2943,6 +3670,28 @@ class ExportHIMI(ExportUnity):
             family_decl = himi_runtime.build_family_palette_decl(family, int(info["slots"]))
             for line in family_decl.ini_lines():
                 palette_section.append(line)
+        # 【t74】每族 **vs-cb3 的副本**（attach CS 的 `cs-cb1` 源）：资源段只写段名 —— 尺寸与
+        # 布局由 `copy vs-cb3` 的源视图决定（本仓 ZZMI 的 `copy vs-cb1` 先例同款，
+        # `tests/test_zzmi_merged_skeleton_ini.py` 钉死「不许写 type/stride」）。
+        for family, _info in items:
+            for line in himi_runtime.cb3_capture_ini_lines(family):
+                palette_section.append(line)
+        # 【t74】跨族物体矩阵表（`cs-u1`）：3 个 float4 × 族数，运行期由各族自己那段 CS 写入，
+        # 宿主族那笔再读回来算 X = M_base⁻¹·M_own。
+        object_matrix_name = ""
+        try:
+            object_decl = himi_runtime.build_object_matrix_decl(str(plan.role_key), len(items))
+        except Exception as exc:  # noqa: BLE001 - 声明不合法 ⇒ 不发 u1（CS 退回载荷兜底 X）
+            self._himi_notify(
+                f"物体矩阵表（cs-u1）声明不合法（{exc}）⇒ 本次不发布该资源，"
+                "X_f 退回导出期烘死的载荷兜底。",
+                warning=True,
+            )
+            object_decl = None
+        if object_decl is not None:
+            object_matrix_name = str(object_decl.name)
+            for line in object_decl.ini_lines():
+                palette_section.append(line)
         # 【F5】每族的**身份资源**声明（16 字节 = base/span/version/magic）：
         # 它是 base/span 的权威来源，让「本族 span 上界」不再与查表键同源。
         buffer_folder = str(folder_name or himi_runtime.ATTACH_RANGE_DEFAULT_FOLDER)
@@ -2968,6 +3717,7 @@ class ExportHIMI(ExportUnity):
                 base=int(info["base"]),
                 slots=int(info["slots"]),
                 skeleton_name=skeleton_name,
+                object_matrix_name=object_matrix_name,
             ):
                 # 【单文件改写】只动 `cs =` 那一行，其余逐字保留（含 Dispatch / 解绑行）。
                 if line.startswith("cs = "):
@@ -2985,14 +3735,21 @@ class ExportHIMI(ExportUnity):
         self._himi_attach_cs_paths = emitted_paths
 
     def add_unity_vs_texture_override_ib_sections(self, ini_builder: M_IniBuilder, drawib_model):
-        """基类 IB 段 + 每一笔 ``drawindexed`` **之前**插一次 ``run = <该族 attach>``。
+        """基类 IB 段 + 每一笔 ``drawindexed`` **之前**插 ``cb3 捕获`` + ``run = <该族 attach>``。
 
         为什么每笔前都要跑（ZZMI 纪律，`ui/universal/zzmi.py:129-135`）：骨架由各族的 CS
         逐帧填充，而渲染 draw 可能发生在**本族 deform pass 之外的时刻**（多实例/多 IB 共享
         同一 SO 目标）；CS 幂等 ⇒ 每笔前插一次是安全且必要的（少了它 ⇒ 骨架为空 ⇒ 模型
         整体消失）。
 
-        ``run`` 只在该 DrawIB 通过 G1（``_himi_rebind_for`` 非 ``None``）且该族**有专属块**
+        两行**同源**于 ``himi_runtime.render_attach_render_capture_lines``（不在这里拼文本）：
+
+        * ``ResourceHI3Cb3_<fam> = copy vs-cb3 unless_null`` —— 渲染 draw（indexed）的 vs-cb3
+          才是 **160 B / rows 0..7 = 物体矩阵 + 其逆**；deform（non-indexed）draw 的 368 B
+          版本 rows 0..7 不是物体矩阵 ⇒ 采集点必须在这里，运行期 X 才会真正生效。
+        * ``run = <该族 attach>`` —— 必须紧跟捕获行（否则 CS 读到的是别族/上一帧的副本）。
+
+        只在该 DrawIB 通过 G1（``_himi_rebind_for`` 非 ``None``）且该族**有专属块**
         时插入；否则逐字走基类产物。
         """
         before = list(getattr(ini_builder, "ini_section_list", []) or ())
@@ -3008,6 +3765,7 @@ class ExportHIMI(ExportUnity):
         after = list(getattr(ini_builder, "ini_section_list", []) or ())
         new_sections = after[len(before):]
         attach = himi_runtime.attach_section_name(family)
+        capture_lines = himi_runtime.render_attach_render_capture_lines(family)
         touched = 0
         for section in new_sections:
             if getattr(section, "SectionType", None) != M_SectionType.TextureOverrideIB:
@@ -3016,7 +3774,7 @@ class ExportHIMI(ExportUnity):
             out: list = []
             for line in lines:
                 if str(line).strip().startswith("drawindexed"):
-                    out.append("run = " + attach)
+                    out.extend(capture_lines)
                     touched += 1
                 out.append(line)
             if touched:
