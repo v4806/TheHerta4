@@ -1,20 +1,21 @@
-"""导出期接缝焊接：在 ``SubMeshModel`` join 之后的**临时 mesh** 上按缝合边焊接顶点。
+"""导出期接缝焊接：在 ``SubMeshModel`` join 之后的**临时 mesh** 上按缝合边统一接缝顶点属性。
 
-用户最终拍板的方案（2026-10-22，唯一实现方式）：
-    用户已在 Blender 里**手动把需要按距离合并的顶点标记为缝合边（seam edge）**。
-    导出器不再按位置自动猜接缝、也不再自定义代表顶点规则，只按这个标记焊：
+用户最终拍板的方案（2026-10-22，方案 A：只统一属性，不删顶点）：
+    用户已在 Blender 里**手动把需要合并的顶点标记为缝合边（seam edge）**。
+    导出器不再按位置自动猜接缝，只按这个标记处理：
 
 1. 导出器本来就会把同一子网格的所有物体 join 成一个临时 mesh（现有代码）；
 2. join 后给每个顶点 / 每个面打 bmesh int 层「原物体 id」（按 join 顺序的顶点区间、
    loop 区间），供后续 draw 段与形态键使用；
-3. **只在每个分组内**：选中该分组内物体的、且属于缝合边的顶点，调用
-   ``bmesh.ops.remove_doubles(verts=这些顶点, dist=阈值)`` —— 位置合并完全交给
-   Blender 原生实现，代表顶点也由它决定，本模块不做任何优先 / 自定义；
-4. 各分组之间不参与彼此的 ``verts`` 集合，所以不会跨组合并；
-5. 焊接完正常导出（顶点 / 索引 / 形态键 / 帧表由导出器从焊好的 mesh 重新生成）；
-6. draw 段（物体切换）：焊后每个存活面仍带原物体 id，按原物体顺序统计剩余面数 →
-   重算每段 ``index_offset`` / ``index_count``；``match_index_count`` /
-   ``match_first_index`` 等 INI 匹配字段完全不动。
+3. **只在每个分组内**：把该分组内物体的、属于缝合边、且彼此距离在「距离阈值」以内的
+   顶点聚成一处（``cluster_positions``：空间哈希 + 真实距离判定），再把它们的
+   坐标 / 顶点组权重 / 形态键统一到同一个代表顶点。代表优先取该组的常驻物体
+   （出现在多个组里的物体，通常是身体）的顶点，否则取组内最小号顶点；
+4. 顶点行、面、loop、draw 段编号一律不变——所以物体切换与形态键帧表都不受影响，
+   导出器读到的只是一份「接缝两侧属性完全一致」的 mesh；
+5. 各分组之间不参与彼此的顶点集合，所以不会跨组统一；
+6. 接缝两侧的 per-loop 法线也统一到代表顶点的 corner 法线，否则反光会在接缝处
+   留下一条折线；法线统一失败只 warning，不中断导出。
 
 无 seam 边 = 不焊接（warning「没有缝合边标记」）；任何异常整体回退（备份 mesh），
 warning 后继续导出，不中断。
@@ -24,6 +25,7 @@ warning 后继续导出，不中断。
 
 from __future__ import annotations
 
+import math
 import time
 
 import numpy
@@ -59,6 +61,7 @@ def _empty_stats(reason: str) -> dict:
         "total_index_count": 0,
         "seam_edge_count": 0,
         "seam_vertex_count": 0,
+        "unified_vertex_count": 0,
         "group_count": 0,
         "matched_group_count": 0,
         "group_stats": [],
@@ -434,8 +437,93 @@ def polygon_counts_per_range(mesh, ranges) -> dict | None:
 
 
 # ---------------------------------------------------------------------------
-# 4. 执行焊接（bmesh：int 层标原物体 id → 读 seam 边 → 逐组 remove_doubles）
+# 4. 执行焊接（bmesh：int 层标原物体 id → 读 seam 边 → 逐组统一接缝顶点属性）
 # ---------------------------------------------------------------------------
+
+
+def cluster_positions(points, threshold=DEFAULT_WELD_THRESHOLD) -> list:
+    """把位置彼此相距 ``threshold`` 以内的点聚成一簇（空间哈希 + 真实距离判定）。
+
+    只用来给「接缝两侧应该算同一处」的顶点分组；不移动、不删除任何点。
+
+    参数：
+        points: 可迭代的 ``(x, y, z)`` 坐标序列（顺序即返回的成员下标）。
+        threshold: 距离上限（含等号）；非数值 / NaN / ``<= 0`` 时退化成
+            「坐标完全相等才同簇」，与 Blender「按距离合并」填 0 的语义一致。
+
+    返回：
+        ``list[list[int]]``：每个成员数 ``>= 2`` 的簇的下标列表，按最小成员下标排序。
+        单点簇（没有邻居）不返回——调用方只关心能统一的组。
+    """
+    coords = [(float(point[0]), float(point[1]), float(point[2])) for point in points]
+    count = len(coords)
+    if count < 2:
+        return []
+    try:
+        limit = float(threshold)
+    except (TypeError, ValueError):
+        limit = 0.0
+    if not numpy.isfinite(limit) or limit <= 0.0:
+        buckets: dict = {}
+        for index, point in enumerate(coords):
+            buckets.setdefault(point, []).append(index)
+        return sorted(
+            (members for members in buckets.values() if len(members) >= 2),
+            key=lambda members: members[0],
+        )
+
+    limit_sq = limit * limit
+    inverse = 1.0 / limit
+    cells: dict = {}
+    for index, (x, y, z) in enumerate(coords):
+        key = (math.floor(x * inverse), math.floor(y * inverse), math.floor(z * inverse))
+        cells.setdefault(key, []).append(index)
+
+    # 并查集：只用「半邻域」（含自身格 + 13 个正方向偏移），每对点恰好比较一次
+    parent = list(range(count))
+
+    def find(node: int) -> int:
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    def union(left: int, right: int) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    half_neighbourhood = [
+        (0, 0, 0),
+        (1, 0, 0), (1, 1, 0), (1, -1, 0), (1, 0, 1), (1, 0, -1),
+        (1, 1, 1), (1, 1, -1), (1, -1, 1), (1, -1, -1),
+        (0, 1, 0), (0, 0, 1), (0, 1, 1), (0, 1, -1),
+    ]
+    for (cx, cy, cz), members in cells.items():
+        for dx, dy, dz in half_neighbourhood:
+            same_cell = (dx, dy, dz) == (0, 0, 0)
+            candidates = members if same_cell else cells.get((cx + dx, cy + dy, cz + dz))
+            if not candidates:
+                continue
+            for position, left in enumerate(members):
+                left_x, left_y, left_z = coords[left]
+                others = candidates[position + 1:] if same_cell else candidates
+                for right in others:
+                    right_x, right_y, right_z = coords[right]
+                    delta_x = left_x - right_x
+                    delta_y = left_y - right_y
+                    delta_z = left_z - right_z
+                    if delta_x * delta_x + delta_y * delta_y + delta_z * delta_z <= limit_sq:
+                        union(left, right)
+
+    clusters: dict = {}
+    for index in range(count):
+        clusters.setdefault(find(index), []).append(index)
+    return sorted(
+        (members for members in clusters.values() if len(members) >= 2),
+        key=lambda members: members[0],
+    )
 
 
 def _remove_mesh_attribute(mesh, name: str) -> None:
@@ -449,16 +537,16 @@ def _remove_mesh_attribute(mesh, name: str) -> None:
 
 
 def _weld_with_bmesh(obj, owner_ids, face_buckets, weld_groups, threshold) -> dict:
-    """真正的焊接执行器：bmesh 原生 ``remove_doubles``，只喂分组内的 seam 顶点。
+    """真正的焊接执行器：只统一接缝顶点的属性，不增删顶点 / 面 / loop（方案 A）。
 
     步骤（严格按用户拍板的方案）：
     1. 建 bmesh，给每个顶点 / 每个面写 int 层「原物体 id」；
     2. 读 ``bm.edges`` 里 ``edge.seam == True`` 的边 → 缝合边顶点集合；
-    3. 逐组：``verts = [原物体 ∈ 本组 且 属于 seam 顶点 的 bm.verts]``，
-       ``len(verts) >= 2`` 时调用 ``bmesh.ops.remove_doubles(bm, verts=verts,
-       dist=threshold)``；
-    4. 全部组处理完 ``bm.to_mesh(mesh)``；
-    5. 读回焊后每个顶点的原物体 id（顶点 int 层）与每个面的原物体 id（面 int 层）。
+    3. ``cluster_positions`` 按 ``threshold`` 把 seam 顶点聚成「同一处」；
+    4. 逐组、逐簇：把组内成员的坐标 / 顶点组权重 / 形态键统一到代表顶点
+       （代表优先常驻物体，否则组内最小号）；同时记下「代表 → 成员」供法线统一；
+    5. 全部处理完 ``bm.to_mesh(mesh)``；
+    6. 读回焊后每个顶点 / 每个面的原物体 id，并把接缝两侧的 per-loop 法线统一。
     """
     import bmesh
 
@@ -528,17 +616,15 @@ def _weld_with_bmesh(obj, owner_ids, face_buckets, weld_groups, threshold) -> di
             owner for owner, count in owner_group_count.items() if count >= 2
         }
 
-        def _position_key(co) -> tuple:
-            return (
-                round(float(co.x) * 1000000.0),
-                round(float(co.y) * 1000000.0),
-                round(float(co.z) * 1000000.0),
-            )
-
-        seam_verts = _collect_seam_verts()
-        clusters: dict = {}
-        for vert in seam_verts:
-            clusters.setdefault(_position_key(vert.co), []).append(vert)
+        # 聚类键交给「距离阈值」：seam 顶点彼此相距 <= threshold 才算同一处接缝，
+        # 不再用固定的 1e-6 量化网格（那样阈值填什么都不起作用）。
+        seam_verts = sorted(initial_seam_verts, key=lambda vert: vert.index)
+        cluster_members = cluster_positions(
+            [tuple(vert.co) for vert in seam_verts], threshold
+        )
+        clusters: list = [
+            [seam_verts[index] for index in members] for members in cluster_members
+        ]
 
         group_stats: list = []
         for group in weld_groups or []:
@@ -559,8 +645,9 @@ def _weld_with_bmesh(obj, owner_ids, face_buckets, weld_groups, threshold) -> di
 
         before = len(bm.verts)
         unified_vertices = 0
-        unified_normal_map: dict = {}
-        for members in clusters.values():
+        # 代表顶点下标 -> 被统一到它的顶点下标（代表自己也记进去，法线要统一到同一值）
+        unified_pairs: dict = {}
+        for members in clusters:
             if len(members) < 2:
                 continue
             for group in weld_groups or []:
@@ -581,6 +668,9 @@ def _weld_with_bmesh(obj, owner_ids, face_buckets, weld_groups, threshold) -> di
                 else:
                     representative = min(group_members, key=lambda item: item.index)
                 representative_owner = int(representative[vert_layer])
+                pair = unified_pairs.setdefault(int(representative.index), [])
+                if int(representative.index) not in pair:
+                    pair.append(int(representative.index))
                 for vert in group_members:
                     if vert is representative:
                         continue
@@ -599,7 +689,8 @@ def _weld_with_bmesh(obj, owner_ids, face_buckets, weld_groups, threshold) -> di
                     for shape_layer in shape_layers:
                         vert[shape_layer] = representative[shape_layer]
                     unified_vertices += 1
-                    unified_normal_map[int(vert.index)] = int(representative.index)
+                    if int(vert.index) not in pair:
+                        pair.append(int(vert.index))
         after = len(bm.verts)
         for index, item in enumerate(group_stats):
             item["before_vertex_count"] = int(before)
@@ -631,31 +722,14 @@ def _weld_with_bmesh(obj, owner_ids, face_buckets, weld_groups, threshold) -> di
         bm.free()
 
     mesh.update()
-    # 法线统一：导出器读的是 per-loop 法线（mesh.loops.normal）。方案 A 还必须
-    # 把接缝两侧的法线统一到代表顶点，否则表面反光会在接缝处出现一条折线。
-    if unified_normal_map:
+    # 法线统一：导出器读的是 per-loop 法线（mesh.loops.normal，obj_buffer_helper 同款）。
+    # 方案 A 只统一属性，所以接缝两侧必须把 per-loop 法线也统一到**代表顶点自己的
+    # corner 法线**——只改一侧会让折线换个位置出现，用顶点平均法线又会抹掉硬边。
+    if unified_pairs:
         try:
-            import numpy as _numpy
-
-            loop_count = int(len(mesh.loops))
-            loop_vertex = _numpy.empty(loop_count, dtype=_numpy.int32)
-            mesh.loops.foreach_get("vertex_index", loop_vertex)
-            vertex_normals = _numpy.empty(
-                len(mesh.vertices) * 3, dtype=_numpy.float32
-            )
-            mesh.vertices.foreach_get("normal", vertex_normals)
-            vertex_normals = vertex_normals.reshape(-1, 3)
-            loop_normals = _numpy.empty(loop_count * 3, dtype=_numpy.float32)
-            mesh.loops.foreach_get("normal", loop_normals)
-            loop_normals = loop_normals.reshape(-1, 3)
-            for loop_index, vertex_index in enumerate(loop_vertex):
-                rep_index = unified_normal_map.get(int(vertex_index))
-                if rep_index is not None:
-                    loop_normals[loop_index] = vertex_normals[rep_index]
-            mesh.normals_split_custom_set(loop_normals.tolist())
-            mesh.update()
-        except Exception:
-            pass
+            _unify_seam_loop_normals(mesh, unified_pairs)
+        except Exception as exc:
+            _warn(f"[接缝焊接] 接缝法线统一失败（表面可能出现折线）: {exc}")
     _remove_mesh_attribute(mesh, VERT_OWNER_LAYER)
     _remove_mesh_attribute(mesh, FACE_BUCKET_LAYER)
 
@@ -665,7 +739,66 @@ def _weld_with_bmesh(obj, owner_ids, face_buckets, weld_groups, threshold) -> di
         "seam_edge_count": int(seam_edge_count),
         "seam_vertex_count": int(seam_vertex_count),
         "group_stats": group_stats,
+        "unified_vertex_count": int(unified_vertices),
     }
+
+
+def _read_loop_normals(mesh, loop_count: int):
+    """读 per-loop 法线（corner normals），顺序与 ``mesh.loops`` 一致。"""
+    normals = numpy.empty(loop_count * 3, dtype=numpy.float32)
+    corner_normals = getattr(mesh, "corner_normals", None)
+    if corner_normals is not None and len(corner_normals) == loop_count:
+        corner_normals.foreach_get("vector", normals)
+        return normals.reshape(-1, 3)
+    # 老版本 bpy：先让 split normals 就位再逐 loop 读
+    calc = getattr(mesh, "calc_normals_split", None)
+    if callable(calc):
+        calc()
+    mesh.loops.foreach_get("normal", normals)
+    return normals.reshape(-1, 3)
+
+
+def _unify_seam_loop_normals(mesh, unified_pairs: dict) -> None:
+    """把每组接缝顶点（代表 + 被统一侧）的 per-loop 法线写成代表顶点的 corner 法线。"""
+    loop_count = int(len(mesh.loops))
+    vertex_count = int(len(mesh.vertices))
+    if loop_count <= 0 or vertex_count <= 0:
+        return
+    loop_vertex = numpy.empty(loop_count, dtype=numpy.int32)
+    mesh.loops.foreach_get("vertex_index", loop_vertex)
+    loop_normals = _read_loop_normals(mesh, loop_count)
+
+    # 每个顶点的第一条 loop：代表顶点从这里取自己的 corner 法线
+    first_loop_of_vertex = numpy.full(vertex_count, -1, dtype=numpy.int32)
+    for loop_index in range(loop_count - 1, -1, -1):
+        first_loop_of_vertex[int(loop_vertex[loop_index])] = loop_index
+
+    target_normals = numpy.zeros((vertex_count, 3), dtype=numpy.float32)
+    has_target = numpy.zeros(vertex_count, dtype=bool)
+    assigned = 0
+    for representative, members in unified_pairs.items():
+        representative = int(representative)
+        if not 0 <= representative < vertex_count:
+            continue
+        loop_index = int(first_loop_of_vertex[representative])
+        if loop_index < 0:
+            continue
+        normal = loop_normals[loop_index]
+        for member in members:
+            member = int(member)
+            if not 0 <= member < vertex_count:
+                continue
+            target_normals[member] = normal
+            has_target[member] = True
+            assigned += 1
+    if not assigned:
+        return
+    mask = has_target[loop_vertex]
+    if not bool(mask.any()):
+        return
+    loop_normals[mask] = target_normals[loop_vertex[mask]]
+    mesh.normals_split_custom_set(loop_normals.tolist())
+    mesh.update()
 
 
 def _snapshot_mesh(obj):
@@ -683,6 +816,7 @@ def _snapshot_mesh(obj):
 def _restore_mesh(obj, backup) -> None:
     """把物体 data 指回焊接前的副本（失败回退）。"""
     if backup is None:
+        _warn("[接缝焊接] 没有可用的 mesh 备份，无法回退（本次异常可能留下半焊的 mesh）")
         return
     current = getattr(obj, "data", None)
     try:
@@ -718,22 +852,24 @@ def weld_submesh_mesh(
     threshold=DEFAULT_WELD_THRESHOLD,
     weld_executor=None,
 ) -> dict:
-    """在 join 后的临时 mesh 上按「接缝焊接」分组焊接缝合边顶点。
+    """在 join 后的临时 mesh 上按「接缝焊接」分组统一接缝顶点属性（方案 A）。
 
     参数：
         merged_obj: ``SubMeshModel`` join 出来的临时物体（`obj.data` 是合并 mesh）。
         mesh_object_vertex_ranges: ``build_mesh_vertex_ranges`` 的返回值。
         groups: 节点配置的组（``[[物体名, ...], ...]``）；空 = 不焊接。
-        threshold: 距离阈值（默认 0.0001 = Blender「按距离合并」默认值）。
-        weld_executor: 可选的注入执行器（单测用 fake）；默认 bmesh 原生焊接。
+        threshold: 距离阈值——seam 顶点彼此相距不超过它才算同一处接缝
+            （默认 0.0001 = Blender「按距离合并」默认值）。
+        weld_executor: 可选的注入执行器（单测用 fake）；默认 bmesh 方案 A 执行器。
             执行器签名 ``(obj, owner_ids, face_buckets, weld_groups, threshold)``，
             返回 ``{"vertex_owner", "face_buckets", "seam_edge_count",
-            "seam_vertex_count", "group_stats"}``。
+            "seam_vertex_count", "group_stats", "unified_vertex_count"}``。
 
     返回：
-        stats dict；``applied=True`` 表示 mesh 真的被焊接（顶点数下降）。
-        无缝合边标记 / 任何异常 / 校验失败都会整体回退到焊接前的 mesh 副本并返回
-        ``applied=False``，由调用方写 warning 后继续导出。
+        stats dict；``applied=True`` 表示**真的有顶点被统一**（``unified_vertex_count > 0``），
+        顶点数 / 面数不变。无缝合边标记 / 没有可统一的接缝 / 任何异常 / 校验失败都会
+        整体回退到焊接前的 mesh 副本并返回 ``applied=False``，由调用方写 warning 后
+        继续导出。
     """
     started = time.perf_counter()
     stats = _empty_stats("没有可焊接的分组")
@@ -822,13 +958,20 @@ def weld_submesh_mesh(
         stats["seam_vertex_count"] = int(result.get("seam_vertex_count", 0) or 0)
         group_stats = list(result.get("group_stats") or [])
         stats["group_stats"] = group_stats
+        unified_vertex_count = int(result.get("unified_vertex_count", 0) or 0)
+        if not unified_vertex_count:
+            # 注入的 fake 执行器可能只回报分组统计，按成员统计兜底
+            unified_vertex_count = sum(
+                int(item.get("merged_vertex_count", 0) or 0) for item in group_stats
+            )
+        stats["unified_vertex_count"] = unified_vertex_count
         for item in group_stats:
             _log(
                 f"[接缝焊接] {item.get('label')}"
                 f"[{', '.join(item.get('names') or [])}]: "
                 f"seam 顶点 {item.get('seam_vertex_count')}，"
-                f"合并 {item.get('merged_vertex_count')} "
-                f"({item.get('before_vertex_count')} → "
+                f"统一 {item.get('merged_vertex_count')} "
+                f"(顶点 {item.get('before_vertex_count')} → "
                 f"{item.get('after_vertex_count')})"
             )
         if seam_edge_count <= 0:
@@ -923,20 +1066,28 @@ def weld_submesh_mesh(
         return stats
 
     _drop_snapshot(backup)
-    stats["applied"] = True
-    stats["reason"] = ""
+    # 方案 A 只统一属性：顶点数不变，所以「有没有真的焊到东西」只能看统一数
+    unified_vertex_count = int(stats.get("unified_vertex_count", 0) or 0)
+    stats["applied"] = bool(unified_vertex_count > 0)
+    stats["reason"] = (
+        ""
+        if stats["applied"]
+        else "接缝上没有可统一的顶点（分组没匹配上物体，或两侧顶点都属常驻物体被跳过）"
+    )
     stats["removed_vertex_count"] = int(before_vertex_count - after_vertex_count)
     stats["after_vertex_count"] = int(after_vertex_count)
     stats["elapsed_sec"] = time.perf_counter() - started
+    if not stats["applied"]:
+        _warn(f"[接缝焊接] {stats['reason']}；本次不焊接")
     group_text = "；".join(
-        f"{item.get('label')} seam {item.get('seam_vertex_count')} → 合并 "
+        f"{item.get('label')} seam {item.get('seam_vertex_count')} → 统一 "
         f"{item.get('merged_vertex_count')}"
         for item in stats["group_stats"]
     )
     stats["message"] = (
-        f"接缝焊接(seam 驱动): 顶点 {before_vertex_count} → {after_vertex_count}"
-        f"（合并 {stats['removed_vertex_count']}，面数 {polygon_count_before} → "
-        f"{after_polygon_count}，删退化面 {stats['degenerate_face_count']}，"
+        f"接缝焊接(seam 驱动, 方案 A 属性统一): 统一 {unified_vertex_count} 个顶点"
+        f"（顶点数 {before_vertex_count} → {after_vertex_count}，面数 "
+        f"{polygon_count_before} → {after_polygon_count}，"
         f"seam 边 {seam_edge_count} / seam 顶点 {stats['seam_vertex_count']}），"
         f"{group_text or '无分组'}，"
         f"索引 {stats['total_index_count']}（{len(stats['index_segments'])} 段），"

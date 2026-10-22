@@ -81,7 +81,9 @@ class SubMeshModel:
     # 接缝焊接：每个 DrawCall 在 join 后 mesh 中的 loop 区间 / 索引区间（按它把顶点归回物体）
     drawcall_loop_ranges:list = field(init=False, default_factory=list)
     # 接缝焊接配置（导出器从「接缝焊接」后处理节点读取后注入；None = 不焊接）
-    seam_weld_config:dict = field(init=False, default=None, repr=False)
+    # 必须是 init 字段：导出器在构造时按关键字注入（ui/universal/export_helper.py:61），
+    # 写成 init=False 会让 dataclass 生成的 __init__ 不认这个关键字，所有导出直接 TypeError。
+    seam_weld_config:dict = field(default=None, repr=False)
     # 焊接：焊后 mesh 顶点 -> 原物体 id / 导出顶点池行归属
     weld_vertex_owner_map:numpy.ndarray = field(init=False, default=None, repr=False)
     weld_pool_owner_rows:dict = field(init=False, default_factory=dict, repr=False)
