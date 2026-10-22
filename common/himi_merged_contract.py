@@ -217,3 +217,127 @@ def evaluate_merged_skeleton_contract(
         return {"level": "notice", "message": NO_MERGED_DATA_NOTICE, "hint": ""}
 
     return {"level": "ok", "message": "", "hint": ""}
+
+
+# --------------------------------------------------------------------------- #
+# 【方案 B / t78】顶点侧不校准（VertexCalibration = "none"）
+# --------------------------------------------------------------------------- #
+# 语义（唯一事实源，导出侧 / 运行期校验 / oracle / 测试都读这里）：
+#
+# 写槽矩阵 S = X_f · P_f，顶点缓冲**原样**写盘（不乘任何 Q_f）。
+# 为什么去掉顶点侧变换而结果不变：同族 P·Q⁻¹·Q·v ≡ P·v；而真实产物里跨族借用权重行 = 0
+# （_himi_calibrate_bind_positions 逐行诊断可复核），所以顶点侧那一步只是把基态搬进
+# 「提取帧世界」又原路搬回 —— 净效果恒等，却让**形态键通道**（-Position_merged_packed_pos_delta
+# 等，它没有任何 Q 校准）与基态落在两个不同的空间里 ⇒ 运行期 Q·v + δ 而非 Q·(v+δ)。
+#
+# 身份载荷 [1..3] 原先存这个因子（t39–t43 存 Q_f、t44–t77 存 Q_f⁻¹）。方案 B 起
+# **恒为单位阵**：段位与长度保留（CS 的下标、128 B 布局都不动），乘单位阵 = 恒等。
+VERTEX_CALIBRATION_NONE = "none"
+#: 元数据键名（写进 Config/HIMIMergedSkeleton.json 顶层）。
+VERTEX_CALIBRATION_KEY = "VertexCalibration"
+#: 单位阵判据的容差：发布/校验两侧共用（float32 round-trip 误差 ~1e-8，1e-6 留 2 个数量级余量）。
+ATTACH_PLACEMENT_TOLERANCE = 1e-6
+#: 3×4 行主序单位阵（12 个数）—— 载荷 [1..3] 的内容。
+ATTACH_PLACEMENT_IDENTITY = (
+    1.0, 0.0, 0.0, 0.0,
+    0.0, 1.0, 0.0, 0.0,
+    0.0, 0.0, 1.0, 0.0,
+)
+
+
+def attach_placement_identity() -> list:
+    """单位阵的 12 个数（3×4 行主序）。每次返回**新列表**，调用方可以随意改。"""
+    return list(ATTACH_PLACEMENT_IDENTITY)
+
+
+def attach_placement_deviation(rows) -> float:
+    """rows 与单位阵的最大逐元绝对偏差；形状/数值不可用 ⇒ inf。"""
+    try:
+        values = [float(value) for value in rows]
+    except (TypeError, ValueError):
+        return float("inf")
+    if len(values) != 12:
+        return float("inf")
+    return max(abs(a - b) for a, b in zip(values, ATTACH_PLACEMENT_IDENTITY))
+
+
+def attach_placement_problem(
+    rows, *, label: str = "族级摆放段", tolerance: float = ATTACH_PLACEMENT_TOLERANCE
+) -> str:
+    """非空 = 这一段不是单位阵（方案 B 的硬门：那说明产物会被二次缩放/旋转）。
+
+    返回中文原因（直接拼进 Fatal 文案）；空串 = 通过。
+    """
+    deviation = attach_placement_deviation(rows)
+    limit = float(tolerance)
+    if deviation <= limit:
+        return ""
+    return (
+        f"{label}不是单位阵（最大偏差 {deviation:.6g} > {limit:g}）："
+        "方案 B 已取消顶点侧校准，palette 侧只写 S = X_f·P_f ⇒ 载荷 [1..3] 必须是单位阵；"
+        "非单位阵意味着产物会被二次缩放/旋转（t39–t77 的旧口径）"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 【B3 硬门】合并骨架 + 非 Basis 形态键块 + 形态键节点未勾直出 ⇒ 拒绝导出
+# --------------------------------------------------------------------------- #
+SHAPEKEY_DIRECT_MODE_HINT = (
+    "请把**全部**形态键节点（SSMTNode_PostProcess_ShapeKey）的「直出模式 / direct_export_mode」"
+    "勾上（新节点默认已勾选）后重新导出；若本次不需要形态键，请在导出前删掉这些形态键块。"
+    "不要靠关掉形态键块来绕过：标准路线的槽位轮次会先落盘 Meshes1001+，而合并骨架的 Position "
+    "缓冲与全局顶点组编号只对得上 Meshes0000。"
+)
+
+
+def shapekey_direct_mode_problem(
+    *, merged_active: bool, non_basis_blocks: int, needs_standard_rounds: bool
+) -> str:
+    """【B3】返回中文原因；空串 = 放行。
+
+    * merged_active：本次导出是否真的产出了合并骨架（_himi_merged_attach_active()）；
+    * non_basis_blocks：本次导出涉及的非 Basis 形态键块个数（count_exportable_shapekey_blocks）；
+    * needs_standard_rounds：是否有形态键节点**没有**勾直出（= 会走标准槽位轮次）。
+
+    三者同时成立才会互相踩：合并骨架只在 Meshes0000 里重建了骨骼编号，标准路线的形态键轮次
+    会重新烘焙 Position/顶点组，两边对不上 ⇒ 游戏里形态键一开就整块撕裂。
+    """
+    if not merged_active:
+        return ""
+    try:
+        blocks = int(non_basis_blocks or 0)
+    except (TypeError, ValueError):
+        blocks = 0
+    if blocks <= 0:
+        return ""
+    if not needs_standard_rounds:
+        return ""
+    return (
+        f"HIMI 骨骼合并与「标准（非直出）形态键路线」不能同时使用：本次导出产出了合并骨架，"
+        f"同时检测到 {blocks} 个非 Basis 形态键块，且有形态键节点**没有**勾选 direct_export_mode ⇒ "
+        "标准路线会先落盘 Meshes1001+ 的形态键槽位，而合并骨架的 Position 缓冲/全局骨骼编号"
+        "只对得上 Meshes0000，两者混在一起会让形态键一开就整块撕裂。"
+        + SHAPEKEY_DIRECT_MODE_HINT
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 【方案 B / 第 4 项】离线读口径：Config/HIMIMergedSkeleton.json 里的 VertexCalibration
+# --------------------------------------------------------------------------- #
+def read_vertex_calibration(payload) -> str:
+    """从合并骨架元数据（或单看 ``FamilyX`` 段）里读出方案 B 标注。
+
+    导出侧 :func:`ui.universal.himi.ExportHIMI._himi_publish_family_x_record` 把它写进
+    ``FamilyX`` 段；顶层也认，方便旧产物/手写记录。返回空串 = 没有记录（旧产物）。
+    """
+    if not isinstance(payload, dict):
+        return ""
+    direct = payload.get(VERTEX_CALIBRATION_KEY)
+    if isinstance(direct, str) and direct:
+        return str(direct)
+    section = payload.get("FamilyX")
+    if isinstance(section, dict):
+        value = section.get(VERTEX_CALIBRATION_KEY)
+        if isinstance(value, str) and value:
+            return str(value)
+    return ""

@@ -7,10 +7,12 @@
 里渲染，只剩 ``M_base`` ⇒ 每族都被按宿主族摆放（实测偏差 1.0 ~ 3.8 游戏单位）。
 把族级常量左乘进写槽即可复原：
 
-    S = X_f ∘ P_f ∘ Q_f⁻¹        X_f = M_base⁻¹ · M_f
+    S = X_f · P_f        X_f = M_base⁻¹ · M_f
 
-（``Q_f`` = 顶点侧族级校准 t44；顶点侧用 ``Q_f``、palette 侧用 ``Q_f⁻¹``，同族相消 ⇒ 端到端
-有效变换 = ``M_base · X_f · P_f``。）补上这一项后残差从 1.0 ~ 3.8 掉到 5.5e-16 ~ 9.9e-16。
+方案 B（t78 起）：顶点缓冲**原样**写盘、身份资源 ``[1..3]`` 恒为单位阵 ⇒ 净变换
+``M_base · X_f · P_f · v`` 就是游戏侧真值。补上 X_f 后残差从 1.0 ~ 3.8 掉到 5.5e-16 ~ 9.9e-16。
+更早的 t44～t77 曾用「顶点乘 ``Q_f`` + 写槽乘 ``Q_f⁻¹``」成对相消，已废弃：形态键通道不经
+顶点校准，会漏掉其中一半。
 
 cb3 读法 = ``colT``
 -----------------
@@ -617,7 +619,7 @@ def family_x_audit_record(record, *, host_evidence: str = "", mod_root: str = ""
             "DualityStatus": entry.get("DualityStatus", ""),
         }
     return {
-        "Algorithm": "X_f = M_base⁻¹ · M_f（vs-cb3 colT 口径；写槽 S = X_f ∘ P_f ∘ Q_f⁻¹）",
+        "Algorithm": "X_f = M_base⁻¹ · M_f（vs-cb3 colT 口径；写槽 S = X_f · P_f，方案 B）",
         "SourceFrame": str(record.get("source_frame") or ""),
         "FrameAnalysisPath": str(record.get("frame_analysis_path") or ""),
         "HostFamily": str(record.get("host_family") or ""),

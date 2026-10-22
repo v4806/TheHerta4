@@ -2,11 +2,12 @@ r"""T39-X：HIMI 合并骨架的**族级物体矩阵 X_f** 单测（fake 宿主�
 
 覆盖：
 
-A. 112 B 身份资源载荷（头部 + Q_f^-1 + X_f）的发布 / 解码 / 四方同步（含反例）；
+A. 128 B 身份资源载荷（头部 + 单位阵 + X_f）的发布 / 解码 / 四方同步（含反例）；
+   【t78 方案 B】`[1..3]` 不再是 Q_f⁻¹：顶点侧不校准 ⇒ 这一段恒为单位阵，非单位阵必须被拒；
 B. 合并 attach CS 的 X 左乘块存在且被判据接受；**A4 三处变异必须被 merged_attach_hlsl_problems 抓到**；
 C. X 左乘的文本模型（attach_x_model_from_hlsl / compose_x_rows_from_model）与 mat3x4_compose 数值一致；
 D. 宿主族判定 / 骨对偶校验 / 三态 fail-closed 的纯函数部分；
-E. **导出期硬门**：发布路径用同一组 ranges / placements / family_xs 复核落盘字节（族数 × 112 B）；
+E. **导出期硬门**：发布路径用同一组 ranges / 单位阵 / family_xs 复核落盘字节（族数 × 128 B）；
    期望字节数或载荷里的 X 块被改错时必须 Fatal（变异检测）。
 
 本文件只加载「无 bpy」的真实模块（与 tests/test_himi_merged_runtime.py 同款 fake 包前言，但**不加载**
@@ -17,12 +18,16 @@ utils/vertexgroup_utils.py），因此在本机（无 bpy）也能真跑：
 装了 Blender/bpy 的环境用同一条命令即可（前言替身本身不依赖 bpy）。
 """
 
+import ast
 import importlib.util
+import json
+import shutil
 import inspect
 import os
 import struct
 import sys
 import tempfile
+import textwrap
 import types
 import unittest
 from pathlib import Path
@@ -124,6 +129,7 @@ class _FakeDrawIBExportBase:
 
 _install_module(f"{PKG}.ui.universal.drawib_export_base", DrawIBExportBase=_FakeDrawIBExportBase)
 
+_contract = sys.modules[f"{PKG}.common.himi_merged_contract"]
 _runtime = _load_real_module(f"{PKG}.common.himi_merged_runtime", "common/himi_merged_runtime.py")
 _family_x = _load_real_module(f"{PKG}.common.himi_family_x", "common/himi_family_x.py")
 _unity = _load_real_module(f"{PKG}.ui.universal.unity", "ui/universal/unity.py")
@@ -194,25 +200,41 @@ class AttachRangePayloadTests(unittest.TestCase):
         self.assertTrue(decoded["has_family_x"])
         self.assertEqual(_pack12(decoded["placement"]), _pack12(q))
         self.assertEqual(_pack12(decoded["family_x"]), _pack12(x))
+        # 【t78 方案 B】低层编解码器仍原样保留调用方给的 12 个数，但发布路径只允许单位阵：
+        # 这里 Q 非单位阵 ⇒ 解码必须如实报「不是单位阵」，供 verify 侧 fail-closed。
+        self.assertFalse(decoded["placement_is_identity"])
 
-    def test_missing_blocks_are_zero_and_reported_uncalibrated(self):
+    def test_missing_blocks_publish_identity_and_report_uncalibrated(self):
+        """【t78 方案 B】不给 placement ⇒ v2+ 载荷的 [1..3] 写**单位阵**（不再是全零/Q⁻¹）。
+
+        顶点侧已不再校准 ⇒ 载荷里的摆放段只能是单位阵；写全零会让 CS 的
+        ``calibrated`` 门直接跳过（偶合「不乘」），但那样「单位阵」这条契约在载荷里
+        就没有任何证据，verify 也无从 fail-closed。故默认写单位阵、其余 64 B 为 0。
+        """
         payload = _runtime.attach_range_payload(0, 184)
         self.assertEqual(len(payload), 128)
-        self.assertEqual(payload[16:], bytes(112))
+        self.assertEqual(payload[16:64], _pack12(_contract.attach_placement_identity()))
+        self.assertEqual(payload[64:], bytes(64))
         decoded = _runtime.decode_attach_range_payload(payload)
+        self.assertTrue(decoded["ok"])
         # 【t74】``has_indices`` 只表示「载荷里有 [7] 且版本 >= 4」，**不看数值**：全零的 [7]
         # 与「族 0 / 宿主 0」在数值上不可分（CS 侧靠 own==base ⇒ X=单位阵，与「不左乘」等价）。
         self.assertTrue(decoded["has_indices"])
         self.assertEqual((decoded["own_index"], decoded["base_index"]), (0, 0))
+        self.assertTrue(decoded["has_placement"])
+        self.assertTrue(decoded["placement_is_identity"])
+        self.assertFalse(decoded["has_family_x"])
+        # version 1（历史载荷）没有摆放段 ⇒ 仍是 12 个 0.0，且不能报成「单位阵」
+        legacy_v1 = _runtime.decode_attach_range_payload(
+            struct.pack("<4I", 0, 184, 1, _runtime.ATTACH_RANGE_MAGIC) + bytes(112)
+        )
+        self.assertFalse(legacy_v1["has_placement"])
+        self.assertFalse(legacy_v1["placement_is_identity"])
         legacy = _runtime.decode_attach_range_payload(
             struct.pack("<4I", 0, 184, 3, _runtime.ATTACH_RANGE_MAGIC) + bytes(96)
         )
         self.assertFalse(legacy["has_indices"])
         self.assertEqual((legacy["own_index"], legacy["base_index"]), (-1, -1))
-        decoded = _runtime.decode_attach_range_payload(payload)
-        self.assertTrue(decoded["ok"])
-        self.assertFalse(decoded["has_placement"])
-        self.assertFalse(decoded["has_family_x"])
 
     def test_decode_accepts_legacy_64_byte_payload(self):
         legacy = struct.pack("<4I", 0, 184, 3, _runtime.ATTACH_RANGE_MAGIC) + bytes(48)
@@ -252,7 +274,11 @@ class AttachRangePayloadTests(unittest.TestCase):
             "70a4da3e": {"base": 184, "slots": 71, "own_block": True},
             "694025c6": {"base": 255, "slots": 0, "own_block": False},
         }
-        placements = {"2c706fbd": _rotate_z(12.0), "70a4da3e": _rotate_z(-8.0)}
+        # 【t78 方案 B】摆放段只能是单位阵（顶点侧不校准）
+        placements = {
+            "2c706fbd": _contract.attach_placement_identity(),
+            "70a4da3e": _contract.attach_placement_identity(),
+        }
         family_xs = {"2c706fbd": IDENTITY, "70a4da3e": _translate(0.25, 0.5, -0.75)}
         indices = {"2c706fbd": (0, 0), "70a4da3e": (1, 0)}
         result = _runtime.publish_attach_ranges(
@@ -263,6 +289,7 @@ class AttachRangePayloadTests(unittest.TestCase):
         self.assertEqual(len(result["files"]), 2)
         self.assertIn("128 B", result["message"])
         self.assertIn("X_f", result["message"])
+        self.assertIn("单位阵", result["message"])
         self.assertFalse(
             os.path.exists(os.path.join(folder, _runtime.attach_range_basename("694025c6")))
         )
@@ -286,6 +313,29 @@ class AttachRangePayloadTests(unittest.TestCase):
             folder, ranges, placements=placements, family_xs=family_xs, indices=bad_indices
         )
         self.assertTrue([p for p in problems if "族索引" in p])
+
+    def test_publish_refuses_non_identity_placement(self):
+        """【t78 方案 B】fail-closed：非单位阵的摆放段必须**在写盘前**被拒，且目录里不落文件。"""
+        folder = tempfile.mkdtemp(prefix="himi_attach_x_badq_")
+        ranges = {"2c706fbd": {"base": 0, "slots": 184, "own_block": True}}
+        result = _runtime.publish_attach_ranges(
+            ranges, folder, placements={"2c706fbd": _rotate_z(12.0)}
+        )
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["written"])
+        self.assertEqual(result["files"], [])
+        self.assertIn("不是单位阵", result["message"])
+        self.assertEqual(os.listdir(folder), [])
+        # 同时：把已合规的产物手动改坏成非单位阵，verify 必须报出来（上层据此 Fatal）
+        good = os.path.join(folder, _runtime.attach_range_basename("2c706fbd"))
+        _runtime.publish_attach_ranges(ranges, folder)
+        with open(good, "rb") as handle:
+            raw = bytearray(handle.read())
+        raw[16 : 16 + 48] = _pack12(_rotate_z(12.0))
+        with open(good, "wb") as handle:
+            handle.write(bytes(raw))
+        problems = _runtime.verify_attach_range_files(folder, ranges)
+        self.assertTrue([p for p in problems if "不是单位阵" in p], problems)
 
     def test_verify_catches_wrong_x_bytes(self):
         folder = tempfile.mkdtemp(prefix="himi_attach_x_bad_")
@@ -861,7 +911,11 @@ class FamilyXPureTests(unittest.TestCase):
         self.assertIn("Meshes", picked["source"])
 
 class AttachRangeExportGateTests(unittest.TestCase):
-    """t39-X 硬门：发布路径（`_himi_publish_attach_ranges`）必须在写盘后用**同一组**输入复核。"""
+    """t39-X 硬门：发布路径（`_himi_publish_attach_ranges`）必须在写盘后用**同一组**输入复核。
+
+    【t78 方案 B】"同一组"里的摆放段恒为单位阵：`_Stub._himi_family_placements()` 仍返回一个
+    12° 旋转，用于证明确实**不再**被发布路径读取（否则复核会拿旋转去比单位阵而报错）。
+    """
 
     FAMILY = "2c706fbd"
 
@@ -923,7 +977,9 @@ class AttachRangeExportGateTests(unittest.TestCase):
         return sys.modules[f"{PKG}.utils.format_utils"].Fatal
 
     def _expected_placement(self):
-        return _runtime.mat3x4_inverse(_rotate_z(12.0))
+        # 【t78 方案 B】发布/复核都只认单位阵：_Stub._himi_family_placements() 里那个 12° 旋转
+        # 现在是**故意留下的噪声**——发布若还读它，下面的复核立刻失败。
+        return _contract.attach_placement_identity()
 
     def test_gate_passes_on_correct_publish(self):
         stub, result = self._publish()
@@ -1013,6 +1069,388 @@ class AttachRangeExportGateTests(unittest.TestCase):
         message = str(caught.exception)
         self.assertIn("X_f", message)
         self.assertIn(self.FAMILY, message)
+
+
+
+# --------------------------------------------------------------------------- #
+# F. B3 硬门：合并骨架 × 形态键「标准（非直出）路线」互斥
+# --------------------------------------------------------------------------- #
+
+
+class ShapekeyDirectModeGateTests(unittest.TestCase):
+    """B3：合并骨架 + 非 Basis 形态键块 + 形态键节点未勾直出 ⇒ ``Fatal``（四态全覆盖）。
+
+    判据是纯函数（``shapekey_direct_mode_problem``），门只是采集三件事再照着抛；因此四态在这里
+    可以离线复跑，不需要 bpy：物体用 SimpleNamespace 喂 ``_himi_shapekey_object_probe``。
+    """
+
+    class _Stub:
+        def __init__(self, merged_active, blocks, needs_standard):
+            self.merged_active = bool(merged_active)
+            self.blocks = int(blocks)
+            self.needs_standard = bool(needs_standard)
+            self._himi_shapekey_gate_result = None
+
+        def _himi_merged_attach_active(self):
+            return self.merged_active
+
+        def _himi_shapekey_object_probe(self):
+            key_blocks = [object()] * (1 + self.blocks)
+            shape_keys = types.SimpleNamespace(key_blocks=key_blocks)
+            return [types.SimpleNamespace(data=types.SimpleNamespace(shape_keys=shape_keys))]
+
+        def _needs_standard_shapekey_rounds(self):
+            return self.needs_standard
+
+        _himi_shapekey_direct_mode_probe = ExportHIMI._himi_shapekey_direct_mode_probe
+        _himi_non_basis_shapekey_blocks = ExportHIMI._himi_non_basis_shapekey_blocks
+        _himi_enforce_shapekey_direct_mode = ExportHIMI._himi_enforce_shapekey_direct_mode
+
+    def test_contract_four_states(self):
+        cases = [
+            (True, 7, True, True),
+            (True, 7, False, False),
+            (True, 0, True, False),
+            (False, 7, True, False),
+        ]
+        for merged, blocks, needs, danger in cases:
+            problem = _contract.shapekey_direct_mode_problem(
+                merged_active=merged,
+                non_basis_blocks=blocks,
+                needs_standard_rounds=needs,
+            )
+            self.assertEqual(bool(problem), danger, (merged, blocks, needs, problem))
+            if danger:
+                self.assertIn("HIMI 骨骼合并", problem)
+                self.assertIn("形态键", problem)
+                self.assertIn("direct_export_mode", problem)
+                self.assertIn("Meshes1001", problem)
+
+    def test_gate_raises_only_in_the_danger_state(self):
+        fatal = sys.modules[f"{PKG}.utils.format_utils"].Fatal
+        stub = self._Stub(True, 7, True)
+        with self.assertRaises(fatal) as caught:
+            stub._himi_enforce_shapekey_direct_mode()
+        message = str(caught.exception)
+        self.assertIn("HIMI 骨骼合并", message)
+        self.assertIn(_contract.SHAPEKEY_DIRECT_MODE_HINT, message)
+        self.assertEqual(stub._himi_shapekey_gate_result["ok"], False)
+
+    def test_gate_passes_in_the_other_three_states(self):
+        for args in ((True, 7, False), (True, 0, True), (False, 7, True)):
+            stub = self._Stub(*args)
+            result = stub._himi_enforce_shapekey_direct_mode()
+            self.assertTrue(result["ok"], args)
+            self.assertEqual(result["problem"], "")
+            self.assertEqual(stub._himi_shapekey_gate_result["ok"], True)
+
+
+# --------------------------------------------------------------------------- #
+# G. A4 代码层：顶点侧校准彻底消失（数值层由 tools/himi_family_x_oracle.py 的 A4 段取证）
+# --------------------------------------------------------------------------- #
+
+
+class VertexSideCalibrationRemovedTests(unittest.TestCase):
+    """方案 B 的代码层护栏：诊断函数**不写一个字节**、不取 Q，形态键打包器里没有族级校准。"""
+
+    @classmethod
+    def setUpClass(cls):
+        source = inspect.getsource(ExportHIMI._himi_calibrate_bind_positions)
+        cls.source = textwrap.dedent(source)
+        cls.tree = ast.parse(cls.source)
+
+    def test_no_write_back_to_any_row_buffer(self):
+        banned = {"view2d", "group", "target", "block", "floats", "position"}
+        writes = []
+        for node in ast.walk(self.tree):
+            if isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Store):
+                name = getattr(node.value, "id", "")
+                if name in banned:
+                    writes.append(name)
+        self.assertEqual(writes, [], "顶点侧诊断函数里出现了对行缓冲的写回")
+
+    def test_never_looks_up_the_family_placement(self):
+        calls = {
+            node.func.attr
+            for node in ast.walk(self.tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+        self.assertNotIn("_himi_family_placements", calls)
+        self.assertNotIn("mat3x4_inverse", calls)
+
+    def test_contract_no_longer_gates_on_family_placements(self):
+        # 【t78 方案 B】Q_f 不参与任何变换 ⇒ 摆放读不到不能再降级合并骨架（否则白白丢产物）。
+        # 判据是源码级：`_himi_enforce_contract` 里不得再出现 `not placements` 的降级门。
+        text = inspect.getsource(ExportHIMI._himi_enforce_contract)
+        self.assertNotIn("not placements", text, "摆放缺失仍在降级合并骨架（方案 B 下 Q_f 已不参与变换）")
+        self.assertIn("_himi_family_x()", text, "X_f 的三态门必须仍在契约判定里")
+
+    def test_no_uint8_byte_payload_roundtrip(self):
+        # 旧写回的指纹：numpy.frombuffer(view2d.tobytes(), dtype=numpy.uint8) 的结果再整体赋值回源缓冲。
+        # 注释里提到过这行代码，所以判据必须是 AST（看真实的 dtype=numpy.uint8 调用）而不是找字符串。
+        found = []
+        for node in ast.walk(self.tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not (isinstance(func, ast.Attribute) and func.attr == "frombuffer"):
+                continue
+            for keyword in node.keywords:
+                value = keyword.value
+                if (keyword.arg == "dtype" and isinstance(value, ast.Attribute)
+                        and value.attr == "uint8"):
+                    found.append(getattr(value, "lineno", 0))
+        self.assertEqual(found, [], "顶点侧诊断函数里仍有 uint8 字节级重解释（旧写回手法）")
+
+    def test_diagnostic_call_site_is_kept_before_super(self):
+        entry = inspect.getsource(ExportHIMI.generate_buffer_files)
+        self.assertIn("_himi_calibrate_bind_positions", entry)
+        self.assertLess(
+            entry.index("_himi_calibrate_bind_positions"),
+            entry.index("super().generate_buffer_files"),
+        )
+
+    def test_shapekey_writer_has_no_family_calibration(self):
+        path = REPO_ROOT / "blueprint" / "direct_export_shapekey_output_mixin.py"
+        text = path.read_text(encoding="utf-8")
+        for token in ("mat3x4_inverse", "himi_attach_range", "ATTACH_RANGE", "placement"):
+            self.assertNotIn(token, text, "形态键打包器里出现族级校准痕迹：" + token)
+
+
+# --------------------------------------------------------------------------- #
+# H. 跨族借用权重：方案 B 精确、旧 Q 方案必然错（真实工作空间数据，不 mock 矩阵）
+# --------------------------------------------------------------------------- #
+
+REAL_WORKSPACE = "K:/SSMT-Package-master/WorkSpace/HIMI/嗨♪爱愿妖精♥"
+
+
+def _read_position_rows(path, stride=44):
+    with open(path, "rb") as handle:
+        raw = handle.read()
+    count = len(raw) // stride
+    return [struct.unpack_from("<3f", raw, index * stride) for index in range(count)]
+
+
+class CrossFamilyBorrowingTests(unittest.TestCase):
+    """把权重打在**别族**的槽上：方案 B 给出真值，旧 Q 方案多出 Q_g⁻¹·Q_f ⇒ 必然错。
+
+    一行代数：LBS 是 ``world = Σ w_i·S[c_i]·v``，作用在 v 上的任何常量都能搬到槽上而不改变结果。
+    方案 B 下五族顶点同处一个角色空间（实测 bbox 同处身高 1.69、脚 y≈0），槽里存 ``X_g·P_g[k]``
+    对**任何族**的顶点都给真值 ``M_g·P_g[k]·v``。旧方案因为顶点被乘了 ``Q_f``，跨族借用会多出
+    ``Q_g⁻¹·Q_f``，而实测各族 Q 两两相差 133°–180°，必然错。
+
+    数据全部来自真实工作空间：palette（``-BoneMatrix.buf``）、vs-cb3 对象矩阵、``X_f``、Position 行。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        if not os.path.isdir(REAL_WORKSPACE):
+            raise unittest.SkipTest("真实工作空间缺失：" + REAL_WORKSPACE)
+        frame = _family_x.resolve_frame_analysis_dir(REAL_WORKSPACE)
+        if not frame.get("ok"):
+            raise unittest.SkipTest("抓帧不可用：" + str(frame.get("note")))
+        frame_dir = str(frame.get("path") or "")
+        mod_root = _family_x.resolve_mod_root(REAL_WORKSPACE)
+        sizes = {}
+        for name in sorted(os.listdir(mod_root)):
+            if not name.startswith("Meshes"):
+                continue
+            folder = os.path.join(mod_root, name)
+            if not os.path.isdir(folder):
+                continue
+            for entry in sorted(os.listdir(folder)):
+                if not entry.endswith(_family_x.POSITION_BUFFER_SUFFIX):
+                    continue
+                family = entry[: -len(_family_x.POSITION_BUFFER_SUFFIX)]
+                size = os.path.getsize(os.path.join(folder, entry))
+                if size > sizes.get(family, -1):
+                    sizes[family] = size
+        host = _family_x.pick_host_family(sizes)
+        if not host.get("ok"):
+            raise unittest.SkipTest("宿主族判定失败：" + str(host.get("note")))
+        host_family = str(host.get("family") or "")
+        plan = _runtime.load_workspace_plan(REAL_WORKSPACE)
+        participants = _family_x.participants_from_plan(plan)
+        if not getattr(plan, "ok", False) or not participants:
+            raise unittest.SkipTest("运行时计划不可用：" + str(getattr(plan, "message", "")))
+        record = _family_x.compute_family_x(
+            REAL_WORKSPACE,
+            host_family=host_family,
+            family_bares=participants,
+            host_evidence=str(host.get("note") or ""),
+        )
+        if record.get("problems"):
+            raise unittest.SkipTest("X_f 计算有问题：" + "；".join(record["problems"]))
+        x_by_family = {
+            str(key): [float(value) for value in matrix]
+            for key, matrix in (record.get("x") or {}).items()
+        }
+        palettes = {}
+        rows_by_family = {}
+        matrices = {}
+        for family, bare in sorted(participants.items()):
+            got = _family_x.read_family_palette(REAL_WORKSPACE, bare)
+            if not got.get("ok"):
+                raise unittest.SkipTest("族 palette 不可读：" + family + " — " + str(got.get("note")))
+            palettes[family] = got
+            draw = str(((record.get("families") or {}).get(family) or {}).get("Draw") or "")
+            matrix = _family_x.read_draw_object_matrix(frame_dir, draw)
+            if not matrix.get("ok"):
+                raise unittest.SkipTest("族对象矩阵不可读：" + family + " — " + str(matrix.get("note")))
+            matrices[family] = [float(value) for value in matrix["matrix"]]
+            source_rows = []
+            # participants 的值是 LOD0 目录名（"LOD0.<bare>"），磁盘上的子目录名去掉了前缀
+            bare_name = bare[len("LOD0."):] if bare.startswith("LOD0.") else bare
+            lod = os.path.join(REAL_WORKSPACE, "LOD0", bare_name)
+            types_here = sorted(os.listdir(lod)) if os.path.isdir(lod) else []
+            for type_name in types_here:
+                path = os.path.join(lod, type_name, bare_name + _family_x.POSITION_BUFFER_SUFFIX)
+                if os.path.isfile(path):
+                    source_rows = _read_position_rows(path)
+                    break
+            step = max(1, len(source_rows) // 48)
+            rows_by_family[family] = source_rows[::step][:48]
+        cls.data = {
+            "host": host_family,
+            "m_base": matrices.get(host_family),
+            "matrices": matrices,
+            "palettes": palettes,
+            "x": x_by_family,
+            "rows": rows_by_family,
+        }
+
+    def test_scheme_b_is_exact_and_the_old_q_scheme_is_wrong(self):
+        data = self.data
+        m_base = data["m_base"]
+        if not m_base:
+            self.skipTest("宿主族对象矩阵缺失")
+        worst_new = 0.0
+        worst_old = 0.0
+        witness = {}
+        for vertex_family, rows in sorted(data["rows"].items()):
+            if not rows:
+                continue
+            for slot_family, palette in sorted(data["palettes"].items()):
+                if slot_family == vertex_family:
+                    continue
+                x_g = data["x"].get(slot_family)
+                m_g = data["matrices"].get(slot_family)
+                if not x_g or not m_g:
+                    continue
+                slots = list(palette.get("slots") or [])
+                if len(slots) < 2:
+                    continue
+                # 顶点被「自己族」的 Q_f 搬过；槽里乘的是「槽族」的 Q_g⁻¹ —— 两者族不同才有偏差
+                vertex_slots = list((data["palettes"].get(vertex_family) or {}).get("slots") or [])
+                if not vertex_slots:
+                    continue
+                q_f = vertex_slots[0]
+                q_g_inverse = _runtime.mat3x4_inverse(slots[0])
+                for slot_index in range(1, min(len(slots), 12)):
+                    p_slot = slots[slot_index]
+                    left_new = _runtime.mat3x4_compose(
+                        m_base, _runtime.mat3x4_compose(x_g, p_slot))
+                    left_old = _runtime.mat3x4_compose(
+                        m_base,
+                        _runtime.mat3x4_compose(
+                            x_g, _runtime.mat3x4_compose(p_slot, q_g_inverse)),
+                    )
+                    truth_left = _runtime.mat3x4_compose(m_g, p_slot)
+                    for point in rows:
+                        truth = _runtime.mat3x4_apply(truth_left, point)
+                        got_new = _runtime.mat3x4_apply(left_new, point)
+                        moved = _runtime.mat3x4_apply(q_f, point)
+                        got_old = _runtime.mat3x4_apply(left_old, moved)
+                        new_delta = max(abs(a - b) for a, b in zip(got_new, truth))
+                        old_delta = max(abs(a - b) for a, b in zip(got_old, truth))
+                        if new_delta > worst_new:
+                            worst_new = new_delta
+                            witness["new"] = (vertex_family, slot_family, slot_index)
+                        if old_delta > worst_old:
+                            worst_old = old_delta
+                            witness["old"] = (vertex_family, slot_family, slot_index)
+        self.assertGreater(worst_old, 0.0, "没有任何跨族组合被检查到（数据缺失？）")
+        self.assertLessEqual(
+            worst_new, 1e-6,
+            "方案 B 的跨族真值偏差过大：" + repr(worst_new) + " " + repr(witness.get("new")))
+        self.assertGreater(
+            worst_old, 1e-2,
+            "旧 Q 方案的跨族偏差只有 " + repr(worst_old) + " ⇒ 护栏不是恒真")
+
+
+class FamilyXRecordVertexCalibrationTests(unittest.TestCase):
+    """第 4 项契约元数据：``Config/HIMIMergedSkeleton.json`` 必须留下 ``VertexCalibration: "none"``。
+
+    【t78 方案 B】顶点侧不校准这件事不能只活在代码里 —— 离线 oracle / 排查的人要能从产物元数据
+    读到它，否则拿到旧产物（t39–t77 的 Q_f⁻¹ 口径）无法与方案 B 区分。
+    """
+
+    def setUp(self):
+        self.tempdir = tempfile.mkdtemp(prefix="himi_familyx_record_")
+        os.makedirs(os.path.join(self.tempdir, "Config"), exist_ok=True)
+        self.path = os.path.join(self.tempdir, "Config", "HIMIMergedSkeleton.json")
+        with open(self.path, "w", encoding="utf-8") as handle:
+            handle.write('{"SlotCount": 343, "SkeletonDigest": "deadbeef"}')
+        self._previous_workspace = _GLOBAL_STATE["workspace"]
+        _GLOBAL_STATE["workspace"] = self.tempdir
+        warnings = []
+
+        class Stub(object):
+            _himi_family_x_record = {
+                "families": {
+                    "2c706fbd": {
+                        "Bare": "2c706fbd-3207-60639",
+                        "Draw": "Draw_0",
+                        "X": list(IDENTITY),
+                        "IsIdentity": True,
+                        "Duality": {"hits": 31066, "total": 31066, "max_residual": 1e-16},
+                    },
+                },
+                "host_family": "2c706fbd",
+                "source_frame": "FrameAnalysis-2026-09-23-140134",
+            }
+
+            def _himi_host_family(self, plan):
+                return {"note": "宿主族判定：Position 缓冲最大 2c706fbd（31066 行）"}
+
+            def himi_merged_runtime_plan(self):
+                return types.SimpleNamespace(family_ranges={})
+
+            def _himi_notify(self, message, warning=False):
+                warnings.append((message, warning))
+
+        Stub._himi_publish_family_x_record = ExportHIMI._himi_publish_family_x_record.__get__(Stub(), Stub)
+        self.stub = Stub()
+        self.warnings = warnings
+
+    def tearDown(self):
+        _GLOBAL_STATE["workspace"] = self._previous_workspace
+        shutil.rmtree(self.tempdir, ignore_errors=True)
+
+    def test_record_carries_vertex_calibration_none(self):
+        result = self.stub._himi_publish_family_x_record()
+        self.assertTrue(result.get("ok"), result)
+        with open(self.path, encoding="utf-8") as handle:
+            payload = json.load(handle)
+        self.assertEqual(payload["SlotCount"], 343, "既有键必须保留（只加 FamilyX 一个顶层键）")
+        self.assertEqual(payload["SkeletonDigest"], "deadbeef")
+        section = payload["FamilyX"]
+        self.assertEqual(section[_contract.VERTEX_CALIBRATION_KEY], _contract.VERTEX_CALIBRATION_NONE)
+        self.assertIn("S = X_f · P_f", section["Algorithm"])
+        self.assertNotIn(
+            "P_f ∘ Q_f⁻¹", section["Algorithm"], "旧公式 S = X_f ∘ P_f ∘ Q_f⁻¹ 不能留在元数据里")
+        self.assertEqual(_contract.read_vertex_calibration(payload), "none")
+        self.assertEqual(_contract.read_vertex_calibration(section), "none")
+
+    def test_reader_reports_empty_for_legacy_products(self):
+        self.assertEqual(_contract.read_vertex_calibration({"SlotCount": 3}), "")
+        self.assertEqual(_contract.read_vertex_calibration({}), "")
+        self.assertEqual(_contract.read_vertex_calibration(None), "")
+        self.assertEqual(
+            _contract.read_vertex_calibration({"FamilyX": {"Algorithm": "S = X_f ∘ P_f ∘ Q_f⁻¹"}}),
+            "",
+            "旧产物（没有 VertexCalibration 键）必须读成空串，不能被误判成方案 B",
+        )
 
 
 if __name__ == "__main__":

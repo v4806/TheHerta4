@@ -2025,5 +2025,32 @@ cd E:\代码\TheHerta4 ; .\.venv\Scripts\python.exe -m pytest -q
 | `.dbg/_t46_proof_docstring_only.py` | **T46**：证明 docstring 改动**零代码**（逆向替换回到旧 sha + 剥离 docstring 的 AST 相同） |
 | `reports/himi-merge/05-decisions.md` §3.24 / §3.25 | T44 的两条裁定（C17 拆解 / 白名单边界）；**T45-T46 的裁定与回写（含 T45-F4 登记）** |
 
+### 13.19 t78：形态键与合并骨架的无损兼容 —— **顶点侧校准整块删除（方案 B）**（2026-10-22；离线验收完成，待形态键实机复验）
+
+**现象**：用户报「HIMI 下形态键配置的生成有问题」——按键有反应，但位置错乱、撕裂或整块飞走；路线走的是直出（`direct_export_mode`）。
+
+**真根因**：顶点侧族级校准 `Q_f`（t44 起，`ui/universal/himi.py` `_himi_calibrate_bind_positions`）只改写 Position 缓冲的**前三个通道**（44 B/行 = P12 N12 C4 TA16）；形态键走的是另一条通道（`blueprint/direct_export_shapekey_output_mixin.py` 打包 base + 增量），**从不经过这一步** ⇒ 运行期实际算的是 `Q·v_base + δ_ws`，而正确应是 `Q·(v_base + δ_ws)`。宿主族 `Q = I` 所以宿主看着没事，另外四族缺旋转与 1.6× 缩放 ⇒ 撕裂/飞走。产物指纹：`-Position_merged_packed_pos_delta.buf` 由 32220 B 变 **32196 B**，因为旧增量里混着 `v − Q·v` 这份错误差值。
+
+**为什么可以整块删（不再用"把 Q 扩到形态键"那种补丁）**：LBS 恒等式 `world = Σ wᵢ·S[cᵢ]·v` —— 作用在顶点上的任何常量 T 都能搬到它用到的**每一个槽**上（`S → S·T⁻¹`）而结果不变 ⇒ **顶点侧校准从来不是必需项**。旧方案的 `Q_f`/`Q_f⁻¹` 本就精确相消（实测矩阵元差 1.110e-15），唯一还活着的效果就是让形态键那条路漏乘一半。方案 B 两侧一起删：写槽 `S = X_f · P_f`，顶点缓冲原样写盘。
+
+**顺带撤销一条我方写错的门**：t78 初稿曾令「跨族借用权重 > 0 ⇒ Fatal」。方案 B 下五族顶点同处一个角色空间（bbox 同处身高 1.69、脚在 y≈0），槽里存 `X_g·P_g[k]`，对**任何族**的顶点都给真值 `M_g·P_g[k]·v` ⇒ **跨族借用天然正确**；旧方案反而会多出 `Q_g⁻¹·Q_f`（各族 Q 第 0 槽两两相差 133.38°–180.00°）必然错。现降级为一条警告 + 正向单测（≤1e-6）+ 反向护栏（旧公式 >1e-2），产物里该值实测 = 0。
+
+**修法（6 条）**
+
+1. `_himi_calibrate_bind_positions` 改为**只读诊断**（读 `view2d` 统计，一个字节都不写回）。
+2. palette 侧不再乘 `Q_f⁻¹`；身份资源仍 **128 B / version 4**，`[1..3]` 发布**单位阵**，并在 `common/himi_merged_runtime.py verify_attach_range_files` 与契约层**无条件**断言（容差 1e-6）。
+3. `Config/HIMIMergedSkeleton.json` 记 `FamilyX.VertexCalibration = "none"`、`FamilyX.Algorithm = "S = X_f · P_f（方案 B…）"`。
+4. **B3 硬门**：合并骨架 + 存在非 Basis 键块 + `blueprint/direct_export.py:580-586 _needs_standard_shapekey_rounds()`（有节点没勾 `direct_export_mode`）⇒ 导出前置 `Fatal`。位置必须是 `ui/universal/himi.py:2309 _himi_enforce_shapekey_direct_mode`（`export()` 里、`super().export()` **之前**）——**不能**挂在 `common/m_ini_helper.py`：直出时 `blueprint/direct_export.py:659` 置 suppress，那段直接 return，告警永远不会出现。
+5. 口径注释同步：`common/himi_merged_runtime.py` 载荷版本表、`common/himi_merged_contract.py`、`common/himi_family_x.py` 头 docstring 与 `family_x_audit_record` 的默认 Algorithm 文案。
+6. 测试：`tests/test_himi_family_x.py` 新增 `ShapekeyDirectModeGateTests` / `VertexSideCalibrationRemovedTests` / `CrossFamilyBorrowingTests` / `FamilyXRecordVertexCalibrationTests` 四类；oracle 增 `A1-B`（旧 vs 新）双通道。
+
+**验收证据（离线，可复跑）**
+
+- `tools/himi_family_x_oracle.py`（`PYTHONUTF8=1`）⇒ **ORACLE PASS**：A1 矩阵元 7.386e-08 / 端到端世界 8.207e-08 / **A1-B 旧 vs 新 1.110e-15** / A1-RT 2.220e-16 / A2 反向护栏 5.361728397399057（694025c6 2.796 / 70a4da3e 0.869 / b35cfc6c 3.109 / def0c0ae 5.362 / 宿主 0）/ A3 载荷 128 B·`[1..3]` 单位阵·`[7]` 族索引 / 真实顶点行 19895+3363+3789+1816+1496。
+- 重导产物（2026-10-22 16:47:22）：`2c706fbd-Position.buf` **31066 行**、bbox 最长边 **4.49 → 1.8107**（方案 B 确已生效）；AttachRange 全 128 B、`[1..3]` 残差 **0.00e+00**、X 三行与上一版逐位相同；Blend 跨族行 **0**、权重和恒 1.000000；ini 5 个 attach 段各 11 行非空，**每一个** `run` 前紧邻本族 cb3 副本。
+- `pytest tests/test_himi_family_x.py tests/test_himi_merged_runtime.py` ⇒ 245 passed / 26 subtests（另 2 条既存环境失败：`位面武器·失序时空` 的 `Config/FrameAnalysisPath.json` 指向已删的 `FrameAnalysis-2026-10-16-220530`，与本次改动无关）。
+
+**遗留（不在本次边界，未动）**：`blueprint/*` 共享路径上三条与行序相关的隐患——(a) 前处理采 evaluated mesh 顶点序、与 `obj.data` 无相等断言（`blueprint/preprocess.py:823-839`）；(b) 坐标不随 loop 索引刷新（`:864-870`/`:884`）；(c) 范围靠名字/前缀回退匹配（`blueprint/direct_export_shapekey_runtime_mixin.py:197-203`）。三条影响所有游戏类型，仅作为后续建议上报。
+
 ---
 

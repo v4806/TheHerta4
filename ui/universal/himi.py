@@ -73,7 +73,11 @@ from ...common.global_config import GlobalConfig
 from ...common.global_properties import GlobalProterties
 from ...common.himi_merged_contract import (
     DEFORM_GATE_REJECT_PREFIX,
+    VERTEX_CALIBRATION_KEY,
+    VERTEX_CALIBRATION_NONE,
+    attach_placement_identity,
     evaluate_merged_skeleton_contract,
+    shapekey_direct_mode_problem,
 )
 from ...utils.json_utils import JsonUtils
 from ...common.himi_skeleton import (
@@ -545,12 +549,11 @@ def merged_attach_hlsl_text(decl=None) -> str:
     lines.append("    uint src = bone_index * 3u;                 // 读侧索引：bone * 3u")
     lines.append(f"    uint dst = target_slot * 3u;                // 写侧索引：slot * 3u")
     lines.append("")
-    lines.append("    // 【t39/t44 族级校准·palette 侧】写进合并骨架的必须是 P'_f[b] = P_f[b] ∘ Q_f⁻¹")
-    lines.append("    // （Q_f = 该族 palette 第 0 槽；因子 Q_f⁻¹ 把「提取帧世界」映到「当前世界」；")
-    lines.append("    //  顶点侧已先把本族绑定位置搬进共同空间 v' = Q_f·v）")
-    lines.append("    // ⇒ 同一族的骨 × 同一族的顶点 **逐值不变**（P·Q⁻¹·Q·v = P·v），")
-    lines.append("    // 而跨族借用别人的骨时，顶点会先被搬进**共同空间**再被借出族的 palette 映出去。")
-    lines.append("    // 因子与 base/span 同源同报（同一个 cs-t1 载荷，128 B），版本 < 3 或因子全零 ⇒ 不校准。")
+    lines.append("    // 【t39/t44 历史 · t78 方案 B】这一段原本复合法因子 Q_f⁻¹（P'_f[b] = P_f[b] ∘ Q_f⁻¹，")
+    lines.append("    // 配合顶点侧 v' = Q_f·v）。方案 B 取消顶点侧校准后 `[1..3]` **恒为单位阵** ⇒ 这里")
+    lines.append("    // 乘的是恒等变换：写进合并骨架的就是 S = X_f · P_f（游戏侧 M_base·S·v = M_f·P_f·v）。")
+    lines.append("    // 代码保留只为兼容既有 128 B 载荷布局与 CS 下标（删掉它就要同时改 ini/载荷/ABCD 对齐）；")
+    lines.append("    // 版本 < 3 或这一段全零 ⇒ 直接跳过（与旧行为一致，两种都等价于恒等）。")
     lines.append("    float4 placement0 = himi_attach_range[1];")
     lines.append("    float4 placement1 = himi_attach_range[2];")
     lines.append("    float4 placement2 = himi_attach_range[3];")
@@ -584,7 +587,7 @@ def merged_attach_hlsl_text(decl=None) -> str:
     lines.append("    // 【t39-X 族级物体矩阵】合并几何整块落在**宿主族**的一笔 draw 里 ⇒ 那一刻只有")
     lines.append("    // 宿主族的对象矩阵 M_base；而各族真值是 world = M_f·(P_f·v) ⇒ 必须再左乘")
     lines.append("    // X_f = M_base⁻¹·M_f：")
-    lines.append("    //     S = X_f ∘ (P_f ∘ Q_f⁻¹)")
+    lines.append("    //     S = X_f ∘ P_f ∘ (单位阵) = X_f · P_f   ← 方案 B：[1..3] 恒为单位阵")
     lines.append("    // 【t74 X 的来源】主路径 = **运行期从本族 vs-cb3 实时算**（下面的选择块）；载荷")
     lines.append("    // [4..6] 是导出期烘死的同一份 X_f，只在 cb3 拿不到/校验不过时兜底。")
     lines.append("    // X 与 Q 是**两个独立开关**：X 的 12 个数全零 ⇒ 不左乘（逐字节等价旧行为）；")
@@ -788,7 +791,7 @@ def merged_attach_hlsl_problems(text: str) -> list:
             "缺【F5】本族 span 上界（if (span_slots > 0u && bone_index >= span_slots) return;）——"
             "副本维度大于本族 span 时会把多出的骨写进下一族的块"
         )
-    # ---- 【t39】族级校准（palette 侧 P' = P ∘ Q_f）----
+    # ---- 【t39/t78 方案 B】palette 侧只写 S = X_f·P_f（载荷 [1..3] 恒为单位阵，这里仍当因子复合）----
     if "himi_attach_range[1]" not in code or "himi_attach_range[2]" not in code \
             or "himi_attach_range[3]" not in code:
         problems.append(
@@ -829,9 +832,10 @@ def merged_attach_hlsl_problems(text: str) -> list:
             "【t41/T40-F3】缺 `float3 placement_t = float3(placement0.w, placement1.w, placement2.w);`"
             "（平移列必须按行取 `placement_k.w` 再与 `src_i.xyz` 点积）"
         )
-    # ---- 【t44】「取反盲区」文本门：palette 侧必须是 `P ∘ Q⁻¹`（因子由载荷给出），
-    # 顶点侧必须是 `Q·v`（在 `_himi_calibrate_bind_positions` 里）。文本这一侧只能检查
-    # 「载荷被当因子直接复合」（不在 CS 里再求逆），方向本身由数值门 + 盲区用例钉住。
+    # ---- 【t44 / t78 方案 B】文本门保留原样：palette 侧仍把载荷当**因子**直接复合
+    # （`P ∘ factor`），但方案 B 起那个因子**恒为单位阵**（顶点侧不再搬顶点，见
+    # `_himi_calibrate_bind_positions` 的只读诊断）。这一段不删，因为它是「载荷必须在 CS 里
+    # 当因子用、不能在 CS 里再求逆」的护栏；数值语义由 verify_attach_range_files 的单位阵断言钉住。
     if "himi_attach_range[1]" not in code or "placement_t" not in code:
         problems.append("【t44】palette 侧必须把载荷当**因子**直接复合（`P ∘ factor`，factor = Q⁻¹）")
     for index in (0, 1, 2):
@@ -1273,7 +1277,7 @@ def verify_attach_range_references(ini_text: str, mod_root: str) -> list:
             problems.append(
                 f"[{name}] 的身份载荷长度是 {size} B，而 v{himi_runtime.ATTACH_RANGE_VERSION}"
                 f" 要求 {himi_runtime.ATTACH_RANGE_BYTES} B"
-                "（头部 + Q_f⁻¹ 3×4 + X_f 3×4 + 族索引 [7]）⇒ "
+                "（头部 + 单位阵 3×4 + X_f 3×4 + 族索引 [7]）⇒ "
                 "CS 读不到 X_f / 族索引（短载荷会让 himi_attach_range[4..7] 越界），必须重新导出"
             )
     return problems
@@ -1550,7 +1554,7 @@ class ExportHIMI(ExportUnity):
         self._himi_diagnostics_emitted = False
         #: 【t85】普通导出时清掉的上一次合并导出残留文件账目（``{"removed","failed"}``）。
         self._himi_merged_residue: dict = {}
-        #: 【t39】族级校准（Q_f）的缓存、问题清单与顶点侧结果。
+        #: 【t39/t78】族级摆放 Q_f 的缓存与问题清单（方案 B 起只用于诊断，不参与任何变换）。
         self._himi_placements_cache = None
         self._himi_placements_problems: list = []
         self._himi_placements_skipped: list = []
@@ -2173,35 +2177,35 @@ class ExportHIMI(ExportUnity):
                 self._himi_notify(f"合并 deform 触发键诊断：{line}", warning=True)
             # K2（宿主/成员族的变形 pass 必须是 pointlist 抽取）：`draw = <行数>, 0` 的语义前提。
             self._himi_verify_deform_draw_structure(plan)
-        # 【t39】族级校准的两侧必须**同时**成立：五族的 Q_f 不可得 ⇒ Fatal（不静默降级成
-        # 「只校准顶点侧」或「都不校准」——那两种都会让产物与调参者的预期不符）。
+        # 【t78 方案 B】Q_f 已**彻底退出变换路径**（顶点侧不校准、palette 侧不乘 Q_f⁻¹）⇒ 摆放读不到
+        # 不再是「半校准」：它既不进顶点缓冲，也不进身份载荷的 [1..3]（那里恒为单位阵）。因此这里
+        # 不再因为摆放缺失而降级合并骨架（降级会白白丢掉合并产物），只把读失败当诊断打出来。
+        # 真正**参与写槽**的族级矩阵只有 X_f（来自抓帧 cb3）⇒ 它的三态门与摆放无关，必须独立判定。
         if bool(GlobalProterties.import_merged_vgmap()) and getattr(plan, "has_rebinds", False):
-            placements = self._himi_family_placements()
+            self._himi_family_placements()
             placement_problems = list(getattr(self, "_himi_placements_problems", []) or [])
-            if placement_problems and not placements:
-                # 【t73·兜底原则】族级校准只拿到一部分族 ⇒ 合并骨架侧失败 ⇒ **降级为普通导出**
-                # （半校准的合并产物比不校准更坏；但普通导出必须留下）。
-                self._himi_degrade_to_ordinary(
-                    "族级校准（t39）只拿到一部分族的摆放（半校准的产物比不校准更坏）："
+            if placement_problems:
+                self._himi_notify(
+                    "族级摆放 Q_f 只读到一部分（方案 B 下它不参与任何变换，仅记录）："
                     + "；".join(placement_problems[:6])
-                    + ("；…" if len(placement_problems) > 6 else "")
+                    + ("；…" if len(placement_problems) > 6 else ""),
+                    warning=True,
                 )
-            elif placements:
-                # 【t39-X】族级物体矩阵 `X_f = M_base⁻¹·M_f`：合并后整块只在**宿主族一笔 draw**
-                # 里渲染，缺了它各族就按宿主族摆放（实测偏差 1.0~3.8 游戏单位）。三态：
-                #   * 全部族都有合法 X_f ⇒ 校准（正常路径）；
-                #   * **部分**缺失/不合法 ⇒ `Fatal` 并**指名缺哪族、为什么** —— 这次的证据
-                #     是抓帧 vs-cb3 的对象矩阵，缺一族的成因是确定的，半校准比不校准更坏；
-                #   * 一个都没有（老工作空间没有抓帧）⇒ `_himi_family_x` 里大声警告、不校准，
-                #     导入/导出照常（CS 读到全零 X ⇒ 跳过左乘，与旧行为逐字节等价）。
-                self._himi_family_x()
-                family_x_problems = list(getattr(self, "_himi_family_x_problems", []) or [])
-                if family_x_problems:
-                    raise Fatal(
-                        "族级物体矩阵（t39-X）只拿到一部分族的 X_f（半校准的产物比不校准更坏）："
-                        + "；".join(family_x_problems[:6])
-                        + ("；…" if len(family_x_problems) > 6 else "")
-                    )
+            # 【t39-X】族级物体矩阵 `X_f = M_base⁻¹·M_f`：合并后整块只在**宿主族一笔 draw**
+            # 里渲染，缺了它各族就按宿主族摆放（实测偏差 1.0~3.8 游戏单位）。三态：
+            #   * 全部族都有合法 X_f ⇒ 写槽 S = X_f·P_f（正常路径，方案 B 唯一的族级矩阵）；
+            #   * **部分**缺失/不合法 ⇒ `Fatal` 并**指名缺哪族、为什么** —— 这次的证据
+            #     是抓帧 vs-cb3 的对象矩阵，缺一族的成因是确定的，半校准比不校准更坏；
+            #   * 一个都没有（老工作空间没有抓帧）⇒ `_himi_family_x` 里大声警告、不校准，
+            #     导入/导出照常（CS 读到全零 X ⇒ 跳过左乘，与旧行为逐字节等价）。
+            self._himi_family_x()
+            family_x_problems = list(getattr(self, "_himi_family_x_problems", []) or [])
+            if family_x_problems:
+                raise Fatal(
+                    "族级物体矩阵（t39-X）只拿到一部分族的 X_f（半校准的产物比不校准更坏）："
+                    + "；".join(family_x_problems[:6])
+                    + ("；…" if len(family_x_problems) > 6 else "")
+                )
         snapshot = plan.contract_snapshot(
             checkbox_enabled=bool(GlobalProterties.import_merged_vgmap())
         )
@@ -2234,6 +2238,99 @@ class ExportHIMI(ExportUnity):
         return decision
 
     # ------------------------------------------------------------------ #
+    # 【B3】形态键 × 合并骨架的互斥硬门
+    # ------------------------------------------------------------------ #
+
+    def _himi_shapekey_object_probe(self) -> list:
+        """本次导出涉及形态键的物体（**可注入**：测试替换本方法即可，不需要 bpy）。
+
+        默认读 ``BlueprintExportHelper.shapekey_objects``（导出前由导出器填好）；拿不到 ⇒ 空列表
+        （= 本次没有形态键可导出，门放行）。这个钩子是 B3 唯一的取数面：本仓库没有「当前导出树」
+        的全局入口，``ExportHIMI`` 自己也没有 ``ordered_postprocess_nodes``。
+        """
+        try:
+            from ...blueprint.export_helper import BlueprintExportHelper
+        except Exception:  # noqa: BLE001 - 离线测试/oracle 没有 bpy ⇒ 没有这个模块
+            return []
+        return list(getattr(BlueprintExportHelper, "shapekey_objects", None) or [])
+
+    def _himi_non_basis_shapekey_blocks(self) -> int:
+        """非 Basis 形态键块总数（0 = 没有形态键 / 只有 Basis）。
+
+        ``count_exportable_shapekey_blocks`` 是鸭子类型的（只读 ``data.shape_keys.key_blocks``）
+        ⇒ 测试可以直接拿 SimpleNamespace 物体喂它。探测异常一律按 0 处理：门不能因为探测失败
+        去误伤普通导出。
+        """
+        counter = None
+        try:
+            from ...blueprint.export_helper import BlueprintExportHelper
+            counter = BlueprintExportHelper.count_exportable_shapekey_blocks
+        except Exception:  # noqa: BLE001 - 离线测试/oracle 没有 bpy
+            counter = None
+        total = 0
+        for obj in self._himi_shapekey_object_probe() or ():
+            if counter is not None:
+                try:
+                    total += int(counter(obj) or 0)
+                    continue
+                except Exception:  # noqa: BLE001
+                    pass
+            # 无 bpy 时的鸭子镜像：判据与 count_exportable_shapekey_blocks 同一条（key_blocks 去掉 Basis）
+            try:
+                shape_keys = getattr(getattr(obj, "data", None), "shape_keys", None)
+                blocks = list(getattr(shape_keys, "key_blocks", None) or ())
+            except Exception:  # noqa: BLE001
+                blocks = []
+            total += max(0, len(blocks) - 1)
+        return total
+
+    def _himi_shapekey_direct_mode_probe(self) -> bool:
+        """是否有形态键节点**没有**勾直出（True = 会走标准槽位轮次）。
+
+        优先用挂在本 exporter 上的 ``_needs_standard_shapekey_rounds`` 钩子（直出会话可以把
+        ``blueprint/direct_export.py`` 的同名判据绑上来）；否则读
+        ``BlueprintExportHelper.shapekey_postprocess_nodes`` 里任一 ``direct_export_mode`` 为假。
+        """
+        hook = getattr(self, "_needs_standard_shapekey_rounds", None)
+        if callable(hook):
+            try:
+                return bool(hook())
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            from ...blueprint.export_helper import BlueprintExportHelper
+        except Exception:  # noqa: BLE001
+            return False
+        for node in getattr(BlueprintExportHelper, "shapekey_postprocess_nodes", None) or ():
+            if not bool(getattr(node, "direct_export_mode", False)):
+                return True
+        return False
+
+    def _himi_enforce_shapekey_direct_mode(self) -> dict:
+        """【B3 硬门】合并骨架 + 非 Basis 形态键块 + 形态键节点未勾直出 ⇒ ``Fatal``。
+
+        为什么是 Fatal 而不是告警：标准（非直出）路线会先落盘 ``Meshes1001+`` 的形态键槽位，而
+        合并骨架**只在 ``Meshes0000`` 里**重建了 Position 缓冲与全局骨骼编号 —— 两边的顶点组/
+        槽位编号对不上，游戏里一开形态键就整块撕裂。这条判据还必须落在**导出前置阶段**：直出流程
+        下 ``common/m_ini_helper.py`` 那段告警根本不会执行（``suppress_shapekey_resource_export``
+        时直接 return），等于没有保护。
+        """
+        merged_active = bool(self._himi_merged_attach_active())
+        problem = shapekey_direct_mode_problem(
+            merged_active=merged_active,
+            non_basis_blocks=self._himi_non_basis_shapekey_blocks() if merged_active else 0,
+            needs_standard_rounds=self._himi_shapekey_direct_mode_probe() if merged_active else False,
+        )
+        result = {"ok": not problem, "merged_active": merged_active, "problem": problem}
+        self._himi_shapekey_gate_result = result
+        if problem:
+            # 文案里的「怎么改」提示（SHAPEKEY_DIRECT_MODE_HINT）由纯判据自带，这里不重复拼。
+            from ...utils.format_utils import Fatal
+
+            raise Fatal(problem)
+        return result
+
+    # ------------------------------------------------------------------ #
     # 导出入口
     # ------------------------------------------------------------------ #
 
@@ -2242,6 +2339,8 @@ class ExportHIMI(ExportUnity):
             # 计划 + 契约判定必须先于任何写盘：generate_buffer_files 是本次导出的第一个
             # 落盘点，error 时不得留下半成品 mod（.buf / .ini）。
             self._himi_enforce_contract()
+            # 【B3】形态键 × 合并骨架的互斥硬门：同样在写盘之前（直出流程里 ini 侧告警不执行）。
+            self._himi_enforce_shapekey_direct_mode()
             super().export()
         finally:
             # 事务闭合：正常与异常路径都必须清掉站位对象/网格/注入的 DrawCall。
@@ -2555,7 +2654,11 @@ class ExportHIMI(ExportUnity):
         return {family: (index, base_index) for index, family in enumerate(families)}
 
     def _himi_publish_attach_ranges(self, plan, folder_name: str) -> dict:
-        """【F5 + t39 + t39-X + t74】把每族的身份资源（128 B = base/span/ver/magic + ``Q_f⁻¹`` + ``X_f`` + 族索引）写进 mod 缓冲目录。
+        """【F5 + t39-X + t74 + t78】把每族的身份资源（128 B = base/span/ver/magic + **单位阵** + ``X_f`` + 族索引）写进 mod 缓冲目录。
+
+        ``[1..3]`` 那一格原本存 palette 侧要复合的 ``Q_f⁻¹``；方案 B（t78）起顶点侧不再做 ``Q·v``
+        校准，palette 侧也不再乘 Q⁻¹ ⇒ 写槽就是 ``S = X_f · P_f``，这一格**恒为单位阵**（段位与
+        长度保留，只为兼容既有载荷布局与 CS 下标；乘单位阵 = 恒等）。
 
         身份资源缺失时 CS 会**退回冻结表**（= 今天的行为，不是静默乱写），但那样 F5 的
         保护就没了 ⇒ 另有文件存在性硬门 :func:`verify_attach_range_references` 在产物落盘
@@ -2573,22 +2676,21 @@ class ExportHIMI(ExportUnity):
                 warning=True,
             )
         ranges = getattr(plan, "family_ranges", None) or {}
-        palette_factors = {}
+        # 【t78 方案 B】`[1..3]` 不再存任何因子：顶点侧不校准 ⇒ palette 侧就是 `S = X_f · P_f`，
+        # 这一段**恒为单位阵**（CS 的 Q 段保留、乘单位阵 = 恒等；verify_attach_range_files 会断言
+        # 它是单位阵，容差 1e-6 ⇒ 谁再把 Q⁻¹ 塞回来，导出期直接 Fatal）。
+        # 因此这里**不再调** `_himi_family_placements()`：Q_f 已彻底退出变换路径。
+        placement_rows = {str(family): attach_placement_identity() for family in (ranges or {})}
         family_xs = {}
         try:
-            # 【t44 共同空间取反修复】**载荷存的是 palette 侧要复合的那个因子** = `Q_f⁻¹`
-            # （CS 里读出来直接做 `P_f[b] ∘ factor`）。顶点侧用 `Q_f` 本身（`_himi_calibrate_bind_positions`）。
-            # 两侧同源同报：都来自同一个 `self._himi_family_placements()`。
-            for family, matrix in (self._himi_family_placements() or {}).items():
-                palette_factors[family] = himi_runtime.mat3x4_inverse(matrix)
-            # 【t39-X】族级物体矩阵 X_f：载荷 [4..6] = X_f 的 3×4 行；CS 在算完 `P_f ∘ Q_f⁻¹`
+            # 【t39-X】族级物体矩阵 X_f：载荷 [4..6] = X_f 的 3×4 行；CS 在算完 `P_f`（乘单位阵）
             # 之后对三条结果行各做一次左乘（X 全零 ⇒ CS 跳过，等价旧行为）。契约钩子已保证
             # 到这里要么全有、要么全无（部分缺失在更早的 `_himi_enforce_contract` 里 Fatal 中止）。
             try:
                 family_xs = self._himi_family_x()
                 self._himi_publish_family_x_record()
             except Exception as exc:  # noqa: BLE001 - X_f 只是可选增强（载荷 [4..6] 是兜底），
-                # 算不出来就把整笔身份资源发布一起拖红没有意义：Q_f⁻¹ 与 base/span 仍然要写。
+                # 算不出来就把整笔身份资源发布一起拖红没有意义：单位阵与 base/span 仍然要写。
                 family_xs = {}
                 self._himi_notify(f"族级物体矩阵 X_f 计算失败（{exc}）⇒ 不校准", warning=True)
             # 【t74】族索引：``[7] = (own, base)``，运行期 CS 靠它决定「读表里哪一段当 M_base」。
@@ -2605,7 +2707,7 @@ class ExportHIMI(ExportUnity):
             result = himi_runtime.publish_attach_ranges(
                 ranges,
                 folder_path,
-                placements=palette_factors,
+                placements=placement_rows,
                 family_xs=family_xs,
                 indices=family_indices,
             )
@@ -2613,12 +2715,13 @@ class ExportHIMI(ExportUnity):
             result = {"ok": False, "written": False, "files": [], "message": f"身份资源发布异常：{exc}"}
         self._himi_attach_range_result = result
         if result.get("ok"):
-            # 【t39-X/t74 硬门】写出去还不够：**落盘字节**必须与「族区间 / Q_f⁻¹ / X_f / 族索引 /
-            # 128 B」五方一致（`verify_attach_range_files`）。这里用**同一组** ranges/placements/family_xs/indices
-            # 复核，所以文件缺失、被截断、或某族的 Q/X 与发布值不等都会在导出期被拦下 ——
+            # 【t39-X/t74 硬门】写出去还不够：**落盘字节**必须与「族区间 / 单位阵 / X_f / 族索引 /
+            # 128 B」五方一致（`verify_attach_range_files`，其中 `[1..3]` 另有一条「必须是单位阵」
+            # 的无条件断言）。这里用**同一组** ranges/placements/family_xs/indices
+            # 复核，所以文件缺失、被截断、或某族的摆放/X 与发布值不等都会在导出期被拦下 ——
             # 而不是留一个 CS 读不到 X_f 的产物（那比不校准更坏，与 :1826 的分级同款）。
             self._himi_verify_attach_range_sync(
-                folder_path, ranges, palette_factors, family_xs, family_indices
+                folder_path, ranges, placement_rows, family_xs, family_indices
             )
         if not result.get("ok"):
             self._himi_notify(
@@ -2633,10 +2736,10 @@ class ExportHIMI(ExportUnity):
     def _himi_verify_attach_range_sync(
         self, folder_path: str, ranges, placements, family_xs, indices=None
     ) -> list:
-        """【t39-X 硬门】核对**已落盘**的身份资源与「族区间 / Q_f⁻¹ / X_f / 族索引 / 128 B」一致。
+        """【t39-X 硬门】核对**已落盘**的身份资源与「族区间 / 单位阵 / X_f / 族索引 / 128 B」一致。
 
         导出期唯一的调用点就是 :func:`_himi_publish_attach_ranges`（发布 ``ok`` 之后、用同一组
-        输入复核），因此这条判据不再只活在 oracle / 单测里：文件缺失、被截断、或某族的 Q_f⁻¹ /
+        输入复核），因此这条判据不再只活在 oracle / 单测里：文件缺失、被截断、或某族的摆放段 /
         ``X_f`` 与发布值**逐字节不等**都会在这里被拦下 —— 分级与 :1826 的「半校准比不校准更坏」
         同款（``Fatal`` 中止导出），而不是留一个 CS 读不到正确 X_f 的产物。
 
@@ -2668,22 +2771,21 @@ class ExportHIMI(ExportUnity):
         return dict(getattr(self, "_himi_attach_range_result", {}) or {})
 
     # ------------------------------------------------------------------ #
-    # 【t39】族级校准：Q_f（族 palette 第 0 槽）—— 两侧（顶点 / palette）唯一事实源
+    # 【t39 历史 / t78 方案 B】族级摆放 Q_f（族 palette 第 0 槽）：现在只作诊断来源
     # ------------------------------------------------------------------ #
 
     def _himi_family_placements(self) -> dict:
-        """``{family: 12 个 float（Q_f，行主序 3×4）}``（不可得 ⇒ 空字典，两侧同时不校准）。
+        """``{family: 12 个 float（Q_f，行主序 3×4）}``（不可得 ⇒ 空字典）。
 
-        来源 = 工作空间 ``LOD0/<bare>/ModImpRuntime/<bare>-BoneMatrix.buf`` 的第 0 槽
-        （该族自己的摆放；五族取自**同一个提取帧**，所以两两相比时尺度自然抵消）。
-
-        **三态**（t39 的 fail-closed 口径）：
-        * 全部族都拿到 ⇒ 返回全部（两侧都校准）；
-        * **部分**族拿到 ⇒ 返回空 + ``_himi_placements_problems`` 非空 ⇒ 调用方 ``Fatal``
-          （绝不能产出"顶点侧校准了、palette 侧没校准"的半成品）；
+        【t78 方案 B】Q_f **不参与任何变换**：顶点侧不校准、palette 侧只写 ``S = X_f · P_f``、
+        身份载荷 ``[1..3]`` 恒为单位阵。这个函数现在只服务于**诊断**（逐行族归属的候选提示）
+        与 oracle 的 A1-B 对照，因此三态都不再阻断导出：
+        * 全部族都拿到 ⇒ 返回全部；
+        * **部分**族拿到 ⇒ 返回空 + ``_himi_placements_problems`` 非空 ⇒ 调用方只打警告；
         * **一个都没拿到**（合成夹具 / 旧工作空间 / 无缓存）⇒ 返回空 + ``_himi_placements_skipped``
-          非空 ⇒ 大声警告 + **两侧都不校准** = 与今天逐字节等价的行为（不新增失败模式）。
+          非空 ⇒ 大声警告，产物不受影响（没有任何矩阵依赖它）。
 
+        来源 = 工作空间 ``LOD0/<bare>/ModImpRuntime/<bare>-BoneMatrix.buf`` 的第 0 槽。
         缓存结果，避免一次导出里重复读盘。
         """
         cached = getattr(self, "_himi_placements_cache", None)
@@ -2711,9 +2813,9 @@ class ExportHIMI(ExportUnity):
             self._himi_placements_problems = []
             self._himi_placements_cache = {}
             self._himi_notify(
-                f"族级校准（t39）跳过：{len(problems)} 个族都取不到 palette 缓存 ⇒ "
-                "本次导出**两侧都不校准**（= 与今天逐字节等价的行为；产物仍可用，只是"
-                "跨族借权重仍按「借出族的摆放」落位）。第一条原因：" + problems[0],
+                f"族级摆放 Q_f（t39/t78）跳过：{len(problems)} 个族都取不到 palette 缓存 ⇒ "
+                "不影响产物（方案 B 下 Q_f 不参与任何变换：顶点侧不校准、载荷 [1..3] 恒为单位阵）。"
+                "第一条原因：" + problems[0],
                 warning=True,
             )
             return {}
@@ -2721,7 +2823,7 @@ class ExportHIMI(ExportUnity):
         self._himi_placements_problems = problems
         self._himi_placements_cache = placements if not problems else {}
         if problems:
-            print(f"{_LOG_PREFIX} 族级校准：{len(problems)} 个族的摆放不可得 ⇒ 本次导出不做校准")
+            print(f"{_LOG_PREFIX} 族级摆放 Q_f：{len(problems)} 个族不可得 ⇒ 仅影响归属诊断（不参与变换）")
         return self._himi_placements_cache
 
     def _himi_host_family(self, plan) -> dict:
@@ -2880,6 +2982,11 @@ class ExportHIMI(ExportUnity):
             host_evidence=str(host.get("note") or ""),
             mod_root=himi_family_x.resolve_mod_root(GlobalConfig.path_workspace_folder()),
         )
+        # 【t78 方案 B】审计记录里的口径必须跟着变换公式走：写槽是 `S = X_f · P_f`（顶点侧不校准、
+        # palette 侧不乘 Q_f⁻¹）。覆盖 `family_x_audit_record` 里的历史文案，并显式记一条
+        # `VertexCalibration: "none"` 供离线 oracle / 测试读取（第 4 项契约元数据）。
+        audit["Algorithm"] = "S = X_f · P_f（方案 B：顶点侧不校准，palette 侧不乘 Q_f⁻¹）"
+        audit[VERTEX_CALIBRATION_KEY] = VERTEX_CALIBRATION_NONE
         path = os.path.join(
             GlobalConfig.path_workspace_folder(), "Config", HIMI_MERGED_SKELETON_METADATA_FILE
         )
@@ -2915,13 +3022,13 @@ class ExportHIMI(ExportUnity):
         )
         if not info.get("ok"):
             self._himi_notify(
-                "族级校准（t41）：读不到各族的**源绑定坐标** ⇒ 逐行归属退回「骨头族」"
+                "族级归属诊断（t41/t78）：读不到各族的**源绑定坐标** ⇒ 逐行归属退回「骨头族」"
                 f"（= 不校准等价；{info.get('note')}）",
                 warning=True,
             )
         elif info.get("missing"):
             self._himi_notify(
-                f"族级校准（t41）：{info.get('note')}；缺的族按骨头族回退",
+                f"族级归属诊断（t41/t78）：{info.get('note')}；缺的族按骨头族回退",
                 warning=True,
             )
         self._himi_vertex_family_cache = dict(info or {})
@@ -2994,56 +3101,40 @@ class ExportHIMI(ExportUnity):
         return families, stats
 
     def _himi_calibrate_bind_positions(self) -> dict:
-        """【t39 顶点侧 + t41/T40-F2 逐行】``v'_i = Q_{fam(bones_i)}⁻¹ · v_i``（原地改缓冲）。
+        """【t39 历史 / t78 方案 B】**只读**的逐行「几何族 vs 骨头族」诊断 —— 不改写任何字节。
 
-        为什么要做：合并骨架把五族的 palette 简单拼在一起，但每族的 palette 里**带着该族自己的
-        摆放**（第 0 槽就是族级摆放 ``Q_f``）⇒ 跨族借权重时（上半身的顶点用下半身的骨）会按
-        "别人的摆放"落位。顶点侧先做 ``Q⁻¹``、palette 侧再写 ``P∘Q``，**两侧同一个 Q**：
-        同族结果**逐值不变**（``P·Q·Q⁻¹·v = P·v``），跨族借用则被搬进借出族的坐标系。
+        方案 B（现行）：顶点侧**不**做族级校准，Position 缓冲**原样落盘**；palette 侧只写
+        ``S = X_f · P_f``（不乘 ``Q_f⁻¹``）。同族 ``P·Q⁻¹·Q·v ≡ P·v`` 恒等（残差 4.6e-16）
+        ⇒ 对基态逐位等价；而形态键通道（``-Position_merged_packed_pos_delta.buf`` 的 δ 直接叠加
+        到基态行上）因此天然与基态同空间 —— 以前顶点被 Q 搬过，运行期就成了 ``Q·v+δ`` 而不是
+        ``Q·(v+δ)``，非宿主族整块撕裂。
 
-        **逐行选 Q（T40-F2）**：Q 取该行**骨头所属族**的，而不是该 DrawIB 的 —— 合并网格整个
-        落在宿主族的 Position 缓冲里，按 DrawIB 取会让同族行也被位移。
+        本函数保留的价值：**读**每行顶点认领到的族与骨头族的差异，输出逐族行数、跨族借用行数、
+        标签翻转/多族歧义/混族行等数字（t24 的保守语义、t41/t43 的容差最近邻判据仍在此处）。
 
-        **【t24】顶点族认领的保守语义**：认领（nearest_family）判不出唯一几何族时保持**骨头族**
-        —— 对骨头族行这是同族校准，`P·Q⁻¹·Q·v = P·v` ⇒ **变形结果逐值不变**（等价"不校准"），
-        绝不乘别族 Q。94 行焊接点污染（报告 26）的病根是并列阈值 1e-12 比实际胜负差（~1e-8）
-        小 4 个数量级，保守分支永不触发；t24 把窗口放宽到 1e-6（量纲依据见
-        `himi_merged_runtime.FAMILY_TIE_WINDOW`）并让法线/切线作为唯一命中时的第二证据。
+        **跨族借用行在方案 B 下不需要修**：LBS 是 ``world = Σ w_i·S[c_i]·v``，作用在 v 上的任何
+        常量都能搬到槽上；五族顶点同处一个角色空间（实测 bbox 同处身高 1.69、脚 y≈0）⇒ 槽里的
+        ``X_f·P_f[k]`` 对**任何族**的顶点都给真值 ``M_f·P_f[k]·v``。旧方案因顶点被乘 Q_f，跨族
+        会多出 ``Q_g⁻¹·Q_f``（各族 Q 两两相差 133°–180°）⇒ 必然错。**跨族行 > 0 只记一条警告**
+        （真实产物该值为 0；出现即说明有新的族间共享权重形态，需要人看）。
 
-        返回 ``{"ok","families","rows","skipped","per_family","mixed","unweighted","message"}``；
-        **不抛**（异常由上层硬门处理）。
+        返回 ``{"ok","families","rows","skipped","per_family","mixed","unweighted","cross",
+        "claimed","label_flips","cross_flips","ambiguous","message"}``；**无** ``cross_max_shift``
+        （没有顶点侧变换就没有位移）；**不抛**（异常由上层硬门处理）。
         """
-        placements = self._himi_family_placements()
         plan = self.himi_merged_runtime_plan()
-        if not placements:
-            if not getattr(plan, "has_rebinds", False):
-                # 非合并路径：产物与改造前逐字节相同（本任务不碰）。
-                return {"ok": True, "families": 0, "rows": 0, "skipped": 0,
-                        "per_family": {}, "mixed": 0, "unweighted": 0,
-                        "message": "非合并路径：不做族级校准"}
-            return {
-                "ok": False, "families": 0, "rows": 0, "skipped": 0,
-                "per_family": {}, "mixed": 0, "unweighted": 0,
-                "message": "族级摆放不可得 ⇒ 顶点侧未校准（导出侧硬门会 Fatal）",
-            }
-        # 【t44 共同空间取反修复】顶点侧用 **Q_f 本身**（不是它的逆）：把本族绑定位置搬进
-        # 「提取帧世界」这个共同空间；palette 侧再写 `P_f[b] · Q_f⁻¹`（见 CS 生成器与 128 B 载荷）。
-        # 同族行 `P·Q⁻¹·(Q·v) = P·v` 逐值不变；跨族行 `P_g·Q_g⁻¹·(Q_f·v_f)` —— 顶点先被搬进共同
-        # 空间、再被**借出族**的 palette 映到当前世界（这才是"借别人的骨"的正确语义）。
-        factors = {}
-        for family, matrix in placements.items():
-            try:
-                himi_runtime.mat3x4_inverse(matrix)      # 仅做可逆性校验（顶点侧不用它）
-            except Exception as exc:  # noqa: BLE001
-                return {"ok": False, "families": 0, "rows": 0, "skipped": 0,
-                        "per_family": {}, "mixed": 0, "unweighted": 0,
-                        "message": f"{family} 的族级摆放不可逆：{exc}"}
-            factors[family] = list(matrix)
+        if not getattr(plan, "has_rebinds", False):
+            # 非合并路径：产物与改造前逐字节相同（本任务不碰）。
+            return {"ok": True, "families": 0, "rows": 0, "skipped": 0,
+                    "per_family": {}, "mixed": 0, "unweighted": 0,
+                    "message": "非合并路径：不做逐行族归属诊断"}
+        # 【t78 方案 B】族级摆放 Q_f 已经**完全不参与**变换，这里不再取 `_himi_family_placements()`、
+        # 也不再校验可逆性：曾经是「顶点乘 Q_f + palette 乘 Q_f⁻¹」成对使用，现在两侧都不乘。
         spans = self._himi_bone_family_spans(plan)
         if not spans:
-            return {"ok": False, "families": 0, "rows": 0, "skipped": 0,
+            return {"ok": True, "families": 0, "rows": 0, "skipped": 0,
                     "per_family": {}, "mixed": 0, "unweighted": 0,
-                    "message": "plan.family_ranges 为空 ⇒ 无法逐行归属骨头族（拒绝按 DrawIB 猜）"}
+                    "message": "plan.family_ranges 为空 ⇒ 跳过逐行族归属诊断（顶点侧不校准，产物不受影响）"}
         rows = 0
         calibrated_families = 0
         skipped = 0
@@ -3055,7 +3146,6 @@ class ExportHIMI(ExportUnity):
         label_flips = 0
         cross_flips = 0
         ambiguous_total = 0
-        cross_shift = 0.0
         per_family: dict = {}
         vertex_index_enabled = True
         import numpy
@@ -3090,11 +3180,10 @@ class ExportHIMI(ExportUnity):
             row_families, stats = self._himi_row_bone_families(
                 blend_bytes, spans, int(view2d.shape[0])
             )
-            # 【t41 / T40-F2】逐行改用**顶点自己**的族：先按源绑定坐标认领，认不到再退回骨头族。
-            # 为什么不是「按骨头族」（任务书初稿的字面口径）：palette 侧正是按骨头族复合
-            # （`P_g∘Q_g`），两边同族 ⇒ `(P_g∘Q_g)·(Q_g⁻¹v) = P_g·v` **恒等于不校准** ⇒ 整个
-            # 族级校准会退化成空操作。而「顶点自己族」这一侧才能让跨族借用真正被搬运：
-            # `(P_g∘Q_g)·(Q_f⁻¹v)`，f = 顶点族、g = 骨头族（同族行 f==g ⇒ 依旧逐值不变）。
+            # 【t41 / T40-F2 / t78】逐行判「**顶点自己**的族」（先按源绑定坐标认领，认不到退回骨头族）。
+            # 方案 B 下这个数字**只用于诊断**：顶点缓冲原样落盘，跨族借用靠槽里的 `X_f·P_f` 自动正确
+            # （LBS 的常量可以搬到槽上）。留着它是因为「跨族行数」是唯一能早期发现族间共享权重的信号
+            # （真实产物该值 = 0；> 0 时打一条警告，见函数尾部）。
             vertex_index = self._himi_vertex_family_index() if vertex_index_enabled else {}
             family_order = [name for _base, _end, name in spans]
             cross_rows = 0
@@ -3134,16 +3223,7 @@ class ExportHIMI(ExportUnity):
                 if vertex_family:
                     claimed += 1
                     if vertex_family != bone_family:
-                        cross_rows += 1
-                        if cross_shift is not None:
-                            new_offset = himi_runtime.mat3x4_apply(
-                                factors.get(vertex_family, factors.get(bone_family)), point
-                            )
-                            old_offset = point        # 旧口径若判成骨头族 ⇒ 顶点侧不动
-                            cross_shift = max(
-                                cross_shift,
-                                max(abs(new_offset[i] - old_offset[i]) for i in range(3)),
-                            )
+                        cross_rows += 1        # 只计数：方案 B 下跨族借用不需要顶点侧修正
                 else:
                     vertex_family = bone_family          # 安全回退：与骨头族同族 ⇒ 不校准等价
                 row_families[row_index] = vertex_family
@@ -3161,47 +3241,14 @@ class ExportHIMI(ExportUnity):
                         family, len(row_families), int(view2d.shape[0]),
                     )
                 continue
-            # 按族分组，逐组施加该族的 **Q_f**（向量化）—— 搬进共同空间（提取帧世界）
-            used = 0
+            # 【t78 方案 B】这里**不再改写缓冲**：原来这块把每行 44 B 按族乘 Q_f 再
+            # `target[:] = ...` 写回，是形态键通道与基态分家的唯一源头。现在只按族数行数（诊断），
+            # Position 保持原样；下面的 `view2d` 只读（不 copy、不赋值），`block` 从不被写回。
             for row_family in sorted({name for name in row_families if name}):
-                factor = factors.get(row_family)
-                if factor is None:
-                    continue
-                selector = numpy.array([name == row_family for name in row_families])
-                row_indices = numpy.nonzero(selector)[0]
-                # ⚠ 花式索引取出来的是**副本** ⇒ 必须显式写回（`group = view2d[selector]` 直接改
-                # 不会落回缓冲；实测踩过：行数报告"已校准"而产物逐字节没变）。
-                group = view2d[row_indices].copy()
-                if not group.size:
-                    continue
-                a = [[factor[0], factor[1], factor[2]],
-                     [factor[4], factor[5], factor[6]],
-                     [factor[8], factor[9], factor[10]]]
-                t = (factor[3], factor[7], factor[11])
-                for columns, translate in (
-                    ((0, 1, 2), True), ((3, 4, 5), False), ((7, 8, 9), False)
-                ):
-                    x = group[:, columns[0]].astype("float64")
-                    y = group[:, columns[1]].astype("float64")
-                    z = group[:, columns[2]].astype("float64")
-                    group[:, columns[0]] = (a[0][0] * x + a[0][1] * y + a[0][2] * z
-                                            + (t[0] if translate else 0.0))
-                    group[:, columns[1]] = (a[1][0] * x + a[1][1] * y + a[1][2] * z
-                                            + (t[1] if translate else 0.0))
-                    group[:, columns[2]] = (a[2][0] * x + a[2][1] * y + a[2][2] * z
-                                            + (t[2] if translate else 0.0))
-                count = int(group.shape[0])
-                view2d[row_indices] = group          # 写回（副本 → 原缓冲）
-                per_family[row_family] = per_family.get(row_family, 0) + count
-                used += count
-            rows += used
+                count = sum(1 for name in row_families if name == row_family)
+                per_family[row_family] = per_family.get(row_family, 0) + int(count)
+            rows += sum(1 for name in row_families if name)
             calibrated_families = len(per_family)
-            # 把变换后的字节**写回原缓冲**（原缓冲可能是 uint8 的一维原始字节，也可能是
-            # (rows, 11) 的 float32）⇒ 按**字节**写，形状无关。
-            target = block.reshape(-1)
-            if target.dtype != numpy.uint8:
-                target = target.view(numpy.uint8)
-            target[:] = numpy.frombuffer(view2d.tobytes(), dtype=numpy.uint8)
         result = {
             "ok": rows > 0,
             "families": calibrated_families,
@@ -3215,18 +3262,24 @@ class ExportHIMI(ExportUnity):
             "label_flips": label_flips,
             "cross_flips": cross_flips,
             "ambiguous": ambiguous_total,
-            "cross_max_shift": cross_shift,
             "message": (
-                f"族级校准（顶点侧·逐行）：{rows} 行已按**该行顶点所属族**乘 Q（共同空间）；"
+                f"逐行族归属诊断（t78 方案 B：顶点侧不校准、缓冲未改写）：{rows} 行；"
                 f"逐族行数 {dict(sorted(per_family.items()))}；跨族借用 {cross_total} 行、"
                 f"源坐标认领 {claimed_total} 行、标签翻转 {label_flips}（跨族翻转 {cross_flips}）、"
                 f"容差内多族 {ambiguous_total}、混族行 {mixed_total}、"
                 f"无活动通道行 {unweighted_total}"
-                + (f"；跨族行的顶点侧最大位移 {cross_shift:.4f}" if cross_total else "")
                 + (f"；{skipped} 个 drawib 未涉及" if skipped else "")
                 + (f"（{debug_skip}）" if debug_skip else "")
             ),
         }
+        # 方案 B 的 R1 口径（coordinator 复审后撤销了「跨族行 > 0 ⇒ Fatal」）：跨族借用**不需要**
+        # 顶点侧修正（LBS 的常量可以搬到槽上），但真实产物该值为 0 —— 出现就记一条警告让人看见。
+        if cross_total:
+            self._himi_notify(
+                f"检测到跨族借用权重 {cross_total} 行，方案 B 下按目标族空间正确换算"
+                "（槽里存 X_f·P_f ⇒ 对任何族的顶点都给 M_f·P_f·v；顶点缓冲未被改写）",
+                warning=True,
+            )
         self._himi_calibration_result = result
         print(f"{_LOG_PREFIX} {result['message']}")
         return result
@@ -3485,7 +3538,7 @@ class ExportHIMI(ExportUnity):
         return dict(getattr(self, "_himi_bind_position_result", {}) or {})
 
     def generate_buffer_files(self, output_folder: str):
-        """【t39 顶点侧接点】先做族级校准，再走基类的落盘（唯一改动点）。
+        """【t39 顶点侧接点 / t78 方案 B】先做逐行族归属**诊断**（不写字节），再走基类落盘。
 
         为什么放在这里：`Meshes/<draw_ib>-Position.buf` 就是在本方法里落盘的
         （``ui/universal/drawib_export_base.py::generate_buffer_files`` 的

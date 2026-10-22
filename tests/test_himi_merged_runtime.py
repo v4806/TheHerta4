@@ -5494,7 +5494,12 @@ class HIMIIdentitySpanZeroSemanticsTests(unittest.TestCase):
 
 
 class HIMIFamilyCalibrationTests(unittest.TestCase):
-    """【t39】族级校准：顶点侧 ``v' = Q⁻¹·v``、palette 侧 ``P' = P ∘ Q``（两侧同一个 Q_f）。
+    """【t39 历史 / t78 方案 B】族级校准：**顶点侧不校准**，写槽矩阵 = ``X_f · P_f``。
+
+    方案 B 之前的实现是「顶点侧 ``v' = Q·v`` + palette 侧 ``P' = P∘Q⁻¹``」：同族恒等，
+    但形态键通道（δ 直接叠加到基态行）没有 Q ⇒ 运行期是 ``Q·v+δ`` 而不是 ``Q·(v+δ)``，
+    非宿主族整块撕裂。本组用例因此全部改成「顶点缓冲逐字节不动」口径；下面这段历史对照
+    仍保留（t39 当初的配对推导）。
 
     ⚠ 与任务书初稿的差异（**有证据**）：任务书写的是 ``P' = Q⁻¹·P`` + ``v' = Q·v``，
     但那对组合的左式 = ``Q⁻¹·P·Q·v``（相似变换），只有 P 与 Q 可交换才等于 ``P·v``
@@ -5678,18 +5683,22 @@ class HIMIFamilyCalibrationTests(unittest.TestCase):
                 "keys": keys, "points": sum(len(v) for v in grid.values()), "missing": [],
                 "note": "测试夹具"}
 
-    def test_vertex_side_applies_common_space_placement_TWO_STATE(self):
-        """**两态**：没有 Q_f ⇒ 缓冲逐字节不动；给了 Q_f ⇒ 恰好乘 **Q**（搬进共同空间）。
+    def test_vertex_side_never_rewrites_the_buffer_TWO_STATE(self):
+        """【t78 方案 B】**两态**：有没有族级摆放，Position 缓冲都逐字节不动（顶点侧不校准）。
 
-        【t44 共同空间取反修复】顶点侧是 `v' = Q_f·v`（**不是** `Q_f⁻¹·v`）：把本族绑定位置搬进
-        「提取帧世界」这个共同空间；palette 侧再写 `P_f[b]·Q_f⁻¹`（载荷存因子）⇒
-        同族行 `P·Q⁻¹·Q·v = P·v` 逐值不变。本用例对**取反**是敏感的（见末尾的对照）。
+        旧实现（t39–t77）在这里把每行乘 Q_f 搬进「共同空间」，代价是形态键通道
+        （``-Position_merged_packed_pos_delta.buf`` 的 δ 直接叠加到基态行上）变成 ``Q·v+δ``
+        而不是 ``Q·(v+δ)`` ⇒ 非宿主族（Q = 1.6×R、R 84.6°–133.5°）整块撕裂/飞走。
+        方案 B 把变换整体从顶点侧删掉、只留 palette 侧的 ``S = X_f·P_f``：同族
+        ``P·Q⁻¹·Q·v ≡ P·v``（实测残差 4.6e-16）⇒ 基态逐位不变，δ 也回到同一空间。
+
+        本用例对「偷偷写回一行」敏感：B 态给了 Q_f 且逐行归属判得出来，任何写回都会让
+        ``assertEqual(buffer_b.tobytes(), before_b.tobytes())`` 立刻红。
         """
         rows = [(0.35, 0.90, -0.05), (1.0, 0.0, 0.5), (-0.25, 0.75, 1.25)]
         q = self._matrix(33, 1.6, (0.5, -0.25, 0.125))
-        q_inv = _runtime.mat3x4_inverse(q)
 
-        # A 态（无摆放）：完全不改缓冲（= 今天的产物）
+        # A 态（非合并路径）：不诊断、不写
         exporter_a, buffer_a = self._exporter_with_buffer(rows)
         exporter_a._himi_family_placements = lambda: {}
         exporter_a.himi_merged_runtime_plan = lambda: types.SimpleNamespace(has_rebinds=False)
@@ -5698,36 +5707,33 @@ class HIMIFamilyCalibrationTests(unittest.TestCase):
         self.assertEqual(buffer_a.tobytes(), before_a.tobytes(), "A 态必须逐字节不动")
         self.assertEqual(result_a["families"], 0)
 
-        # B 态（有摆放）：每行 = Q·v，法线/切线同转、COLOR 与 T.w 不动
+        # B 态（合并路径 + 给了 Q_f）：只数行数，缓冲原样；连取 Q_f 都不该发生
         exporter_b, buffer_b = self._exporter_with_buffer(rows)
-        exporter_b._himi_family_placements = lambda: {"aaaa1111": q}
+        exporter_b._himi_family_placements = lambda: (_ for _ in ()).throw(
+            AssertionError("【t78 方案 B】顶点侧不再取族级摆放 Q_f")
+        )
         exporter_b.himi_merged_runtime_plan = self._plan_with_two_families
         before_b = buffer_b.copy()
         result_b = exporter_b._himi_calibrate_bind_positions()
         self.assertTrue(result_b["ok"], result_b)
-        self.assertEqual(result_b["families"], 1)
-        self.assertEqual(result_b["rows"], len(rows))
+        self.assertEqual(result_b["families"], 1, result_b)
+        self.assertEqual(result_b["rows"], len(rows), result_b)
+        self.assertEqual(result_b["per_family"], {"aaaa1111": len(rows)}, result_b)
+        self.assertNotIn("cross_max_shift", result_b, "没有顶点侧变换就没有位移")
+        self.assertEqual(buffer_b.tobytes(), before_b.tobytes(), "B 态也必须逐字节不动")
         for index, point in enumerate(rows):
-            want = _runtime.mat3x4_apply(q, point)
             got = self._row(buffer_b, index)
-            self.assertLess(max(abs(a - b) for a, b in zip(got[0:3], want)), 1e-6)
-            # 方向量：法线/切线按 Q 的**线性部分**一起转
-            want_normal = _runtime.mat3x4_rotate(q, (0.0, 0.0, 1.0))
-            self.assertLess(
-                max(abs(a - b) for a, b in zip(got[3:6], want_normal)), 1e-6
-            )
-            want_tangent = _runtime.mat3x4_rotate(q, (1.0, 0.0, 0.0))
-            self.assertLess(
-                max(abs(a - b) for a, b in zip(got[7:10], want_tangent)), 1e-6
-            )
+            for axis, want in enumerate(point):
+                self.assertAlmostEqual(got[axis], want, places=6, msg=f"第 {index} 行原位不动")
+            self.assertEqual(got[3:6], (0.0, 0.0, 1.0), "法线原样")
+            self.assertEqual(got[7:10], (1.0, 0.0, 0.0), "切线原样")
             self.assertEqual(got[6], 0.0, "COLOR 不动")
             self.assertEqual(got[10], 1.0, "TANGENT.w（手性）不动")
-            # 【t44 盲区】取反版会得到 Q⁻¹·v —— 与 Q·v 明显不同（本用例对取反**不盲**）
-            self.assertGreater(
-                max(abs(a - b) for a, b in zip(_runtime.mat3x4_apply(q_inv, point), want)), 1e-3,
-                "取反版与正版必须可分辨（否则本用例对 t44 的取反错误是盲的）",
-            )
-        self.assertNotEqual(bytes(buffer_b), bytes(before_b), "B 态必须真的改了缓冲")
+        # 反向护栏：夹具必须能让「写回 Q·v」被看见（否则本用例对写回是盲的）
+        self.assertGreater(
+            max(abs(a - b) for a, b in zip(_runtime.mat3x4_apply(q, rows[0]), rows[0])), 1e-2,
+            "夹具必须能让『写回 Q·v』被看见",
+        )
 
     def test_generate_buffer_files_hooks_the_calibration(self):
         """接点检查：`generate_buffer_files` 必须先校准再走基类（否则产物与 ini 不同源）。"""
@@ -5765,15 +5771,18 @@ class HIMIFamilyCalibrationTests(unittest.TestCase):
                     f"{label} ⇒ 判据必须报错（否则判据恒真）",
                 )
 
-    def test_row_level_q_selection_TWO_STATE(self):
-        """【t41 / T40-F2 + t44】逐行选 Q：**同族行的变形结果逐值不变**、跨族行落进借出族坐标系。
+    def test_row_family_diagnostics_do_not_touch_the_buffer_TWO_STATE(self):
+        """【t41/t43 诊断 + t78 方案 B】逐行「几何族 vs 骨头族」只产出数字，缓冲原样。
 
-        口径（t44 之后）：顶点侧 `v' = Q_{顶点族}·v`（搬进共同空间）；palette 侧 `P_{骨头族}·Q_{骨头族}⁻¹`。
-        * 同族行：`P·Q⁻¹·Q·v = P·v` ⇒ **逐值不变**（≤1e-5）；
-        * 跨族行（顶点族 f、骨头族 g）：`P_g·Q_g⁻¹·(Q_f·v_f)` ⇒ 顶点先进共同空间、再被 g 的 palette 映出去。
+        夹具：DrawIB ``aaaa1111``（族区间 [0,4)），另有族 ``bbbb2222``（[4,8)）。
+        第 0/2 行的骨头在自己族（槽 1/2）、第 1 行借 ``bbbb2222`` 的槽 5、第 3 行无活动通道。
 
-        夹具：DrawIB `aaaa1111`（族区间 [0,4)），另有族 `bbbb2222`（[4,8)）。
-        第 0/2 行的骨头在自己族（槽 1/2）、第 1 行借 `bbbb2222` 的槽 5、第 3 行无活动通道。
+        方案 B 下跨族借用的正确性来自着色器里的 ``S = X_g·P_g[k]``：LBS 是
+        ``world = Σ w_i·S[c_i]·v``，作用在 v 上的任何常量都能搬到槽上 ⇒ **顶点不必先搬空间**。
+        旧方案错在这一行可以量化：顶点被乘了 Q_a 之后，槽里的 ``P_b∘Q_b⁻¹`` 得到
+        ``P_b·Q_b⁻¹·Q_a·v``，与真值 ``P_b·v`` 相差 > 0.1（各族 Q 两两相差 133°–180°）。
+        本用例一次钉住三件事：(1) 诊断数字仍然正确；(2) 缓冲一个字节都没动；
+        (3) 旧方案在跨族行上确实错（所以「撤销 R1 Fatal」不是放水，而是把错的那侧删掉）。
         """
         rows = [(0.35, 0.90, -0.05), (1.0, 0.0, 0.5), (-0.25, 0.75, 1.25), (2.0, 1.0, 0.0)]
         bones = [
@@ -5784,16 +5793,15 @@ class HIMIFamilyCalibrationTests(unittest.TestCase):
         ]
         q_a = self._matrix(33, 1.6, (0.5, -0.25, 0.125))
         q_b = self._matrix(-24, 1.6, (-0.8, 0.4, 0.05))
-        p_a = self._matrix(17, 1.0, (0.2, 0.1, -0.3))     # 自己族的某根骨（线性部分 + 平移）
         p_b = self._matrix(-9, 1.0, (-0.4, 0.6, 0.2))     # 借出族的某根骨
-        palette_a = _runtime.mat3x4_inverse(q_a)          # 载荷存的是因子 Q⁻¹（t44）
-        palette_b = _runtime.mat3x4_inverse(q_b)
         exporter, buffer = self._exporter_with_buffer(rows, bones=bones)
         exporter._himi_family_placements = lambda: {"aaaa1111": q_a, "bbbb2222": q_b}
         exporter.himi_merged_runtime_plan = self._plan_with_two_families
         # 顶点族索引：真实路径由 `load_family_position_index` 建（容差网格）；这里给形状相同的
         # 最小索引（第 0/1/2 行的顶点都属于 aaaa1111 ⇒ 第 1 行是**跨族借用**）。
         exporter._himi_vertex_family_index = lambda: self._index_for(rows, "aaaa1111")
+        warnings = []
+        exporter._himi_notify = lambda detail, warning=False: warnings.append((detail, warning))
         before = bytes(buffer)
 
         result = exporter._himi_calibrate_bind_positions()
@@ -5802,77 +5810,22 @@ class HIMIFamilyCalibrationTests(unittest.TestCase):
         self.assertEqual(result["cross"], 1, result)
         self.assertEqual(result["mixed"], 0, result)
         self.assertEqual(result["unweighted"], 1, result)
-
-        # 无活动通道行（3）：不动（变形输出本来就是 0 加权）
-        self.assertEqual(
-            self._row(buffer, 3), struct.unpack("<11f", before[3 * 44 : 3 * 44 + 44])
-        )
-
-        # ---- 硬门：同族行（0、2）的**变形结果**校准前后逐值不变（≤1e-5）----
-        for index, q_f, palette in ((0, q_a, palette_a), (2, q_a, palette_a)):
-            original = rows[index]
-            calibrated = self._row(buffer, index)[0:3]
-            self.assertLess(
-                max(abs(a - b) for a, b in zip(calibrated, _runtime.mat3x4_apply(q_f, original))),
-                1e-6, f"第 {index} 行必须先乘自己族的 Q（共同空间）",
-            )
-            world_before = _runtime.mat3x4_apply(p_a, original)
-            world_after = _runtime.mat3x4_apply(_runtime.mat3x4_compose(p_a, palette), calibrated)
-            self.assertLess(
-                max(abs(a - b) for a, b in zip(world_before, world_after)), 1e-5,
-                f"同族第 {index} 行的变形结果必须逐值不变（这是 T40-F2 的硬门）",
-            )
-            # 保守口径的对照：若按**骨头族**取 Q（= 与 palette 同族）⇒ 该行退化成"不校准"，
-            # 与本次采用的口径（顶点自己的族）不同 —— 用第 1 行演示（见下）
-            self.assertLess(
-                max(abs(a - b) for a, b in zip(world_before, _runtime.mat3x4_apply(
-                    _runtime.mat3x4_compose(p_a, palette),
-                    _runtime.mat3x4_apply(q_f, original)))), 1e-9,
-            )
-
-        # ---- 跨族行（1）：顶点族 aaaa1111、骨头族 bbbb2222 ⇒ 顶点侧乘 Q_aaaa1111（共同空间），
-        #      再被 palette 侧 `P_bbbb2222 ∘ Q_bbbb2222⁻¹` 映到当前世界 = 落进**借出族**坐标系 ----
-        calibrated_borrow = self._row(buffer, 1)[0:3]
-        self.assertLess(
-            max(abs(a - b) for a, b in zip(calibrated_borrow, _runtime.mat3x4_apply(q_a, rows[1]))),
-            1e-6, "跨族行必须乘**顶点自己族**的 Q（搬进共同空间）",
-        )
-        want_borrow = _runtime.mat3x4_apply(
-            _runtime.mat3x4_compose(p_b, palette_b),
+        self.assertEqual(result["rows"], 3, result)
+        # 方案 B 的硬门：诊断不得改写任何字节（含第 3 行「无活动通道」）
+        self.assertEqual(bytes(buffer), before, "方案 B：诊断不得改写缓冲")
+        # 跨族 > 0 ⇒ 一条 warn（R1 门已按 coordinator 复审撤销：不 Fatal，只让人看见）
+        self.assertTrue(warnings, "跨族借用必须留一条诊断")
+        self.assertTrue(all(warning for _detail, warning in warnings), warnings)
+        self.assertIn("跨族借用权重 1 行", warnings[0][0])
+        self.assertIn("方案 B", warnings[0][0])
+        # 旧方案（顶点乘 Q_a + palette 乘 Q_b⁻¹）在跨族行上的偏差：必须 > 1e-2
+        old_world = _runtime.mat3x4_apply(
+            _runtime.mat3x4_compose(p_b, _runtime.mat3x4_inverse(q_b)),
             _runtime.mat3x4_apply(q_a, rows[1]),
         )
-        world_borrow = _runtime.mat3x4_apply(
-            _runtime.mat3x4_compose(p_b, palette_b), calibrated_borrow
-        )
-        self.assertLess(
-            max(abs(a - b) for a, b in zip(world_borrow, want_borrow)), 1e-5,
-            "跨族行必须落进借出族的坐标系（顶点先进共同空间，再被借出族的 palette 映出去）",
-        )
-        # 错版 A（**取反**：palette 侧 `P∘Q`、顶点侧 `Q⁻¹·v` = t39–t43 的实现）
-        # ⇒ 跨族行落在一个**无意义的中间空间**上，与正版差得远（这就是用户看到的「消失/炸开」）
-        inverted = _runtime.mat3x4_apply(
-            _runtime.mat3x4_compose(p_b, q_b),
-            _runtime.mat3x4_apply(_runtime.mat3x4_inverse(q_a), rows[1]),
-        )
-        self.assertGreater(
-            max(abs(a - b) for a, b in zip(inverted, want_borrow)), 0.1,
-            "取反版与正版在跨族行上必须明显不同（本用例 = t44 的**取反盲区门**）",
-        )
-        # 错版 B（按骨头族取 Q）：跨族行退化成 `P_b·v`（= 不校准）
-        noop = _runtime.mat3x4_apply(p_b, rows[1])
-        self.assertGreater(
-            max(abs(a - b) for a, b in zip(noop, want_borrow)), 0.1,
-            "按骨头族取 Q 会让跨族行退化成不校准（本用例必须能分辨这两种口径）",
-        )
-        # 错版 C（t41 之前的"整块 Q_host"）：同族第 0 行的变形结果被位移（用「顶点族==骨族==宿族」演示）
-        world_wrong = _runtime.mat3x4_apply(
-            _runtime.mat3x4_compose(p_a, palette_a),
-            _runtime.mat3x4_apply(q_a, rows[0]),
-        )
-        self.assertLess(
-            max(abs(a - b) for a, b in zip(
-                world_wrong, _runtime.mat3x4_apply(p_a, rows[0]))), 1e-5,
-        )
+        truth_world = _runtime.mat3x4_apply(p_b, rows[1])
+        deviation = max(abs(a - b) for a, b in zip(old_world, truth_world))
+        self.assertGreater(deviation, 1e-2, f"旧方案在跨族行上必须明显错（实测 {deviation:.6f}）")
 
     def test_blend_origin_sidecar_and_out_of_range_log_TWO_STATE(self):
         """【t49 / t47 方案 A+C】旁写 ``<fam>-BlendOrigin.buf``（8 B/顶点）+ 越界引用计数。
@@ -6293,11 +6246,12 @@ class HIMINearestFamilyTieTests(unittest.TestCase):
             self.assertEqual(hit["family"], baseline["family"], (query, hit))
 
     def test_calibration_end_to_end_weld_rows_stay_on_bone_family_TWO_STATE(self):
-        """**端到端两态**：焊接行在完整校准路径上不再被乘别族 Q。
+        """**端到端两态**：焊接行在完整诊断路径上不被写回，且归属仍判回**骨头族**。
 
         夹具 = 报告 26 §1 的 1:1 缩影：族 ``aaaa1111`` 缓冲里的 2 行，每行的位置在
         ``bbbb2222`` 源池里有一份差 3e-8 的拷贝（焊接点）。旧行为（镜像复算）会把两行
-        判给 bbbb ⇒ 乘 Q_bbbb；新行为保持 aaaa ⇒ 乘 Q_aaaa（本族）。
+        判给 bbbb ⇒ 当时乘 Q_bbbb 而不是 Q_aaaa（t44 之后那一版）；【t78 方案 B】起顶点侧
+        根本不写字节，但归属**数字**仍必须稳定判回 aaaa（判给 bbbb 会让 cross 变 2）。
         """
         rows = [(0.35, 0.90, -0.05), (1.0, 0.0, 0.5)]
         q_a = HIMIFamilyCalibrationTests._matrix(33, 1.6, (0.5, -0.25, 0.125))
@@ -6324,21 +6278,23 @@ class HIMINearestFamilyTieTests(unittest.TestCase):
             )
             self.assertEqual(legacy, self.FAM_OTHER, "旧口径镜像必须翻给别族（两态的红态）")
 
+        before = bytes(buffer)
         result = exporter._himi_calibrate_bind_positions()
         self.assertTrue(result["ok"], result)
         self.assertEqual(result["per_family"], {"aaaa1111": len(rows)}, result)
         self.assertEqual(result["claimed"], len(rows), result)
+        self.assertEqual(result["cross"], 0, "焊接行必须判回骨头族（否则会被记成跨族借用）")
+        # 【t78 方案 B】顶点侧不校准 ⇒ 缓冲一个字节都不动
+        self.assertEqual(bytes(buffer), before, "方案 B：焊接行也不得被写回")
         for index, point in enumerate(rows):
             got = HIMIFamilyCalibrationTests._row(buffer, index)[0:3]
-            want = _runtime.mat3x4_apply(q_a, point)
-            self.assertLess(
-                max(abs(a - b) for a, b in zip(got, want)), 1e-6,
-                f"焊接行 {index} 必须乘**本族** Q（保守回退骨头族），绝不乘别族 Q",
-            )
-            wrong = _runtime.mat3x4_apply(q_b, point)
+            for axis, want in enumerate(point):
+                self.assertAlmostEqual(got[axis], want, places=6, msg=f"焊接行 {index} 原位不动")
+            # 反向护栏：两族 Q 必须可分辨（否则「乘错族」这类变异对本用例是盲的）
             self.assertGreater(
-                max(abs(a - b) for a, b in zip(got, wrong)), 1e-3,
-                f"焊接行 {index} 的结果必须与「乘别族 Q」明显不同（本用例对该错版不盲）",
+                max(abs(a - b) for a, b in zip(
+                    _runtime.mat3x4_apply(q_a, point), _runtime.mat3x4_apply(q_b, point))), 1e-3,
+                f"焊接行 {index}: Q_aaaa 与 Q_bbbb 必须明显不同",
             )
 
 

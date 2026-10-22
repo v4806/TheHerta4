@@ -2717,15 +2717,19 @@ ATTACH_RANGE_INI_FORMAT = "R32G32B32A32_FLOAT"
 ATTACH_RANGE_BASENAME_SUFFIX = "-AttachRange.buf"
 #: 载荷布局（typed float4 数组，**8 个 float4 = 128 B**）：
 #:   ``[0]``   头部 ``(base, span, version, magic)``（**形状与语义都不动**）；
-#:   ``[1..3]`` = **palette 侧要复合的因子**（t44 起 = ``Q_f⁻¹``：把「提取帧世界」映到「当前世界」；
-#:              t39–t43 曾存 ``Q_f``，方向是反的）；
+#:   ``[1..3]`` = **保留的「族级摆放」段**：方案 B（t78）起**恒为单位阵** —— 顶点侧不再做
+#:              ``Q·v`` 校准，palette 侧只写 ``S = X_f · P_f``，这一段没有因子要复合；段位与长度
+#:              保留，只为兼容既有载荷布局与 CS 下标（乘单位阵 = 恒等）。
+#:              （历史：t39–t43 存 ``Q_f``、t44–t77 存 ``Q_f⁻¹``；两种方向都已废弃。）
 #:   ``[4..6]`` = **族级物体矩阵** ``X_f = M_base⁻¹ · M_f``（t74 新增，3×4 行主序）；
 #:              **t74 起降级为兜底**：主路径是 attach CS 运行期从本族 vs-cb3 实时算出 X，
 #:              只有 cb3 副本拿不到/校验不过时才用它（它仍是「当前导出这一次」的 X，不是随机数）；
 #:   ``[7]``    = ``(asuint own_index, asuint base_index, 0, 0)`` —— 本族/宿主族在物体矩阵表里的序号。
 #: ``X_f`` 修的是「合并后几何全在宿主族那一笔 draw 里渲染 ⇒ 只有 ``M_base``」这条偏差：
-#: 写进合并骨架的必须是 ``S = X_f ∘ P_f ∘ Q_f⁻¹``，游戏侧 ``M_base · S · (Q_f·v)`` 才等于真值
-#: ``M_f · P_f · v``（实测残差从 1.0–3.8 游戏单位掉到 ~1e-16）。
+#: 写进合并骨架的是 ``S = X_f · P_f``（方案 B：顶点侧原样，不再有 ``Q_f·v``），游戏侧
+#: ``M_base · S · v`` 等于真值 ``M_f · P_f · v``（实测残差从 1.0–3.8 游戏单位掉到 ~1e-16）。
+#: 旧口径 ``S = X_f ∘ P_f ∘ Q_f⁻¹`` 配顶点侧 ``Q_f·v`` 端到端逐位等价，但形态键通道没有 Q
+#: ⇒ 已废弃（见 ``.dbg/_t78_*`` 的证据）。
 #: 为什么与 base/span/Q 同资源（而不是另开一个）：三者都由「本次导出的 plan + 该族的
 #: palette 缓存 + 该族的 vs-cb3」推导，分资源就会有两种真相；而且 CS 只多读 3 个 float4，
 #: 不新增绑定槽（``cs-t1`` 不变）。**ver 字段保持 3**（头部形状按需求"保持原样"）：
@@ -2764,7 +2768,7 @@ def attach_range_resource_name(family: str) -> str:
 
 
 def attach_range_basename(family: str) -> str:
-    """``<fam>-AttachRange.buf``（128 B：头部 + ``Q_f⁻¹`` 3×4 + ``X_f`` 3×4 + 族索引 4×u32）。"""
+    """``<fam>-AttachRange.buf``（128 B：头部 + 单位阵 3×4（方案 B 保留位）+ ``X_f`` 3×4 + 族索引）。"""
     return f"{str(family or '').strip()}{ATTACH_RANGE_BASENAME_SUFFIX}"
 
 
@@ -2779,8 +2783,10 @@ def attach_range_payload(
 ) -> bytes:
     """身份载荷 = 头部 ``(base, span, version, magic)`` + ``Q_f⁻¹``（``[1..3]``）+ ``X_f``（``[4..6]``）。
 
-    * ``placement=None`` ⇒ ``[1..3]`` 写 12 个 0.0（**保留 v1 语义**：CS 不做 Q 校准）；
-    * ``placement`` 给 12 个数（行主序 3×4）⇒ 写进 ``[1..3]`` 三个 float4；
+    * ``placement=None`` ⇒ v2+ 写**单位阵**（方案 B：顶点侧不校准，这一段没有因子要复合），
+      v1 写 12 个 0.0（v1 载荷本就没有这一段）；
+    * ``placement`` 给 12 个数（行主序 3×4）⇒ 原样写进 ``[1..3]`` 三个 float4（本函数是低层
+      编解码器，**发布路径** ``publish_attach_ranges`` 只允许单位阵，见契约层判据）；
     * ``family_x`` 给 12 个数（行主序 3×4）⇒ 写进 ``[4..6]`` 三个 float4；``None`` ⇒ 12 个 0.0
       （= 未校准，CS 跳过 X 左乘 ⇒ 逐字节等价旧行为）。
 
@@ -2796,10 +2802,14 @@ def attach_range_payload(
     """
     import struct as _struct
 
+    from .himi_merged_contract import attach_placement_identity
+
     base = int(base)
     span = int(span)
     if base < 0 or span < 0:
         raise HIMIResourceDeclError(f"身份资源不接受负值（base={base}, span={span}）")
+    if placement is None and int(version) >= 2:
+        placement = attach_placement_identity()
     header = b"".join(
         value.to_bytes(4, "little")
         for value in (base, span, int(version), ATTACH_RANGE_MAGIC)
@@ -2844,16 +2854,21 @@ def decode_attach_range_payload(payload: bytes) -> dict:
     兼容四种形态：v1 的 16 B（无 Q）、v2/v3 的 64 B（带 Q）、112 B（带 Q + ``X_f``）、
     **128 B（带 Q + ``X_f`` + 族索引）**，以及其它长度（``ok=False``）。``has_placement`` 只在
     ``version >= 2`` **且** Q 的 12 个数里至少有一个非零时为真（全零 = 生成侧没给摆放 ⇒
-    语义等同 v1）；``has_family_x`` 只由「12 个数里至少一个非零」判定（与 CS 的
+    语义等同 v1；方案 B 起 v2+ 的 ``[1..3]`` **恒为单位阵**，故恒为真）；
+    ``placement_is_identity`` 是方案 B 的判据（12 个数与单位阵的偏差 ≤ 1e-6），
+    ``has_family_x`` 只由「12 个数里至少一个非零」判定（与 CS 的
     ``x_calibrated`` 同一判据，不看 version）；``has_indices`` 只由「``[7]`` 存在且
     ``base_index`` 非全零」判定（与 CS 的 ``version >= 4u`` 门配合）。
     """
     import struct as _struct
 
+    from .himi_merged_contract import ATTACH_PLACEMENT_TOLERANCE, attach_placement_deviation
+
     raw = bytes(payload or b"")
     empty = {
         "base": -1, "span": -1, "version": -1, "magic": -1,
         "ok": False, "has_placement": False, "placement": [],
+        "placement_is_identity": False,
         "has_family_x": False, "family_x": [],
         "own_index": -1, "base_index": -1, "has_indices": False,
     }
@@ -2877,6 +2892,11 @@ def decode_attach_range_payload(payload: bytes) -> dict:
         "ok": values[3] == ATTACH_RANGE_MAGIC,
         "has_placement": bool(values[2] >= 2 and placement and any(v != 0.0 for v in placement)),
         "placement": placement,
+        "placement_is_identity": bool(
+            values[2] >= 2
+            and placement
+            and attach_placement_deviation(placement) <= ATTACH_PLACEMENT_TOLERANCE
+        ),
         "has_family_x": bool(family_x and any(v != 0.0 for v in family_x)),
         "family_x": family_x,
         "own_index": int(own_index),
@@ -2888,15 +2908,15 @@ def decode_attach_range_payload(payload: bytes) -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# 【t39】族级校准的纯数学（顶点侧 v' = Q⁻¹·v ；palette 侧 P' = P ∘ Q）
+# 【t39 历史 · t78 方案 B 停用】族级 Q 的两侧配对（顶点 v' = Q·v ；palette P' = P ∘ Q⁻¹）
 # --------------------------------------------------------------------------- #
 #
-# 为什么是这一对（而不是「P' = Q⁻¹·P 且 v' = Q·v」）：不变量要求
-#     P'[b] · v' ≡ P[b] · v   （同一族的骨）
-# 若取 P' = Q⁻¹·P、v' = Q·v，则左侧 = Q⁻¹·P·Q·v —— 那是**相似变换**，只有 P 与 Q 可交换才相等；
-# 实测五族 × 若干槽 × 若干顶点 **最大偏差 0.774**（≫ 1e-5）。取 P' = P∘Q、v' = Q⁻¹·v 时
-# 左侧 = P·Q·Q⁻¹·v = P·v **恒等**（实测 1.3e-15）。两者对**跨族借用**都会产生 ~1.3 单位的
-# 位移（用户症状量级），但只有后者满足本任务自己的硬门。完整证据：`.dbg/_t39_math_verify.py`。
+# 这一段只留作历史与证明素材：方案 B 已把**顶点侧**整个去掉（缓冲原样写），palette 侧也不再乘
+# Q⁻¹ ⇒ 今天的写槽是 `S = X_f · P_f`，Q 只用于「逐行族归属」诊断（_himi_calibrate_bind_positions）。
+# 当时的推导（不变量 P'[b]·v' ≡ P[b]·v）：取 P' = P∘Q⁻¹、v' = Q·v 时左侧 = P·Q⁻¹·Q·v = P·v
+# **恒等**（实测 1.3e-15）；而 P' = Q⁻¹·P 配 v' = Q·v 是相似变换，只有 P 与 Q 可交换才成立
+# （实测最大偏差 0.774）。为什么最终停用：真实产物跨族权重行 = 0、那一步净效果恒等，却让**没有
+# Q 校准的形态键通道**与基态分处两个空间（`Q·v+δ ≠ Q·(v+δ)`）。证据：`.dbg/_t39_math_verify.py`。
 
 
 def mat3x4_compose(a, b):
@@ -3083,18 +3103,23 @@ def publish_attach_ranges(
 ) -> dict:
     """把每族的身份载荷写进 mod 缓冲目录（幂等；返回 ``{"ok","written","files","message"}``）。
 
-    ``placements``：``{family: 12 个 float（Q_f⁻¹，行主序 3×4）}``（t39 族级校准）。
+    ``placements``：``{family: 12 个 float（行主序 3×4）}`` —— **方案 B（t78）起恒为单位阵**：
+    顶点侧已不再做 ``Q·v`` 校准，这一段没有因子要复合；给非单位阵会被**本函数拒绝**
+    （fail-closed，写盘之前就返回 ``ok=False``），发布侧的判据在 ``common/himi_merged_contract.py``。
     ``family_xs``：``{family: 12 个 float（X_f = M_base⁻¹·M_f，行主序 3×4）}``（t39-X 物体矩阵；
     t74 起是**兜底**值，主路径由 CS 运行期从 vs-cb3 现算）。
     ``indices``：``{family: (own_index, base_index)}`` —— 本族/宿主族在物体矩阵表里的序号。
-    载荷长度**恒为** ``ATTACH_RANGE_BYTES``（128 B = 头部 + Q_f⁻¹ + X_f + 族索引）：
-    没给对应因子 ⇒ 那 48 B 写零（CS 跳过那一步，**语义等价旧行为**，不是静默乱写）。
+    载荷长度**恒为** ``ATTACH_RANGE_BYTES``（128 B = 头部 + 单位阵 + X_f + 族索引）：
+    没给 ``family_xs`` ⇒ 那 48 B 写零（CS 跳过那一步，**语义等价旧行为**，不是静默乱写）；
+    没给 ``placements`` ⇒ 写**单位阵**（不是全零，也不影响 CS 的 ``x_calibrated`` 外的任何行为）。
 
     缺任何一族的文件都会让该族 CS 的 ``cs-t1`` 绑空 ⇒ 退回冻结表（不是静默乱写），
     但导出侧另有**文件存在性硬门**（``ui/universal/himi.py::verify_attach_range_references``）
     把它拦在产物落盘那一步；该硬门同时核对**长度**（必须是 128 B —— 64/112 B 的旧载荷会让
     CS 读到 ``himi_attach_range[4..7]`` 之外 ⇒ 宁可 Fatal 也不产出半校准的产物）。
     """
+    from .himi_merged_contract import attach_placement_identity, attach_placement_problem
+
     folder = str(folder_path or "")
     if not folder:
         return {
@@ -3123,10 +3148,17 @@ def publish_attach_ranges(
             span = int(info.get("slots", 0) or 0)
             if span <= 0:
                 continue  # 借位族没有自己的块 ⇒ 不发身份资源（与「不发 attach 段」同源）
+            placement = placements.get(str(family))
+            if placement is None:
+                placement = attach_placement_identity()  # 方案 B：不该有因子，缺省就是恒等
+            else:
+                problem = attach_placement_problem(placement, label=f"{family}: 载荷 [1..3]")
+                if problem:
+                    return {"ok": False, "written": False, "files": files, "message": problem}
             payload = attach_range_payload(
                 int(info.get("base", 0) or 0),
                 span,
-                placement=placements.get(str(family)),
+                placement=placement,
                 family_x=family_xs.get(str(family)),
                 indices=indices.get(str(family)),
             )
@@ -3155,7 +3187,8 @@ def publish_attach_ranges(
         "files": files,
         "message": (
             f"已写出 {len(files)} 个家族身份资源（重写 {written} 个；"
-            f"其中 {calibrated} 个带族级摆放 Q_f⁻¹、{matrixed} 个带族级物体矩阵 X_f（兜底）、"
+            f"分族摆放段恒为单位阵（方案 B：顶点侧不校准；{calibrated} 个显式给值）、"
+            f"{matrixed} 个带族级物体矩阵 X_f（兜底）、"
             f"{indexed} 个带物体矩阵表索引 / {ATTACH_RANGE_BYTES} B）"
         ),
     }
@@ -3164,16 +3197,19 @@ def publish_attach_ranges(
 def verify_attach_range_files(
     folder_path: str, ranges, *, placements=None, family_xs=None, indices=None
 ) -> list:
-    """【A3 四方同步】核对**已落盘**的身份资源与「族区间 / Q_f⁻¹ / X_f / 族索引 / 128 B」逐项一致。
+    """【A3 四方同步】核对**已落盘**的身份资源与「族区间 / 单位阵 / X_f / 族索引 / 128 B」逐项一致。
 
     四方 = ① 文件字节数（ini 侧是 typed Buffer、**没有 ``array=``**，资源长度只能由
     字节数体现 ⇒「族数 × 128」就是 ini 与 CS 之间的同步点）② 解码出的 base/span/族索引
-    ③ 解码出的 Q_f⁻¹ ④ 解码出的 X_f。比较一律用 ``struct.pack("<12f")`` 的**字节相等**
+    ③ 解码出的 ``[1..3]``：方案 B 起**必须**是单位阵（容差 1e-6，否则就是有人在顶点侧偷偷乘了 Q）
+    ④ 解码出的 X_f。比较一律用 ``struct.pack("<12f")`` 的**字节相等**
     （发布侧本来就是 float32 ⇒ 逐字节可比，不受 float64 期望值的舍入影响）。
 
     返回问题清单（空 = 通过）；借位族（``slots <= 0``）不发文件、也不检查。
     """
     import struct as _struct
+
+    from .himi_merged_contract import attach_placement_problem
 
     folder = str(folder_path or "")
     ranges = dict(ranges or {})
@@ -3205,7 +3241,7 @@ def verify_attach_range_files(
         if len(raw) != ATTACH_RANGE_BYTES:
             problems.append(
                 f"{family}: 载荷长度 {len(raw)} B ≠ {ATTACH_RANGE_BYTES} B"
-                "（8 个 float4：头部 + Q_f⁻¹ + X_f + 族索引）"
+                "（8 个 float4：头部 + 单位阵 + X_f + 族索引）"
             )
             continue
         decoded = decode_attach_range_payload(raw)
@@ -3217,8 +3253,17 @@ def verify_attach_range_files(
             )
         if int(decoded.get("span", -1)) != span:
             problems.append(f"{family}: 载荷 span {decoded.get('span')} ≠ 族区间 slots {span}")
+        # 方案 B（t78）的无条件硬门：`[1..3]` 只能是单位阵（容差 1e-6）。
+        if len(raw) >= ATTACH_RANGE_HEADER_BYTES + ATTACH_RANGE_FAMILY_X_BYTES and int(
+            decoded.get("version", -1)
+        ) >= 2:
+            problem = attach_placement_problem(
+                decoded.get("placement") or [], label=f"{family}: 载荷 [1..3]"
+            )
+            if problem:
+                problems.append(problem)
         for label, key, expected in (
-            ("Q_f⁻¹", "placement", placements.get(str(family))),
+            ("单位阵[1..3]", "placement", placements.get(str(family))),
             ("X_f", "family_x", family_xs.get(str(family))),
         ):
             if expected is None:
