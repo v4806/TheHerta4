@@ -83,7 +83,7 @@ class SubMeshModel:
     # 接缝焊接配置（导出器从「接缝焊接」后处理节点读取后注入；None = 不焊接）
     seam_weld_config:dict = field(init=False, default=None, repr=False)
     # 焊接：焊后 mesh 顶点 -> 原物体 id / 导出顶点池行归属
-    weld_vertex_owner_map = field(init=False, default=None, repr=False)
+    weld_vertex_owner_map:numpy.ndarray = field(init=False, default=None, repr=False)
     weld_pool_owner_rows:dict = field(init=False, default_factory=dict, repr=False)
     weld_bucket_by_cache_key:dict = field(init=False, default_factory=dict, repr=False)
     seam_weld_index_recount_applied:bool = field(init=False, default=False)
