@@ -2064,7 +2064,7 @@ class OperatorInvokeTests(_BackgroundTestBase):
         # 进度条非空时插在「后台导出：」之后、步骤文本之前
         self.assertEqual(
             _FAKE_AREAS[0].header,
-            "后台导出：[░░░░░░░░░░░░░░░░░░░░] 0% 准备 0/2",
+            "后台导出：▏────────────────────▕ 0% 准备 0/2",
         )
 
     def test_modal_escape_clears_view_nav_state(self):
@@ -2240,7 +2240,7 @@ class OperatorInvokeTests(_BackgroundTestBase):
         self.assertEqual(result, {'RUNNING_MODAL'})
         self.assertEqual(
             _FAKE_AREAS[0].header,
-            "后台导出：[████████░░░░░░░░░░░░] 40% 13/32 前处理-恢复非镜像｜"
+            "后台导出：▏████████────────────▕ 40% 13/32 前处理-恢复非镜像｜"
             "蕾米埃尔-NF/物体信息.013",
         )
 
@@ -2276,7 +2276,7 @@ class OperatorInvokeTests(_BackgroundTestBase):
 
         self.assertEqual(result, {'RUNNING_MODAL'})
         self.assertEqual(_FAKE_WINDOW_MANAGER.progress_calls, [])
-        self.assertIn("[█████", _FAKE_AREAS[0].header)
+        self.assertIn("▏█████", _FAKE_AREAS[0].header)
         self.assertIn("25%", _FAKE_AREAS[0].header)
 
     def test_modal_progress_update_throttled_when_done_unchanged(self):
@@ -2294,7 +2294,7 @@ class OperatorInvokeTests(_BackgroundTestBase):
             result = operator.modal(context, types.SimpleNamespace(type='TIMER'))
             self.assertEqual(result, {'RUNNING_MODAL'})
             # 文本进度条仍每 tick 刷新（节流只针对原生 progress_update）
-            self.assertIn("[████████░░░░░░░░░░░░] 40%", _FAKE_AREAS[0].header)
+            self.assertIn("▏████████────────────▕ 40%", _FAKE_AREAS[0].header)
 
         self.assertEqual(
             _FAKE_WINDOW_MANAGER.progress_calls,
@@ -2895,30 +2895,30 @@ class StepProgressTests(_BackgroundTestBase):
 
     def test_format_progress_bar(self):
         self.assertEqual(
-            export_background.format_progress_bar(0, 5), "[░░░░░░░░░░░░░░░░░░░░] 0%"
+            export_background.format_progress_bar(0, 5), "▏────────────────────▕ 0%"
         )
         self.assertEqual(
-            export_background.format_progress_bar(5, 5), "[████████████████████] 100%"
+            export_background.format_progress_bar(5, 5), "▏████████████████████▕ 100%"
         )
         self.assertEqual(export_background.format_progress_bar(3, 0), "")
 
     def test_format_percent_bar(self):
-        self.assertEqual(export_background.format_percent_bar(0), "[░░░░░░░░░░░░░░░░░░░░] 0%")
-        self.assertEqual(export_background.format_percent_bar(40), "[████████░░░░░░░░░░░░] 40%")
-        self.assertEqual(export_background.format_percent_bar(100), "[████████████████████] 100%")
-        self.assertEqual(export_background.format_percent_bar(120), "[████████████████████] 100%")
+        self.assertEqual(export_background.format_percent_bar(0), "▏────────────────────▕ 0%")
+        self.assertEqual(export_background.format_percent_bar(40), "▏████████────────────▕ 40%")
+        self.assertEqual(export_background.format_percent_bar(100), "▏████████████████████▕ 100%")
+        self.assertEqual(export_background.format_percent_bar(120), "▏████████████████████▕ 100%")
 
     def test_compose_background_progress_text_layout(self):
         """进度条插在「后台导出：」之后、步骤文本之前；为空时原样返回文本。"""
         compose = ui_func_export.compose_background_progress_text
         self.assertEqual(
-            compose("后台导出：13/32 前处理-恢复非镜像｜树/节点", "[████████░░░░░░░░░░░░] 40%"),
-            "后台导出：[████████░░░░░░░░░░░░] 40% 13/32 前处理-恢复非镜像｜树/节点",
+            compose("后台导出：13/32 前处理-恢复非镜像｜树/节点", "▏████████────────────▕ 40%"),
+            "后台导出：▏████████────────────▕ 40% 13/32 前处理-恢复非镜像｜树/节点",
         )
         self.assertEqual(compose("后台导出：准备 0/2", ""), "后台导出：准备 0/2")
         # 非标准进度文案（完成 / 取消 / 失败）不插入进度条，避免拼出重复前缀
         self.assertEqual(
-            compose("后台导出完成（31/31，用时 27.7 秒）", "[████████████████████] 100%"),
+            compose("后台导出完成（31/31，用时 27.7 秒）", "▏████████████████████▕ 100%"),
             "后台导出完成（31/31，用时 27.7 秒）",
         )
 
@@ -3257,7 +3257,7 @@ class FixedStepProgressTests(_BackgroundTestBase):
             _FAKE_WINDOW_MANAGER.progress_calls,
             [("begin", 0, 100), ("update", 30)],
         )
-        self.assertIn("[██████░░░░░░░░░░░░░░] 30%", text)
+        self.assertIn("▏██████──────────────▕ 30%", text)
         session.cleanup()
 
 

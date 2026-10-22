@@ -695,6 +695,22 @@ def _disable_nested_parallel() -> None:
     _configure_worker_parallel()
 
 
+def _clear_export_section_registry() -> None:
+    """worker 进程内清空 DrawIB→ini 段登记表（与主进程同步导出入口保持一致）。
+
+    登记表由 ``common/export_section_registry.py`` 提供，可能尚未落地（精简加载 /
+    测试桩），因此软导入：拿不到模块或清理失败都只留一条提示，绝不让后台导出失败。
+    """
+    try:
+        from ..common import export_section_registry as _section_registry
+    except Exception:
+        return
+    try:
+        _section_registry.clear()
+    except Exception as error:
+        print(f"⚠️ 清理导出段登记表失败（已忽略）: {error}")
+
+
 def _run_worker(manifest_path: str) -> None:
     """在干净实例里跑完整导出：全部轮次串行 → 后处理 → 写 result.json / log。
 
@@ -704,6 +720,9 @@ def _run_worker(manifest_path: str) -> None:
     逐项推进 ``done``，收尾 ``finish_steps()`` 补满。
     """
     manifest = _read_json(manifest_path) or {}
+
+    # worker 与主进程内存隔离：这里再清一次，保证后处理节点只看到本次导出的 ini 段。
+    _clear_export_section_registry()
 
     stage_path = str(manifest.get("stage_path") or "")
     result_path = str(manifest.get("result_path") or "")
@@ -999,7 +1018,7 @@ def format_progress_bar(done, total, width: int = 20) -> str:
     cells = max(1, int(width or 20))
     filled = max(0, min(cells, int(round(done_value / total_value * cells))))
     percent = int(done_value / total_value * 100)
-    return f"[{'█' * filled}{'░' * (cells - filled)}] {percent}%"
+    return f"▏{'█' * filled}{'─' * (cells - filled)}▕ {percent}%"
 
 
 def format_percent_bar(percent, width: int = 20) -> str:
@@ -1017,7 +1036,7 @@ def format_percent_bar(percent, width: int = 20) -> str:
 
     cells = max(1, int(width or 20))
     filled = max(0, min(cells, int(round(value / 100 * cells))))
-    return f"[{'█' * filled}{'░' * (cells - filled)}] {value}%"
+    return f"▏{'█' * filled}{'─' * (cells - filled)}▕ {value}%"
 
 
 def _resolve_status_workspace(context=None):
