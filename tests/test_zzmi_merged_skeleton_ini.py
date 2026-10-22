@@ -416,6 +416,22 @@ def _make_exporter(drawib_models, merged_vgmap=True, ordered_drawcalls=None):
     return exporter
 
 
+def _cross_group_switch(enabled):
+    """把跨组开关钉在指定值（其余属性开关保持各自声明的默认）。
+
+    该开关默认已开启，凡是要验「关闭路径」的用例都必须显式钉住它，不能依赖默认值。
+    """
+    return mock.patch.object(
+        sys.modules[f"{PKG}.ui.universal.zzmi"],
+        "_zzmi_prop_flag",
+        lambda name, default: (
+            enabled
+            if name == ZZMICrossGroupAttachTests.SWITCH
+            else bool(default)
+        ),
+    )
+
+
 class ZZSIMergedSkeletonCollectTests(unittest.TestCase):
     def test_collect_gated_by_checkbox(self):
         models = [_FakeDrawIBModel("b20f90ea", [_FakeSubmesh("LOD0.b20f90ea-19182-0", 154, 51)])]
@@ -587,7 +603,8 @@ class ZZSIMergedSkeletonIniTests(unittest.TestCase):
             exporter._collect_merged_skeleton_components()
         )
         builder = _FakeIniBuilder()
-        exporter.add_merged_skeleton_sections(builder)
+        with _cross_group_switch(False):
+            exporter.add_merged_skeleton_sections(builder)
         lines = _all_builder_lines(builder)
         text = "\n".join(lines)
 
@@ -812,7 +829,8 @@ class ZZSIMergedSkeletonIniTests(unittest.TestCase):
             exporter._collect_merged_skeleton_components()
         )
         builder = _FakeIniBuilder()
-        exporter.add_merged_skeleton_sections(builder)
+        with _cross_group_switch(False):
+            exporter.add_merged_skeleton_sections(builder)
         lines = _all_builder_lines(builder)
         text = "\n".join(lines)
 
@@ -1111,7 +1129,8 @@ class ZZMICrossGroupGuardTests(unittest.TestCase):
             {"draw_ib": "b20f90ea", "vg_offset": 105, "vg_count": 51, "skeleton_group": 1},
         ]
         exporter = self._make_component_exporter("a23aa8a3", submesh, components)
-        out = self._capture_warnings(exporter)
+        with _cross_group_switch(False):
+            out = self._capture_warnings(exporter)
         self.assertIn("禁止跨组别骨骼合并", out)
         self.assertIn("a23aa8a3", out)
         self.assertIn("骨架组 G0", out)
@@ -1162,7 +1181,8 @@ class ZZMICrossGroupGuardTests(unittest.TestCase):
         ]
         exporter = self._make_component_exporter("a23aa8a3", submesh, components)
         try:
-            out = self._capture_warnings(exporter)
+            with _cross_group_switch(False):
+                out = self._capture_warnings(exporter)
         except TypeError as exc:  # pragma: no cover - 修复前走这条
             self.fail(f"跨组守卫不应因类型混排抛 TypeError: {exc}")
         self.assertIn("禁止跨组别骨骼合并", out)
@@ -1179,7 +1199,8 @@ class ZZMICrossGroupGuardTests(unittest.TestCase):
             {"draw_ib": "a23aa8a3", "vg_offset": 0, "vg_count": 105, "skeleton_group": 0},
         ]
         exporter = self._make_component_exporter("a23aa8a3", submesh, components)
-        out = self._capture_warnings(exporter)
+        with _cross_group_switch(False):
+            out = self._capture_warnings(exporter)
         self.assertIn("禁止跨组别骨骼合并", out)
         self.assertIn("[300]", out)
         self.assertIn("['未知（不在导出组件范围）']", out)
@@ -1194,8 +1215,9 @@ class ZZMICrossGroupGuardTests(unittest.TestCase):
         ]
         exporter = self._make_component_exporter("a23aa8a3", submesh, components)
         try:
-            out = self._capture_warnings(exporter)
-            groups = exporter._merged_skeleton_groups()
+            with _cross_group_switch(False):
+                out = self._capture_warnings(exporter)
+                groups = exporter._merged_skeleton_groups()
         except TypeError as exc:  # pragma: no cover - 修复前走这条
             self.fail(f"组号归一后不应抛 TypeError: {exc}")
         self.assertIn("禁止跨组别骨骼合并", out)
@@ -1269,13 +1291,7 @@ class ZZMICrossGroupAttachTests(unittest.TestCase):
 
     @staticmethod
     def _switch(enabled: bool):
-        return mock.patch.object(
-            sys.modules[f"{PKG}.ui.universal.zzmi"],
-            "_zzmi_prop_flag",
-            lambda name, default: (
-                True if (enabled and name == ZZMICrossGroupAttachTests.SWITCH) else bool(default)
-            ),
-        )
+        return _cross_group_switch(enabled)
 
     def _render_attach_sections(self, exporter):
         builder = _FakeIniBuilder()
@@ -1293,10 +1309,11 @@ class ZZMICrossGroupAttachTests(unittest.TestCase):
         return "\n".join(_all_builder_lines(builder))
 
     def test_disabled_emits_no_cross_attach(self):
-        """默认关闭：检测直接返回空 ⇒ 不发射 AttachX_ 段（零行为变化）。"""
+        """关掉开关：检测直接返回空 ⇒ 不发射 AttachX_ 段（零行为变化）。"""
         exporter, _model = self._make_fixture()
-        self.assertEqual(exporter._merged_cross_group_component_ids(0), [])
-        text = self._render_attach_sections(exporter)
+        with self._switch(False):
+            self.assertEqual(exporter._merged_cross_group_component_ids(0), [])
+            text = self._render_attach_sections(exporter)
         self.assertNotIn("AttachX_", text)
         self.assertNotIn("CROSS_GROUP_ATTACH", str(exporter._zzmi_merge_diagnostics))
 
@@ -1601,11 +1618,12 @@ class ZZMICrossGroupAttachTests(unittest.TestCase):
         self.assertIn("bind_flags = unordered_access vertex_buffer", out_block)
 
     def test_disabled_emits_no_cross_publish(self):
-        """默认关闭：零行为变化（无跨组发布段、无 SO 捕获、无诊断）。"""
+        """关掉开关：零行为变化（无跨组发布段、无 SO 捕获、无诊断）。"""
         exporter, model = self._make_fixture_with_geometry()
-        text = self._render_attach_sections(exporter) + self._render_vb_section(
-            exporter, model
-        )
+        with self._switch(False):
+            text = self._render_attach_sections(exporter) + self._render_vb_section(
+                exporter, model
+            )
         self.assertNotIn("CustomShaderZZMISkin_G0", text)
         self.assertNotIn("ResourceZZRedirectSO_G0_s1 = ref so0", text)
         self.assertNotIn("CROSS_GROUP_PUBLISH", str(exporter._zzmi_merge_diagnostics))
@@ -1636,7 +1654,7 @@ class ZZMICrossGroupAttachTests(unittest.TestCase):
     def test_guard_keeps_forbidden_warning_when_disabled(self):
         exporter, _model = self._make_fixture()
         buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
+        with self._switch(False), contextlib.redirect_stdout(buf):
             exporter._warn_cross_group_bone_references()
         out = buf.getvalue()
         self.assertIn("禁止跨组别骨骼合并", out)

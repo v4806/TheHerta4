@@ -32,6 +32,11 @@ _REAL_MODULES = (
 	("common", "safe_write"),
 	# t75：共享骨图 / 通道骨判定的唯一实现（zzmi_skeleton 与 zzmi.py 都依赖它）。
 	("common", "zzmi_channel"),
+	# 跨组骨骼合并：zzmi.py 的 cross-group 分支运行期导入 zzmi_skeleton，缺这一条
+	# 就让 4 个 ZZMICrossGroupAttachTests 全部 ModuleNotFoundError（按依赖顺序追加）。
+	("utils", "json_utils"),
+	("common", "efmi_skeleton"),
+	("common", "zzmi_skeleton"),
 	# 形态键「顶点命中索引」：纯 numpy/标准库的叶子模块，blueprint 侧的
 	# node_postprocess_shapekey.py 与 direct_export_shapekey_output_mixin.py 都依赖它。
 	("blueprint", "shapekey_sparse_index"),

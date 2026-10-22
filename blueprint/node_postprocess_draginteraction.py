@@ -56,8 +56,34 @@ MERGED_SKELETON_PRODUCT_MARKERS = (
     "zz_ms_prev_",
     "ResourceZZRedirectSO",
 )
+# t88 绑定只准引用产物里真实存在的合并骨架组，且只准用本组件自己的出现次计数器：
+#   组号 ← 本件 deform 段里引用的 ResourceZZMergedSkeleton_G<n>_s<k>（同一产物可以有多个
+#          组，各组绝不共享骨架缓冲，只有本件自己那段能判定归属）；
+#   cid  ← 同一段里的 $zz_ms_occ_<cid>（zzmi 生成侧按「合并组件序号」命名）。
+MERGED_SKELETON_SECTION_RE = re.compile(r"^\[ResourceZZMergedSkeleton_G(\d+)_s\d+\]$")
+MERGED_SKELETON_REF_RE = re.compile(r"ResourceZZMergedSkeleton_G(\d+)_s\d+\b")
+MERGED_SKELETON_OCC_RE = re.compile(r"\$zz_ms_occ_(\d+)\b")
 VAR_SYNC_FLOAT4_CAPACITY = 9
 VAR_SYNC_MAX_BINDINGS = VAR_SYNC_FLOAT4_CAPACITY * 4
+
+
+def _warn_missing_merged_skeleton_binding(comp_name, reason):
+    """t88 绑定无法从产物唯一确定时告警：宁可整块不发射，也不 ref 一个不存在的资源。
+
+    猜错组号会让 cs-t88 = ref ResourceZZMergedSkeleton_G<n>_s<k> 指向产物里没有的资源
+    （3DMigoto 加载即报错），猜错 cid 会让本件读到别人的出现次计数器。
+    """
+    message = (
+        f"[DragInteraction] 组件 {comp_name or '<未知>'} 未发射 cs-t88 合并骨架绑定：{reason}。"
+        "碰撞面蒙皮因此不跟随骨架（绑定产物里不存在的资源会让 3DMigoto 加载失败）；"
+        "若该组件本应跟随骨架，请确认它确实参与了合并骨架导出。"
+    )
+    try:
+        from ..utils.log_utils import LOG as _LOG
+    except Exception:
+        print(message)
+        return
+    _LOG.warning(message)
 
 
 def _node_identity_key(node):
@@ -1535,6 +1561,63 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
         if self._is_merged_skeleton_product(sections):
             return "INFO", merged_skeleton_suffix
         return "WARNING", ""
+
+    @staticmethod
+    def _merged_skeleton_binding(sections, comp):
+        """推导本组件的 (合并骨架组号, 出现次计数器 cid, 诊断)，推导不出的一律返回 None。
+
+        组号与 cid 只从产物文本推导，两级来源：
+        1. 本组件自己的 deform 段（段名以 [TextureOverride_VB_<draw_ib>_ 开头）：
+           段内 $zz_ms_occ_<cid> 的自增给出 cid，段内引用的
+           ResourceZZMergedSkeleton_G<n>_s<k> 给出本件所属组。同一产物可以有多个组，
+           各组绝不共享骨架缓冲，所以只有本件自己那段能判定归属。
+        2. 组号兜底：全产物的 [ResourceZZMergedSkeleton_G<n>_s<k>] 资源段名，仅当只
+           存在唯一一个组号时才采用（本件那段的骨架引用可能已被别的 redirect 吸收）。
+
+        任一级出现零个或多个候选 ⇒ 返回 None 并给出诊断；调用方整块不发射并告警，
+        禁止退化成 G3 / cid=0 之类的默认值。
+        """
+        draw_ib = str(comp.get("hash") or "")
+        occ_ids = set()
+        groups = set()
+        if draw_ib:
+            prefix = f"[TextureOverride_VB_{draw_ib}_".casefold()
+            for section_name, lines in sections.items():
+                section_text = str(section_name)
+                if not section_text.casefold().startswith(prefix):
+                    continue
+                if not section_text.endswith("]"):
+                    continue
+                for line in lines or ():
+                    text = str(line)
+                    occ_ids.update(
+                        int(match.group(1))
+                        for match in MERGED_SKELETON_OCC_RE.finditer(text)
+                    )
+                    groups.update(
+                        int(match.group(1))
+                        for match in MERGED_SKELETON_REF_RE.finditer(text)
+                    )
+        if not groups:
+            groups = {
+                int(match.group(1))
+                for match in (
+                    MERGED_SKELETON_SECTION_RE.match(str(name))
+                    for name in sections
+                )
+                if match
+            }
+        if len(occ_ids) != 1:
+            return None, None, (
+                f"本件 deform 段 [TextureOverride_VB_{draw_ib}_*] 里找到的出现次计数器为 "
+                f"{sorted(occ_ids) or '空'}，无法唯一确定 $zz_ms_occ_<cid>"
+            )
+        if len(groups) != 1:
+            return None, None, (
+                f"产物里的合并骨架组号为 {sorted(groups) or '空'}，无法唯一确定 "
+                "ResourceZZMergedSkeleton_G<n>_s<k>"
+            )
+        return next(iter(groups)), next(iter(occ_ids)), ""
 
     @staticmethod
     def _strip_legacy_help_mode_block(text):
@@ -5115,14 +5198,33 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                 lines.append(f"cs-u2 = ResourceDragJiggleBlendOut_{cn}_{ns}")
                 # 碰撞面跟随动画（t22）：碰撞三角形顶点要按「当帧骨架」蒙皮，否则碰撞面留在
                 # 导出姿态，角色一摆腿顶点就穿过薄壳（实测漂移 >1 mm 即穿，gap 只有 0.37~1.74 mm）。
-                # 合并骨架是 s1/s2 两帧 ping-pong：本帧 deform 段按 $zz_ms_occ_0 选一份写入，
-                # 而拖拽 CS 在渲染 draw 上执行 ⇒ 必须同步选同一份，固定 s1 会让 occ==2 的帧
-                # 读到上一帧骨架（滞后误差 ≈ −1.5 mm/度，0.35° 就耗尽全部余量）。
-                lines.append(f"\tif $zz_ms_occ_0 == 1")
-                lines.append(f"\t\tcs-t88 = ref ResourceZZMergedSkeleton_G3_s1")
-                lines.append(f"\telse")
-                lines.append(f"\t\tcs-t88 = ref ResourceZZMergedSkeleton_G3_s2")
-                lines.append(f"\tendif")
+                # 合并骨架是 s1/s2 ping-pong：本件 deform 段按「自己的」 $zz_ms_occ_<cid> 选一份
+                # 写入（occ==1 → s1、occ==2 → s2），而拖拽 CS 在渲染 draw 上执行 ⇒ 绑定必须用
+                # 同一条计数器、同一套槽位口径。计数器每帧被 [Present] 清零，本件 deform 段
+                # 还没跑时是 0 ⇒ 只有 2 对应 s2，0/1 都按 s1（旧口径 occ == 1 把 0 判成 s2，
+                # 读到上一帧第 2 次出现留下的旧值或全零骨架）。
+                # 组号/cid 一律从产物推导：猜错组号会 ref 一个不存在的资源，整个 ini 加载失败。
+                # 非合并产物既没有 [ResourceZZMergedSkeleton_G<n>_s<k>] 也没有出现次计数器，
+                # 那本就不该有 t88 绑定 ⇒ 静默整块跳过（不加这条门控时每个非合并部件都会
+                # 走一次「推导不出」的告警，文案在非合并场景是误导）。
+                if self._is_merged_skeleton_product(sections):
+                    skeleton_group, skeleton_occ, skeleton_reason = self._merged_skeleton_binding(
+                        sections, comp
+                    )
+                    if skeleton_group is None or skeleton_occ is None:
+                        _warn_missing_merged_skeleton_binding(
+                            comp.get("comp_name", ""), skeleton_reason
+                        )
+                    else:
+                        lines.append(f"\tif $zz_ms_occ_{skeleton_occ} == 2")
+                        lines.append(
+                            f"\t\tcs-t88 = ref ResourceZZMergedSkeleton_G{skeleton_group}_s2"
+                        )
+                        lines.append("\telse")
+                        lines.append(
+                            f"\t\tcs-t88 = ref ResourceZZMergedSkeleton_G{skeleton_group}_s1"
+                        )
+                        lines.append("\tendif")
         lines.extend([
             "",
             f"ResourceDragJiggleTempVB0_{cn}_{ns} = vb0",

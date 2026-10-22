@@ -288,7 +288,7 @@ class GlobalProterties(bpy.types.PropertyGroup):
         name="跨组融合统一顶点组测试",
         description=(
             "【实验开关，仅 ZZMI】跨 SkeletonGroup（对象变换 / 渲染 vs-cb1 对象空间"
-            "不同）的骨骼合并总开关，默认关闭。开启后：① 被吸收进宿主网格的**别组**"
+            "不同）的骨骼合并总开关，默认开启（2026-10-27 用户拍板；关掉即回退历史路线）。开启后：① 被吸收进宿主网格的**别组**"
             "部件，其骨骼写进**吸收它的宿主组**骨架缓冲（跨组 attach，旧行为会让被"
             "吸收的顶点读未初始化矩阵 ⇒ 部件消失）；② 合并网格**按来源拆分绘制**——"
             "对象变换 cb1 是**每次绘制一份**的常量（464 B，顶点没有索引它的机制），而"
@@ -314,7 +314,7 @@ class GlobalProterties(bpy.types.PropertyGroup):
             "排查存档见 `ZZMI骨骼合并计划书.md` ⑭ 与 §9。与已验证可用"
             "的合并骨骼（使用融合统一顶点组）完全分离，关闭时逐字节保持历史行为"
         ),
-        default=False,
+        default=True,
     ) # type: ignore
 
     zzmi_merged_redirect_enabled: bpy.props.BoolProperty(
@@ -627,7 +627,7 @@ class GlobalProterties(bpy.types.PropertyGroup):
 
     @classmethod
     def cross_group_merged_vgmap_test(cls):
-        """跨组融合统一顶点组测试开关（仅 ZZMI，实验用，默认关闭）。
+        """跨组融合统一顶点组测试开关（仅 ZZMI，默认开启）。
 
         与 `import_merged_vgmap`（已验证可用的合并骨骼）**完全分离**：互不影响，
         关闭本开关时任何既有行为都不变。
@@ -638,9 +638,10 @@ class GlobalProterties(bpy.types.PropertyGroup):
         `vs-cb1`）。**已知未解问题（2026-10-10 报告，至今未定位）**：角色展示页
         （大世界之外那条渲染路径）下本方案的段命令 `draw` / `drawindexed` 不执行 ——
         画面不推进、什么都看不见（大世界一切正常；进程未死、资源级覆盖仍生效）。
-        排查存档见 `ZZMI骨骼合并计划书.md` ⑭ 与 §9；默认关闭正是为此。
+        排查存档见 `ZZMI骨骼合并计划书.md` ⑭ 与 §9；默认值已按用户要求改为开启，
+        遇到该现象关掉本开关即逐字节回到历史行为。
         """
-        return cls._bool_attr("cross_group_merged_vgmap_test", False)
+        return cls._bool_attr("cross_group_merged_vgmap_test", True)
 
     @classmethod
     def set_cross_group_merged_vgmap_test(cls, value: bool):

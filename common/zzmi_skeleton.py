@@ -718,6 +718,10 @@ class ZZMISkeletonMergeHelper:
     # 性质，逐成员单独算会退化（`select_channel_plan` 的单件分量）。
     _zzmi_legacy_upgrade_draw_ibs: set[str] = set()
 
+    # 骨骼池方案（参考实现 loyaltools 路线）：导入期算好，导出期只读。
+    # None = 本次没算（开关关 / 锚点链算不出来）⇒ 导出侧走历史分组编号。
+    cross_group_profile: dict | None = None
+
     @staticmethod
     def _configured_frame_analysis_paths(workspace_root: str) -> list[str]:
         """读取 ZZMI 工作区显式记录的 FrameAnalysis 路径。"""
@@ -1377,6 +1381,120 @@ class ZZMISkeletonMergeHelper:
             ready += 1
         return ready
 
+    @staticmethod
+    def cross_group_merged_enabled() -> bool:
+        """跨组骨骼合并开关（`cross_group_merged_vgmap_test`）。
+
+        `common/` 不能反向 import `ui/`，这里只按名字取 `GlobalProterties` 上的同名
+        访问器；宿主没注册该属性时退回插件里的默认值（开启，与属性声明一致）。
+        """
+        try:
+            from .global_properties import GlobalProterties
+        except Exception:
+            return True
+        getter = getattr(GlobalProterties, "cross_group_merged_vgmap_test", None)
+        if not callable(getter):
+            return True
+        try:
+            return bool(getter())
+        except Exception:
+            return True
+
+    @classmethod
+    def _cross_group_plan_or_none(cls, ready_groups: dict) -> dict | None:
+        """算「整只角色一个骨骼池」的锚点链方案；算不出来返回 None（回落历史编号）。
+
+        绝不让它把导入搞崩：跨组没有共享骨可锚、骨骼表/物体矩阵读不到、部件之间
+        互相矛盾时 `plan_from_parts` 会抛 `ZZMICrossGroupPaletteError` —— 这里吞掉
+        并打印原因，调用方走历史分组 + 组基址编号（跨组骨骼不合并，行为同旧版）。
+        """
+        try:
+            from .zzmi_cross_group_palette import plan_from_parts
+        except Exception as exc:  # pragma: no cover - 导入期缺文件
+            print(f"[ZZMI骨骼合并] 骨骼池方案不可用：{exc}")
+            return None
+        # 共有骨从**导入期去重表**取：`build_vg_maps` 按骨骼矩阵逐位相等判等，得到
+        # 的「本部件局部骨号 ↔ 另一部件局部骨号」是精确对应关系。本机各部件的
+        # `vs-cb1` 逐位相同（同一帧五份 dump 的 sha 一致），抬到世界空间一根骨都
+        # 对不上——参考实现「靠世界空间认骨」这一步在本机没有数据可依，但锚点公式、
+        # 生成树、运行期换算仍然完全用参考实现那一套，只是「谁和谁是同一根骨」
+        # 这个事实改由去重表回答。
+        shared_pairs: dict[str, dict[str, list]] = {}
+        try:
+            dedup_maps, dedup_offsets, _ = ZZMIBoneMapBuilder.build_vg_maps(
+                {draw_ib: group["palette"] for draw_ib, group in ready_groups.items()},
+                {
+                    draw_ib: group["signatures"]
+                    for draw_ib, group in ready_groups.items()
+                },
+                dedup_excluded={
+                    draw_ib
+                    for draw_ib, group in ready_groups.items()
+                    if group.get("dedup_excluded")
+                },
+            )
+        except Exception as exc:
+            print(f"[ZZMI骨骼合并] 去重表算不出来，共有骨退回世界空间匹配：{exc}")
+            dedup_maps, dedup_offsets = {}, {}
+        if dedup_maps:
+            block_owner: dict[int, tuple] = {}
+            for draw_ib, offset in dedup_offsets.items():
+                bone_count = len(ready_groups[draw_ib]["palette"])
+                for local in range(int(bone_count)):
+                    block_owner.setdefault(int(offset) + local, (draw_ib, local))
+            for draw_ib, mapping in dedup_maps.items():
+                for local, slot in mapping.items():
+                    owner = block_owner.get(int(slot))
+                    if owner is None or owner[0] == draw_ib:
+                        continue
+                    shared_pairs.setdefault(draw_ib, {}).setdefault(
+                        owner[0], []
+                    ).append((int(local), int(owner[1])))
+            if shared_pairs:
+                total_pairs = sum(
+                    len(pairs)
+                    for per_owner in shared_pairs.values()
+                    for pairs in per_owner.values()
+                )
+                print(
+                    f"[ZZMI骨骼合并] 去重表认出 {total_pairs} 对共有骨，"
+                    f"跨 {len(shared_pairs)} 个部件（用作锚点）"
+                )
+        try:
+            planned_maps, planned_offsets, profile, plan_warnings = plan_from_parts({
+                draw_ib: {
+                    "palette": group["palette"],
+                    "transform": group["transform"],
+                    "slot_weights": group.get("slot_weights"),
+                    "vertex_count": group.get("vertex_count"),
+                    "shape_keyed": bool(group.get("shape_keyed")),
+                    "shared": shared_pairs.get(draw_ib) or {},
+                }
+                for draw_ib, group in ready_groups.items()
+            })
+        except Exception as exc:
+            print(f"[ZZMI骨骼合并] 骨骼池方案算不出来，本次按历史分组编号：{exc}")
+            return None
+        if not profile or not profile.get("components"):
+            print("[ZZMI骨骼合并] 骨骼池方案为空，本次按历史分组编号。")
+            return None
+        components = profile.get("components") or []
+        anchored = sum(
+            1 for item in components
+            if int(item.get("parent_component_id", -1)) >= 0
+        )
+        print(
+            f"[ZZMI骨骼合并] 骨骼池方案就绪：{len(components)} 个部件 / "
+            f"{int(profile.get('pool_bones', 0))} 根骨骼 / {anchored} 条锚点边"
+            f"（跨组骨骼合并将按参考实现的锚点链换算）"
+        )
+        return {
+            "maps": planned_maps,
+            "offsets": planned_offsets,
+            "profile": profile,
+            "warnings": list(plan_warnings or ()),
+        }
+
     @classmethod
     def ensure_skeleton_data(
         cls,
@@ -2035,30 +2153,73 @@ class ZZMISkeletonMergeHelper:
         for draw_ib, group_index in group_of.items():
             group_members.setdefault(group_index, []).append(draw_ib)
 
-        # 组内去重（组内槽位 0 起）
-        local_maps: dict[str, dict] = {}
-        local_offsets: dict[str, int] = {}
-        group_slots: dict[int, int] = {}
-        for group_index in sorted(group_members):
-            members = group_members[group_index]
-            gm, go, total = ZZMIBoneMapBuilder.build_vg_maps(
-                {draw_ib: ready_groups[draw_ib]["palette"] for draw_ib in members},
-                {draw_ib: ready_groups[draw_ib]["signatures"] for draw_ib in members},
-                dedup_excluded={
-                    draw_ib for draw_ib in members
-                    if ready_groups[draw_ib].get("dedup_excluded")
-                },
-            )
-            local_maps.update(gm)
-            local_offsets.update(go)
-            group_slots[group_index] = total
+        cross_plan = (
+            cls._cross_group_plan_or_none(ready_groups)
+            if cls.cross_group_merged_enabled()
+            else None
+        )
+        if cross_plan is not None:
+            # 跨组：整只角色共用一个骨骼池，槽位由锚点链算（参考实现 loyaltools 路线）。
+            # 池槽位 = 部件基址 + 本地骨号；canonical 号只当身份用，正好当全局骨号下发。
+            profile = cross_plan["profile"]
+            cls.cross_group_profile = profile
+            # 落盘：导出可能发生在这个会话之外（重开 Blender 再导出），只挂在类
+            # 属性上会丢，掉盘后就按历史分组发 ini，跨组等于白算。
+            try:
+                from .zzmi_cross_group_palette import write_profile
+                cls.cross_group_profile_path = write_profile(workspace_root, profile)
+            except Exception as exc:  # pragma: no cover - 磁盘异常
+                cls.cross_group_profile_path = None
+                print(f"[ZZMI骨骼合并] 骨骼池方案落盘失败（导出会退回历史分组）：{exc}")
+            for warning in cross_plan["warnings"]:
+                print(f"[ZZMI骨骼合并] {warning}")
+            group_of = {draw_ib: 0 for draw_ib in ready_groups}
+            group_members = {0: list(ready_groups)}
+            local_maps = {
+                draw_ib: dict(vg_map)
+                for draw_ib, vg_map in cross_plan["maps"].items()
+            }
+            local_offsets = dict(cross_plan["offsets"])
+            group_base = {0: 0}
+            total_slots = int(profile["pool_bones"])
+        else:
+            # 历史路线（含「开关开着但锚点链算不出来」的回落）：清掉上一次会话残留的
+            # 骨骼池方案——内存和磁盘都要清，否则导出侧会按上一次的池槽位发 ini，
+            # 而这次的 VGMap 是历史编号，两者对不上就是满屏错位。
+            cls.cross_group_profile = None
+            try:
+                from .zzmi_cross_group_palette import get_profile_path
+                stale_path = get_profile_path(workspace_root)
+                if os.path.isfile(stale_path):
+                    os.remove(stale_path)
+            except Exception:
+                pass
+            cls.cross_group_profile_path = None
+            # 组内去重（组内槽位 0 起）
+            local_maps: dict[str, dict] = {}
+            local_offsets: dict[str, int] = {}
+            group_slots: dict[int, int] = {}
+            for group_index in sorted(group_members):
+                members = group_members[group_index]
+                gm, go, total = ZZMIBoneMapBuilder.build_vg_maps(
+                    {draw_ib: ready_groups[draw_ib]["palette"] for draw_ib in members},
+                    {draw_ib: ready_groups[draw_ib]["signatures"] for draw_ib in members},
+                    dedup_excluded={
+                        draw_ib for draw_ib in members
+                        if ready_groups[draw_ib].get("dedup_excluded")
+                    },
+                )
+                local_maps.update(gm)
+                local_offsets.update(go)
+                group_slots[group_index] = total
 
-        # 组基址（组索引升序累加）
-        group_base: dict[int, int] = {}
-        base = 0
-        for group_index in sorted(group_members):
-            group_base[group_index] = base
-            base += group_slots[group_index]
+            # 组基址（组索引升序累加）
+            group_base: dict[int, int] = {}
+            base = 0
+            for group_index in sorted(group_members):
+                group_base[group_index] = base
+                base += group_slots[group_index]
+            total_slots = base
 
         vg_maps: dict[str, dict] = {}
         vg_offsets: dict[str, int] = {}
@@ -2239,7 +2400,7 @@ class ZZMISkeletonMergeHelper:
         success_message = (
             f"已为 {written} 个子网格生成骨骼合并数据"
             f"（{len(ready_groups)} 个部件 / {len(group_members)} 个骨架组，"
-            f"全局共 {sum(group_slots.values())} 槽）"
+            f"全局共 {total_slots} 槽）"
         )
         # 完整性报告：只要还有目标未处理（部件未生成 / 目标无法解析 / json 写回
         # 失败），就不能报告完整成功——部分完成必须大声暴露，否则调用方会把

@@ -82,6 +82,74 @@ except Exception:  # pragma: no cover
         return False
 
 
+def _merged_palette_profile() -> dict | None:
+    """本次会话算出来的骨骼池方案（导入期算好，挂在骨架助手类上）。
+
+    会话里没有就去工作区读导入期落盘的那一份：导出经常发生在「重开 Blender
+    以后」，只靠类属性会让跨组方案在导出时凭空消失，退回不含锚点链的历史分组。
+    """
+    try:
+        from ...common.zzmi_skeleton import ZZMISkeletonMergeHelper
+    except Exception:
+        return None
+    profile = getattr(ZZMISkeletonMergeHelper, "cross_group_profile", None)
+    if isinstance(profile, dict):
+        return profile
+    try:
+        from ...common.zzmi_cross_group_palette import load_profile
+        workspace_folder = str(GlobalConfig.path_workspace_folder() or "")
+    except Exception:
+        return None
+    if not workspace_folder:
+        return None
+    try:
+        loaded = load_profile(workspace_folder, required=False)
+    except Exception:
+        return None
+    if isinstance(loaded, dict) and loaded.get("components"):
+        try:
+            ZZMISkeletonMergeHelper.cross_group_profile = loaded
+        except Exception:
+            pass
+        return loaded
+    return None
+
+
+def _merged_palette_conv_component_ids() -> set:
+    """有「换算 palette」缓冲的部件下标 —— 只有方案里真正参与合并的那些。
+
+    没参与合并的部件（形态键 / 和角色不共用骨骼）在池尾占自己的私有段，骨骼矩阵
+    就在自己空间里，直接绑骨架缓冲就对了；给它们也发换算缓冲没有意义（换算 CS 的
+    部件表里没有它们，`x1` 会指到界外），所以这里按方案成员过滤。
+    """
+    profile = _merged_palette_profile() or {}
+    cache = globals().get("_MERGED_CONV_IDS_CACHE")
+    if isinstance(cache, tuple) and cache[0] is profile:
+        return cache[1]
+    try:
+        from ...common.zzmi_cross_group_palette import merged_components
+        ids = {int(component["component_id"]) for component in merged_components(profile)}
+    except Exception:
+        ids = set()
+    globals()["_MERGED_CONV_IDS_CACHE"] = (profile, ids)
+    return ids
+
+
+def _merged_palette_route_active() -> bool:
+    """跨组骨骼合并是否走「骨骼池 + 换算 palette」路线（参考实现 loyaltools 的做法）。
+
+    成立条件两条：开关打开 **且** 本次会话真的算出了骨骼池方案。缺一样就退回历史
+    行为——没有方案数据却按新路线发射，会拿到空池和全零换算表。
+
+    这条路线与历史的「按来源拆分绘制 + 每骨架组一份 cb1 + 换绑 vs-cb1」互斥：
+    合成一个物体以后，每个参与部件都用**自己算出来的 palette** 画整份合并几何，
+    压根不需要对象变换，也就不需要 cb1。所以本函数为真时旧路线必须整体让位。
+    """
+    if not _zzmi_prop_flag("cross_group_merged_vgmap_test", True):
+        return False
+    return _merged_palette_profile() is not None
+
+
 def _zzmi_prop_flag(name: str, default: bool) -> bool:
     """Read an optional ZZMI boolean property without breaking lightweight hosts.
 
@@ -213,7 +281,7 @@ ZZMI_MERGE_DIAG_POSE_UNAVAILABLE = "POSE_ALIGNMENT_UNAVAILABLE"
 # ⚠ **已知未解（2026-10-10 实机报告，原因未定）**：角色展示页（大世界之外那条渲染
 #   路径）里本方案的段命令 `draw` / `drawindexed` **不执行** —— 画面不推进、什么都
 #   看不见（大世界一切正常；进程未死、资源级覆盖仍生效）。排查存档：本仓
-#   `ZZMI骨骼合并计划书.md` ⑭ 与 §9。本开关默认关闭正是为此（关闭时逐字节保持历史行为）。
+#   `ZZMI骨骼合并计划书.md` ⑭ 与 §9。本开关默认已开启；关掉它即逐字节保持历史行为。
 ZZMI_MERGE_DIAG_CROSS_GROUP_ATTACH = "CROSS_GROUP_ATTACH"
 # ---------------------------------------------------------------------------
 # O3（用户裁定 (a)：诊断先行、零行为变更）——「捕获 : 消费」记账
@@ -2460,7 +2528,70 @@ class ExportZZMI(ExportUnity):
         并由 `_warn_cross_group_bone_references` 大声报警。开启后由 `_merged_cross_*`
         系列把它们的骨骼写进**吸收它的宿主组**缓冲。
         """
-        return bool(_zzmi_prop_flag("cross_group_merged_vgmap_test", False))
+        return bool(
+            _zzmi_prop_flag("cross_group_merged_vgmap_test", True)
+        ) and not _merged_palette_route_active()
+
+    @staticmethod
+    def _merged_palette_enabled() -> bool:
+        """骨骼池路线总开关（与 `_merged_cross_group_enabled` 互斥）。"""
+        return _merged_palette_route_active()
+
+    def _merged_deform_palette_name(
+        self, ib_key, skeleton_group: int, slot: int
+    ) -> str:
+        """deform / 重放绘制该绑哪一份 palette。
+
+        骨骼池路线绑**换算后**的那份（本部件空间、按 canonical 索引）；历史路线绑本
+        组骨架缓冲（直拷、按池槽位索引）。两者布局完全不同，混绑会让顶点按别人的
+        对象空间蒙皮 —— 这正是跨组要修的东西，所以每次绑 vs-t0 都必须过这里。
+        """
+        if _merged_palette_route_active():
+            component_id = self.merged_skeleton_component_id_dict.get(str(ib_key))
+            if component_id is not None and int(component_id) in _merged_palette_conv_component_ids():
+                return self._merged_palette_conv_name(int(component_id), int(slot))
+            # 本部件没参与合并（形态键 / 与角色不共用骨骼）：它的顶点组仍是自己的
+            # 局部骨号，池槽位索引与它对不上。绑它自己的 palette 原始副本（本帧
+            # `copy vs-t0` 捕获的那份），游戏自己的绘制照旧成立；绑骨架池会让这一段
+            # 按别人的池槽位取骨 ⇒ 整段炸开（实测：展示页红色炸开）。
+            return self._merged_palette_name(str(ib_key), int(slot))
+        return self._merged_skeleton_name(int(skeleton_group), int(slot))
+
+    def _merged_so_space_palette_ib(
+        self, group_plan: dict | None, target_ib: str, consumer_ib: str = ""
+    ) -> str:
+        """合并 SO 的几何表达在谁的调色板空间（重放 draw / 皮肤 CS 的 palette 来源）。
+
+        重放写共享 SO，SO 再作为 vb0 交给渲染段，而渲染用的是**写它那份几何的部件**
+        的对象矩阵，也就是计划里的 `so_owner_ib`（target 只有占位几何时是 carriers[0]，
+        见 `_build_merged_mesh_redirect_plan`）。因此整条链——重放 draw 的 `vs-t0` 与
+        皮肤 CS 的 `cs-t2`——都必须绑**owner 的**换算：`Conv_C<owner 组件>` 每槽输出
+        Inv(ToRoot(owner))·ToRoot(owner)·bone = bone，正好是这份 SO 需要的空间。
+        绑 target 的换算时，target 在合并网格里零顶点 ⇒ 每槽拿到的是同一份常量仿射，
+        对全部顶点左乘 ⇒ 整体刚性下沉（实机：整个角色插进地里）。
+
+        历史路线（非池）没有换算，各消费部件用自己的空间重放。
+        """
+        if not self._merged_palette_enabled():
+            return consumer_ib or target_ib
+        owner_ib = ""
+        if group_plan:
+            owner_ib = str(group_plan.get("so_owner_ib") or "")
+        return owner_ib or target_ib
+
+    @staticmethod
+    def _merged_palette_conv_name(component_id: int, slot: int) -> str:
+        """「换算到本部件对象空间之后」的 palette 缓冲名；deform 与 skin 都读它。
+
+        名字按**部件下标**取（与 attach 段 `_C<id>_s<槽>` 同一套编号），不按 IB：
+        同一个 IB 可能出现在多个部件里。
+        """
+        return f"ResourceZZPaletteConv_C{int(component_id)}_s{int(slot)}"
+
+    @staticmethod
+    def _merged_palette_conv_section_name(component_id: int, slot: int) -> str:
+        """换算计算着色器的段名（跑在 attach 之后、deform 之前）。"""
+        return f"CustomShaderZZMSPaletteConv_C{int(component_id)}_s{int(slot)}"
 
     @staticmethod
     def _merged_cb1_capture_name(skeleton_group: int) -> str:
@@ -2968,8 +3099,23 @@ class ExportZZMI(ExportUnity):
                 section.append(f"w1 = {int(row_floats)}")
                 section.append(f"cs-t0 = ref {vb0_resource}")
                 section.append(f"cs-t1 = ref {vb2_resource}")
+                # cs-t2 必须是**画这份合并几何的部件自己那份** palette：deform 段
+                # 已经把 vs-t0 换成换算版（该部件空间），这里的自建蒙皮 CS 若仍读
+                # 原始骨架池（混合空间），就会用别人的空间做 LBS，把 deform 刚写好
+                # 的 SO 覆盖成错位结果（实机症状：整体爆炸/扭曲）。
+                # 池路线下返回该部件的换算缓冲，历史路线下仍是本组骨架缓冲。
+                # 「该部件」= `so_owner_ib`（写这份 SO 几何的部件），不是目标 IB：
+                # target 只有占位几何时两者不同，绑 target 的换算 ⇒ 全部顶点被同一份
+                # 常量仿射左乘（实机：整体刚性下沉、插进地里）。
                 section.append(
-                    "cs-t2 = ref " + self._merged_skeleton_name(skeleton_group, slot)
+                    "cs-t2 = ref "
+                    + self._merged_deform_palette_name(
+                        self._merged_so_space_palette_ib(
+                            group_plan, str(group_plan.get("target_ib", ""))
+                        ),
+                        skeleton_group,
+                        slot,
+                    )
                 )
                 section.append(
                     "cs-u0 = ref "
@@ -4492,14 +4638,36 @@ class ExportZZMI(ExportUnity):
                     "run = "
                     + self._merged_cross_attach_name(component_id, int(host_group), slot)
                 )
+            # 4d) 骨骼池路线（参考实现）：池里是**混合空间**——每个槽的矩阵留在它
+            #     所属部件的对象空间。deform 之前必须先把别人的骨骼用锚点链搬到本
+            #     部件空间，写进本部件专有的一份 palette。顺序：attach（填池）→
+            #     换算 → deform 读换算结果。旧路线不需要这一步（它换的是 cb1）。
+            #     换算集合 = 本段所有 `vs-t0 = ResourceZZPaletteConv_*` 的来源（见
+            #     `_merged_deform_conv_component_ids`），不只本部件自己：合并几何的
+            #     **重放**同样发生在本段，只换算自己时，宿主不是本帧最后一个提交的
+            #     部件的那一帧，重放绑的是「池只更新了一半」的旧快照。
+            for conv_component_id in self._merged_deform_conv_component_ids(
+                draw_ib,
+                component_id,
+                skeleton_group,
+                group_target=group_target,
+                absorbed_hosts=absorbed_hosts,
+                palette_owner_ib=str((group_plan or {}).get("so_owner_ib") or ""),
+            ):
+                texture_override_vb_section.append(
+                    "run = "
+                    + self._merged_palette_conv_section_name(conv_component_id, slot)
+                )
 
         # 4.5) 【已回退】F5 曾在此处（attach 之后）追加一次捕获以实现跨组同帧化，
         #      用户实测导致「两侧都抖、骨骼矩阵不对」——原因见 3) 上方注释。
 
-        # 5) 默认换绑本组 s<slot_first> 骨架（每槽绘制按需按槽覆盖）
-        texture_override_vb_section.append(
-            f"vs-t0 = {self._merged_skeleton_name(skeleton_group, slot_first)}"
-        )
+        # 5) 换绑骨架：骨骼池路线绑换算后的那份（本部件空间），历史路线绑本组缓冲。
+        if self._merged_palette_enabled() and int(component_id) in _merged_palette_conv_component_ids():
+            palette_source = self._merged_palette_conv_name(component_id, slot_first)
+        else:
+            palette_source = self._merged_skeleton_name(skeleton_group, slot_first)
+        texture_override_vb_section.append("vs-t0 = " + palette_source)
         texture_override_vb_section.append("handling = skip")
 
         # 5b) 跨组供骨件自己那段的合并几何重放（F3）：与宿主那段同一套守卫条件，
@@ -4568,7 +4736,7 @@ class ExportZZMI(ExportUnity):
                         f"if {self._merged_slot_guard_condition(guard_component_ids, skeleton_group, slot)}"
                     )
                     texture_override_vb_section.append(
-                        f"    vs-t0 = {self._merged_skeleton_name(skeleton_group, slot)}"
+                        f"    vs-t0 = {self._merged_deform_palette_name(draw_ib, skeleton_group, slot)}"
                     )
                     texture_override_vb_section.append(
                         f"    so0 = ref {self._merged_redirect_so_name(skeleton_group, slot)}"
@@ -4714,7 +4882,7 @@ class ExportZZMI(ExportUnity):
         for slot in slots:
             section.append(f"if {occ_var} == {slot}")
             section.append(
-                f"    vs-t0 = {self._merged_skeleton_name(skeleton_group, slot)}"
+                f"    vs-t0 = {self._merged_deform_palette_name(draw_ib, skeleton_group, slot)}"
             )
             section.append(f"    draw = {own_count}, 0")
             section.append("endif")
@@ -4881,8 +5049,17 @@ class ExportZZMI(ExportUnity):
             section.append(
                 f"if {self._merged_slot_guard_condition(guard_component_ids, skeleton_group, slot)}"
             )
+            # 重放写的是**共享的**本槽 SO，而 SO 会作为 vb0 交给渲染段——渲染用的是
+            # 写这份几何的部件（plan[`so_owner_ib`]）的对象矩阵，所以 SO 里的几何必须
+            # 统一是 **owner 空间**，不是 target 空间：target 只有占位几何时真正的几何
+            # 全在 carrier 上，绑 target 的换算会让整份 SO 按 target 那套常量仿射整体
+            # 下沉（实机：角色插进地里）。target 有真实几何时 owner == target，
+            # 这一行与旧行为逐字节等价。
+            replay_palette_ib = self._merged_so_space_palette_ib(
+                plan, target_ib, consumer_ib
+            )
             section.append(
-                f"    vs-t0 = {self._merged_skeleton_name(skeleton_group, slot)}"
+                f"    vs-t0 = {self._merged_deform_palette_name(replay_palette_ib, skeleton_group, slot)}"
             )
             section.append(
                 f"    so0 = ref {self._merged_redirect_so_name(skeleton_group, slot)}"
@@ -4945,6 +5122,68 @@ class ExportZZMI(ExportUnity):
         there = self._drawib_blend_layout_signature(host_ib)
         return here is not None and here == there
 
+    def _merged_deform_conv_component_ids(
+        self,
+        draw_ib: str,
+        component_id: int,
+        skeleton_group: int,
+        group_target: str = "",
+        absorbed_hosts: list[dict] | None = None,
+        palette_owner_ib: str = "",
+    ) -> list[int]:
+        """本段 deform 的守卫体可能绑定的「换算 palette」所属组件（按需集合的上界）。
+
+        根因（实机定位，2026-10-13）：整份骨骼池的换算 CS 只在宿主**自己**的
+        deform 段里发 `run`，但消费它的合并几何重放会出现在组内**每个**部件的
+        deform 段（`_append_merged_absorbed_replay` / `_append_merged_target_slot_guards`）
+        ⇒ 宿主不是本帧最后一个提交的部件时，那一笔 draw 绑的是「池只更新了一半」
+        的旧快照（实测 294/310 根骨落后一帧；运动时抖动、静止时看不出）。因此每
+        个槽的 attach 之后，必须把本段可能消费的换算都补算一遍。
+
+        集合 = ①本部件自己（`_append_merged_direct_slot_guards` /
+                 `_append_merged_anchor_own_geometry_draw` 的 `vs-t0`）
+              ∪ ②重放用的 SO 空间（`_append_merged_target_slot_guards` 的
+                 `replay_palette_ib` = `_merged_so_space_palette_ib`：计划里的
+                 `so_owner_ib`，`palette_owner_ib` 传入；缺省退回 `group_target`，
+                 与「target 有真实几何 ⇒ owner == target」的旧口径一致）
+              ∪ ③本组吸收宿主（`absorbed_hosts`，即 `_append_merged_absorbed_replay`
+                 的 `host['draw_ib']`）
+              ∪ ④跨组重放宿主（`_append_merged_cross_group_replays`）。
+        ①②③④ 由分支互斥地生效，这里取并集 ⇒ 是**按需集合的上界**：最多多发一
+        份本段用不到的换算（代价一次 Dispatch），少发则退回陈旧快照。结果再与
+        `_merged_palette_conv_component_ids()` 求交——不在骨池里的部件没有换算
+        段可 `run`，`_merged_deform_palette_name` 对它返回的是原始捕获。
+        """
+        if not self._merged_palette_enabled():
+            return []
+        conv_ids = _merged_palette_conv_component_ids()
+        if not conv_ids:
+            return []
+        candidates: list[int] = [int(component_id)]
+        # ②：重放绑的是 SO 所属空间（so_owner），target 只有占位几何时它们不同 ——
+        # 此时若仍按 target 推导，§C1/C2 段不会 run 自己那条重放要用的 Conv_C0，
+        # 重放就读到陈旧快照。
+        replay_palette_ib = str(palette_owner_ib or group_target or "")
+        replay_component_id = self.merged_skeleton_component_id_dict.get(replay_palette_ib)
+        if replay_component_id is not None:
+            candidates.append(int(replay_component_id))
+        for host in absorbed_hosts or ():
+            candidates.append(int(host["component_id"]))
+        for host_group in self._merged_cross_host_group_map().get(int(component_id), []):
+            if self._merged_group_redirect_target(int(host_group)):
+                continue
+            for host in self._merged_group_absorbed_hosts(int(host_group)):
+                if not self._merged_absorbed_replay_compatible(
+                    draw_ib, str(host["draw_ib"])
+                ):
+                    continue
+                candidates.append(int(host["component_id"]))
+        ordered: list[int] = []
+        for candidate in candidates:
+            if candidate in conv_ids and candidate not in ordered:
+                ordered.append(candidate)
+        return ordered
+
     def _append_merged_absorbed_replay(
         self,
         section,
@@ -4987,7 +5226,7 @@ class ExportZZMI(ExportUnity):
         section.append(
             f"if {self._merged_absorb_redundant_seen_clauses(' && '.join(p for p in (gate, clauses) if p))}"
         )
-        section.append(f"    vs-t0 = {self._merged_skeleton_name(skeleton_group, slot)}")
+        section.append(f"    vs-t0 = {self._merged_deform_palette_name(host['draw_ib'], skeleton_group, slot)}")
         section.append(
             f"    so0 = ref {self._merged_redirect_so_name(skeleton_group, slot)}"
         )
@@ -5121,7 +5360,7 @@ class ExportZZMI(ExportUnity):
                 # （说明留源码，不写进配置表）
                 section.append(f"if {occ_var} == {slot}")
                 section.append(
-                    f"    vs-t0 = {self._merged_skeleton_name(skeleton_group, slot)}"
+                    f"    vs-t0 = {self._merged_deform_palette_name(draw_ib, skeleton_group, slot)}"
                 )
                 section.append(f"    draw = {draw_count}, 0")
                 section.append("endif")
@@ -5138,7 +5377,7 @@ class ExportZZMI(ExportUnity):
                 f"if {self._merged_slot_guard_condition(self._merged_group_component_ids(skeleton_group), skeleton_group, slot)}"
             )
             section.append(
-                f"    vs-t0 = {self._merged_skeleton_name(skeleton_group, slot)}"
+                f"    vs-t0 = {self._merged_deform_palette_name(draw_ib, skeleton_group, slot)}"
             )
             section.append(f"    draw = {draw_count}, 0")
             section.append("endif")
@@ -5665,6 +5904,11 @@ class ExportZZMI(ExportUnity):
         绝不谎称已修复。
         """
         if not self.merged_skeleton_components:
+            return
+        if _merged_palette_route_active():
+            # 骨骼池路线：顶点里的骨号是 canonical 身份号，本来就不落在任何部件的
+            # 池槽位区间里；跨空间由换算段解决。这里按槽位区间判"越界引用"会全量
+            # 误报，所以整段跳过。
             return
         cross_enabled = self._merged_cross_group_enabled()
         unknown_group = int(type(self).UNKNOWN_BONE_GROUP)
@@ -6783,7 +7027,7 @@ class ExportZZMI(ExportUnity):
         - 骨架**按槽分份**：每组每槽一份 `ResourceZZMergedSkeleton_G<N>_s<k>`
           （array 同现状 = 全局 max(vg_offset+vg_count)）。deform 段按出现次把
           当帧 palette 写进 s<k>，attach 也只写该槽 → 多实例各占一槽、互不覆盖。
-        - **跨组别骨骼合并 = 默认关闭的实验总开关**（`cross_group_merged_vgmap_test`）。
+        - **跨组别骨骼合并 = 默认开启的总开关**（`cross_group_merged_vgmap_test`）。
           关闭（默认）：各组骨架只含本组骨骼；跨组别引用在导出时大声报警
           （`_warn_cross_group_bone_references`，无校准的运行时这些槽位永远不会被
           写入 = 原点塌陷）。开启：① 跨组件骨骼由 `AttachX_C<部件>_g<宿主组>_s<槽>`
@@ -6896,14 +7140,109 @@ class ExportZZMI(ExportUnity):
             vgmap_filename = f"zz_vgmap_{component['draw_ib']}.buf"
             section.append("filename = Meshes/" + vgmap_filename)
             section.new_line()
+            # 骨骼池路线下这两套编号**不同**，别合并：
+            #   · 顶点里的骨号（Blender 顶点组名 / BLENDINDICES）= canonical 身份号；
+            #   · 池里的槽位（attach 的落笔位置）= 部件私有块基址 + 本地骨号。
+            # deform 用 canonical 去查 vs-t0（换算后的 palette，按 canonical 索引），
+            # attach 必须按池槽位落笔，所以这张表在池路线下写「基址 + 本地骨号」。
+            # 历史路线两者是同一个数，保持原样。
+            _pool_route = _merged_palette_route_active()
+            _slot_base = int(component.get("vg_offset") or 0)
             payload = b"".join(
-                _struct.pack("<4I", int(vg_map[local]), 0, 0, 0)
+                _struct.pack(
+                    "<4I",
+                    (_slot_base + local) if _pool_route else int(vg_map[local]),
+                    0,
+                    0,
+                    0,
+                )
                 for local in range(component["vg_count"])
             )
             self._atomic_write_binary(
                 os.path.join(mod_meshes_dir, vgmap_filename),
                 payload,
             )
+
+        # 跨组骨骼合并（参考实现 loyaltools 路线）：**骨骼池就是合并骨架缓冲本身**
+        # ——全宽、每槽矩阵留在它所属部件的对象空间里。运行期要补两样整数表：
+        #   · 部件表：每部件两个 uint4，正好是锚点链换算需要的东西
+        #     （vg_offset/vg_count/父部件下标 / 父部件里的锚点槽、自己这边的锚点槽）
+        #   · 重映射表：canonical 槽位 -> 池里优先读哪个槽。本部件自己有这份骨
+        #     就读自己那份（LOD / 网格读数才落在同一批下标上），没有才读别人的。
+        # 两张表都走 filename 二进制：本 fork 上多行 `data` 只写第 0 个元素。
+        # 骨骼池路线也要这两张整数表（部件表喂锚点链、重映射表做 canonical→池槽），
+        # 只是不需要 cb1 / 拆分绘制那套运行时。这里按**原始开关**判，好让「开关开着
+        # 但本次会话没有方案数据」也能落一条可见的提示，而不是静默退回历史产物。
+        if _zzmi_prop_flag("cross_group_merged_vgmap_test", True):
+            from ...common.zzmi_skeleton import ZZMISkeletonMergeHelper
+
+            profile = getattr(
+                ZZMISkeletonMergeHelper, "cross_group_profile", None
+            )
+            if profile is None:
+                print(
+                    "[ZZMI骨骼合并] 跨组开关开着，但本次会话没有骨骼池方案数据，"
+                    "本次按历史行为发射（不跨组）。重新导入一次骨架数据再导出即可。"
+                )
+            else:
+                from ...common.zzmi_cross_group_palette import (
+                    merged_components,
+                    runtime_component_table,
+                )
+
+                table = runtime_component_table(profile)
+                section.append("[ResourceZZMSComponents]")
+                section.append("type = Buffer")
+                section.append("format = R32G32B32A32_UINT")
+                section.append("filename = Meshes/zz_cgcomponents.buf")
+                section.new_line()
+                self._atomic_write_binary(
+                    os.path.join(mod_meshes_dir, "zz_cgcomponents.buf"),
+                    b"".join(
+                        _struct.pack(
+                            "<4I",
+                            *(int(value) & 0xFFFFFFFF for value in table[index:index + 4]),
+                        )
+                        for index in range(0, len(table), 4)
+                    ),
+                )
+
+                # 池宽口径：没参与合并的部件也把骨骼落在池尾，骨架/换算缓冲必须按
+                # **整池**开（`pool_bones`），否则它们的槽位在缓冲之外，attach 写出
+                # 边界被丢弃、蒙皮读到没写过的空间 —— 实测整块炸开。
+                bones_count = int(
+                    profile.get("pool_bones") or profile.get("bones_count") or 0
+                )
+                # 每部件一份 Params（参考实现的 `Buffer<uint4> Params : register(t2)`）：
+                # `Params[0] = (本部件在部件表里的下标, 合并部件数, 池骨骼数, 0)`。
+                # 换算 CS 只认这张表，索引口径是**池槽位**，没有 remap 层。
+                component_count = len(merged_components(profile))
+                for component_index, component in enumerate(
+                    merged_components(profile)
+                ):
+                    draw_ib = component["ib_hash"]
+                    section.append(
+                        f"[ResourceZZCgParams_C{int(component_index)}]"
+                    )
+                    section.append("type = Buffer")
+                    section.append("format = R32G32B32A32_UINT")
+                    section.append(
+                        f"filename = Meshes/zz_cgparams_C{int(component_index)}.buf"
+                    )
+                    section.new_line()
+                    self._atomic_write_binary(
+                        os.path.join(
+                            mod_meshes_dir,
+                            f"zz_cgparams_C{int(component_index)}.buf",
+                        ),
+                        _struct.pack(
+                            "<4I",
+                            int(component_index) & 0xFFFFFFFF,
+                            int(component_count) & 0xFFFFFFFF,
+                            int(bones_count) & 0xFFFFFFFF,
+                            0,
+                        ),
+                    )
 
         # 跨组：每骨架组一份「对象→世界 cb1」捕获资源（**拆分绘制**用）。
         # 合并网格按来源拆成多次绘制时，每次绘制要绑**该来源自己**的对象变换，而
@@ -7109,6 +7448,76 @@ class ExportZZMI(ExportUnity):
                 )
                 section.append(f"Dispatch = {dispatch_count}, 1, 1")
                 section.append("cs-u0 = null")
+                if self._merged_palette_enabled() and int(component_id) in _merged_palette_conv_component_ids():
+                    # 池（骨架缓冲）是混合空间，deform 直接读会把别人的骨骼按错误
+                    # 的空间蒙皮；这一段用锚点链把每根异物骨骼搬到本部件空间，
+                    # 输出缓冲按 canonical 槽位索引 —— 与 vg_map 天生对齐，网格
+                    # 与权重不用改任何数字。
+                    profile = _merged_palette_profile() or {}
+                    bones_total = int(profile.get("bones_count", 0))
+                    if bones_total <= 0:
+                        bones_total = int(component["vg_offset"]) + vg_count
+                    conv_name = self._merged_palette_conv_name(component_id, slot)
+                    # 换算段里的「我是第几个部件」必须是**池部件表**里的下标，
+                    # 不是 merged_skeleton_components 的下标：两张表的排序来源
+                    # 不同（前者按 vg_offset 升序 / pool 顺序），混用会让 CS 把
+                    # 自己算成别的部件，to_self 直接错。
+                    from ...common.zzmi_cross_group_palette import (
+                        merged_components as _conv_merged_components,
+                    )
+
+                    _conv_key = str(component["draw_ib"]).strip().lower()
+                    conv_index = -1
+                    for _conv_i, _conv_c in enumerate(
+                        _conv_merged_components(profile)
+                    ):
+                        if str(_conv_c.get("ib_hash", "")).strip().lower() == _conv_key:
+                            conv_index = _conv_i
+                            break
+                    if conv_index < 0:
+                        continue
+                    section.append(f"[{conv_name}]")
+                    section.append("type = RWBuffer")
+                    section.append("format = R32G32B32A32_FLOAT")
+                    section.append(f"array = {bones_total * 3}")
+                    section.append("bind_flags = shader_resource unordered_access")
+                    section.new_line()
+                    section.append(
+                        f"[{self._merged_palette_conv_section_name(component_id, slot)}]"
+                    )
+                    section.append(
+                        "flags = optimization_level3 all_resources_bound skip_validation"
+                    )
+                    section.append("cs = ./res/zzmi_cross_group_palette.hlsl")
+                    # 参数全在 `ResourceZZCgParams_C<id>` 里（参考实现同款），
+                    # 本段不读 IniParams ⇒ x1..z2 一律不发，免得误占 attach 的槽位。
+                    section.append(
+                        "cs-t0 = ref "
+                        + self._merged_skeleton_name(
+                            int(component["skeleton_group"]), slot
+                        )
+                    )
+                    section.append("cs-t1 = ref ResourceZZMSComponents")
+                    section.append(
+                        f"cs-t2 = ref ResourceZZCgParams_C{conv_index}"
+                    )
+                    section.append(f"cs-u0 = ref {conv_name}")
+                    section.append(
+                        "Dispatch = "
+                        + str(
+                            max(
+                                1,
+                                (
+                                    bones_total
+                                    + self.MERGED_SKELETON_ATTACH_THREADS
+                                    - 1
+                                )
+                                // self.MERGED_SKELETON_ATTACH_THREADS,
+                            )
+                        )
+                        + ", 1, 1"
+                    )
+                    section.append("cs-u0 = null")
                 component_key_driven = self._merged_component_is_key_driven(component)
                 if slot == slots[0]:
                     # 诊断探针（主症①b / AC-A3 的**运行时**失败标记）：把本部件在
@@ -7325,6 +7734,10 @@ class ExportZZMI(ExportUnity):
             "zzmi_merged_skeleton_attach.hlsl",
             self._merged_skin_shader_filename(),
         ]
+        if _merged_palette_route_active():
+            # 骨骼池路线：deform 之前要把池里每根 canonical 骨换算到本部件空间，
+            # 少了这个着色器整条路线静默失效（palette 空 ⇒ 全塌到原点）。
+            shader_names.append("zzmi_cross_group_palette.hlsl")
         # 拆分绘制路线不使用校准版 attach：跨组 attach 与同组一样是**直拷**，源件骨骼
         # 留在自己的对象空间，由该来源自己的渲染段用**它自己的 cb1** 单独绘制一次
         # （见 `_append_merged_render_split_draws`）。因此 res/ 里只有直拷 attach 与

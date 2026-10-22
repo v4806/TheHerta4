@@ -5,7 +5,7 @@
 本开关先把"实验入口"与**已验证可用的合并骨骼**（import_merged_vgmap，「使用融合统一
 顶点组」）分离出来，供后续实验/测试使用：
 
-1. 属性存在、标签精确为「跨组融合统一顶点组测试」、默认 False（关闭时零行为变化）；
+1. 属性存在、标签精确为「跨组融合统一顶点组测试」、默认 True（关闭时零行为变化）；
 2. 面板放置：位于「使用融合统一顶点组」**正下方**，且仅 ZZMI 逻辑名下渲染；
 3. 分离契约（**2026-08 初建口径，已被下方 2026-10-10 更新取代**）：本开关在实现跨组
    功能前**不参与任何导入/导出决策** —— 除属性定义与面板渲染外，生产代码不得引用它。
@@ -38,6 +38,10 @@ ALLOWED_REFERENCING_FILES = {
     "ui/ui_panel_basic.py",
     # 2026-10-10 F1：跨组骨骼合并的导出侧消费点（读开关决定是否写宿主组缓冲）
     "ui/universal/zzmi.py",
+    # 2026-10-21 骨骼池路线（参考实现 loyaltools）：导入侧消费点 —— 开关开启且
+    # 锚点链方案算得出来时，槽位由 `plan_from_parts` 定（整只角色一个骨骼池）；
+    # 算不出来（跨组无共享骨可锚）则原样回落到历史分组编号。
+    "common/zzmi_skeleton.py",
 }
 
 # 生产代码扫描根（排除 tests/临时产物/备份/工具产物）
@@ -80,16 +84,16 @@ class PropertyDeclarationTests(unittest.TestCase):
         self.assertIsNotNone(block, f"{PROPERTY_KEY} 必须声明为 bpy.props.BoolProperty")
         body = block.group(1)
         self.assertIn(f'name="{PROPERTY_LABEL}"', body)
-        self.assertRegex(body, r"default=False")
+        self.assertRegex(body, r"default=True")
 
-    def test_accessor_defaults_false(self):
+    def test_accessor_defaults_true(self):
         source = _read(GLOBAL_PROPERTIES)
         self.assertRegex(
             source,
             rf"def {PROPERTY_KEY}\(cls\):",
             "必须提供类方法访问器（面板与后续链路统一从这里读）",
         )
-        self.assertIn(f'_bool_attr("{PROPERTY_KEY}", False)', source)
+        self.assertIn(f'_bool_attr("{PROPERTY_KEY}", True)', source)
 
     def test_independent_from_proven_merged_skeleton_switch(self):
         """两个开关互不代写：各自的 setter 只动自己的键。"""
@@ -191,7 +195,7 @@ class SeparationContractTests(unittest.TestCase):
 class CrossGroupConsumerContractTests(unittest.TestCase):
     """F1 消费点契约（只读源码）：
 
-    * 默认 False ⇒ 检测函数直接返回空 ⇒ 产物与历史**逐字节相同**；
+    * 关闭 ⇒ 检测函数直接返回空 ⇒ 产物与历史**逐字节相同**；
     * 开启 ⇒ 跨组件骨骼写进**宿主组**骨架缓冲，调色板仍取跨组件自己的资源；
     * 守卫感知开关：关闭时保留历史「禁止跨组别骨骼合并」文案。
     """
@@ -203,13 +207,13 @@ class CrossGroupConsumerContractTests(unittest.TestCase):
         self.assertIn(header, self.source, f"缺少 {header}")
         return self.source.split(header, 1)[1]
 
-    def test_gate_reads_switch_with_false_default(self):
+    def test_gate_reads_switch_with_true_default(self):
         body = self._block("def _merged_cross_group_enabled() -> bool:")
         body = body.split("\n    @staticmethod", 1)[0]
         self.assertIn(
-            f'_zzmi_prop_flag("{PROPERTY_KEY}", False)',
+            f'_zzmi_prop_flag("{PROPERTY_KEY}", True)',
             body,
-            "开关必须按 False 缺省读取（关闭时零行为变化）",
+            "开关必须按 True 缺省读取（与属性声明默认一致）",
         )
 
     def test_detection_short_circuits_when_disabled(self):

@@ -236,7 +236,7 @@
 | 实验开关 | 默认 | 声明 | 生产消费者 | 现状 |
 |---|---|---|---|---|
 | `zzmi_merged_redirect_enabled`（面板名「启用合并网格自动重定向（实验）」） | False | `common/global_properties.py` 的 `BoolProperty` 声明（访问器只有 getter `zzmi_merged_redirect_enabled()`（返回 `_bool_attr("zzmi_merged_redirect_enabled", False)`）；**无 setter**——原先的 setter 零引用，已删除） | `ui/universal/zzmi.py` 的 `_export_impl` 重定向决策处（`_zzmi_prop_flag("zzmi_merged_redirect_enabled", False)`）+ 面板渲染（`ui/ui_panel_basic.py`） | **已接线，但默认关** |
-| `cross_group_merged_vgmap_test`（面板名「跨组融合统一顶点组测试」） | False | 同上（访问器 `cross_group_merged_vgmap_test()` 与 `set_cross_group_merged_vgmap_test()`，两者都在） | **`ui/universal/zzmi.py`（2026-10-10 F1 起）**：`_merged_cross_group_enabled()`（读开关）→ `_merged_cross_group_component_ids()` / `_merged_cross_group_offending_bone_ids()`（跨组判定）+ attach 段发射 + deform VB 段逐槽 `run` + 守卫措辞；另面板渲染（`ui/ui_panel_basic.py`） | **真开关（默认关；关闭时逐字节维持历史行为，开启后走 F1 跨组 attach + F2 渲染 cb1 校准 + F3/F3-CS 顺序无关发布；F4/F5 两个时序方案均实测否决并已回退，跨组块运动时残余「一帧姿态差」）** |
+| `cross_group_merged_vgmap_test`（面板名「跨组融合统一顶点组测试」） | True | 同上（访问器 `cross_group_merged_vgmap_test()` 与 `set_cross_group_merged_vgmap_test()`，两者都在） | **`ui/universal/zzmi.py`（2026-10-10 F1 起）**：`_merged_cross_group_enabled()`（读开关）→ `_merged_cross_group_component_ids()` / `_merged_cross_group_offending_bone_ids()`（跨组判定）+ attach 段发射 + deform VB 段逐槽 `run` + 守卫措辞；另面板渲染（`ui/ui_panel_basic.py`） | **真开关（默认开；关闭时逐字节维持历史行为，开启后走 F1 跨组 attach + F2 渲染 cb1 校准 + F3/F3-CS 顺序无关发布；F4/F5 两个时序方案均实测否决并已回退，跨组块运动时残余「一帧姿态差」）** |
 
 `zzmi_merged_redirect_enabled` 的行为路径（依据 `ui/universal/zzmi.py` 的 `_export_impl`）：
 重定向计划先按现有实现算好（`_build_merged_mesh_redirect_plan`），随后
@@ -332,7 +332,7 @@ VGMap 也不改变导入结果**；复选框开启时仍传预生成结果（失
     - **帧尾 [Present]**：**先把 `$zz_ms_seen_*` 抄进 `$zz_ms_prev_*`，再清零 `$zz_ms_occ_*` / `$zz_ms_seen_*`**（跨帧兜底；依据 `ui/universal/zzmi.py` 的 `add_merged_skeleton_sections` 里 `[Present]` 段的 `prev = seen` 抄录语句）；**帧级闩锁 `drawn`/`ready` 及相位计数 `$zz_ms_group_phase_*` 已废除**（v9 的槽位本身承担实例分离，不再需要相位）；**不再重放持久 palette**，也**不在帧末复位 `ResourceZZRedirectSO_G<g>_s<k>`**（F8 已回退：该语句会废掉 [Present] 清场，实例加入/剔除的过渡帧残留半组状态 → 错槽重放，后加入实例闪烁直至卡死）；否则会把缺席部件/上一实例的内容重新灌入骨架，形成脏数据。
     - 效果：所有部件当帧姿态；首帧即正确（无自愈期）；**未生成组件走游戏原渲染（当帧 palette），与合并部件天然同帧一致，无需任何延迟机制**。
     - 备注：共享骨骼 canonical 槽位被后 deform 部件 attach 覆盖（同帧 bitwise 相同，覆盖无害）；先 deform 部件的 SO 已在 deform 时固定，不受后续覆盖影响。
-5. **跨部件/跨组权重**：同组（相同对象空间）直接引用合法——组内统一骨架；**跨组别骨骼合并（2026-10-10 起：默认关闭的实验总开关 `cross_group_merged_vgmap_test`）**——关闭时导出侧 `_warn_cross_group_bone_references` 对引用非本组骨骼 id 的部件报警「禁止跨组别骨骼合并 … 原点塌陷」；开启时 F1 把跨组件骨骼写进**吸收它的宿主组**缓冲，F2 再用两组的渲染 cb1 把骨骼从源对象空间**校准**到宿主对象空间；守卫改为报「跨组骨骼合并已接入 F1」+ 残余说明。用户仍可只把同组部件 join 到同一对象（不依赖本开关）。
+5. **跨部件/跨组权重**：同组（相同对象空间）直接引用合法——组内统一骨架；**跨组别骨骼合并（2026-10-10 起实验总开关 `cross_group_merged_vgmap_test`，2026-10-27 起默认开启）**——关闭时导出侧 `_warn_cross_group_bone_references` 对引用非本组骨骼 id 的部件报警「禁止跨组别骨骼合并 … 原点塌陷」；开启时 F1 把跨组件骨骼写进**吸收它的宿主组**缓冲，F2 再用两组的渲染 cb1 把骨骼从源对象空间**校准**到宿主对象空间；守卫改为报「跨组骨骼合并已接入 F1」+ 残余说明。用户仍可只把同组部件 join 到同一对象（不依赖本开关）。
 6. **未生成组件（2026-08-25 定案：零延迟后无需任何机制）**：合并部件 deform 输出当帧姿态，未生成部件走游戏原渲染（当帧 palette）——两者天然同帧一致，**延迟双缓冲机制（`ResourceZZDelayedPalette_<>` / `TextureOverride_VB_ZZDelayed_<>`）已整体废弃删除**。导出子集时未生成部件保持原版渲染即可。
 
 ## 6. 任务拆解（TDD，每步可独立验收）
@@ -487,6 +487,14 @@ VGMap 也不改变导入结果**；复选框开启时仍传预生成结果（失
 | G3 身体 | a23aa8a3 / b20f90ea / b30db54e（共享 13/2/6 根） | (-15.223, 1.585, -5.513) | 79..248 |
 | G4 | add6ff13 + d892c658（同空间） | (-15.459, 1.815, -5.629) | 249..265 |
 全局合计 266 槽（组基址拼接组内槽位）；组内去重后唯一骨骼总计 244；运行时**每组每槽**一份全宽骨架（array=266，v9 起 `_s1`/`_s2` 两份），**只直拷本组骨骼**（跨组附加：F1 写进宿主组缓冲 + F2 用两组渲染 cb1 校准 `M' = C×M`）。cb1 提取口径（仅用于分组键）：dump 行逐 draw 反查 vs-cb1（绑定调用是持久状态、多数 draw 不重发，不可靠），自 2026-09-16 / 算法 v4 起改为按绑定窗口解析：dump 行先解析 `VSSetConstantBuffers1(first_constant=N)` 窗口，再把整块 dump 按窗口起点 offset = 4×N 取 16 floats（不再有 ≤512B 限制），窗口越界返回 None（绝不回退读 float 0）；该窗口起点随 `ObjectCB1FirstConstant` 写回子网格 json，无 dump 重建时同口径（依据 `common/zzmi_skeleton.py:90-93` 解析绑定行、`:116` 存窗口、`:334` 取窗口起点、`:487-532` 按窗口取 16 floats / 越界返回 None）。rows 0-3 即对象→世界矩阵（w 列 0/0/0/1 校验）。
+
+14. **2026-10-13 ZZMI 合并骨骼「palette 换算陈旧」（菲欧妮 294/310 骨落后一帧）**：骨骼池路线把整份 pool 换算到宿主部件空间的 `CustomShaderZZMSPaletteConv_C<宿主>_s<k>` CS，原先只在**宿主自己**的 deform 段发 `run`，而合并几何的重放 `draw` 会出现在组内**每个**部件的 deform 段里 ⇒ 只要宿主不是本帧最后一个提交的部件，落笔用的就是「pool 只更新了一半」的旧快照（静止看不出、运动抖动）。
+    **修复**：`ui/universal/zzmi.py` 的 `_append_merged_skeleton_deform_block_body` 在每个槽的全部 attach `run` 之后（同一 `for slot in slots` 层，**绝不进 if**）改发 `_merged_deform_conv_component_ids(...)` 给出的换算集合 = 本部件 ∪ 本组 target ∪ 本组被吸收宿主 ∪ 各跨组宿主的 absorbed host，再与 `_merged_palette_conv_component_ids()` 求交（这是按需集合的**上界**）。
+    **回归**：`tests/test_zzmi_palette_conv_ordering.py` 断言「每条 `vs-t0 = ResourceZZPaletteConv_X_s<k>` 之前同段已有 `run = CustomShaderZZMSPaletteConv_X_s<k>`」且新增 run 不落在 if 内；用户实测修好的 `菲欧妮.ini` 跑同一检查器 = 0 违规，退回旧行为则 4 处违规。
+15. **2026-10-20 ZZMI 合并骨骼「重放调色板空间选错部件」（菲欧妮整角色插地）**：target 只有 3 行占位几何、真实几何在 carrier 上时，`so_owner_ib` 已由 `_build_merged_mesh_redirect_plan`（`ui/universal/zzmi.py:6664-6669`）算成 `carriers[0]["draw_ib"]`，但重放 `vs-t0` 与皮肤 CS 的 `cs-t2` 仍按 `target_ib` 取 `ResourceZZPaletteConv_C<target>_s<k>`。该 component 在合并网格里**零顶点**（菲欧妮实测 `9040e2c4-Blend.buf` 29814 行、292 根骨、槽段 `[294,310)` 权重引用数 0）⇒ 6 处整条 VB 重放（`draw = 29814, 0`）对全部顶点套同一个 `Inv(ToRoot(C2))·ToRoot(C0)` 常量仿射 ⇒ **整体刚性下沉、不撕裂**（实机：整个角色插进地里）。`Conv_C<self>` 每槽输出 `Inv(ToRoot(self))·ToRoot(owner)·bone`，故重放/皮肤的 palette 必须取「合并 SO 几何所表达的空间」= `so_owner` 的 component。
+    **修复**：① 新增 `_merged_so_space_palette_ib(group_plan, target_ib, consumer_ib)`——池路线返回 `group_plan["so_owner_ib"]`（空则回落 `target_ib`），非池路线仍返回 `consumer_ib or target_ib`；② `_append_merged_target_slot_guards` 的重放 `vs-t0`、③ `_append_merged_skin_cs_sections` 的 `cs-t2` 都改用它（两处注释原本写的就是正确意图）；④ `_merged_deform_conv_component_ids(...)` 新增 `palette_owner_ib` 参数，候选集合 ② 分支（原 = target 的组件）改按 so_owner 的组件推导——否则 C1/C2 段不会补跑 `Conv_C0`，「先算自己会绑的那份换算」不成立。
+    **证据**：组 3 合成夹具（target `a23aa8a3` 3 行 stub、carrier `b20f90ea` 真实几何、`so_owner_ib = b20f90ea` = C1）产物里 6 处重放 `vs-t0` 全为 `ResourceZZPaletteConv_C1_s1/_s2`、皮肤 `cs-t2` 同、三段 deform 各自 bind 前都先 `run = CustomShaderZZMSPaletteConv_C1_s<k>`；`target` 有真实几何（`so_owner == target`）与直连/非池四种配置的 vb/ib/skeleton/stdout sha256 与修改前**逐字节相同**。
+    **回归**：`tests/test_zzmi_palette_conv_ordering.py` 新增 `ZZMIPaletteConvSoOwnerSpaceTests` 七例（6 处重放 / 皮肤 cs-t2 / 每段 Conv 顺序 / 候选集合跟随 owner / target 有真几何时保持 target 空间）；把修复点变异回 target 空间时该文件 5~6 例变红。用户实机确认：手改这三处（6 处重放与 `cs-t2` 换成 `Conv_C0`、C1/C2 段补 `run = Conv_C0`）后角色不再插地。
 
 ## 8. 验收标准
 
