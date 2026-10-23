@@ -1607,16 +1607,21 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             self.assertEqual(lines[-1], "; [/SSMT-TTL]")
             self.assertGreater(lines.index(group[0]), lines.index(taken_line))
 
-            # 段头克隆照旧：hash / ib / ZZMI 贴图绑定 / SkinTexture
-            for cloned in (
+            # 组头：第一行是本网格注释，第二行是锚点，其后只留这笔绘制真正要重设的东西
+            self.assertEqual(group[1], anchor)
+            for cloned in (f"run = CommandList{BS}ZZMI{BS}SetTextures",):
+                self.assertIn(cloned, group)
+            # 匹配段的字段与 SkinTexture 不复制：在同一段里写第二遍是死代码
+            for dead_line in (
                 "hash = 241deac5",
                 "match_first_index = 0",
                 "ib = Resource_LOD0.241deac5_56376_0_Index",
-                f"run = CommandList{BS}ZZMI{BS}SetTextures",
                 "run = CommandListSkinTexture",
-                anchor,
             ):
-                self.assertIn(cloned, group)
+                self.assertNotIn(dead_line, group)
+            self.assertEqual(
+                [line for line in group if line.strip().startswith(("vb0 =", "vb1 =", "vb2 ="))], []
+            )
 
             diffuse_token = node._latin_token_for_text("衣服")
             normal_token = node._latin_token_for_text("腿")
@@ -2156,7 +2161,15 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             self.assertIn("; --- DRAG HOOK END 241deac5P0_A ---", stripped_group)
             self.assertNotIn("else", stripped_group)
             self.assertNotIn("vb0 = Resource241deac5Position", stripped_group)
-            self.assertIn("ib = Resource_LOD0.241deac5_56376_0_Index", group)
+            # 组里只有钩子逐字克隆 + 本网格贴图绑定，没有匹配段的死代码字段
+            self.assertIn("run = CommandList\\ZZMI\\SetTextures", stripped_group)
+            for dead_line in (
+                "hash = 241deac5",
+                "match_first_index = 0",
+                "ib = Resource_LOD0.241deac5_56376_0_Index",
+                "run = CommandListSkinTexture",
+            ):
+                self.assertNotIn(dead_line, group)
             self.assertIn(f"run = CommandList{BS}TTL{BS}Draw", group)
 
     def test_ttl_stale_command_list_left_untouched(self):
@@ -2284,8 +2297,15 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             self.assertNotIn("ResourceDragJiggleTempVB0_aaaa1111_A", group_text,
                              "别的 DrawIB 的 jiggle 影子 VB0 严禁落到本段")
             self.assertNotIn("CommandListSSMTTTLDraw_", group_text)
-            self.assertIn("ib = Resource_LOD0.bbbb2222_200_0_Index", group,
-                          "索引缓冲必须仍是本段自己的 ib")
+            self.assertNotIn("aaaa1111", group_text, "组里不得出现别段 DrawIB 的任何资源名")
+            # 组不再重抄 ib/match_first_index，一对一由「绘制参数取自本块」证明
+            self.assertEqual([line for line in group if line.strip().startswith("ib = ")], [])
+            self.assertEqual([line for line in group if line.strip().startswith("match_first_index = ")], [])
+            self.assertIn(f"${BS}TTL{BS}_1 = 56376", group_text,
+                          "计数必须是本块 draw 的 56376，而不是兄弟段的 600")
+            self.assertIn(f"${BS}TTL{BS}_2 = 0", group_text, "起始索引取自本块 draw")
+            self.assertNotIn(f"${BS}TTL{BS}_1 = 600", group_text)
+            self.assertIn("; [SSMT TTL 已接管] drawindexed = 56376, 0, 0", lines)
 
     def test_ttl_group_is_appended_after_last_block(self):
         """新契约①：TTL 组内联在原段，且位置在最后一个块之后（段尾）"""

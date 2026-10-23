@@ -25,6 +25,18 @@ _TTL_GROUP_END = "; [/SSMT-TTL]"
 # 这一行的数字就是唯一来源。
 _TTL_DRAW_TAKEN_PREFIX = "; [SSMT TTL 已接管] "
 _TTL_DRAW_TAKEN_RE = re.compile(r"^;\s*\[SSMT TTL 已接管\]", re.IGNORECASE)
+# 段头抄进 TTL 组时丢掉段级属性：hash / match_first_index / ib / vb* 只在
+# 3Dmigoto 匹配这个段的那一刻有意义，同一段里再写一遍是死的；override_* 同理。
+# 目标是组里只留「这一笔绘制真正需要重设的东西」——本网格的贴图绑定与 SetTextures。
+_TTL_HEADER_ATTR_RE = re.compile(
+    r"^(?:hash|match_priority|match_first_index|match_index_count|handling|filter_index|"
+    r"ib|vb\d|override_\w+|draw\w*)\s*=",
+    re.IGNORECASE,
+)
+# 段头的 checktextureoverride 一遍：块自己都不带，组也不必带。
+_TTL_HEADER_DROP_RUNS = {"run = commandlistskintexture"}
+# 拖拽钩子和 swapkey 条件都从段头第一行 if 开始，那之后一律原样保留。
+_TTL_HEADER_IF_RE = re.compile(r"^if\b", re.IGNORECASE)
 # TTL 合成亮度默认值（TTLib 的 $\TTL\V，即 HSV 的 Value）。
 # 必须写在 if 条件块之外：TTLib 的 CommandListFrameReset 每帧把 $V 重置为 1.0，
 # 只有绘制前重新赋值才生效；不需要提亮的段落手动删掉这一行即可。
@@ -2022,10 +2034,27 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
 
             new_lines = []
             object_to_diffuse_swapkey = {}
+            # 组以本网格的 mesh 注释开头：重导出时它就是这一组的锚点，跟块里的
+            # 锚点同形，看起来也跟原带的写法一致。
+            anchor_line = str(lines[mesh_index])
+            if anchor_line.lstrip().startswith(';'):
+                new_lines.append(anchor_line)
+            else:
+                new_lines.append(f"; {mesh_name}")
+            # 段头里只有第一行 if 之前的那些才算「段级属性 + 贴图绑定」；if 之后是
+            # 拖拽钩子/条件分支，那是要原样带走的运行逻辑，不能按属性名过筛。
+            header_verbatim = False
             for header_line in header_lines:
                 stripped = str(header_line).strip()
                 if not stripped:
                     continue
+                if not header_verbatim and _TTL_HEADER_IF_RE.match(stripped):
+                    header_verbatim = True
+                if not header_verbatim:
+                    if _TTL_HEADER_ATTR_RE.match(stripped):
+                        continue
+                    if stripped.casefold() in _TTL_HEADER_DROP_RUNS:
+                        continue
                 if stripped.casefold().startswith(_TTL_MASK_INVERT_PREFIX):
                     continue
                 resource_match = re.match(
@@ -2046,12 +2075,6 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
                             new_lines.extend(generated_lines)
                             continue
                 new_lines.append(header_line)
-
-            anchor_line = str(lines[mesh_index])
-            if anchor_line.lstrip().startswith(';'):
-                new_lines.append(anchor_line)
-            else:
-                new_lines.append(f"; {mesh_name}")
 
             if ttl_materials:
                 ttl_lines_ref, next_swap_key_num = self.generate_material_lines(
