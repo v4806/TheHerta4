@@ -260,6 +260,11 @@ _install_module(
     TimerUtils=types.SimpleNamespace(start_stage=lambda *_a, **_k: None, end_stage=lambda *_a, **_k: None),
 )
 
+# 骨骼池方案模块（`...common.zzmi_cross_group_palette`）由 zzmi.py 在函数内按需
+# 相对导入，**不在本文件全局登记**：本文件其余 170 多条契约是在「池路线失活」的
+# 旧口径下逐字比对产物的，登记它会让那批产物整体变形（已实测：3 条契约变红）。
+# 只有真要验池路线的用例才调 `_enable_pool_route()`。
+
 _module_path = REPO_ROOT / "ui" / "universal" / "zzmi.py"
 _spec = importlib.util.spec_from_file_location(f"{PKG}.ui.universal.zzmi", _module_path)
 _zzmi_module = importlib.util.module_from_spec(_spec)
@@ -2957,6 +2962,148 @@ class ZZMIStubObjectTests(unittest.TestCase):
         self.assertEqual(exporter._zzmi_stub_object_names, [])
         names = [str(dc.get_workspace_unique_str()) for dc in ordered]
         self.assertEqual(names, ["LOD0.b20f90ea-19182-0"])
+
+    def _enable_pool_route(self):
+        """登记真实方案模块并复位池缓存，供「池路线」用例使用。
+
+        逐用例登记（而非模块级）是为了不改变同文件其它契约的产物基准；用例结束
+        把缓存与解析结果还原，避免把本用例的临时工作区带进下一条用例。
+        """
+        module = _load_real_module(
+            f"{PKG}.common.zzmi_cross_group_palette", "common/zzmi_cross_group_palette.py"
+        )
+        helper = sys.modules[f"{PKG}.common.zzmi_skeleton"].ZZMISkeletonMergeHelper
+        previous_profile = getattr(helper, "cross_group_profile", None)
+        self.addCleanup(setattr, helper, "cross_group_profile", previous_profile)
+        self.addCleanup(setattr, _zzmi_module, "_MERGED_POOL_SEGMENTS_CACHE", None)
+        _zzmi_module._MERGED_POOL_SEGMENTS_CACHE = None
+        return module
+
+    def _write_pool_profile(self):
+        """写出骨骼池方案（形状取自菲欧妮实测，池缩到 9 根）。
+
+        三段：``aaaa0001`` [0,4) 是根，``aaaa0002`` [4,7) 借位使用 1、2 号槽位，
+        ``aaaa0003`` [7,9) 两根骨**全部**借位到前两段 —— 自属段为空，正是实测
+        ``b11ff137-6078-0`` 被吸收时的形态。走生产写盘口，方案不合法会让用例
+        立刻炸，而不是静默退回旧口径。
+        """
+        profile = {
+            "format_version": 1,
+            "mode": "ZZMI_CROSS_GROUP_PALETTE",
+            "components": [
+                {
+                    "component_id": 0,
+                    "ib_hash": "aaaa0001",
+                    "role": "merged",
+                    "vg_offset": 0,
+                    "vg_count": 4,
+                    "vg_map": {"0": 0, "1": 1, "2": 2, "3": 3},
+                    "parent_component_id": 0,
+                    "anchor_parent_slot": 0,
+                    "anchor_self_slot": 0,
+                },
+                {
+                    "component_id": 1,
+                    "ib_hash": "aaaa0002",
+                    "role": "merged",
+                    "vg_offset": 4,
+                    "vg_count": 3,
+                    "vg_map": {"0": 1, "1": 4, "2": 2},
+                    "parent_component_id": 0,
+                    "anchor_parent_slot": 1,
+                    "anchor_self_slot": 4,
+                },
+                {
+                    "component_id": 2,
+                    "ib_hash": "aaaa0003",
+                    "role": "merged",
+                    "vg_offset": 7,
+                    "vg_count": 2,
+                    "vg_map": {"0": 2, "1": 1},
+                    "parent_component_id": 1,
+                    "anchor_parent_slot": 5,
+                    "anchor_self_slot": 7,
+                },
+            ],
+        }
+        _palette_module = self._enable_pool_route()
+        _palette_module.write_profile(self.tmp, profile)
+
+    def _write_pool_workspace(self):
+        """池方案 + 三族部件 json + 组件表（载体对象由用例自己登记）。"""
+        self._write_pool_profile()
+        self._write_vgmap_json_full(
+            "aaaa0001-100-0", {0: 0, 1: 1, 2: 2, 3: 3}, vg_offset=0, vg_count=4
+        )
+        self._write_vgmap_json_full(
+            "aaaa0002-200-0", {0: 1, 1: 4, 2: 2}, vg_offset=4, vg_count=3
+        )
+        self._write_vgmap_json_full(
+            "aaaa0003-300-0", {0: 2, 1: 1}, vg_offset=7, vg_count=2
+        )
+        self._write_component_map(
+            {
+                "aaaa0001": {"0": "aaaa0001-100-0"},
+                "aaaa0002": {"0": "aaaa0002-200-0"},
+                "aaaa0003": {"0": "aaaa0003-300-0"},
+            }
+        )
+
+    def test_pool_plan_stubs_absorbed_part_whose_slots_are_all_borrowed(self):
+        """**骨骼池路线**：整份 VGMap 都借位的被吸收部件仍必须补占位。
+
+        实测（2026-10-23 菲欧妮）：``b11ff137-6078-0`` 的 16 根骨全部借位到宿主
+        池段，自属段为空 ⇒ 走 `_is_drawib_absorbed` 的退化分支；而宿主的池级
+        VGMap 把这些借位槽位一并声明了 ⇒ 旧口径「引用方声明过的不算外来」把证据
+        吃干净 ⇒ 判「没被吸收」⇒ 整族缺席的部件既不插桩也不报错，游戏里整块
+        几何不见。
+
+        可证伪：修复前 `_zzmi_stub_object_names == []`（必红）。
+        """
+        self._write_pool_workspace()
+        # 在场：aaaa0001 自己（引用全在自属段内）、aaaa0002（引用自属段里的 5
+        # 加借位来的 1、2 —— 1、2 正是被吸收部件 aaaa0003 的两根骨）
+        self._register_present_object_with_groups("LOD0.aaaa0001-100-0", [0, 1, 2, 3])
+        self._register_present_object_with_groups("LOD0.aaaa0002-200-0", [5, 2, 1])
+
+        dcm = sys.modules[f"{PKG}.common.draw_call_model"].DrawCallModel
+        ordered = [
+            dcm(obj_name="LOD0.aaaa0002-200-0"),
+            dcm(obj_name="LOD0.aaaa0001-100-0"),
+        ]
+        exporter = _make_exporter([], merged_vgmap=True, ordered_drawcalls=ordered)
+
+        self.assertEqual(
+            exporter._zzmi_stub_object_names,
+            ["LOD0.aaaa0003-300-0"],
+            "池方案下被吸收部件的槽位全被宿主声明过，也只能靠池段口径认出吸收",
+        )
+        stub = _fake_bpy_data.objects.get("LOD0.aaaa0003-300-0")
+        self.assertIsNotNone(stub)
+        self.assertEqual(stub.get("ZZMI_STUB"), 1)
+        # 占位权重必须挂在被吸收部件自己 json 的已注册槽位（VGMap 首值 2）
+        self.assertEqual(stub.vertex_groups[0].name, "2")
+        exporter._cleanup_stub_objects()
+
+    def test_pool_plan_treats_references_inside_referrer_segment_as_own(self):
+        """池路线不得把「段内引用」当吸收证据（对照组，防止一刀切成乱插桩）。
+
+        载体只引用自己池段 [4,7) 里的槽位 ⇒ 外来集合为空 ⇒ 缺席的 aaaa0003 不被
+        判「已被吸收」⇒ 不插桩。
+        """
+        self._write_pool_workspace()
+        self._register_present_object_with_groups("LOD0.aaaa0001-100-0", [0, 1, 2, 3])
+        self._register_present_object_with_groups("LOD0.aaaa0002-200-0", [4, 5])
+
+        dcm = sys.modules[f"{PKG}.common.draw_call_model"].DrawCallModel
+        ordered = [
+            dcm(obj_name="LOD0.aaaa0002-200-0"),
+            dcm(obj_name="LOD0.aaaa0001-100-0"),
+        ]
+        exporter = _make_exporter([], merged_vgmap=True, ordered_drawcalls=ordered)
+
+        self.assertEqual(exporter._zzmi_stub_object_names, [])
+        self.assertIsNone(_fake_bpy_data.objects.get("LOD0.aaaa0003-300-0"))
 
     def _write_vgmap_json(self, bare, gid, group=None, excluded=False):
         type_dir = os.path.join(self.tmp, "LOD0", bare, "TYPE_GPU_TEST_")

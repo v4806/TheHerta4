@@ -132,6 +132,53 @@ def _merged_palette_profile() -> dict | None:
     return None
 
 
+def _merged_pool_segments() -> dict[str, tuple[int, int]]:
+    """骨骼池方案里每个 DrawIB 自己的池段：``{ib_hash: (起点, 终点)}``。
+
+    站位（占位小三角）判定用。池方案下同一个 DrawIB 的全部部件共享一段
+    ``[vg_offset, vg_offset + vg_count)``，其余槽位都归别的部件所有——这是
+    「引用里哪些能用引用方**自己的**骨骼解释」在池路线下的唯一答案。
+    拿不到方案数据时返回空 dict，调用方必须退回历史口径（VGMap 值域，见
+    `_collect_foreign_used_group_ids`）。
+    """
+    profile = _merged_palette_profile()
+    cache = globals().get("_MERGED_POOL_SEGMENTS_CACHE")
+    if isinstance(cache, tuple) and cache[0] is profile:
+        return cache[1]
+    segments: dict[str, tuple[int, int]] = {}
+    for component in (profile or {}).get("components") or []:
+        try:
+            ib_hash = str(component.get("ib_hash") or "").strip().lower()
+            offset = int(component.get("vg_offset"))
+            count = int(component.get("vg_count"))
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if ib_hash and count > 0:
+            segments[ib_hash] = (offset, offset + count)
+    globals()["_MERGED_POOL_SEGMENTS_CACHE"] = (profile, segments)
+    return segments
+
+
+def _merged_pool_segment_of(unique_str: str) -> tuple[int, int] | None:
+    """部件身份 → 它自己在骨骼池里的段；没有池方案 / 认不出部件时返回 ``None``。"""
+    segments = _merged_pool_segments()
+    if not segments:
+        return None
+    value = str(unique_str or "").strip()
+    if "." in value:
+        head, tail = value.split(".", 1)
+        if head.upper().startswith("LOD"):
+            value = tail
+    if not value:
+        return None
+    if value in segments:
+        return segments[value]
+    for ib_hash, segment in segments.items():
+        if value.startswith(ib_hash + "-"):
+            return segment
+    return None
+
+
 def _merged_palette_conv_component_ids() -> set:
     """有「换算 palette」缓冲的部件下标 —— 只有方案里真正参与合并的那些。
 
@@ -1300,6 +1347,12 @@ class ExportZZMI(ExportUnity):
         自属引用（引用方自己声明过的槽位一律不计入），所以上面的合并组误判不会
         在退化路径上复现。
 
+        骨骼池路线（`_merged_pool_segments` 非空）让这条退化分支从例外变成常态
+        ——被锚定的部件整份 VGMap 都借位到宿主的池段，自属段必然为空；而池化后
+        「引用方声明过的槽位」也不再能反证归属（宿主连借来的槽位一起声明）。
+        此时 `foreign_used_group_ids` 的口径换成「引用方池段之外的引用」，详见
+        `_collect_foreign_used_group_ids` 的池路线小节。
+
         跨组别引用由 `_warn_cross_group_bone_references` 在导出时大声报警
         （无校准模式下已禁止）。
         """
@@ -1435,10 +1488,32 @@ class ExportZZMI(ExportUnity):
         判定不到部件 json（`_zzmi_workspace_vg_count` / `_zzmi_workspace_declared_slots`
         返回 None）时按旧行为**计入** —— 信息不足时宁可保守插桩，也不要漏掉真正
         被吸收的几何。
+
+        ## 骨骼池路线（`_merged_pool_segments` 非空）改用「池段」口径
+
+        池方案（`cross_group_merged_vgmap_test` 默认开启，见
+        `common/zzmi_cross_group_palette.py`）把「借位」从例外变成常规：被别的
+        部件锚定的部件，它的 canonical 槽位**全部**落在宿主的池段里，自己那段
+        一个都不用。这时「引用方声明过这个槽位」不再能反过来证明归属 —— 宿主
+        自己也借了别人的槽位，整段都声明了，于是本函数收不到任何外来引用。
+
+        实测（2026-10-23，菲欧妮）：``b11ff137-6078-0`` 的 16 个 VGMap 值
+        （``33、180、210–217、224、225、243、252、253、271``）全部借位，逐个
+        都落在宿主 ``ad90e710`` 的池级 VGMap 里（``{32,33} ∪ [172,294)``）⇒
+        外来集合为空 ⇒ `_is_drawib_absorbed` 判「没被吸收」⇒ 整族缺席的部件
+        既不插桩也不报错，游戏里整块几何不见。这是结构性的：凡「全部骨骼都
+        借位到宿主块」的被吸收部件都如此。
+
+        所以池路线下「自己的骨骼」= 引用方在方案里的池段
+        ``[vg_offset, vg_offset + vg_count)``（同一 DrawIB 的全部部件共用）：
+        段内的引用是它自己的骨骼（自身份或借位），段外的引用一律算外来。口径
+        宁松勿漏 —— 池方案下多插一个 3 顶点占位只是多一行声明，漏插却是整块
+        几何不出现。认不出引用方的池段（不在方案里）时仍退回 VGMap 值域口径。
         """
         foreign = set()
         vg_count_cache: dict[str, int | None] = {}
         declared_cache: dict[str, set[int] | None] = {}
+        pool_segment_cache: dict[str, tuple[int, int] | None] = {}
         for draw_call in ordered:
             try:
                 obj_name = draw_call.get_blender_obj_name()
@@ -1464,7 +1539,12 @@ class ExportZZMI(ExportUnity):
                     declared_cache[unique_str] = self._zzmi_workspace_declared_slots(
                         unique_str
                     )
+                if unique_str not in pool_segment_cache:
+                    pool_segment_cache[unique_str] = _merged_pool_segment_of(
+                        unique_str
+                    )
             declared = declared_cache.get(unique_str)
+            own_pool_segment = pool_segment_cache.get(unique_str)
             mesh = getattr(obj, "data", None) if obj is not None else None
             vertices = getattr(mesh, "vertices", None)
             if vertices is None:
@@ -1481,7 +1561,11 @@ class ExportZZMI(ExportUnity):
                     if not group_name.isdigit():
                         continue
                     slot = int(group_name)
-                    if declared is not None and slot in declared:
+                    if own_pool_segment is not None:
+                        # 骨骼池路线：段内 = 引用方自己的骨骼（自身份或借位）
+                        if own_pool_segment[0] <= slot < own_pool_segment[1]:
+                            continue
+                    elif declared is not None and slot in declared:
                         # 引用方自己的局部顶点组：不构成几何吸收证据
                         continue
                     foreign.add(slot)
