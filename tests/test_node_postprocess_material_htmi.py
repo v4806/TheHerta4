@@ -164,49 +164,79 @@ class _FakeObject(dict):
         self["modimp_texture_slots"] = json.dumps(texture_slots)
 
 
-TTL_GROUP_HEAD = "; [SSMT-TTL]"
-TTL_GROUP_TAIL = "; [/SSMT-TTL]"
 TTL_TAKEN_PREFIX = "; [SSMT TTL 已接管]"
+TTL_DRAW_RUN = "run = CommandList" + chr(92) + "TTL" + chr(92) + "Draw"
 
 
-def _group_spans(lines):
-    """返回 `; [SSMT-TTL]` … `; [/SSMT-TTL]` 之间的行号闭区间。"""
-    spans = []
-    start = None
-    for index, line in enumerate(lines):
-        stripped = str(line).strip()
-        if stripped.startswith(TTL_GROUP_HEAD):
-            start = index
-        elif stripped == TTL_GROUP_TAIL and start is not None:
-            spans.append((start, index))
-            start = None
-    return spans
+def _write_png(temp_dir, filename):
+    """在临时目录里造一个占位贴图文件，返回路径。"""
+    path = os.path.join(temp_dir, filename)
+    with open(path, "wb") as file_obj:
+        file_obj.write(filename.encode("ascii"))
+    return path
 
 
-def _group_for(lines, mesh_name):
-    """取某个 mesh 的内联 TTL 组（含两端的组标记行）；必须恰好存在一个。"""
-    matched = [
-        lines[start:end + 1]
-        for start, end in _group_spans(lines)
-        if str(lines[start]).strip() == f"{TTL_GROUP_HEAD} {mesh_name}"
-    ]
-    if len(matched) != 1:
-        raise AssertionError(
-            f"期望恰有一个 TTL 组 {mesh_name!r}，实际 {len(matched)} 个：\n" + "\n".join(map(str, lines))
-        )
-    return matched[0]
+def _ttl_node(**overrides):
+    """TTL 处理用的节点：除了测试显式覆盖的字段，其余按默认导出形态。"""
+    node = node_postprocess_material.SSMTNode_PostProcess_Material()
+    node.name = "MaterialNode"
+    node.material_to_resource_override = False
+    node.material_switch_var = "$swapkey150"
+    for key, value in overrides.items():
+        setattr(node, key, value)
+    return node
 
 
-def _group_count(lines):
-    return len(_group_spans(lines))
-
-
-def _outside_group(lines, mesh_name):
-    """段内除该组之外的所有行。"""
-    start, end = next(
-        span for span in _group_spans(lines) if str(lines[span[0]]).strip() == f"{TTL_GROUP_HEAD} {mesh_name}"
+def _run_process(node, sections, section_name):
+    node.process_texture_override_section(
+        section_name, sections,
+        material_group_to_swapkey={},
+        swap_key_prefix="$swapkey",
+        next_swap_key_num=150,
+        used_swap_keys=set(),
+        transparency_sections_to_add=OrderedDict(),
     )
-    return lines[:start] + lines[end + 1:]
+
+
+def _anchor_index(lines, mesh_name):
+    """mesh 锚点行下标；必须恰好一行。"""
+    hits = [index for index, line in enumerate(lines) if f"[mesh:{mesh_name}]" in str(line)]
+    if len(hits) != 1:
+        raise AssertionError(
+            f"期望恰有一个 mesh 锚点 {mesh_name!r}，实际 {len(hits)} 个：\n" + "\n".join(map(str, lines))
+        )
+    return hits[0]
+
+
+def _inline_block(lines, mesh_name):
+    """原位内联块：mesh 锚点之后、到 TTL draw run 那一行为止（含该行）。"""
+    anchor = _anchor_index(lines, mesh_name)
+    for index in range(anchor + 1, len(lines)):
+        if str(lines[index]).strip() == TTL_DRAW_RUN:
+            return list(lines[anchor + 1:index + 1])
+    raise AssertionError(
+        f"锚点 {mesh_name!r} 之后没有 TTL draw run：\n" + "\n".join(map(str, lines))
+    )
+
+
+def _only(block, needle):
+    """needle 在 block 里必须恰好出现一次，返回下标。"""
+    hits = [index for index, line in enumerate(block) if needle in str(line)]
+    if len(hits) != 1:
+        raise AssertionError(
+            f"期望 {needle!r} 恰出现一次，实际 {len(hits)} 次：\n" + "\n".join(map(str, block))
+        )
+    return hits[0]
+
+
+def _live_draws(lines):
+    """段内仍然生效的绘制行（注释掉的旧绘制不算）。"""
+    return [
+        line for line in lines
+        if not str(line).lstrip().startswith(";")
+        and str(line).strip().split(" ")[0] in ("drawindexed", "drawindexedinstanced")
+    ]
+
 
 
 def _dump_sections(sections, skip=("_config_path",)):
@@ -1531,23 +1561,18 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
         self.assertTrue(complex_name.endswith("0.75"))
 
     def test_ttl_transparent_with_zzmi_materials_inlined_in_same_section(self):
-        """TTL：_透明0.75 + 四前缀材质不再另建段，改为原段保留、段尾内联一个 TTL 组"""
+        """TTL：_透明0.75 + 四前缀材质不再另建段，原位把绘制换成 TTL 参数行"""
         with tempfile.TemporaryDirectory() as temp_dir:
             BS = chr(92)
-            material_paths = {}
-            for prefix, filename in [
-                ("DiffuseMap", "diffuse.png"), ("NormalMap", "normal.png"),
-                ("LightMap", "light.png"), ("MaterialMap", "material.png"),
-            ]:
-                path = os.path.join(temp_dir, filename)
-                with open(path, "wb") as file_obj:
-                    file_obj.write(filename.encode("ascii"))
-                material_paths[prefix] = path
-
+            material_paths = {
+                prefix: _write_png(temp_dir, filename)
+                for prefix, filename in [
+                    ("DiffuseMap", "diffuse.png"), ("NormalMap", "normal.png"),
+                    ("LightMap", "light.png"), ("MaterialMap", "material.png"),
+                ]
+            }
             mesh_name = "LOD0.241deac5-56376-0.中文中文_透明0.75_copy"
-            ttl_path = os.path.join(temp_dir, "ttl.png")
-            with open(ttl_path, "wb") as file_obj:
-                file_obj.write(b"ttl")
+            ttl_path = _write_png(temp_dir, "ttl.png")
             obj = _FakeObject(mesh_name, {}, [
                 ("DiffuseMap_衣服", material_paths["DiffuseMap"]),
                 ("NormalMap_腿", material_paths["NormalMap"]),
@@ -1558,128 +1583,97 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             _fake_bpy.data.objects[obj.name] = obj
 
             section_name = "[TextureOverride_LOD0.241deac5_56376_0]"
-            anchor = f"; [mesh:{mesh_name}] [vertex_count:15618]"
+            header = [
+                "hash = 241deac5",
+                "match_first_index = 0",
+                "ib = Resource_LOD0.241deac5_56376_0_Index",
+                f"Resource{BS}ZZMI{BS}Diffuse = ref Resource-241deac5-56376-0-DiffuseMap",
+                f"Resource{BS}ZZMI{BS}NormalMap = ref Resource-241deac5-56376-0-NormalMap",
+                f"Resource{BS}ZZMI{BS}LightMap = ref Resource-241deac5-56376-0-LightMap",
+                f"Resource{BS}ZZMI{BS}MaterialMap = ref Resource-241deac5-56376-0-MaterialMap",
+                f"run = CommandList{BS}ZZMI{BS}SetTextures",
+                "run = CommandListSkinTexture",
+            ]
             sections = OrderedDict([
-                (section_name, [
-                    "hash = 241deac5",
-                    "match_first_index = 0",
-                    "ib = Resource_LOD0.241deac5_56376_0_Index",
-                    f"Resource{BS}ZZMI{BS}Diffuse = ref Resource-241deac5-56376-0-DiffuseMap",
-                    f"Resource{BS}ZZMI{BS}NormalMap = ref Resource-241deac5-56376-0-NormalMap",
-                    f"Resource{BS}ZZMI{BS}LightMap = ref Resource-241deac5-56376-0-LightMap",
-                    f"Resource{BS}ZZMI{BS}MaterialMap = ref Resource-241deac5-56376-0-MaterialMap",
-                    f"run = CommandList{BS}ZZMI{BS}SetTextures",
-                    "run = CommandListSkinTexture",
-                    anchor,
+                (section_name, header + [
+                    f"; [mesh:{mesh_name}] [vertex_count:15618]",
                     "drawindexed = 56376, 0, 3",
                 ]),
                 ("_config_path", temp_dir),
             ])
 
-            node = node_postprocess_material.SSMTNode_PostProcess_Material()
-            node.name = "MaterialNode"
-            node.material_to_resource_override = False
-            node.material_switch_var = "$swapkey150"
-            node.process_texture_override_section(
-                section_name, sections,
-                material_group_to_swapkey={},
-                swap_key_prefix="$swapkey",
-                next_swap_key_num=150,
-                used_swap_keys=set(),
-                transparency_sections_to_add=OrderedDict(),
-            )
+            node = _ttl_node()
+            _run_process(node, sections, section_name)
 
-            # 不再建段：原段原位保留，也没有第二个 TextureOverride / 命令列表
-            self.assertIn(section_name, sections)
+            # 不建段、不建命令列表：整份 sections 只有原段一个 TextureOverride
             self.assertEqual(
                 [key for key in sections if key.startswith("[TextureOverride")],
                 [section_name],
             )
-            self.assertNotIn("[CommandListSSMTTTLDraw_", _dump_sections(sections))
+            self.assertNotIn("CommandListSSMTTTLDraw_", _dump_sections(sections))
 
             lines = sections[section_name]
-            taken_line = "; [SSMT TTL 已接管] drawindexed = 56376, 0, 3"
-            self.assertIn(taken_line, lines)
-            group = _group_for(lines, mesh_name)
-            self.assertEqual(group[0], f"; [SSMT-TTL] {mesh_name}")
-            self.assertEqual(group[-1], "; [/SSMT-TTL]")
-            # 组排段尾：整段最后一行就是组尾标记，且组头在接管注释之后
-            self.assertEqual(lines[-1], "; [/SSMT-TTL]")
-            self.assertGreater(lines.index(group[0]), lines.index(taken_line))
+            # 块位置与段头一个字都不动
+            self.assertEqual(lines[:len(header)], header)
+            self.assertEqual(_live_draws(lines), [])
 
-            # 组头：第一行是本网格注释，第二行是锚点，其后只留这笔绘制真正要重设的东西
-            self.assertEqual(group[1], anchor)
-            for cloned in (f"run = CommandList{BS}ZZMI{BS}SetTextures",):
-                self.assertIn(cloned, group)
-            # 匹配段的字段与 SkinTexture 不复制：在同一段里写第二遍是死代码
-            for dead_line in (
-                "hash = 241deac5",
-                "match_first_index = 0",
-                "ib = Resource_LOD0.241deac5_56376_0_Index",
-                "run = CommandListSkinTexture",
-            ):
-                self.assertNotIn(dead_line, group)
-            self.assertEqual(
-                [line for line in group if line.strip().startswith(("vb0 =", "vb1 =", "vb2 ="))], []
-            )
-
-            diffuse_token = node._latin_token_for_text("衣服")
-            normal_token = node._latin_token_for_text("腿")
-            light_token = node._latin_token_for_text("袖子")
-            material_token = node._latin_token_for_text("身体")
-            self.assertIn(f"Resource{BS}ZZMI{BS}Diffuse = ref Resource_DiffuseMap_{diffuse_token}", group)
-            self.assertIn(f"Resource{BS}ZZMI{BS}NormalMap = ref Resource_NormalMap_{normal_token}", group)
-            self.assertIn(f"Resource{BS}ZZMI{BS}LightMap = ref Resource_LightMap_{light_token}", group)
-            self.assertIn(f"Resource{BS}ZZMI{BS}MaterialMap = ref Resource_MaterialMap_{material_token}", group)
-            self.assertIn(f"[Resource_DiffuseMap_{diffuse_token}]", sections)
-            self.assertIn(
-                f"filename = Textures/DiffuseMap_{diffuse_token}.png",
-                sections[f"[Resource_DiffuseMap_{diffuse_token}]"],
-            )
-
+            block = _inline_block(lines, mesh_name)
             ttl_ref_line = f"Resource{BS}TTL{BS}TransparencyTex = ref Resource_TTLMap_Rkydfsmefl"
             mask_channel_line = f"${BS}TTL{BS}mask_channel = 3"
             mask_line = f"${BS}TTL{BS}mask_invert = 1"
             alpha_line = f"${BS}TTL{BS}alpha = $TTLAlpha0_75"
             brightness_line = f"${BS}TTL{BS}V = 1.5"
-            for ttl_line in (ttl_ref_line, mask_channel_line, mask_line, alpha_line, brightness_line):
-                self.assertIn(ttl_line, group)
-            self.assertLess(group.index(ttl_ref_line), group.index(mask_channel_line))
-            self.assertLess(group.index(mask_channel_line), group.index(mask_line))
-            self.assertLess(group.index(mask_line), group.index(alpha_line))
-            self.assertLess(group.index(alpha_line), group.index(brightness_line))
+            index_count_line = f"${BS}TTL{BS}_1 = 56376"
+            first_index_line = f"${BS}TTL{BS}_2 = 0"
+            base_vertex_line = f"${BS}TTL{BS}_3 = 3"
+            self.assertEqual(block[-9:], [
+                ttl_ref_line, mask_channel_line, mask_line, alpha_line, brightness_line,
+                index_count_line, first_index_line, base_vertex_line, TTL_DRAW_RUN,
+            ])
 
+            # 本块的四种前缀贴图原位重绑，匹配段字段与 SkinTexture 不重抄
+            diffuse_token = node._latin_token_for_text("衣服")
+            normal_token = node._latin_token_for_text("腿")
+            light_token = node._latin_token_for_text("袖子")
+            material_token = node._latin_token_for_text("身体")
+            self.assertEqual(block[:-9], [
+                f"Resource{BS}ZZMI{BS}Diffuse = ref Resource_DiffuseMap_{diffuse_token}",
+                f"Resource{BS}ZZMI{BS}NormalMap = ref Resource_NormalMap_{normal_token}",
+                f"Resource{BS}ZZMI{BS}LightMap = ref Resource_LightMap_{light_token}",
+                f"Resource{BS}ZZMI{BS}MaterialMap = ref Resource_MaterialMap_{material_token}",
+                f"run = CommandList{BS}ZZMI{BS}SetTextures",
+            ])
+            self.assertIn(f"[Resource_DiffuseMap_{diffuse_token}]", sections)
+            self.assertIn(
+                f"filename = Textures/DiffuseMap_{diffuse_token}.png",
+                sections[f"[Resource_DiffuseMap_{diffuse_token}]"],
+            )
             self.assertIn("global $TTLAlpha0_75 = 0.75", sections["[Constants]"])
-            self.assertIn(f"${BS}TTL{BS}_1 = 56376", group)
-            self.assertIn(f"${BS}TTL{BS}_2 = 0", group)
-            self.assertIn(f"${BS}TTL{BS}_3 = 3", group)
-            self.assertIn(f"run = CommandList{BS}TTL{BS}Draw", group)
 
-    def test_ttl_if_switch_condition_carried_into_group(self):
-        """TTL：原块在 if 里时，条件行随组搬进段尾，_1/_2/_3/run 缩进包在 if 内"""
+    def test_ttl_if_switch_condition_stays_on_block(self):
+        """TTL：块本来在 if 里时，条件与 endif 原地不动，参数行沿用该分支缩进"""
         with tempfile.TemporaryDirectory() as temp_dir:
             BS = chr(92)
-            diffuse_path = os.path.join(temp_dir, "diffuse.png")
-            with open(diffuse_path, "wb") as file_obj:
-                file_obj.write(b"diffuse")
-
+            diffuse_path = _write_png(temp_dir, "diffuse.png")
             mesh_name = "LOD0.241deac5-56376-0.中文中文_透明0.75_copy"
-            ttl_path = os.path.join(temp_dir, "ttl.png")
-            with open(ttl_path, "wb") as file_obj:
-                file_obj.write(b"ttl")
-            obj = _FakeObject(mesh_name, {}, [("DiffuseMap_衣服", diffuse_path), ("TTLMap_遮罩", ttl_path)])
+            ttl_path = _write_png(temp_dir, "ttl.png")
+            obj = _FakeObject(mesh_name, {}, [
+                ("DiffuseMap_衣服", diffuse_path), ("TTLMap_遮罩", ttl_path),
+            ])
             _fake_bpy.data.objects[obj.name] = obj
 
             section_name = "[TextureOverride_LOD0.241deac5_56376_0]"
+            header = [
+                "hash = 241deac5",
+                "match_first_index = 0",
+                "ib = Resource_LOD0.241deac5_56376_0_Index",
+                f"Resource{BS}ZZMI{BS}Diffuse = ref Resource-241deac5-56376-0-DiffuseMap",
+                f"run = CommandList{BS}ZZMI{BS}SetTextures",
+                "run = CommandListSkinTexture",
+                "if $swapkey0 == 0 && $swapkey1 == 0",
+            ]
             sections = OrderedDict([
-                (section_name, [
-                    "hash = 241deac5",
-                    "match_first_index = 0",
-                    "ib = Resource_LOD0.241deac5_56376_0_Index",
-                    f"Resource{BS}ZZMI{BS}Diffuse = ref Resource-241deac5-56376-0-DiffuseMap",
-                    f"run = CommandList{BS}ZZMI{BS}SetTextures",
-                    "run = CommandListSkinTexture",
-                    "if $swapkey0 == 0 && $swapkey1 == 0",
+                (section_name, header + [
                     f"  ; [mesh:{mesh_name}] [vertex_count:15618]",
                     "  drawindexed = 56376,0,3",
                     "endif",
@@ -1687,46 +1681,46 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
                 ("_config_path", temp_dir),
             ])
 
-            node = node_postprocess_material.SSMTNode_PostProcess_Material()
-            node.name = "MaterialNode"
-            node.material_to_resource_override = False
-            node.material_switch_var = "$swapkey150"
-            node.process_texture_override_section(
-                section_name, sections,
-                material_group_to_swapkey={},
-                swap_key_prefix="$swapkey",
-                next_swap_key_num=150,
-                used_swap_keys=set(),
-                transparency_sections_to_add=OrderedDict(),
-            )
+            node = _ttl_node()
+            _run_process(node, sections, section_name)
 
-            self.assertIn(section_name, sections)
             lines = sections[section_name]
-            group = _group_for(lines, mesh_name)
-            self.assertEqual(lines[-1], "; [/SSMT-TTL]")
-            self.assertIn("if $swapkey0 == 0 && $swapkey1 == 0", group)
-            self.assertIn(f"    ${BS}TTL{BS}_1 = 56376", group)
-            self.assertIn(f"    ${BS}TTL{BS}_2 = 0", group)
-            self.assertIn(f"    ${BS}TTL{BS}_3 = 3", group)
-            self.assertIn(f"    run = CommandList{BS}TTL{BS}Draw", group)
-            self.assertEqual(group[-2], "endif")
-            # V/alpha 在 if 之前，条件块只包绘制参数
-            self.assertLess(
-                group.index(f"${BS}TTL{BS}alpha = $TTLAlpha0_75"),
-                group.index("if $swapkey0 == 0 && $swapkey1 == 0"),
-            )
-            self.assertIn("; [SSMT TTL 已接管] drawindexed = 56376,0,3", lines)
+            self.assertEqual(lines[:len(header)], header)
+            self.assertEqual(lines[-1], "endif")
+            self.assertEqual([line for line in lines if line.strip() == "endif"], ["endif"])
+            self.assertEqual(_live_draws(lines), [])
+
+            block = _inline_block(lines, mesh_name)
+            expected = [
+                f"Resource{BS}TTL{BS}TransparencyTex = ref Resource_TTLMap_Rkydfsmefl",
+                f"${BS}TTL{BS}mask_channel = 3",
+                f"${BS}TTL{BS}mask_invert = 1",
+                f"${BS}TTL{BS}alpha = $TTLAlpha0_75",
+                f"${BS}TTL{BS}V = 1.5",
+                f"${BS}TTL{BS}_1 = 56376",
+                f"${BS}TTL{BS}_2 = 0",
+                f"${BS}TTL{BS}_3 = 3",
+                f"run = CommandList{BS}TTL{BS}Draw",
+            ]
+            # 参数行落在同一个 if 分支里，缩进跟原绘制行一致
+            self.assertEqual(block[-9:], ["  " + line for line in expected])
+            anchor = _anchor_index(lines, mesh_name)
+            if_index = lines.index("if $swapkey0 == 0 && $swapkey1 == 0")
+            endif_index = lines.index("endif")
+            self.assertLess(if_index, anchor)
+            self.assertLess(anchor, endif_index)
+            for line in block[-9:]:
+                self.assertLess(anchor, lines.index(line))
+                self.assertLess(lines.index(line), endif_index)
+            # 旧形态的接管注释不再产生
+            self.assertEqual([line for line in lines if line.strip().startswith(TTL_TAKEN_PREFIX)], [])
 
     def test_ttl_transparent_plus_fxmap_writes_ttl_ref(self):
-        """TTL：_透明0.5 且有 TTLMap 材质时，组内写 TransparencyTex 引用并生成资源段"""
+        """TTL：_透明0.5 且有 TTLMap 材质时，原位写 TransparencyTex 引用并生成资源段"""
         with tempfile.TemporaryDirectory() as temp_dir:
             BS = chr(92)
-            diffuse_path = os.path.join(temp_dir, "diffuse.png")
-            ttlmap_path = os.path.join(temp_dir, "ttlmap.png")
-            for path in (diffuse_path, ttlmap_path):
-                with open(path, "wb") as file_obj:
-                    file_obj.write(os.path.basename(path).encode("ascii"))
-
+            diffuse_path = _write_png(temp_dir, "diffuse.png")
+            ttlmap_path = _write_png(temp_dir, "ttlmap.png")
             mesh_name = "Body_透明0.5"
             obj = _FakeObject(mesh_name, {}, [
                 ("DiffuseMap_衣服", diffuse_path),
@@ -1735,45 +1729,40 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             _fake_bpy.data.objects[obj.name] = obj
 
             section_name = "[TextureOverride_Body]"
+            header = [
+                "hash = 241deac5",
+                "match_first_index = 0",
+                "ib = Resource_Body_Index",
+                f"Resource{BS}ZZMI{BS}Diffuse = ref Resource-old-DiffuseMap",
+                f"run = CommandList{BS}ZZMI{BS}SetTextures",
+                "run = CommandListSkinTexture",
+            ]
             sections = OrderedDict([
-                (section_name, [
-                    "hash = 241deac5",
-                    "match_first_index = 0",
-                    "ib = Resource_Body_Index",
-                    f"Resource{BS}ZZMI{BS}Diffuse = ref Resource-old-DiffuseMap",
-                    f"run = CommandList{BS}ZZMI{BS}SetTextures",
-                    "run = CommandListSkinTexture",
+                (section_name, header + [
                     f"[mesh:{mesh_name}]",
                     "drawindexed = 100, 5, 0",
                 ]),
                 ("_config_path", temp_dir),
             ])
 
-            node = node_postprocess_material.SSMTNode_PostProcess_Material()
-            node.name = "MaterialNode"
-            node.material_to_resource_override = False
-            node.material_switch_var = "$swapkey150"
-            node.process_texture_override_section(
-                section_name, sections,
-                material_group_to_swapkey={},
-                swap_key_prefix="$swapkey",
-                next_swap_key_num=150,
-                used_swap_keys=set(),
-                transparency_sections_to_add=OrderedDict(),
-            )
+            node = _ttl_node()
+            _run_process(node, sections, section_name)
 
-            self.assertIn(section_name, sections)
             lines = sections[section_name]
-            group = _group_for(lines, mesh_name)
+            self.assertEqual(lines[:len(header)], header)
+            block = _inline_block(lines, mesh_name)
             fx_token = node._latin_token_for_text("遮罩")
             tex_ref_line = f"Resource{BS}TTL{BS}TransparencyTex = ref Resource_TTLMap_{fx_token}"
             alpha_line = f"${BS}TTL{BS}alpha = $TTLAlpha0_5"
             mask_invert_line = f"${BS}TTL{BS}mask_invert = 1"
-            self.assertIn(tex_ref_line, group)
-            self.assertIn(alpha_line, group)
-            self.assertIn(mask_invert_line, group)
-            self.assertLess(group.index(tex_ref_line), group.index(mask_invert_line))
-            self.assertLess(group.index(mask_invert_line), group.index(alpha_line))
+            self.assertIn(tex_ref_line, block)
+            self.assertIn(alpha_line, block)
+            self.assertIn(mask_invert_line, block)
+            self.assertLess(_only(block, "TransparencyTex"), _only(block, "mask_invert"))
+            self.assertLess(_only(block, "mask_invert"), _only(block, "alpha = "))
+            self.assertIn(f"${BS}TTL{BS}_1 = 100", block)
+            self.assertIn(f"${BS}TTL{BS}_2 = 5", block)
+            self.assertIn(f"${BS}TTL{BS}_3 = 0", block)
             self.assertIn("global $TTLAlpha0_5 = 0.5", sections["[Constants]"])
             self.assertIn(f"[Resource_TTLMap_{fx_token}]", sections)
             self.assertIn(
@@ -1784,13 +1773,11 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             self.assertNotIn(r"ResourceRabbitFXFXMap", joined)
             self.assertNotIn(r"ResourceNTEMIFXFXMap", joined)
 
-    def test_ttl_fxmap_mask_invert_appended_exactly_once_even_when_header_has_legacy_key(self):
-        """TTL：组内 mask_invert 只写一次；旧头部残留的该键不复制进组，不会重复赋值"""
+    def test_ttl_fxmap_mask_invert_written_exactly_once(self):
+        """TTL：mask_invert 在本块只写一次；段头里残留的旧键原地不动、不被复制"""
         with tempfile.TemporaryDirectory() as temp_dir:
             BS = chr(92)
-            ttlmap_path = os.path.join(temp_dir, "ttlmap.png")
-            with open(ttlmap_path, "wb") as file_obj:
-                file_obj.write(b"fxmap")
+            ttlmap_path = _write_png(temp_dir, "ttlmap.png")
             mesh_name = "Body_透明0.5"
             obj = _FakeObject(mesh_name, {}, [("TTLMap_遮罩", ttlmap_path)])
             _fake_bpy.data.objects[obj.name] = obj
@@ -1798,100 +1785,92 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             mask_key = f"${BS}TTL{BS}mask_invert = 1"
             legacy_key = f"${BS}TTL{BS}mask_invert = 0"
             section_name = "[TextureOverride_Body]"
+            header = [
+                "hash = 241deac5",
+                "match_first_index = 0",
+                "ib = Resource_Body_Index",
+                legacy_key,
+                "run = CommandListSkinTexture",
+            ]
             sections = OrderedDict([
-                (section_name, [
-                    "hash = 241deac5",
-                    "match_first_index = 0",
-                    "ib = Resource_Body_Index",
-                    legacy_key,
-                    "run = CommandListSkinTexture",
+                (section_name, header + [
                     f"[mesh:{mesh_name}]",
                     "drawindexed = 100, 5, 0",
                 ]),
                 ("_config_path", temp_dir),
             ])
 
-            node = node_postprocess_material.SSMTNode_PostProcess_Material()
-            node.name = "MaterialNode"
-            node.material_to_resource_override = False
-            node.material_switch_var = "$swapkey150"
-            node.process_texture_override_section(
-                section_name, sections, material_group_to_swapkey={},
-                swap_key_prefix="$swapkey", next_swap_key_num=150, used_swap_keys=set(),
-                transparency_sections_to_add=OrderedDict(),
-            )
+            _run_process(_ttl_node(), sections, section_name)
 
             lines = sections[section_name]
-            group = _group_for(lines, mesh_name)
-            self.assertEqual(group.count(mask_key), 1)
-            self.assertNotIn(legacy_key, group)
-            # 旧头部那一行留在段头原地，不被复制（整段仍只有一个 = 0 和一个 = 1）
-            outside = _outside_group(lines, mesh_name)
-            self.assertEqual([line for line in outside if "mask_invert" in line], [legacy_key])
+            self.assertEqual(lines[:len(header)], header)
+            block = _inline_block(lines, mesh_name)
+            self.assertEqual([line for line in block if "mask_invert" in line], [mask_key])
             self.assertEqual([line for line in lines if line.strip() == mask_key], [mask_key])
+            self.assertEqual([line for line in lines if "mask_invert" in line], [legacy_key, mask_key])
 
     def test_ttl_fxmap_only_writes_alpha_1(self):
-        """TTL：仅有 TTLMap 材质（无透明后缀）时 alpha 固定 1.0，组内联在原段"""
+        """TTL：仅有 TTLMap 材质（无透明后缀）时 alpha 固定 1.0，参数行原位内联"""
         with tempfile.TemporaryDirectory() as temp_dir:
             BS = chr(92)
-            ttlmap_path = os.path.join(temp_dir, "ttlmap.png")
-            with open(ttlmap_path, "wb") as file_obj:
-                file_obj.write(b"fxmap")
+            ttlmap_path = _write_png(temp_dir, "ttlmap.png")
             mesh_name = "GenericMesh"
             obj = _FakeObject(mesh_name, {}, [("TTLMap_Generic", ttlmap_path)])
             _fake_bpy.data.objects[obj.name] = obj
             section_name = "[TextureOverride_Generic]"
+            header = [
+                "hash = 12345678",
+                "match_first_index = 0",
+                "ib = Resource_GenericMesh_Index",
+                "run = CommandListSkinTexture",
+            ]
             sections = OrderedDict([
-                (section_name, [
-                    "hash = 12345678",
-                    "match_first_index = 0",
-                    "ib = Resource_GenericMesh_Index",
-                    "run = CommandListSkinTexture",
+                (section_name, header + [
                     f"[mesh:{mesh_name}]",
                     "drawindexed = 3, 0, 0",
                 ]),
                 ("_config_path", temp_dir),
             ])
-            node = node_postprocess_material.SSMTNode_PostProcess_Material()
-            node.name = "MaterialNode"
-            node.material_to_resource_override = False
-            node.material_switch_var = "$swapkey150"
-            node.process_texture_override_section(
-                section_name, sections, material_group_to_swapkey={},
-                swap_key_prefix="$swapkey", next_swap_key_num=150, used_swap_keys=set(),
-                transparency_sections_to_add=OrderedDict(),
-            )
-            self.assertIn(section_name, sections)
+
+            _run_process(_ttl_node(), sections, section_name)
+
             self.assertNotIn("[TextureOverrideGenericMesh]", sections)
             lines = sections[section_name]
-            group = _group_for(lines, mesh_name)
-            self.assertIn("; GenericMesh", group)
-            self.assertIn(f"Resource{BS}TTL{BS}TransparencyTex = ref Resource_TTLMap_Generic", group)
-            self.assertIn(f"${BS}TTL{BS}alpha = $TTLAlpha1_0", group)
+            self.assertEqual(lines[:len(header)], header)
+            block = _inline_block(lines, mesh_name)
+            self.assertEqual(block, [
+                f"Resource{BS}TTL{BS}TransparencyTex = ref Resource_TTLMap_Generic",
+                f"${BS}TTL{BS}mask_channel = 3",
+                f"${BS}TTL{BS}mask_invert = 1",
+                f"${BS}TTL{BS}alpha = $TTLAlpha1_0",
+                f"${BS}TTL{BS}V = 1.5",
+                f"${BS}TTL{BS}_1 = 3",
+                f"${BS}TTL{BS}_2 = 0",
+                f"${BS}TTL{BS}_3 = 0",
+                TTL_DRAW_RUN,
+            ])
             self.assertIn("global $TTLAlpha1_0 = 1.0", sections["[Constants]"])
-            self.assertIn(f"${BS}TTL{BS}_1 = 3", group)
-            self.assertIn(f"${BS}TTL{BS}_2 = 0", group)
-            self.assertEqual(lines[-1], "; [/SSMT-TTL]")
 
-    def test_ttl_default_brightness_written_outside_if_block(self):
-        r"""TTL：提亮默认值 $\TTL\V = 1.5 写在组内 if 之外（回归：写进 if 内会爆炸）"""
+    def test_ttl_default_brightness_written_once_in_place(self):
+        r"""TTL：提亮默认值 $\TTL\V = 1.5 只写一次，落在绘制所在的同一分支里"""
         with tempfile.TemporaryDirectory() as temp_dir:
             BS = chr(92)
             mesh_name = "LOD0.241deac5-56376-0.中文中文_copy"
-            ttl_path = os.path.join(temp_dir, "ttl.png")
-            with open(ttl_path, "wb") as file_obj:
-                file_obj.write(b"ttl")
+            ttl_path = _write_png(temp_dir, "ttl.png")
             obj = _FakeObject(mesh_name, {}, [("TTLMap_遮罩", ttl_path)])
             _fake_bpy.data.objects[obj.name] = obj
 
             section_name = "[TextureOverride_LOD0.241deac5_56376_0]"
+            boundary = "if $swapkey0 == 0"
+            header = [
+                "hash = 241deac5",
+                "match_first_index = 0",
+                "ib = Resource_LOD0.241deac5_56376_0_Index",
+                "run = CommandListSkinTexture",
+                boundary,
+            ]
             sections = OrderedDict([
-                (section_name, [
-                    "hash = 241deac5",
-                    "match_first_index = 0",
-                    "ib = Resource_LOD0.241deac5_56376_0_Index",
-                    "run = CommandListSkinTexture",
-                    "if $swapkey0 == 0",
+                (section_name, header + [
                     f"  ; [mesh:{mesh_name}] [vertex_count:15618]",
                     "  drawindexed = 56376,0,3",
                     "endif",
@@ -1899,92 +1878,79 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
                 ("_config_path", temp_dir),
             ])
 
-            node = node_postprocess_material.SSMTNode_PostProcess_Material()
-            node.name = "MaterialNode"
-            node.material_to_resource_switch = False
-            node.material_to_resource_override = False
-            node.material_switch_var = "$swapkey150"
-
-            node.process_texture_override_section(
-                section_name, sections,
-                material_group_to_swapkey={},
-                swap_key_prefix="$swapkey",
-                next_swap_key_num=150,
-                used_swap_keys=set(),
-                transparency_sections_to_add=OrderedDict(),
-            )
+            node = _ttl_node(material_to_resource_switch=False)
+            _run_process(node, sections, section_name)
 
             lines = sections[section_name]
-            group = _group_for(lines, mesh_name)
+            self.assertEqual(lines[:len(header)], header)
             brightness_line = f"${BS}TTL{BS}V = 1.5"
-            if_line = "if $swapkey0 == 0"
             alpha_line = f"${BS}TTL{BS}alpha = $TTLAlpha1_0"
-
-            # 1) 默认生成
-            self.assertIn(brightness_line, group)
-            # 2) 第 0 列：与 if 同级，不被条件块缩进
-            self.assertEqual([line for line in group if line.strip() == brightness_line], [brightness_line])
-            # 3) 位置在 alpha 之后、if 之前 —— 即条件块之外
-            self.assertLess(group.index(alpha_line), group.index(brightness_line))
-            self.assertLess(group.index(brightness_line), group.index(if_line))
-            # 4) 条件块本身仍完整
-            self.assertIn(f"    ${BS}TTL{BS}_1 = 56376", group)
-            self.assertIn(f"    ${BS}TTL{BS}_2 = 0", group)
-            self.assertIn(f"    ${BS}TTL{BS}_3 = 3", group)
-            self.assertIn(f"    run = CommandList{BS}TTL{BS}Draw", group)
-            self.assertEqual(group[-2], "endif")
+            # 只写一次
+            self.assertEqual([line for line in lines if line.strip() == brightness_line], ["  " + brightness_line])
+            block = _inline_block(lines, mesh_name)
+            self.assertLess(_only(block, "alpha = "), _only(block, "V = 1.5"))
+            # 与绘制同分支：都在 if 与 endif 之间
+            endif_index = lines.index("endif")
+            for line in block:
+                self.assertLess(lines.index(boundary), lines.index(line))
+                self.assertLess(lines.index(line), endif_index)
+            self.assertIn(f"${BS}TTL{BS}_1 = 56376", [line.strip() for line in block])
+            self.assertIn(f"${BS}TTL{BS}_2 = 0", [line.strip() for line in block])
+            self.assertIn(f"${BS}TTL{BS}_3 = 3", [line.strip() for line in block])
+            self.assertEqual([line for line in block if line.strip().startswith("run = CommandList")],
+                             ["  " + TTL_DRAW_RUN])
 
     def test_ttl_multiple_fxmap_materials_use_switch_branches(self):
-        """TTL：同一物体多个 TTLMap 材质在组内生成 $swapkey 分支"""
+        """TTL：同一物体多个 TTLMap 材质时，原位生成 $swapkey 分支选贴图"""
         with tempfile.TemporaryDirectory() as temp_dir:
             BS = chr(92)
-            fx_a = os.path.join(temp_dir, "fxmap-a.png")
-            fx_b = os.path.join(temp_dir, "fxmap-b.png")
-            for path in (fx_a, fx_b):
-                with open(path, "wb") as file_obj:
-                    file_obj.write(os.path.basename(path).encode("ascii"))
+            fx_a = _write_png(temp_dir, "fxmap-a.png")
+            fx_b = _write_png(temp_dir, "fxmap-b.png")
             mesh_name = "Body"
             obj = _FakeObject(mesh_name, {}, [("TTLMap_A", fx_a), ("TTLMap_B", fx_b)])
             _fake_bpy.data.objects[obj.name] = obj
             section_name = "[TextureOverride_Body]"
+            header = [
+                "hash = 12345678",
+                "match_first_index = 0",
+                "ib = Resource_Body_Index",
+            ]
             sections = OrderedDict([
-                (section_name, [
-                    "hash = 12345678",
-                    "match_first_index = 0",
-                    "ib = Resource_Body_Index",
+                (section_name, header + [
                     f"[mesh:{mesh_name}]",
                     "drawindexed = 6, 3, 0",
                 ]),
                 ("_config_path", temp_dir),
             ])
-            node = node_postprocess_material.SSMTNode_PostProcess_Material()
-            node.name = "MaterialNode"
-            node.material_to_resource_override = False
-            node.material_switch_var = "$swapkey150"
-            node.process_texture_override_section(
-                section_name, sections, material_group_to_swapkey={},
-                swap_key_prefix="$swapkey", next_swap_key_num=150, used_swap_keys=set(),
-                transparency_sections_to_add=OrderedDict(),
-            )
-            self.assertIn(section_name, sections)
-            lines = sections[section_name]
-            group = _group_for(lines, mesh_name)
-            self.assertIn("if $swapkey150 == 0", group)
-            self.assertIn("if $swapkey150 == 1", group)
-            self.assertIn(f"    Resource{BS}TTL{BS}TransparencyTex = ref Resource_TTLMap_A", group)
-            self.assertIn(f"    Resource{BS}TTL{BS}TransparencyTex = ref Resource_TTLMap_B", group)
-            self.assertEqual(lines[-1], "; [/SSMT-TTL]")
 
-    def test_ttl_shared_if_only_transparent_gets_own_if(self):
-        """TTL：共用 if 里只把 _透明 那块搬进段尾组，普通网格的绘制留在原处"""
+            _run_process(_ttl_node(), sections, section_name)
+
+            lines = sections[section_name]
+            self.assertEqual(lines[:len(header)], header)
+            block = _inline_block(lines, mesh_name)
+            self.assertEqual([line for line in block if line.strip() == "if $swapkey150 == 0"], ["if $swapkey150 == 0"])
+            self.assertEqual([line for line in block if line.strip() == "if $swapkey150 == 1"], ["if $swapkey150 == 1"])
+            self.assertIn(f"    Resource{BS}TTL{BS}TransparencyTex = ref Resource_TTLMap_A", block)
+            self.assertIn(f"    Resource{BS}TTL{BS}TransparencyTex = ref Resource_TTLMap_B", block)
+            self.assertLess(_only(block, "== 0"), _only(block, "Resource_TTLMap_A"))
+            self.assertLess(_only(block, "Resource_TTLMap_A"), _only(block, "== 1"))
+            self.assertLess(_only(block, "== 1"), _only(block, "Resource_TTLMap_B"))
+            # 参数只写一套，且在本块里
+            self.assertEqual([line for line in block if "mask_channel" in line], [f"${BS}TTL{BS}mask_channel = 3"])
+            self.assertEqual([line for line in block if "mask_invert" in line], [f"${BS}TTL{BS}mask_invert = 1"])
+            self.assertEqual([line for line in block if "alpha = " in line], [f"${BS}TTL{BS}alpha = $TTLAlpha1_0"])
+            self.assertEqual([line for line in block if line.strip() == TTL_DRAW_RUN], [TTL_DRAW_RUN])
+            self.assertIn(f"${BS}TTL{BS}_1 = 6", block)
+            self.assertIn(f"${BS}TTL{BS}_2 = 3", block)
+            self.assertIn(f"[Resource_TTLMap_A]", sections)
+            self.assertIn(f"[Resource_TTLMap_B]", sections)
+
+    def test_ttl_shared_if_only_transparent_gets_inline_block(self):
+        """TTL：共用 if 里只有 _透明 那块被替换，普通网格的绘制留在原处"""
         with tempfile.TemporaryDirectory() as temp_dir:
             BS = chr(92)
-            diffuse_path = os.path.join(temp_dir, "diffuse.png")
-            with open(diffuse_path, "wb") as file_obj:
-                file_obj.write(b"diffuse")
-            ttl_path = os.path.join(temp_dir, "ttl.png")
-            with open(ttl_path, "wb") as file_obj:
-                file_obj.write(b"ttl")
+            diffuse_path = _write_png(temp_dir, "diffuse.png")
+            ttl_path = _write_png(temp_dir, "ttl.png")
             transparent_mesh = "Body_透明0.5"
             transparent_obj = _FakeObject(transparent_mesh, {}, [
                 ("DiffuseMap_衣服", diffuse_path), ("TTLMap_遮罩", ttl_path),
@@ -1993,74 +1959,71 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             _fake_bpy.data.objects[transparent_obj.name] = transparent_obj
             _fake_bpy.data.objects[normal_obj.name] = normal_obj
             section_name = "[TextureOverride_Shared]"
+            header = [
+                "hash = 241deac5",
+                "match_first_index = 0",
+                "ib = Resource_Shared_Index",
+                f"Resource{BS}ZZMI{BS}Diffuse = ref Resource-old-DiffuseMap",
+                f"run = CommandList{BS}ZZMI{BS}SetTextures",
+                "run = CommandListSkinTexture",
+                "if $swapkey0 == 0",
+            ]
+            normal_block = ["  [mesh:Body]", "  drawindexed = 100, 0, 0"]
             sections = OrderedDict([
-                (section_name, [
-                    "hash = 241deac5",
-                    "match_first_index = 0",
-                    "ib = Resource_Shared_Index",
-                    f"Resource{BS}ZZMI{BS}Diffuse = ref Resource-old-DiffuseMap",
-                    f"run = CommandList{BS}ZZMI{BS}SetTextures",
-                    "run = CommandListSkinTexture",
-                    "if $swapkey0 == 0",
-                    "  [mesh:Body]",
-                    "  drawindexed = 100, 0, 0",
+                (section_name, header + normal_block + [
                     f"  [mesh:{transparent_mesh}]",
                     "  drawindexed = 200, 100, 0",
                     "endif",
                 ]),
                 ("_config_path", temp_dir),
             ])
-            node = node_postprocess_material.SSMTNode_PostProcess_Material()
-            node.name = "MaterialNode"
-            node.material_to_resource_override = False
-            node.material_switch_var = "$swapkey150"
-            node.process_texture_override_section(
-                section_name, sections, material_group_to_swapkey={},
-                swap_key_prefix="$swapkey", next_swap_key_num=150, used_swap_keys=set(),
-                transparency_sections_to_add=OrderedDict(),
-            )
-            self.assertIn(section_name, sections)
+
+            _run_process(_ttl_node(), sections, section_name)
+
             shared = sections[section_name]
-            # 普通网格原样留着
-            self.assertIn("  [mesh:Body]", shared)
-            self.assertIn("  drawindexed = 100, 0, 0", shared)
+            self.assertEqual(shared[:len(header)], header)
+            # 普通网格的块与绘制留在原处，绘制仍然生效（贴图重绑是材质节点的正常职责）
+            self.assertEqual([line for line in shared if line == "  [mesh:Body]"], ["  [mesh:Body]"])
+            self.assertEqual(shared.count("  drawindexed = 100, 0, 0"), 1)
             self.assertLess(shared.index("  [mesh:Body]"), shared.index("  drawindexed = 100, 0, 0"))
-            # _透明 那块只在组里出现一次（段头克隆自带锚点；裸 [mesh:X] 锚点在组里
-            # 写成 `; X`，注释形态的锚点才逐字保留）
-            group = _group_for(shared, transparent_mesh)
+            self.assertLess(shared.index("  drawindexed = 100, 0, 0"), shared.index(f"  [mesh:{transparent_mesh}]"))
+            self.assertEqual(_live_draws(shared), ["  drawindexed = 100, 0, 0"])
+            self.assertEqual(shared[-1], "endif")
             self.assertEqual(shared.count(f"  [mesh:{transparent_mesh}]"), 1)
-            self.assertTrue(group)
-            self.assertIn(f"; {transparent_mesh}", group)
-            self.assertIn("; [SSMT TTL 已接管] drawindexed = 200, 100, 0", shared)
-            self.assertIn("if $swapkey0 == 0", group)
-            self.assertIn(f"    ${BS}TTL{BS}_1 = 200", group)
-            self.assertIn(f"    ${BS}TTL{BS}_2 = 100", group)
-            self.assertIn(f"    run = CommandList{BS}TTL{BS}Draw", group)
-            self.assertIn("endif", group)
-            self.assertEqual(shared[-1], "; [/SSMT-TTL]")
+
+            block = _inline_block(shared, transparent_mesh)
+            self.assertEqual(block[-9:], [
+                f"  Resource{BS}TTL{BS}TransparencyTex = ref Resource_TTLMap_Rkydfsmefl",
+                f"  ${BS}TTL{BS}mask_channel = 3",
+                f"  ${BS}TTL{BS}mask_invert = 1",
+                f"  ${BS}TTL{BS}alpha = $TTLAlpha0_5",
+                f"  ${BS}TTL{BS}V = 1.5",
+                f"  ${BS}TTL{BS}_1 = 200",
+                f"  ${BS}TTL{BS}_2 = 100",
+                f"  ${BS}TTL{BS}_3 = 0",
+                "  " + TTL_DRAW_RUN,
+            ])
 
     def test_ttl_same_alpha_value_reuses_same_variable(self):
         """TTL：相同透明数值复用同一个 $TTLAlpha 变量，[Constants] 只定义一次"""
         with tempfile.TemporaryDirectory() as temp_dir:
             BS = chr(92)
-            diffuse_path = os.path.join(temp_dir, "diffuse.png")
-            with open(diffuse_path, "wb") as file_obj:
-                file_obj.write(b"diffuse")
-            ttl_path = os.path.join(temp_dir, "ttl.png")
-            with open(ttl_path, "wb") as file_obj:
-                file_obj.write(b"ttl")
+            diffuse_path = _write_png(temp_dir, "diffuse.png")
+            ttl_path = _write_png(temp_dir, "ttl.png")
             mesh_a = "BodyA_透明0.75"
             mesh_b = "BodyB_透明0.75"
-            obj_a = _FakeObject(mesh_a, {}, [("DiffuseMap_衣服", diffuse_path), ("TTLMap_遮罩", ttl_path)])
-            obj_b = _FakeObject(mesh_b, {}, [("DiffuseMap_衣服", diffuse_path), ("TTLMap_遮罩", ttl_path)])
-            _fake_bpy.data.objects[obj_a.name] = obj_a
-            _fake_bpy.data.objects[obj_b.name] = obj_b
+            for name in (mesh_a, mesh_b):
+                _fake_bpy.data.objects[name] = _FakeObject(name, {}, [
+                    ("DiffuseMap_衣服", diffuse_path), ("TTLMap_遮罩", ttl_path),
+                ])
             section_name = "[TextureOverride_Shared]"
+            header = [
+                "hash = 241deac5",
+                "match_first_index = 0",
+                "ib = Resource_Shared_Index",
+            ]
             sections = OrderedDict([
-                (section_name, [
-                    "hash = 241deac5",
-                    "match_first_index = 0",
-                    "ib = Resource_Shared_Index",
+                (section_name, header + [
                     f"[mesh:{mesh_a}]",
                     "drawindexed = 100, 0, 0",
                     f"[mesh:{mesh_b}]",
@@ -2068,61 +2031,65 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
                 ]),
                 ("_config_path", temp_dir),
             ])
-            node = node_postprocess_material.SSMTNode_PostProcess_Material()
-            node.name = "MaterialNode"
-            node.material_to_resource_override = False
-            node.material_switch_var = "$swapkey150"
-            node.process_texture_override_section(
-                section_name, sections, material_group_to_swapkey={},
-                swap_key_prefix="$swapkey", next_swap_key_num=150, used_swap_keys=set(),
-                transparency_sections_to_add=OrderedDict(),
-            )
-            constants = sections.get("[Constants]", [])
-            self.assertEqual(constants.count("global $TTLAlpha0_75 = 0.75"), 1)
-            lines = sections[section_name]
-            # 同一段两个网格各自成组
-            self.assertEqual(_group_count(lines), 2)
-            alpha_line = f"${BS}TTL{BS}alpha = $TTLAlpha0_75"
-            self.assertEqual([line for line in lines if line.strip() == alpha_line], [alpha_line, alpha_line])
-            self.assertIn(f"${BS}TTL{BS}_1 = 100", _group_for(lines, mesh_a))
-            self.assertIn(f"${BS}TTL{BS}_1 = 200", _group_for(lines, mesh_b))
 
-    def test_ttl_drag_hook_lines_cloned_into_group(self):
-        """TTL：拖拽钩子行随段头一起克隆进组，不再生成任何命令列表。
+            _run_process(_ttl_node(), sections, section_name)
+
+            sections_constants = sections.get("[Constants]", [])
+            self.assertEqual(sections_constants.count("global $TTLAlpha0_75 = 0.75"), 1)
+            lines = sections[section_name]
+            self.assertEqual(lines[:len(header)], header)
+            alpha_line = f"${BS}TTL{BS}alpha = $TTLAlpha0_75"
+            self.assertEqual(lines.count(alpha_line), 2)
+            # 同一段两块各自独立取参
+            block_a = _inline_block(lines, mesh_a)
+            block_b = _inline_block(lines, mesh_b)
+            self.assertEqual(
+                [line for line in block_a if line.strip().startswith(f"${BS}TTL{BS}_")],
+                [f"${BS}TTL{BS}_1 = 100", f"${BS}TTL{BS}_2 = 0", f"${BS}TTL{BS}_3 = 0"],
+            )
+            self.assertEqual(
+                [line for line in block_b if line.strip().startswith(f"${BS}TTL{BS}_")],
+                [f"${BS}TTL{BS}_1 = 200", f"${BS}TTL{BS}_2 = 100", f"${BS}TTL{BS}_3 = 0"],
+            )
+            self.assertLess(_anchor_index(lines, mesh_a), _anchor_index(lines, mesh_b))
+            self.assertLess(lines.index(block_a[-1]), _anchor_index(lines, mesh_b))
+
+    def test_ttl_drag_hook_lines_stay_in_place(self):
+        """TTL：拖拽钩子行一个字都不动，且不生成任何命令列表。
 
         钩子只在拖拽激活时绑 jiggle 临时 VB0，绝不生成 else 分支绑 Position 基础输入
-        （否则骨骼丢失）；组内不写死 ib —— ib 由克隆来的段头行决定，索引缓冲与顶点
-        缓冲因此始终同源。"""
+        （否则骨骼丢失）；TTL 参数行直接接在钩子之后的本块里，索引缓冲与顶点缓冲
+        因为同段同块而始终同源。"""
         with tempfile.TemporaryDirectory() as temp_dir:
             BS = chr(92)
-            ttl_path = os.path.join(temp_dir, "ttl.png")
-            with open(ttl_path, "wb") as file_obj:
-                file_obj.write(b"ttl")
+            ttl_path = _write_png(temp_dir, "ttl.png")
             mesh_name = "LOD0.241deac5-56376-0.中文中文_透明0.75_copy"
             obj = _FakeObject(mesh_name, {}, [("TTLMap_遮罩", ttl_path)])
             _fake_bpy.data.objects[obj.name] = obj
 
             section_name = "[TextureOverride_LOD0.241deac5_56376_0]"
+            header = [
+                "hash = 241deac5",
+                "match_first_index = 0",
+                "ib = Resource_LOD0.241deac5_56376_0_Index",
+                f"run = CommandList{BS}ZZMI{BS}SetTextures",
+                "run = CommandListSkinTexture",
+                "    ; --- DRAG HOOK BEGIN 241deac5P0_A ---",
+                "    if $ssmtdrag_drag_enabled_A >= 1 && $ObjectDetectAllowed_A == 1",
+                "        run = CustomShaderDragBake241deac5P0_A",
+                "        run = CustomShaderDragDetect241deac5P0_A",
+                "    endif",
+                "    if $ssmtdrag_drag_enabled_A >= 2 && $ssmtdrag_mode_A == 1",
+                "        if time != $ssmtdrag_last_dispatch_241deac5_A",
+                "            run = CustomShaderDragJiggle241deac5_A",
+                "            $ssmtdrag_last_dispatch_241deac5_A = time",
+                "        endif",
+                "        vb0 = ResourceDragJiggleTempVB0_241deac5_A",
+                "    endif",
+                "    ; --- DRAG HOOK END 241deac5P0_A ---",
+            ]
             sections = OrderedDict([
-                (section_name, [
-                    "hash = 241deac5",
-                    "match_first_index = 0",
-                    "ib = Resource_LOD0.241deac5_56376_0_Index",
-                    f"run = CommandList{BS}ZZMI{BS}SetTextures",
-                    "run = CommandListSkinTexture",
-                    "    ; --- DRAG HOOK BEGIN 241deac5P0_A ---",
-                    "    if $ssmtdrag_drag_enabled_A >= 1 && $ObjectDetectAllowed_A == 1",
-                    "        run = CustomShaderDragBake241deac5P0_A",
-                    "        run = CustomShaderDragDetect241deac5P0_A",
-                    "    endif",
-                    "    if $ssmtdrag_drag_enabled_A >= 2 && $ssmtdrag_mode_A == 1",
-                    "        if time != $ssmtdrag_last_dispatch_241deac5_A",
-                    "            run = CustomShaderDragJiggle241deac5_A",
-                    "            $ssmtdrag_last_dispatch_241deac5_A = time",
-                    "        endif",
-                    "        vb0 = ResourceDragJiggleTempVB0_241deac5_A",
-                    "    endif",
-                    "    ; --- DRAG HOOK END 241deac5P0_A ---",
+                (section_name, header + [
                     f"; [mesh:{mesh_name}] [vertex_count:15618]",
                     "drawindexed = 56376, 0, 0",
                 ]),
@@ -2134,51 +2101,27 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
                 ("_config_path", temp_dir),
             ])
 
-            node = node_postprocess_material.SSMTNode_PostProcess_Material()
-            node.name = "MaterialNode"
-            node.material_to_resource_override = False
-            node.material_switch_var = "$swapkey150"
-            node.process_texture_override_section(
-                section_name, sections,
-                material_group_to_swapkey={},
-                swap_key_prefix="$swapkey",
-                next_swap_key_num=150,
-                used_swap_keys=set(),
-                transparency_sections_to_add=OrderedDict(),
-            )
+            _run_process(_ttl_node(), sections, section_name)
 
             # 新契约：一条命令列表都不生成
             self.assertEqual([key for key in sections if key.startswith("[CommandListSSMTTTLDraw_")], [])
             self.assertNotIn("CommandListSSMTTTLDraw_", _dump_sections(sections))
 
             lines = sections[section_name]
-            group = _group_for(lines, mesh_name)
-            stripped_group = [line.strip() for line in group]
-            self.assertIn("if $ssmtdrag_drag_enabled_A >= 2 && $ssmtdrag_mode_A == 1", stripped_group)
-            self.assertIn("vb0 = ResourceDragJiggleTempVB0_241deac5_A", stripped_group)
-            self.assertIn("run = CustomShaderDragJiggle241deac5_A", stripped_group)
-            self.assertIn("; --- DRAG HOOK BEGIN 241deac5P0_A ---", stripped_group)
-            self.assertIn("; --- DRAG HOOK END 241deac5P0_A ---", stripped_group)
-            self.assertNotIn("else", stripped_group)
-            self.assertNotIn("vb0 = Resource241deac5Position", stripped_group)
-            # 组里只有钩子逐字克隆 + 本网格贴图绑定，没有匹配段的死代码字段
-            self.assertIn("run = CommandList\\ZZMI\\SetTextures", stripped_group)
-            for dead_line in (
-                "hash = 241deac5",
-                "match_first_index = 0",
-                "ib = Resource_LOD0.241deac5_56376_0_Index",
-                "run = CommandListSkinTexture",
-            ):
-                self.assertNotIn(dead_line, group)
-            self.assertIn(f"run = CommandList{BS}TTL{BS}Draw", group)
+            self.assertEqual(lines[:len(header)], header)
+            block = _inline_block(lines, mesh_name)
+            # 这个网格只有 TTLMap 材质：块里就是那 9 行，没有可重绑的不透明贴图
+            self.assertEqual(len(block), 9)
+            self.assertEqual(block[0], f"Resource{BS}TTL{BS}TransparencyTex = ref Resource_TTLMap_Rkydfsmefl")
+            self.assertIn(f"${BS}TTL{BS}_1 = 56376", block)
+            self.assertEqual([line for line in lines if line.strip() == "else"], [])
+            self.assertNotIn("vb0 = Resource241deac5Position", "\n".join(lines))
 
     def test_ttl_stale_command_list_left_untouched(self):
-        """TTL：旧文件中残留的 [CommandListSSMTTTLDraw_*] 不再被重建/改写，绘制入口回到组内"""
+        """TTL：旧文件残留的 [CommandListSSMTTTLDraw_*] 不重建也不改写，绘制入口回到本块"""
         with tempfile.TemporaryDirectory() as temp_dir:
             BS = chr(92)
-            ttl_path = os.path.join(temp_dir, "ttl.png")
-            with open(ttl_path, "wb") as file_obj:
-                file_obj.write(b"ttl")
+            ttl_path = _write_png(temp_dir, "ttl.png")
             mesh_name = "LOD0.241deac5-56376-0.中文中文_透明0.75_copy"
             obj = _FakeObject(mesh_name, {}, [("TTLMap_遮罩", ttl_path)])
             _fake_bpy.data.objects[obj.name] = obj
@@ -2192,330 +2135,323 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
                 "ib = Resource_LOD0.241deac5_56376_0_Index",
                 f"run = CommandList{BS}TTL{BS}Draw",
             ]
+            header = [
+                "hash = 241deac5",
+                "match_first_index = 0",
+                "ib = Resource_LOD0.241deac5_56376_0_Index",
+                f"run = CommandList{BS}ZZMI{BS}SetTextures",
+                "run = CommandListSkinTexture",
+            ]
             sections = OrderedDict([
-                (section_name, [
-                    "hash = 241deac5",
-                    "match_first_index = 0",
-                    "ib = Resource_LOD0.241deac5_56376_0_Index",
-                    f"run = CommandList{BS}ZZMI{BS}SetTextures",
-                    "run = CommandListSkinTexture",
+                (section_name, header + [
                     f"; [mesh:{mesh_name}] [vertex_count:15618]",
-                    f"Resource{BS}TTL{BS}TransparencyTex = ref Resource_TTLMap_DiffuseMap_X",
-                    f"${BS}TTL{BS}mask_channel = 3",
                     "drawindexed = 56376, 0, 0",
                 ]),
                 (stale_name, list(stale_lines)),
                 ("_config_path", temp_dir),
             ])
 
-            node = node_postprocess_material.SSMTNode_PostProcess_Material()
-            node.name = "MaterialNode"
-            node.material_to_resource_override = False
-            node.material_switch_var = "$swapkey150"
-            node.process_texture_override_section(
-                section_name, sections,
-                material_group_to_swapkey={},
-                swap_key_prefix="$swapkey",
-                next_swap_key_num=150,
-                used_swap_keys=set(),
-                transparency_sections_to_add=OrderedDict(),
-            )
+            _run_process(_ttl_node(), sections, section_name)
 
-            # 残留段不被重写，也不再生成新的命令列表
+            # 残留段逐字不动，也没有新的命令列表
             self.assertEqual(sections[stale_name], stale_lines)
             self.assertEqual([key for key in sections if key.startswith("[CommandListSSMTTTLDraw_")], [stale_name])
 
             lines = sections[section_name]
-            group = _group_for(lines, mesh_name)
-            self.assertIn(f"run = CommandList{BS}TTL{BS}Draw", group)
+            self.assertEqual(lines[:len(header)], header)
+            block = _inline_block(lines, mesh_name)
+            self.assertEqual(block[-1], TTL_DRAW_RUN)
             self.assertNotIn("CommandListSSMTTTLDraw_", "\n".join(lines))
             self.assertNotIn("ShadowVB", "\n".join(lines))
 
-    def test_ttl_drag_hook_never_crosses_drawib(self):
-        r"""回归（2026-10-07 实机：洛克茜模组模型爆炸）：别的 DrawIB 的 jiggle 影子 VB0
-        严禁落到本段组里。
+    def test_ttl_other_drawib_section_untouched(self):
+        r"""回归（2026-10-07 实机：洛克茜模组模型爆炸）：处理一个 DrawIB 的 TTL 段时，
+        绝不允许把别的 DrawIB 段的任何一行带进来。
 
         实机链路：身体的 TTL 段带拖拽钩子，头发（另一个 DrawIB）的段没有 → 若跨段借用，
         头发 TTL 二次绘制会拿身体的 jiggle VB0 去配自己的 $\TTL\_1 区间（越界读）→ 乱
-        三角形。现在每段的组只克隆自己的段头，索引缓冲始终是本段自己的 ib。"""
+        三角形。现在参数只取本块自己的 draw，兄弟段逐字不动。"""
         with tempfile.TemporaryDirectory() as temp_dir:
             BS = chr(92)
-            ttl_path = os.path.join(temp_dir, "ttl.png")
-            with open(ttl_path, "wb") as file_obj:
-                file_obj.write(b"ttl")
+            ttl_path = _write_png(temp_dir, "ttl.png")
             mesh_name = "LOD0.bbbb2222-200-0.中文中文_透明0.75_copy"
             obj = _FakeObject(mesh_name, {}, [("TTLMap_遮罩", ttl_path)])
             _fake_bpy.data.objects[obj.name] = obj
 
+            sibling_name = "[TextureOverride_LOD0_aaaa1111_100_0_main]"
+            sibling_lines = [
+                "hash = aaaa1111",
+                "match_first_index = 0",
+                "    ; --- DRAG HOOK BEGIN aaaa1111P0_A ---",
+                "    if $ssmtdrag_drag_enabled_A >= 2 && $ssmtdrag_mode_A == 1",
+                "        vb0 = ResourceDragJiggleTempVB0_aaaa1111_A",
+                "    endif",
+                "    ; --- DRAG HOOK END aaaa1111P0_A ---",
+                "; [mesh:LOD0.aaaa1111-100-0.主体] [vertex_count:100]",
+                "drawindexed = 600, 0, 0",
+            ]
+            section_name = "[TextureOverrideLOD0_bbbb2222_200_0_copy]"
+            header = [
+                "hash = bbbb2222",
+                "match_first_index = 0",
+                "ib = Resource_LOD0.bbbb2222_200_0_Index",
+                f"run = CommandList{BS}ZZMI{BS}SetTextures",
+                "run = CommandListSkinTexture",
+            ]
             sections = OrderedDict([
-                # 兄弟段：拖拽钩子在此，属于另一个 DrawIB（aaaa1111）
-                ("[TextureOverride_LOD0_aaaa1111_100_0_main]", [
-                    "hash = aaaa1111",
-                    "match_first_index = 0",
-                    "    ; --- DRAG HOOK BEGIN aaaa1111P0_A ---",
-                    "    if $ssmtdrag_drag_enabled_A >= 2 && $ssmtdrag_mode_A == 1",
-                    "        vb0 = ResourceDragJiggleTempVB0_aaaa1111_A",
-                    "    endif",
-                    "    ; --- DRAG HOOK END aaaa1111P0_A ---",
-                    "; [mesh:LOD0.aaaa1111-100-0.主体] [vertex_count:100]",
-                    "drawindexed = 600, 0, 0",
-                ]),
-                # 本测试的处理对象：DrawIB = bbbb2222，段内没有钩子
-                ("[TextureOverrideLOD0_bbbb2222_200_0_copy]", [
-                    "hash = bbbb2222",
-                    "match_first_index = 0",
-                    "ib = Resource_LOD0.bbbb2222_200_0_Index",
-                    f"run = CommandList{BS}ZZMI{BS}SetTextures",
-                    "run = CommandListSkinTexture",
+                (sibling_name, list(sibling_lines)),
+                (section_name, header + [
                     f"; [mesh:{mesh_name}] [vertex_count:15618]",
-                    f"Resource{BS}TTL{BS}TransparencyTex = ref Resource_TTLMap_DiffuseMap_X",
-                    f"${BS}TTL{BS}mask_channel = 3",
                     "drawindexed = 56376, 0, 0",
                 ]),
                 ("_config_path", temp_dir),
             ])
 
-            node = node_postprocess_material.SSMTNode_PostProcess_Material()
-            node.name = "MaterialNode"
-            node.material_to_resource_override = False
-            node.material_switch_var = "$swapkey150"
-            node.process_texture_override_section(
-                "[TextureOverrideLOD0_bbbb2222_200_0_copy]",
-                sections,
-                material_group_to_swapkey={},
-                swap_key_prefix="$swapkey",
-                next_swap_key_num=150,
-                used_swap_keys=set(),
-                transparency_sections_to_add=OrderedDict(),
-            )
+            _run_process(_ttl_node(), sections, section_name)
 
+            self.assertEqual(sections[sibling_name], sibling_lines)
+            self.assertEqual(_live_draws(sections[sibling_name]), ["drawindexed = 600, 0, 0"])
             self.assertEqual([key for key in sections if key.startswith("[CommandListSSMTTTLDraw_")], [])
-            lines = sections["[TextureOverrideLOD0_bbbb2222_200_0_copy]"]
-            group = _group_for(lines, mesh_name)
-            group_text = "\n".join(group)
-            self.assertIn(f"run = CommandList{BS}TTL{BS}Draw", group_text)
-            self.assertNotIn("ResourceDragJiggleTempVB0_aaaa1111_A", group_text,
-                             "别的 DrawIB 的 jiggle 影子 VB0 严禁落到本段")
-            self.assertNotIn("CommandListSSMTTTLDraw_", group_text)
-            self.assertNotIn("aaaa1111", group_text, "组里不得出现别段 DrawIB 的任何资源名")
-            # 组不再重抄 ib/match_first_index，一对一由「绘制参数取自本块」证明
-            self.assertEqual([line for line in group if line.strip().startswith("ib = ")], [])
-            self.assertEqual([line for line in group if line.strip().startswith("match_first_index = ")], [])
-            self.assertIn(f"${BS}TTL{BS}_1 = 56376", group_text,
-                          "计数必须是本块 draw 的 56376，而不是兄弟段的 600")
-            self.assertIn(f"${BS}TTL{BS}_2 = 0", group_text, "起始索引取自本块 draw")
-            self.assertNotIn(f"${BS}TTL{BS}_1 = 600", group_text)
-            self.assertIn("; [SSMT TTL 已接管] drawindexed = 56376, 0, 0", lines)
-
-    def test_ttl_group_is_appended_after_last_block(self):
-        """新契约①：TTL 组内联在原段，且位置在最后一个块之后（段尾）"""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            BS = chr(92)
-            ttl_path = os.path.join(temp_dir, "ttl.png")
-            with open(ttl_path, "wb") as file_obj:
-                file_obj.write(b"ttl")
-            ttl_mesh = "LOD0.241deac5-56376-0.中文中文_copy"
-            tail_mesh = "LOD0.241deac5-56376-0.裙子"
-            ttl_obj = _FakeObject(ttl_mesh, {}, [("TTLMap_遮罩", ttl_path)])
-            tail_obj = _FakeObject(tail_mesh, {}, [])
-            _fake_bpy.data.objects[ttl_obj.name] = ttl_obj
-            _fake_bpy.data.objects[tail_obj.name] = tail_obj
-
-            section_name = "[TextureOverride_LOD0.241deac5_56376_0]"
-            sections = OrderedDict([
-                (section_name, [
-                    "hash = 241deac5",
-                    "match_first_index = 0",
-                    "ib = Resource_LOD0.241deac5_56376_0_Index",
-                    "run = CommandListSkinTexture",
-                    f"[mesh:{ttl_mesh}]",
-                    "drawindexed = 56376, 0, 0",
-                    f"[mesh:{tail_mesh}]",
-                    "drawindexed = 128, 56376, 0",
-                ]),
-                ("_config_path", temp_dir),
-            ])
-
-            node = node_postprocess_material.SSMTNode_PostProcess_Material()
-            node.name = "MaterialNode"
-            node.material_to_resource_override = False
-            node.material_switch_var = "$swapkey150"
-            node.process_texture_override_section(
-                section_name, sections,
-                material_group_to_swapkey={},
-                swap_key_prefix="$swapkey",
-                next_swap_key_num=150,
-                used_swap_keys=set(),
-                transparency_sections_to_add=OrderedDict(),
-            )
 
             lines = sections[section_name]
-            group = _group_for(lines, ttl_mesh)
-            self.assertEqual(_group_count(lines), 1)
-            self.assertGreater(lines.index(group[0]), lines.index(f"[mesh:{tail_mesh}]"))
-            self.assertEqual(lines[-1], "; [/SSMT-TTL]")
-            # 后面那个块原样留着
-            self.assertIn(f"[mesh:{tail_mesh}]", _outside_group(lines, ttl_mesh))
-            self.assertIn("drawindexed = 128, 56376, 0", _outside_group(lines, ttl_mesh))
+            self.assertEqual(lines[:len(header)], header)
+            block = _inline_block(lines, mesh_name)
+            block_text = "\n".join(block)
+            self.assertIn(f"${BS}TTL{BS}_1 = 56376", block_text, "计数必须取自本块 draw，而不是兄弟段的 600")
+            self.assertIn(f"${BS}TTL{BS}_2 = 0", block_text)
+            self.assertNotIn(f"${BS}TTL{BS}_1 = 600", block_text)
+            self.assertNotIn("ResourceDragJiggleTempVB0_aaaa1111_A", block_text)
+            self.assertNotIn("aaaa1111", block_text, "本块里不得出现别段 DrawIB 的任何资源名")
 
-    def test_ttl_take_over_comment_keeps_draw_arguments(self):
-        """新契约②：原绘制行变成接管注释，参数留在行里（重导出时靠它取值）"""
+    def test_ttl_take_over_comment_is_parameter_source(self):
+        """TTL：上一次导出留下的接管注释行是参数唯一来源，重导出时按它的数字重建"""
         with tempfile.TemporaryDirectory() as temp_dir:
             BS = chr(92)
-            ttl_path = os.path.join(temp_dir, "ttl.png")
-            with open(ttl_path, "wb") as file_obj:
-                file_obj.write(b"ttl")
+            ttl_path = _write_png(temp_dir, "ttl.png")
             mesh_name = "LOD0.241deac5-56376-0.中文中文_copy"
             obj = _FakeObject(mesh_name, {}, [("TTLMap_遮罩", ttl_path)])
             _fake_bpy.data.objects[obj.name] = obj
 
             section_name = "[TextureOverride_LOD0.241deac5_56376_0]"
+            taken_line = "; [SSMT TTL 已接管] drawindexed = 56376, 271, 3"
+            header = [
+                "hash = 241deac5",
+                "match_first_index = 0",
+                "ib = Resource_LOD0.241deac5_56376_0_Index",
+                "run = CommandListSkinTexture",
+            ]
             sections = OrderedDict([
-                (section_name, [
-                    "hash = 241deac5",
-                    "match_first_index = 0",
-                    "ib = Resource_LOD0.241deac5_56376_0_Index",
-                    "run = CommandListSkinTexture",
-                    f"[mesh:{mesh_name}]",
-                    "drawindexed = 56376, 271, 3",
-                ]),
+                (section_name, header + [f"[mesh:{mesh_name}]", taken_line]),
                 ("_config_path", temp_dir),
             ])
 
-            node = node_postprocess_material.SSMTNode_PostProcess_Material()
-            node.name = "MaterialNode"
-            node.material_to_resource_override = False
-            node.material_switch_var = "$swapkey150"
-            node.process_texture_override_section(
-                section_name, sections,
-                material_group_to_swapkey={},
-                swap_key_prefix="$swapkey",
-                next_swap_key_num=150,
-                used_swap_keys=set(),
-                transparency_sections_to_add=OrderedDict(),
-            )
+            _run_process(_ttl_node(), sections, section_name)
 
             lines = sections[section_name]
-            taken_line = "; [SSMT TTL 已接管] drawindexed = 56376, 271, 3"
-            self.assertIn(taken_line, lines)
-            # 原绘制行不再生效：段里没有裸 drawindexed
-            self.assertEqual(
-                [line for line in lines if line.strip().lower().startswith("drawindexed")],
-                [],
-            )
-            # 组内参数与那一行完全一致
-            group = _group_for(lines, mesh_name)
-            self.assertLess(lines.index(taken_line), lines.index(group[0]))
-            self.assertIn(f"${BS}TTL{BS}_1 = 56376", group)
-            self.assertIn(f"${BS}TTL{BS}_2 = 271", group)
-            self.assertIn(f"${BS}TTL{BS}_3 = 3", group)
+            self.assertEqual(lines[:len(header)], header)
+            # 注释行被参数行取代，不再是段里的活行
+            self.assertEqual([line for line in lines if line.strip().startswith(TTL_TAKEN_PREFIX)], [])
+            self.assertEqual([line for line in lines if line.strip().lower().startswith("drawindexed")], [])
+            block = _inline_block(lines, mesh_name)
+            self.assertIn(f"${BS}TTL{BS}_1 = 56376", block)
+            self.assertIn(f"${BS}TTL{BS}_2 = 271", block)
+            self.assertIn(f"${BS}TTL{BS}_3 = 3", block)
 
     def test_ttl_rerun_is_idempotent(self):
-        """新契约③：同段跑两次，旧组被摘掉再加一份，参数不叠加"""
+        """TTL：同一份 sections 连跑两次，块里不叠参数、不重复建 $TTLAlpha"""
         with tempfile.TemporaryDirectory() as temp_dir:
             BS = chr(92)
-            ttl_path = os.path.join(temp_dir, "ttl.png")
-            with open(ttl_path, "wb") as file_obj:
-                file_obj.write(b"ttl")
+            ttl_path = _write_png(temp_dir, "ttl.png")
             mesh_name = "LOD0.241deac5-56376-0.中文中文_copy"
             obj = _FakeObject(mesh_name, {}, [("TTLMap_遮罩", ttl_path)])
             _fake_bpy.data.objects[obj.name] = obj
 
             section_name = "[TextureOverride_LOD0.241deac5_56376_0]"
+            header = [
+                "hash = 241deac5",
+                "match_first_index = 0",
+                "ib = Resource_LOD0.241deac5_56376_0_Index",
+                "run = CommandListSkinTexture",
+            ]
             sections = OrderedDict([
-                (section_name, [
-                    "hash = 241deac5",
-                    "match_first_index = 0",
-                    "ib = Resource_LOD0.241deac5_56376_0_Index",
-                    "run = CommandListSkinTexture",
+                (section_name, header + [
                     f"[mesh:{mesh_name}]",
                     "drawindexed = 56376, 0, 0",
                 ]),
                 ("_config_path", temp_dir),
             ])
 
-            node = node_postprocess_material.SSMTNode_PostProcess_Material()
-            node.name = "MaterialNode"
-            node.material_to_resource_override = False
-            node.material_switch_var = "$swapkey150"
-
-            def _process():
-                node.process_texture_override_section(
-                    section_name, sections,
-                    material_group_to_swapkey={},
-                    swap_key_prefix="$swapkey",
-                    next_swap_key_num=150,
-                    used_swap_keys=set(),
-                    transparency_sections_to_add=OrderedDict(),
-                )
-
-            _process()
+            node = _ttl_node()
+            _run_process(node, sections, section_name)
             once = list(sections[section_name])
             once_constants = list(sections.get("[Constants]", []))
-            _process()
+            _run_process(node, sections, section_name)
 
             self.assertEqual(sections[section_name], once)
             self.assertEqual(sections.get("[Constants]", []), once_constants)
+
             lines = sections[section_name]
-            self.assertEqual(_group_count(lines), 1)
             alpha_line = f"${BS}TTL{BS}alpha = $TTLAlpha1_0"
             self.assertEqual([line for line in lines if line.strip() == alpha_line], [alpha_line])
-            self.assertEqual([line for line in lines if line.strip().startswith(TTL_GROUP_HEAD)], [f"{TTL_GROUP_HEAD} {mesh_name}"])
-            self.assertEqual([line for line in lines if line.strip() == TTL_GROUP_TAIL], [TTL_GROUP_TAIL])
+            self.assertEqual([line for line in lines if line.strip() == TTL_DRAW_RUN], [TTL_DRAW_RUN])
+            self.assertEqual([line for line in lines if "mask_channel" in line], [f"${BS}TTL{BS}mask_channel = 3"])
+            self.assertEqual(sections.get("[Constants]", []).count("global $TTLAlpha1_0 = 1.0"), 1)
 
     def test_ttl_draw_lines_preserve_drag_vis_flags(self):
-        """TTL 块重建必须保留拖拽物体显隐 flag 行（否则隐藏判定失效）。"""
-        node = node_postprocess_material.SSMTNode_PostProcess_Material()
-        block = [
-            "if $swapkey6 == 5 && $swapkey4 == 2",
-            "    $ssmtdrag_objvis_A_30 = 1",
-            "    drawindexed = 15255, 272901, 0",
-            "endif",
-        ]
-        ttl_lines, found = node._build_ttl_draw_lines(block)
+        """TTL：块内绘制被替换，包裹它的拖拽显隐 flag 行原样留在原处（否则隐藏判定失效）"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            BS = chr(92)
+            ttl_path = _write_png(temp_dir, "ttl.png")
+            mesh_name = "LOD0.241deac5-56376-0.服装03主体替换"
+            obj = _FakeObject(mesh_name, {}, [("TTLMap_遮罩", ttl_path)])
+            _fake_bpy.data.objects[obj.name] = obj
 
-        self.assertTrue(found)
-        stripped = [str(line).strip() for line in ttl_lines]
-        self.assertIn("$ssmtdrag_objvis_A_30 = 1", stripped)
-        self.assertIn("$" + chr(92) + "TTL" + chr(92) + "_1 = 15255", stripped)
+            section_name = "[TextureOverride_Flag]"
+            boundary = "if $swapkey6 == 5 && $swapkey4 == 2"
+            flag_line = "    $ssmtdrag_objvis_A_30 = 1"
+            header = [
+                "hash = 241deac5",
+                "match_first_index = 0",
+                "ib = Resource_Flag_Index",
+                boundary,
+                flag_line,
+            ]
+            sections = OrderedDict([
+                (section_name, header + [
+                    f"    ; [mesh:{mesh_name}] [vertex_count:2702]",
+                    "    drawindexed = 15255, 272901, 0",
+                    "endif",
+                ]),
+                ("_config_path", temp_dir),
+            ])
+
+            _run_process(_ttl_node(), sections, section_name)
+
+            lines = sections[section_name]
+            self.assertEqual(lines[:len(header)], header)
+            self.assertEqual(lines[-1], "endif")
+            self.assertEqual([line for line in lines if line.strip() == flag_line.strip()], [flag_line])
+            block = _inline_block(lines, mesh_name)
+            self.assertIn(f"    ${BS}TTL{BS}_1 = 15255", block)
+            self.assertIn(f"    ${BS}TTL{BS}_2 = 272901", block)
+            self.assertEqual(_live_draws(lines), [])
 
     def test_ttl_draw_lines_preserve_flags_when_block_starts_mid_if(self):
-        r"""TTL 块边界从 mesh 注释行开始（if 头在块外）时，flag 与 drawindexed
-        都走非 if 路径——flag 必须在 $\TTL 参数之前被保留（回归：此前整批 54
-        个 TTL 段标志被静默丢弃，导致可见 TTL 副本无法被命中）。"""
-        node = node_postprocess_material.SSMTNode_PostProcess_Material()
-        block = [
-            "; [mesh:LOD0.241deac5-56376-0.服装03主体替换_copy] [vertex_count:2702]",
-            f"Resource{chr(92)}ZZMI{chr(92)}Diffuse = ref Resource_DiffuseMap_X",
-            "    $ssmtdrag_objvis_A_30 = 1",
-            "  drawindexed = 15255,272901,0",
-            "endif",
-        ]
-        ttl_lines, found = node._build_ttl_draw_lines(block)
+        r"""TTL：块边界从 mesh 注释行开始（if 头在块外）时，flag 必须在 $\TTL 参数之前
+        保留（回归：此前整批 54 个 TTL 段标志被静默丢弃，导致可见 TTL 副本无法被命中）。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            BS = chr(92)
+            ttl_path = _write_png(temp_dir, "ttl.png")
+            mesh_name = "LOD0.241deac5-56376-0.服装03主体替换_copy"
+            obj = _FakeObject(mesh_name, {}, [("TTLMap_遮罩", ttl_path)])
+            _fake_bpy.data.objects[obj.name] = obj
 
-        self.assertTrue(found)
-        stripped = [str(line).strip() for line in ttl_lines]
-        self.assertIn("$ssmtdrag_objvis_A_30 = 1", stripped)
-        arg1_idx = stripped.index("$" + chr(92) + "TTL" + chr(92) + "_1 = 15255")
-        flag_idx = stripped.index("$ssmtdrag_objvis_A_30 = 1")
-        self.assertLess(flag_idx, arg1_idx, "flag 必须在 TTL 参数/绘制之前")
-        self.assertNotIn("drawindexed =", stripped)
+            section_name = "[TextureOverride_MidIf]"
+            boundary = "if $swapkey6 == 5"
+            header = [
+                "hash = 241deac5",
+                "match_first_index = 0",
+                "ib = Resource_MidIf_Index",
+                boundary,
+            ]
+            flag_line = "    $ssmtdrag_objvis_A_30 = 1"
+            sections = OrderedDict([
+                (section_name, header + [
+                    f"  ; [mesh:{mesh_name}] [vertex_count:2702]",
+                    f"  Resource{BS}ZZMI{BS}Diffuse = ref Resource_DiffuseMap_X",
+                    flag_line,
+                    "  drawindexed = 15255,272901,0",
+                    "endif",
+                ]),
+                ("_config_path", temp_dir),
+            ])
+
+            _run_process(_ttl_node(), sections, section_name)
+
+            lines = sections[section_name]
+            self.assertEqual(lines[:len(header)], header)
+            block = _inline_block(lines, mesh_name)
+            stripped = [line.strip() for line in block]
+            self.assertIn(flag_line.strip(), stripped)
+            self.assertLess(stripped.index(flag_line.strip()), _only(block, f"${BS}TTL{BS}_1 = 15255"),
+                            "flag 必须在 TTL 参数/绘制之前")
+            self.assertIn(f"  ${BS}TTL{BS}_1 = 15255", block)
+            self.assertEqual(_live_draws(lines), [])
+            self.assertEqual(lines[-1], "endif")
 
     def test_ttl_draw_lines_preserve_bare_flags_before_bare_draw(self):
-        """无 if 包裹的 bare flag + bare drawindexed：flag 同样必须保留。"""
-        node = node_postprocess_material.SSMTNode_PostProcess_Material()
-        block = [
-            "$ssmtdrag_objvis_A_7 = 1",
-            "drawindexed = 618,60234,0",
-        ]
-        ttl_lines, found = node._build_ttl_draw_lines(block)
+        """无 if 包裹的 bare flag + bare drawindexed：flag 保留，draw 原位被替换。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            BS = chr(92)
+            ttl_path = _write_png(temp_dir, "ttl.png")
+            mesh_name = "LOD0.bare_7"
+            obj = _FakeObject(mesh_name, {}, [("TTLMap_遮罩", ttl_path)])
+            _fake_bpy.data.objects[obj.name] = obj
 
-        self.assertTrue(found)
-        stripped = [str(line).strip() for line in ttl_lines]
-        self.assertIn("$ssmtdrag_objvis_A_7 = 1", stripped)
-        arg1_idx = stripped.index("$" + chr(92) + "TTL" + chr(92) + "_1 = 618")
-        flag_idx = stripped.index("$ssmtdrag_objvis_A_7 = 1")
-        self.assertLess(flag_idx, arg1_idx)
+            section_name = "[TextureOverride_Bare]"
+            flag_line = "$ssmtdrag_objvis_A_7 = 1"
+            header = [
+                "hash = 241deac5",
+                "match_first_index = 0",
+                "ib = Resource_Bare_Index",
+                flag_line,
+            ]
+            sections = OrderedDict([
+                (section_name, header + [
+                    f"[mesh:{mesh_name}]",
+                    "drawindexed = 618,60234,0",
+                ]),
+                ("_config_path", temp_dir),
+            ])
+
+            _run_process(_ttl_node(), sections, section_name)
+
+            lines = sections[section_name]
+            self.assertEqual(lines[:len(header)], header)
+            block = _inline_block(lines, mesh_name)
+            self.assertIn(f"${BS}TTL{BS}_1 = 618", block)
+            self.assertIn(f"${BS}TTL{BS}_2 = 60234", block)
+            self.assertEqual(_live_draws(lines), [])
+            self.assertEqual([line for line in lines if "objvis_A_7" in line], [flag_line])
+
+    def test_ttl_next_block_stays_untouched(self):
+        """新契约：被替换的块之外一个字都不动——后面的块、锚点与绘制都留在原位"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            BS = chr(92)
+            ttl_path = _write_png(temp_dir, "ttl.png")
+            ttl_mesh = "LOD0.241deac5-56376-0.中文中文_copy"
+            tail_mesh = "LOD0.241deac5-56376-0.裙子"
+            _fake_bpy.data.objects[ttl_mesh] = _FakeObject(ttl_mesh, {}, [("TTLMap_遮罩", ttl_path)])
+            _fake_bpy.data.objects[tail_mesh] = _FakeObject(tail_mesh, {}, [])
+
+            section_name = "[TextureOverride_LOD0.241deac5_56376_0]"
+            header = [
+                "hash = 241deac5",
+                "match_first_index = 0",
+                "ib = Resource_LOD0.241deac5_56376_0_Index",
+                "run = CommandListSkinTexture",
+            ]
+            tail_block = [f"[mesh:{tail_mesh}]", "drawindexed = 128, 56376, 0"]
+            sections = OrderedDict([
+                (section_name, header + [
+                    f"[mesh:{ttl_mesh}]",
+                    "drawindexed = 56376, 0, 0",
+                ] + tail_block),
+                ("_config_path", temp_dir),
+            ])
+
+            _run_process(_ttl_node(), sections, section_name)
+
+            lines = sections[section_name]
+            self.assertEqual(lines[:len(header)], header)
+            block = _inline_block(lines, ttl_mesh)
+            self.assertEqual(block[-1], TTL_DRAW_RUN)
+            # 后面的块整段原样接在 TTL 参数之后，绘制仍生效
+            tail_start = lines.index(TTL_DRAW_RUN) + 1
+            self.assertEqual(lines[tail_start:], tail_block)
+            self.assertEqual(_live_draws(lines), ["drawindexed = 128, 56376, 0"])
+            self.assertEqual(_anchor_index(lines, ttl_mesh), len(header))
+
 
     def test_transparency_suffix_alone_triggers_transparency_code_not_ttl(self):
         """澄清：_透明 后缀不再自动触发 TTL/FX，仅独立生成透明代码（CustomShaderTransparencyCloth）"""

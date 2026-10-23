@@ -189,7 +189,7 @@ MESH_COMMENT_RE = re.compile(r"^;\s*\[mesh:(?P<object_name>[^\]]+)\]", re.IGNORE
 TTL_ARG1_RE = re.compile(r'^\$\\TTL\\_1\s*=\s*(\d+)', re.IGNORECASE)
 TTL_ARG2_RE = re.compile(r'^\$\\TTL\\_2\s*=\s*(\d+)', re.IGNORECASE)
 TTL_ARG3_RE = re.compile(r'^\$\\TTL\\_3\s*=\s*(\d+)', re.IGNORECASE)
-TTL_DRAW_RUN_RE = re.compile(r'^run\s*=\s*CommandListSSMTTTLDraw_', re.IGNORECASE)
+TTL_DRAW_RUN_RE = re.compile(r'^run\s*=\s*CommandList(?:SSMTTTLDraw_|\\TTL\\Draw\b)', re.IGNORECASE)
 # TTL 改成同段内联后，原绘制行被注释接管，参数留在注释里；收集绘制站点时
 # 必须把它当成一笔正常绘制读，否则这个网格的钩子无处可挂。
 TTL_TAKEN_DRAW_RE = re.compile(r'^;\s*\[SSMT TTL 已接管\]\s*(drawindexed\w*\s*=\s*.+)$',
@@ -6022,8 +6022,8 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             new_lines = lines[:insert_at] + hook + lines[insert_at:]
             sections[section] = new_lines
 
-        # 3) 已删除：TTL 不再单独建 copy 段。TTL 组现在内联在原段段尾，段头是整段
-        #    克隆过来的（含上面的 part 钩子），组里的 TTL 绘制天然吃到段级换绑，
+        # 3) 已删除：TTL 既不建 copy 段，也不再另建命令列表。TTL 调用就地替换原段里
+        #    那一笔绘制，上面第 2) 步的段级 part 钩子（vb0 换绑）天然作用在它上面，
         #    当年「命令列表内层 vb0 传播不到 run = 嵌套绘制」的缺口不复存在。
 
     @classmethod

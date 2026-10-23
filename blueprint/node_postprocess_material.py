@@ -16,27 +16,15 @@ _name_mapping_cache = {}
 _reverse_name_mapping_cache = {}
 # 资源缓存按“材质内容签名”去重，避免同一套贴图被重复复制/重复生成 Resource。
 _material_resource_cache = {}
-_TTL_MASK_INVERT_PREFIX = "${}TTL{}mask_invert".format(chr(92), chr(92)).casefold()
-# TTL 组在段内的边界标记。TTL 的那几笔捕获不再搬进独立段，而是排到本段末尾，
-# 靠这两个标记在重导出时把上一份整组摘掉，避免参数行叠加。
+# 旧版把 TTL 写成段尾一整组，靠这两个标记在重导出时整组摘掉。现在是就地替换，
+# 标记只剩兼容用途：老工程文件里残留的组仍由 _strip_ttl_groups 摘走。
 _TTL_GROUP_MARKER = "; [SSMT-TTL] {}"
 _TTL_GROUP_END = "; [/SSMT-TTL]"
-# 被 TTL 接管的原始绘制行：注释掉但保留参数。重导出时块里没有可用的绘制行，
-# 这一行的数字就是唯一来源。
+# 旧版注释掉的原绘制行：块里没有别的绘制行时，这一行的数字就是唯一来源。
 _TTL_DRAW_TAKEN_PREFIX = "; [SSMT TTL 已接管] "
 _TTL_DRAW_TAKEN_RE = re.compile(r"^;\s*\[SSMT TTL 已接管\]", re.IGNORECASE)
-# 段头抄进 TTL 组时丢掉段级属性：hash / match_first_index / ib / vb* 只在
-# 3Dmigoto 匹配这个段的那一刻有意义，同一段里再写一遍是死的；override_* 同理。
-# 目标是组里只留「这一笔绘制真正需要重设的东西」——本网格的贴图绑定与 SetTextures。
-_TTL_HEADER_ATTR_RE = re.compile(
-    r"^(?:hash|match_priority|match_first_index|match_index_count|handling|filter_index|"
-    r"ib|vb\d|override_\w+|draw\w*)\s*=",
-    re.IGNORECASE,
-)
-# 段头的 checktextureoverride 一遍：块自己都不带，组也不必带。
-_TTL_HEADER_DROP_RUNS = {"run = commandlistskintexture"}
-# 拖拽钩子和 swapkey 条件都从段头第一行 if 开始，那之后一律原样保留。
-_TTL_HEADER_IF_RE = re.compile(r"^if\b", re.IGNORECASE)
+# 就地替换后块里出现的调用行：见到它就知道这个块已经换过，重导出别再来一遍。
+_TTL_CALL_LINE = "run = CommandList{}TTL{}Draw".format(chr(92), chr(92))
 # TTL 合成亮度默认值（TTLib 的 $\TTL\V，即 HSV 的 Value）。
 # 必须写在 if 条件块之外：TTLib 的 CommandListFrameReset 每帧把 $V 重置为 1.0，
 # 只有绘制前重新赋值才生效；不需要提亮的段落手动删掉这一行即可。
@@ -1864,130 +1852,39 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
             kept.append(line)
         lines[:] = kept
 
-    def _ttl_first_drawindexed(self, block_lines):
+    def _ttl_inline_draws(self, block_lines, param_lines):
+        """把块里的绘制行就地换成「参数 + TTL 调用」，其余行原样保留。
+
+        TTLib 的捕获走的是 CustomShader，而 3Dmigoto 在执行 CustomShader 前后会把
+        ps/vs/混合/深度/光栅/RT 整套备份再还原（CommandList.cpp 的
+        RunCustomShaderCommand::run），所以调用留在这一笔绘制原来的位置是安全的：
+        同一段里后面的绘制不会被上一次捕获的状态污染，也就不必整组搬到段尾。
+        """
+        inline = []
         for line in block_lines:
-            draw = self._ttl_parse_drawindexed(line)
-            if draw is not None:
-                return draw
-        return None
-
-    @classmethod
-    def _ttl_find_block_start(cls, lines, anchor):
-        start = anchor
-        i = anchor - 1
-        while i >= 0:
-            if re.search(r'\[mesh:([^\]]+)\]', str(lines[i] or "")) is not None:
-                break
-            stripped = str(lines[i]).strip()
-            if re.match(r'^(?:if\s+)', stripped, re.IGNORECASE) or stripped.casefold() == 'else':
-                start = i
-                i -= 1
+            raw = str(line)
+            stripped = raw.strip()
+            draw = self._ttl_parse_drawindexed(stripped)
+            if draw is None:
+                inline.append(line)
                 continue
-            break
-        return start
-
-    def _build_ttl_draw_lines(self, block_lines):
-        ttl_lines = []
-        found = False
-        pending_flags = []
-        i = 0
-        n = len(block_lines)
-        while i < n:
-            stripped = str(block_lines[i]).strip()
-            if _DRAG_OBJVIS_LINE_RE.match(stripped):
-                # 拖拽显隐 flag 行先收集，在紧随的绘制转换输出前冲刷。
-                # TTL 块边界从 mesh 注释行开始（可能落在 if 块内部），此时
-                # flag 与 drawindexed 都走「非 if 路径」——必须保留 flag，
-                # 否则隐藏物体仍可被命中。
-                if not pending_flags or str(pending_flags[-1]).strip() != stripped:
-                    pending_flags.append(block_lines[i])
-                i += 1
-                continue
-            if re.match(r'^if\s+', stripped, re.IGNORECASE):
-                if pending_flags:
-                    ttl_lines.extend(pending_flags)
-                    pending_flags = []
-                depth = 0
-                j = i
-                else_index = -1
-                while j < n:
-                    current = str(block_lines[j]).strip()
-                    if re.match(r'^if\s+', current, re.IGNORECASE):
-                        depth += 1
-                    elif current.casefold() == 'endif':
-                        depth -= 1
-                        if depth == 0:
-                            break
-                    elif current.casefold() == 'else' and depth == 1 and else_index == -1:
-                        else_index = j
-                    j += 1
-                if j >= n or depth != 0:
-                    break
-                head = block_lines[i]
-                tail = block_lines[j]
-                branch1_end = else_index if else_index != -1 else j
-                branch1 = block_lines[i + 1:branch1_end]
-                branch2 = block_lines[else_index + 1:j] if else_index != -1 else []
-                draw1 = self._ttl_first_drawindexed(branch1)
-                draw2 = self._ttl_first_drawindexed(branch2) if else_index != -1 else None
-                if draw1 is None and draw2 is None:
-                    i = j + 1
-                    continue
-                found = True
-                ttl_lines.append(head)
-                if draw1 is not None:
-                    # 保留拖拽显隐 flag 行（重建不得丢弃，否则隐藏物体仍可被命中）
-                    for bl in branch1:
-                        if _DRAG_OBJVIS_LINE_RE.match(str(bl).strip()):
-                            ttl_lines.append(bl)
-                    ttl_lines.append("    ${}TTL{}_1 = {}".format(chr(92), chr(92), draw1[0]))
-                    ttl_lines.append("    ${}TTL{}_2 = {}".format(chr(92), chr(92), draw1[1]))
-                    ttl_lines.append("    ${}TTL{}_3 = {}".format(chr(92), chr(92), draw1[2]))
-                    ttl_lines.append("    run = CommandList{}TTL{}Draw".format(chr(92), chr(92)))
-                if else_index != -1:
-                    ttl_lines.append(block_lines[else_index])
-                    if draw2 is not None:
-                        for bl in branch2:
-                            if _DRAG_OBJVIS_LINE_RE.match(str(bl).strip()):
-                                ttl_lines.append(bl)
-                        ttl_lines.append("    ${}TTL{}_1 = {}".format(chr(92), chr(92), draw2[0]))
-                        ttl_lines.append("    ${}TTL{}_2 = {}".format(chr(92), chr(92), draw2[1]))
-                        ttl_lines.append("    ${}TTL{}_3 = {}".format(chr(92), chr(92), draw2[2]))
-                        ttl_lines.append("    run = CommandList{}TTL{}Draw".format(chr(92), chr(92)))
-                ttl_lines.append(tail)
-                i = j + 1
-            else:
-                draw = self._ttl_parse_drawindexed(stripped)
-                if draw is not None:
-                    found = True
-                    ttl_lines.extend(pending_flags)
-                    pending_flags = []
-                    ttl_lines.append("${}TTL{}_1 = {}".format(chr(92), chr(92), draw[0]))
-                    ttl_lines.append("${}TTL{}_2 = {}".format(chr(92), chr(92), draw[1]))
-                    ttl_lines.append("${}TTL{}_3 = {}".format(chr(92), chr(92), draw[2]))
-                    ttl_lines.append("run = CommandList{}TTL{}Draw".format(chr(92), chr(92)))
-                i += 1
-        return ttl_lines, found
+            indent = raw[:len(raw) - len(raw.lstrip())]
+            for param in param_lines:
+                inline.append(indent + str(param))
+            inline.append("{}${}TTL{}_1 = {}".format(indent, chr(92), chr(92), draw[0]))
+            inline.append("{}${}TTL{}_2 = {}".format(indent, chr(92), chr(92), draw[1]))
+            inline.append("{}${}TTL{}_3 = {}".format(indent, chr(92), chr(92), draw[2]))
+            inline.append("{}run = CommandList{}TTL{}Draw".format(indent, chr(92), chr(92)))
+        return inline
 
     def _process_ttl_sections(self, section_name, lines, all_sections, material_group_to_swapkey,
                               swap_key_prefix, next_swap_key_num, used_swap_keys, texture_folder):
         from ..utils.log_utils import LOG as _LOG
-        # 上一次导出留在段尾的 TTL 组先摘掉，避免重导出叠第二份。
+        # 旧版把 TTL 排在段尾；重导出时先摘掉那几组，免得和就地替换叠成两份绘制。
         self._strip_ttl_groups(lines)
         mesh_lines_info = [(i, self.extract_mesh_name(line)) for i, line in enumerate(lines) if self.extract_mesh_name(line)]
         if not mesh_lines_info:
             return next_swap_key_num
-
-        first_mesh_index = mesh_lines_info[0][0]
-        block_start = self._ttl_find_block_start(lines, first_mesh_index)
-        # 段头（ib / vb* / ps-t 绑定 + 拖拽钩子）原样抄进每个 TTL 组。
-        # 组要排到段尾，中间那些普通块改过什么绑定这里一概不知道，
-        # 不重抄就会用上一个 mesh 的缓冲和贴图去捕获。
-        # 钩子也一起抄：拖拽节点的 vb0 换绑于是对 TTL 绘制天然生效，
-        # 以前那套「命令列表 + 全表找 vb0」正是为了补这一个缺口才存在的。
-        header_lines = lines[:block_start]
-
-        generated_groups = []
 
         if_stack = []
         if_endif_map = {}
@@ -2014,6 +1911,8 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
             if not ttl_materials:
                 continue
 
+            # 块的范围：本 mesh 注释到下一个 mesh 注释之间；若这个块落在 if 分支里，
+            # 到所属 if 的 endif 为止（不然会把段级的条件结构切碎）。
             cond_if_indexes = mesh_cond.get(mesh_index, [])
             innermost_endif = None
             if cond_if_indexes:
@@ -2027,107 +1926,33 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
             if innermost_endif is not None and innermost_endif < block_end:
                 block_end = innermost_endif
             block_lines = lines[block_start:block_end]
-            ttl_draw_lines, draw_found = self._build_ttl_draw_lines(block_lines)
-            if not draw_found:
+
+            # 已经换过就原样留着：参数行就在调用上面，重导出不该再叠一份。
+            if any(str(bl).strip().casefold() == _TTL_CALL_LINE.casefold() for bl in block_lines):
+                continue
+            if not any(self._ttl_parse_drawindexed(str(bl).strip()) is not None for bl in block_lines):
                 _LOG.info(f"      TTL: 跳过 '{mesh_name}'（块内无 drawindexed）")
                 continue
 
-            new_lines = []
-            object_to_diffuse_swapkey = {}
-            # 组以本网格的 mesh 注释开头：重导出时它就是这一组的锚点，跟块里的
-            # 锚点同形，看起来也跟原带的写法一致。
-            anchor_line = str(lines[mesh_index])
-            if anchor_line.lstrip().startswith(';'):
-                new_lines.append(anchor_line)
-            else:
-                new_lines.append(f"; {mesh_name}")
-            # 段头里只有第一行 if 之前的那些才算「段级属性 + 贴图绑定」；if 之后是
-            # 拖拽钩子/条件分支，那是要原样带走的运行逻辑，不能按属性名过筛。
-            header_verbatim = False
-            for header_line in header_lines:
-                stripped = str(header_line).strip()
-                if not stripped:
-                    continue
-                if not header_verbatim and _TTL_HEADER_IF_RE.match(stripped):
-                    header_verbatim = True
-                if not header_verbatim:
-                    if _TTL_HEADER_ATTR_RE.match(stripped):
-                        continue
-                    if stripped.casefold() in _TTL_HEADER_DROP_RUNS:
-                        continue
-                if stripped.casefold().startswith(_TTL_MASK_INVERT_PREFIX):
-                    continue
-                resource_match = re.match(
-                    r'^(ps-t\d+|Resource\\[^\s=]+)\s*=\s*(?:ref\s+)?(.*)$',
-                    stripped,
-                    re.IGNORECASE,
-                )
-                if resource_match:
-                    param_name = resource_match.group(1).strip()
-                    texture_type = self.extract_texture_type_from_resource(resource_match.group(2).strip())
-                    if texture_type:
-                        matching_materials = self.find_matching_materials(obj, texture_type) if obj is not None else []
-                        if matching_materials:
-                            generated_lines, next_swap_key_num = self.generate_material_lines(
-                                matching_materials, param_name, texture_type, obj, texture_folder, all_sections,
-                                object_to_diffuse_swapkey, material_group_to_swapkey,
-                                swap_key_prefix, next_swap_key_num, used_swap_keys)
-                            new_lines.extend(generated_lines)
-                            continue
-                new_lines.append(header_line)
-
-            if ttl_materials:
-                ttl_lines_ref, next_swap_key_num = self.generate_material_lines(
-                    ttl_materials, r"Resource\TTL\TransparencyTex", "TTLMap", obj, texture_folder, all_sections,
-                    {}, material_group_to_swapkey, swap_key_prefix, next_swap_key_num, used_swap_keys)
-                new_lines.extend(ttl_lines_ref)
-                new_lines.append("${}TTL{}mask_channel = 3".format(chr(92), chr(92)))
-
-            if ttl_materials:
-                new_lines.append("${}TTL{}mask_invert = 1".format(chr(92), chr(92)))
-
+            # 参数紧贴调用写、落在同一个分支里：TTLib 每笔 Draw 结尾会把 alpha /
+            # mask_channel / mask_invert / 遮罩 / _1.._3 全部复位，所以下一个块必须
+            # 自己重新交一遍，参数也就不能提到块外。
+            param_lines = []
+            ttl_ref_lines, next_swap_key_num = self.generate_material_lines(
+                ttl_materials, r"Resource\TTL\TransparencyTex", "TTLMap", obj, texture_folder, all_sections,
+                {}, material_group_to_swapkey, swap_key_prefix, next_swap_key_num, used_swap_keys)
+            param_lines.extend(ttl_ref_lines)
+            param_lines.append("${}TTL{}mask_channel = 3".format(chr(92), chr(92)))
+            param_lines.append("${}TTL{}mask_invert = 1".format(chr(92), chr(92)))
             alpha_value = transparency_value if transparency_value else "1.0"
             alpha_var = self._ttl_ensure_alpha_variable(alpha_value, all_sections)
-            new_lines.append("${}TTL{}alpha = {}".format(chr(92), chr(92), alpha_var))
-            # 提亮默认写在条件块之外（此时 if 块尚未拼接），否则进 if 内会失效/爆炸。
-            new_lines.append("${}TTL{}V = {}".format(chr(92), chr(92), _TTL_DEFAULT_BRIGHTNESS))
+            param_lines.append("${}TTL{}alpha = {}".format(chr(92), chr(92), alpha_var))
+            param_lines.append("${}TTL{}V = {}".format(chr(92), chr(92), _TTL_DEFAULT_BRIGHTNESS))
 
-            if cond_if_indexes:
-                cond_block = []
-                for if_idx in cond_if_indexes:
-                    cond_block.append(lines[if_idx])
-                indent = "    " * len(cond_if_indexes)
-                for ttl_line in ttl_draw_lines:
-                    if str(ttl_line).strip():
-                        cond_block.append(indent + str(ttl_line))
-                    else:
-                        cond_block.append(ttl_line)
-                for if_idx in reversed(cond_if_indexes):
-                    _end_idx, end_line = if_endif_map.get(if_idx, (None, None))
-                    if end_line is not None:
-                        cond_block.append(end_line)
-                new_lines.extend(cond_block)
-            else:
-                new_lines.extend(ttl_draw_lines)
-
-            generated_groups.append(
-                [_TTL_GROUP_MARKER.format(mesh_name), *new_lines, _TTL_GROUP_END]
-            )
-            # 段内只把这一笔绘制注释掉，块本身留在原位：mesh 注释与贴图绑定因此
-            # 继续受材质节点那条链路管（以前整块搬进 copy 段，copy 段又被段级早退
-            # 跳过，等于永久冻结）。参数留在注释里，重导出时就是这里的唯一来源。
-            for draw_index in range(block_start, block_end):
-                draw_line = str(lines[draw_index])
-                if _TTL_DRAW_TAKEN_RE.match(draw_line.strip()):
-                    continue
-                if self._ttl_parse_drawindexed(draw_line) is not None:
-                    lines[draw_index] = f"{_TTL_DRAW_TAKEN_PREFIX}{draw_line.strip()}"
-
-        # 全部排到段尾：TTL 的那几笔捕获会留下 ps=CaptureMask、不写深度、additive 混合
-        # 这些没人复位的东西（TTLib 只还 o\*、ps-t69 和常量），排在普通绘制后面，
-        # 段里就不会再有下一笔画在污染里。
-        for group in reversed(generated_groups):
-            lines.extend(group)
+            # 就地替换：块位置、mesh 注释、贴图绑定、if 结构都不动，只把这一笔绘制
+            # 换成库调用。重导出时块照旧被这张节点认领；拖拽节点的 vb0 换绑也天然
+            # 作用在同一段上（命令列表内部的换绑不会传给嵌套的 run）。
+            lines[block_start:block_end] = self._ttl_inline_draws(block_lines, param_lines)
 
         return next_swap_key_num
 
@@ -2571,9 +2396,9 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
                 if reset_insert_idx != -1:
                     lines[reset_insert_idx:reset_insert_idx] = reset_lines
         # 半透明生成有两套互不相干的协议，按游戏分派：
-        # - ZZMI：TTLib 的「把这一笔拆成第二遍绘制」，_process_ttl_sections 重建段；
+        # - ZZMI：TTLib 的「把这一笔拆成第二遍绘制」，_process_ttl_sections 就地换掉绘制行；
         # - EFMI：EFMITTL 共享库接管这一笔绘制，_process_efmi_ttl_sections 就地换掉
-        #   drawindexed 并交给库（不新建段、不改索引/顶点缓冲绑定）。
+        #   drawindexed 并交给库（同样不新建段、不改索引/顶点缓冲绑定）。
         # 别的逻辑只做普通材质转资源与 FX/Glowmap，不得因为某种 drawindexed 参数恰好
         # 能被正则解析就误入半透明链路。
         # 别和 HI3FX 的 TTLMap 混淆：那是**第二个遮罩通道**（抖动半透明），属于普通
@@ -2590,8 +2415,9 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
                 section_name, lines, all_sections, material_group_to_swapkey,
                 swap_key_prefix, next_swap_key_num, used_swap_keys, texture_folder)
 
-        # TTL 组排在本段段尾，组内自带 `; [mesh:]` 锚点；phase2 的锚点扫描必须
-        # 跳过组内那些行，否则同一 mesh 会被当成两个块，组会被切碎搬进透明段。
+        # 旧版把 TTL 组排在本段段尾、组内自带 `; [mesh:]` 锚点。现在改成就地替换，
+        # 新产物里不会有组；这里仍跳过旧工程残留的组，免得 phase2 把组内锚点当成
+        # 第二个块、连组一起搬进透明段。
         ttl_group_spans = self._ttl_group_spans(lines)
         mesh_lines_info_phase2 = [
             (i, self.extract_mesh_name(line))
@@ -2609,12 +2435,16 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
         for mesh_index, mesh_name in reversed(mesh_lines_info_phase2):
             transparency_shader_name, transparency_value = self.extract_transparency_info_from_mesh_name(mesh_name)
             if transparency_shader_name:
-                # TTL 接管过的块不再搬：混合已经由 TTL 库的绘制自己做，再搬一份
-                # 进透明段只会让 TTL 组跟着挪走（组必须留在原段段尾）。
+                # TTL 接管过的块不再搬：混合已经由 TTL 库的绘制自己做，搬进透明段
+                # 等于把这一笔又画一遍。就地替换后块里留着的是库调用本身。
                 taken_over = False
                 for i in range(mesh_index + 1, len(lines)):
                     probe = lines[i].strip()
-                    if probe.startswith("; [SSMT-TTL]") or probe.startswith(_TTL_DRAW_TAKEN_PREFIX.strip()):
+                    if (
+                        probe.startswith("; [SSMT-TTL]")
+                        or probe.startswith(_TTL_DRAW_TAKEN_PREFIX.strip())
+                        or probe.casefold() == _TTL_CALL_LINE.casefold()
+                    ):
                         taken_over = True
                         break
                     if self.extract_mesh_name(lines[i]) or (
