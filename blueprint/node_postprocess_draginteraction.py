@@ -190,6 +190,10 @@ TTL_ARG1_RE = re.compile(r'^\$\\TTL\\_1\s*=\s*(\d+)', re.IGNORECASE)
 TTL_ARG2_RE = re.compile(r'^\$\\TTL\\_2\s*=\s*(\d+)', re.IGNORECASE)
 TTL_ARG3_RE = re.compile(r'^\$\\TTL\\_3\s*=\s*(\d+)', re.IGNORECASE)
 TTL_DRAW_RUN_RE = re.compile(r'^run\s*=\s*CommandListSSMTTTLDraw_', re.IGNORECASE)
+# TTL 改成同段内联后，原绘制行被注释接管，参数留在注释里；收集绘制站点时
+# 必须把它当成一笔正常绘制读，否则这个网格的钩子无处可挂。
+TTL_TAKEN_DRAW_RE = re.compile(r'^;\s*\[SSMT TTL 已接管\]\s*(drawindexed\w*\s*=\s*.+)$',
+                               re.IGNORECASE)
 # 物体显隐 flag 行（注入绘制分支内；material 的 TTL 块重建必须保留）
 DRAG_OBJVIS_LINE_RE = re.compile(r'^\s*\$ssmtdrag_objvis_[\w]*\s*=\s*1\s*$')
 
@@ -2184,6 +2188,9 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
 
             for line_idx, line in enumerate(lines):
                 s = line.strip()
+                taken_draw = TTL_TAKEN_DRAW_RE.match(s)
+                if taken_draw:
+                    s = taken_draw.group(1)
                 normalized = s.casefold()
                 ttl_arg1 = TTL_ARG1_RE.match(s)
                 if ttl_arg1:
@@ -6015,51 +6022,9 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
             new_lines = lines[:insert_at] + hook + lines[insert_at:]
             sections[section] = new_lines
 
-        # 3) TTL 材质 copy 段的段级钩子（瘦身形态：探针 + drawn + jiggle 烘焙/换绑，
-        #    不含 Bake/Detect）。
-        #    必须段级换绑的原因：命令列表内层的 vb0 赋值传播不到 run = 嵌套命令
-        #    列表的绘制（2026-09-02 实机：仅 CommandListSSMTTTLDraw 内换绑时 TTLib
-        #    离屏捕获读到的是段级 RedirectSO 原始数据 → TTL 层完全不吃拖拽/形态键，
-        #    与本体出现一层分歧）。Bake/Detect 的逐段重复 dispatch 才是 86e3c86
-        #    去重要消的开销（同 IB 55 钩子帧数个位数）；jiggle 烘焙有 time 守卫
-        #    每帧全局至多一次，探针有 armed 门控，瘦身钩子零额外成本。
-        #    读入侧 _remove_existing_draw_hooks 会全表剥离钩子，此处无条件重建，
-        #    重导出路径同样生效。
-        cl_ref = f"run = CommandListSSMTTTLDraw_{cn}_{ns}"
-        for section_name, sec_lines in list(sections.items()):
-            if not isinstance(sec_lines, list):
-                continue
-            if section_name.startswith("[CommandList"):
-                continue
-            if any("DRAG HOOK BEGIN" in line for line in sec_lines):
-                continue
-            if not any(str(line).strip() == cl_ref for line in sec_lines):
-                continue
-            # 该 copy 段克隆自哪个 part：按段名内嵌的 drawid 归归属，兜底 P0
-            parent_p_idx = 0
-            haystack = re.sub(r"[^0-9A-Za-z_]+", "_", str(section_name))
-            for p_idx, part in enumerate(comp["parts"]):
-                raw = str(part.get("section", "")).strip().strip("[]")
-                raw = re.sub(r"^TextureOverride_?", "", raw)
-                token = re.sub(r"[^0-9A-Za-z_]+", "_", raw).strip("_")
-                if token and token in haystack:
-                    parent_p_idx = p_idx
-                    break
-            hook = self._build_hook_block(comp, parent_p_idx, ns, include_detect=False)
-            insert_at = self._find_ttl_copy_hook_insert_index(sec_lines)
-            sections[section_name] = sec_lines[:insert_at] + hook + sec_lines[insert_at:]
-
-    @staticmethod
-    def _find_ttl_copy_hook_insert_index(lines):
-        """TTL copy 段钩子落点：最后一个 run = CommandListSkinTexture 之后
-        （与旧版可用布局一致：钩子位于段头资源绑定之后、mesh 注释/TTL 参数之前）。"""
-        for i in range(len(lines) - 1, -1, -1):
-            if str(lines[i]).strip() == "run = CommandListSkinTexture":
-                return i + 1
-        for i, line in enumerate(lines):
-            if str(line).strip().startswith("; [mesh:"):
-                return i
-        return len(lines)
+        # 3) 已删除：TTL 不再单独建 copy 段。TTL 组现在内联在原段段尾，段头是整段
+        #    克隆过来的（含上面的 part 钩子），组里的 TTL 绘制天然吃到段级换绑，
+        #    当年「命令列表内层 vb0 传播不到 run = 嵌套绘制」的缺口不复存在。
 
     @classmethod
     def _find_part_hook_insert_index(cls, lines, part):

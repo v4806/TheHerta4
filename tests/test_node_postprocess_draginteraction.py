@@ -1824,70 +1824,61 @@ class DragNodeEmitTests(unittest.TestCase):
             self.assertIn("ResourceDragJiggleTempVB0_abc123_43191_testns", line)
             self.assertNotIn("ShadowVB", line)
 
-    def test_ttl_copy_sections_get_slim_hook(self):
-        # 回归（2026-09-02 实机：TTL 层完全不吃形态键/拖拽，与本体一层分歧）：
-        # 引用 CommandListSSMTTTLDraw 的材质 copy 段必须获得段级钩子——命令
-        # 列表内层的 vb0 换绑传播不到 run = 嵌套命令列表的绘制，仅 CL 内换绑时
-        # TTLib 离屏捕获读到的是段级 RedirectSO 原始数据。
-        # 钩子为瘦身形态（无 Bake/Detect）：逐段重复 Bake/Detect dispatch 是
-        # 86e3c86 去重要消的开销；jiggle 烘焙 time 守卫每帧至多一次。
-        node = _make_node(self.mod)
-        sections = _base_sections()
-        comps = node._locate_components(sections, ["abc123"])
-        node._emit_sections(sections, comps, "testns")
-        copy_sec = "[TextureOverrideLOD0_abc123_abc123-43191A_deadbeef_copy]"
-        sections[copy_sec] = [
+    def _inline_ttl_section_lines(self):
+        """生产形态：TTL 内联在原段段尾，原绘制行被注释接管，参数留在注释里。"""
+        return [
             "hash = abc123",
-            "match_first_index = 0",
-            "vb0 = ResourceZZRedirectSO_deadbeef",
-            "ib = Resourceabc123-43191AIB",
+            "match_first_index = 52688",
+            "ib = Resourceabc123-43191BIB",
             "run = CommandListSkinTexture",
-            "if $swapkey0 == 1",
-            "    run = CommandListSSMTTTLDraw_abc123_43191_testns",
-            "endif",
+            "; [mesh: abc123-43191BP0] [vertex_count: 14078]",
+            "; [SSMT TTL 已接管] drawindexed = 12000, 0, 0",
+            "$\\TTL\\alpha = 0.5",
+            "$\\TTL\\mask_channel = 3",
+            "$\\TTL\\mask_invert = 1",
+            "$\\TTL\\V = 1.5",
+            "$\\TTL\\_1 = 12000",
+            "$\\TTL\\_2 = 0",
+            "$\\TTL\\_3 = 0",
+            "run = CommandList\\TTL\\Draw",
         ]
-        for comp in comps:
-            node._inject_draw_hooks(sections, comp, "testns")
-        copy_lines = sections[copy_sec]
-        copy_text = "\n".join(copy_lines)
-        self.assertIn("DRAG HOOK BEGIN abc123_43191P0_testns", copy_text)
-        self.assertIn("vb0 = ResourceDragJiggleTempVB0_abc123_43191_testns", copy_text)
-        self.assertNotIn("CustomShaderDragBake", copy_text)
-        self.assertNotIn("CustomShaderDragDetect", copy_text)
-        # 钩子落点：SkinTexture 之后、TTL 条件块之前（与旧版可用布局一致）
-        skin_idx = next(i for i, l in enumerate(copy_lines)
-                        if l.strip() == "run = CommandListSkinTexture")
-        hook_idx = next(i for i, l in enumerate(copy_lines)
-                        if "DRAG HOOK BEGIN" in l)
-        cond_idx = next(i for i, l in enumerate(copy_lines)
-                        if l.strip() == "if $swapkey0 == 1")
-        self.assertLess(skin_idx, hook_idx)
-        self.assertLess(hook_idx, cond_idx)
 
-    def test_ttl_copy_hook_reexport_idempotent(self):
-        # 重导出链路：读入剥离（_remove_existing_draw_hooks）后必须重建 copy
-        # 段钩子，且重复注入不产生重复钩子（回归：重导出后 TTL 段钩子永久丢失）
+    def test_inline_ttl_section_gets_hook(self):
+        # TTL 内联后（不再建 copy 段）：原段里那笔被注释接管的绘制仍是绘制站点，
+        # 钩子必须挂在它前面 —— 否则内联 TTL 绘制吃不到段级 jiggle 换绑。
         node = _make_node(self.mod)
         sections = _base_sections()
         comps = node._locate_components(sections, ["abc123"])
         node._emit_sections(sections, comps, "testns")
-        copy_sec = "[TextureOverrideLOD0_abc123_abc123-43191A_deadbeef_copy]"
-        sections[copy_sec] = [
-            "hash = abc123",
-            "match_first_index = 0",
-            "ib = Resourceabc123-43191AIB",
-            "run = CommandListSkinTexture",
-            "    run = CommandListSSMTTTLDraw_abc123_43191_testns",
-        ]
+        inline_sec = "[TextureOverride_abc123_abc123-43191B]"
+        sections[inline_sec] = self._inline_ttl_section_lines()
         for comp in comps:
             node._inject_draw_hooks(sections, comp, "testns")
-        # 模拟重导出：读入剥离 → 重新注入
+        text = "\n".join(sections[inline_sec])
+        self.assertIn("DRAG HOOK BEGIN", text)
+        self.assertIn("vb0 = ResourceDragJiggleTempVB0_abc123_43191_testns", text)
+        hook_idx = next(i for i, l in enumerate(sections[inline_sec])
+                        if "DRAG HOOK BEGIN" in l)
+        taken_idx = next(i for i, l in enumerate(sections[inline_sec])
+                         if "[SSMT TTL 已接管]" in l)
+        self.assertLess(hook_idx, taken_idx)
+
+    def test_inline_ttl_hook_reexport_idempotent(self):
+        # 重导出链路：读入剥离后必须按内联形态重建钩子，且重复注入不产生重复钩子
+        node = _make_node(self.mod)
+        sections = _base_sections()
+        comps = node._locate_components(sections, ["abc123"])
+        node._emit_sections(sections, comps, "testns")
+        inline_sec = "[TextureOverride_abc123_abc123-43191B]"
+        sections[inline_sec] = self._inline_ttl_section_lines()
+        for comp in comps:
+            node._inject_draw_hooks(sections, comp, "testns")
         node._remove_existing_draw_hooks(sections)
-        self.assertNotIn("DRAG HOOK BEGIN", "\n".join(sections[copy_sec]))
+        self.assertNotIn("DRAG HOOK BEGIN", "\n".join(sections[inline_sec]))
         comps = node._locate_components(sections, ["abc123"])
         for comp in comps:
             node._inject_draw_hooks(sections, comp, "testns")
-        text = "\n".join(sections[copy_sec])
+        text = "\n".join(sections[inline_sec])
         self.assertEqual(text.count("DRAG HOOK BEGIN"), 1)
 
     def test_bake_offsets_part_local(self):
@@ -5139,6 +5130,67 @@ class DragCollisionTests(unittest.TestCase):
         # 那样 fxc 编译时间暴涨，游戏重载 shader 时直接卡死）。
         self.assertIn("if (ox == 0 && oy == 0 && oz == 0)", shader)
         self.assertIn("checked < COLLISION_QUERY_MAX_TRIS", shader)
+
+    def test_shader_collision_final_invariant(self):
+        """整圈顶点同时被拖拽时不得穿过碰撞体（用户 m00001/m00030）。
+
+        两个结构性的洞让「路径求解看起来在做碰撞、整圈却整块穿过去」：
+          1) 终点预判的早退只看终点带符号距离 —— 整圈被同向推出碰撞体另一侧时
+             终点落在**外侧**，dEnd 为正，整圈原样放行；
+          2) 路径求解只保证「采样到的旧路径」与终点，不保证它改完之后的**新**路径
+             （rem 只裁掉沿 pushDir 的分量，弦切方向仍能擦进表面）。
+        所以外层必须压上「位移不含沿起点法线 n0 的向内分量」这一最终不变量，
+        而且要压在所有返回路径之后（含终点预判早退的那两支）。
+        """
+        shader = (REPO_ROOT / "Toolset" / "drag_interaction" / "rzm_jiggle_interaction.hlsl").read_text(encoding="utf-8")
+        # 入口保留每顶点 L0 的取法与阈值推导，只把路径段交给 Core
+        self.assertIn("float3 CollisionSolveGridCore(float3 p0, float3 offset, float3 n0, float gap)", shader)
+        self.assertIn("float3 solved = CollisionSolveGridCore(p0, offset, n0, gap);", shader)
+        # 不变量本体：只剪掉位移沿 n0 的负分量，切向原样保留
+        self.assertIn("float3 GuardInwardHalfSpace(float3 p0, float3 p, float3 n0)", shader)
+        self.assertIn("return inward < 0.0 ? p0 + disp - n0 * inward : p;", shader)
+        # 两处生效：网格路径的出口 + 主 pass 的统一兜底（点云回退路径也走这里）
+        self.assertEqual(shader.count("GuardInwardHalfSpace("), 3)
+        self.assertIn("return GuardInwardHalfSpace(p0, solved, n0);", shader)
+        # 主 pass 的顺序：求解 → 不变量 → 位移限幅 → 写回
+        i_solve = shader.index("float3 solved = CollisionSolve(i, localPos, totalOffset, vnUnit);")
+        i_guard = shader.index("solved = GuardInwardHalfSpace(localPos, solved,", i_solve)
+        i_clamp = shader.index("v.position = GuardClampDelta(solved, localPos, GUARD_MAX_OFFSET);", i_guard)
+        self.assertLess(i_solve, i_guard)
+        self.assertLess(i_guard, i_clamp)
+        # n0/gap 只在一处推导：两处各算一遍迟早漂，夹取用的法线必须与求解用的同一个
+        self.assertEqual(shader.count("float gap = base * COLLISION_GAP_SCALE;"), 1)
+        self.assertEqual(shader.count("float base = COLLISION_BASE_SIGN"), 1)
+        self.assertEqual(shader.count("n0 = n0len > 1e-6 ? n0 / n0len : vn;"), 1)
+        # 不变量不得靠加查询实现（2026-10-22 掉帧修复的预算：每顶点至多 80 次查询）
+        i_def = shader.index("float3 GuardInwardHalfSpace(")
+        guard_body = shader[i_def:i_def + 400]
+        self.assertNotIn("DistGridSignedN", guard_body)
+        self.assertNotIn("GridAccumTri", guard_body)
+
+    def test_collision_ring_drag_never_tunnels(self):
+        """行为回归：整圈顶点同向被拖时，沿实际位移不得陷进碰撞体任何一点。
+
+        跑 tools/check_drag_collision_ring_tunnel.py 的 CPU 移植（_bake_collider_tri_grid
+        + DistGridSignedN + CollisionSolveGrid 三段 1:1 搬到 numpy），比 shader 文本断言
+        更能抓住「整环贯穿」：文本断言只证明那三行还在，这个证明它真的挡住。
+        负控一并断言 —— 不压最终不变量时确实会穿；负控变绿说明仿真场景失效，
+        这条测试就成了永远绿的摆设。
+        """
+        import importlib.util
+        path = REPO_ROOT / "tools" / "check_drag_collision_ring_tunnel.py"
+        spec = importlib.util.spec_from_file_location("check_drag_collision_ring_tunnel", path)
+        sim = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(sim)
+        # 垂直腿轴 0.35（整圈同时位移、碰撞体在中间）、斜向 0.50
+        for drag, mag in (((1, 0, 0), 0.35), ((1, 0, 1), 0.50)):
+            tunneled, depth, _ = sim.run("old", drag, mag, 3.9e-4, "regress", clamp=True)
+            self.assertEqual(tunneled, 0, f"{drag} {mag}: 有顶点沿位移陷进碰撞体")
+            self.assertAlmostEqual(depth, 0.0, places=9)
+        # 负控：同一场景、同一终点预判，只去掉最终不变量
+        tunneled, depth, _ = sim.run("old", (1, 0, 0), 0.35, 3.9e-4, "control", clamp=False)
+        self.assertGreater(tunneled, 0)
+        self.assertGreater(depth, 0.01)
 
     # ---- 端到端烘焙 ----
 

@@ -17,6 +17,14 @@ _reverse_name_mapping_cache = {}
 # 资源缓存按“材质内容签名”去重，避免同一套贴图被重复复制/重复生成 Resource。
 _material_resource_cache = {}
 _TTL_MASK_INVERT_PREFIX = "${}TTL{}mask_invert".format(chr(92), chr(92)).casefold()
+# TTL 组在段内的边界标记。TTL 的那几笔捕获不再搬进独立段，而是排到本段末尾，
+# 靠这两个标记在重导出时把上一份整组摘掉，避免参数行叠加。
+_TTL_GROUP_MARKER = "; [SSMT-TTL] {}"
+_TTL_GROUP_END = "; [/SSMT-TTL]"
+# 被 TTL 接管的原始绘制行：注释掉但保留参数。重导出时块里没有可用的绘制行，
+# 这一行的数字就是唯一来源。
+_TTL_DRAW_TAKEN_PREFIX = "; [SSMT TTL 已接管] "
+_TTL_DRAW_TAKEN_RE = re.compile(r"^;\s*\[SSMT TTL 已接管\]", re.IGNORECASE)
 # TTL 合成亮度默认值（TTLib 的 $\TTL\V，即 HSV 的 Value）。
 # 必须写在 if 条件块之外：TTLib 的 CommandListFrameReset 每帧把 $V 重置为 1.0，
 # 只有绘制前重新赋值才生效；不需要提亮的段落手动删掉这一行即可。
@@ -1791,8 +1799,10 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
 
     @staticmethod
     def _ttl_parse_drawindexed(line):
+        # 原生绘制行，以及被本节点注释掉（TTL 已接管）的那一行，都要认：
+        # 后者是重导出时唯一还留着的参数来源——块本身不搬走，只把绘制注释掉。
         match = re.match(
-            r'^\s*drawindexed(?:instanced)?\s*=\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)',
+            r'^\s*;?\s*(?:\[SSMT TTL 已接管\]\s*)?drawindexed(?:instanced)?\s*=\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)',
             str(line or "").strip(),
             re.IGNORECASE,
         )
@@ -1803,6 +1813,44 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
             # 不能丢弃，否则 TTL 二次绘制会从 base_vertex=0 错读 SO。
             return int(match.group(1)), int(match.group(2)), int(match.group(3))
         return None
+
+    @staticmethod
+    def _ttl_group_spans(lines):
+        """返回各 TTL 组占用的行号闭区间，供 phase2 跳过组内锚点。"""
+        spans = []
+        start = None
+        marker_prefix = _TTL_GROUP_MARKER.split("{}")[0].strip()
+        for index, line in enumerate(lines):
+            stripped = str(line).strip()
+            if start is None and stripped.startswith(marker_prefix):
+                start = index
+            elif start is not None and stripped == _TTL_GROUP_END:
+                spans.append((start, index))
+                start = None
+        if start is not None:
+            spans.append((start, len(lines) - 1))
+        return spans
+
+    @staticmethod
+    def _strip_ttl_groups(lines):
+        """摘掉上一次导出留在段尾的 TTL 组。
+
+        TTL 组现在跟普通块同处一个段，材质节点每次导出都会重扫这个段；不先摘掉，
+        组里的 `; [mesh:]` 锚点就会被当成普通块重写一遍，参数行随之叠加。
+        """
+        kept = []
+        skipping = False
+        for line in lines:
+            stripped = str(line).strip()
+            if stripped.startswith(_TTL_GROUP_MARKER.split("{}")[0].strip()):
+                skipping = True
+                continue
+            if skipping:
+                if stripped == _TTL_GROUP_END:
+                    skipping = False
+                continue
+            kept.append(line)
+        lines[:] = kept
 
     def _ttl_first_drawindexed(self, block_lines):
         for line in block_lines:
@@ -1825,137 +1873,6 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
                 continue
             break
         return start
-
-    @staticmethod
-    def _strip_drag_hook_blocks(lines):
-        result = []
-        i = 0
-        n = len(lines)
-        while i < n:
-            line = lines[i]
-            if "DRAG HOOK BEGIN" in line:
-                result.append(line)
-                i += 1
-                while i < n:
-                    current = lines[i]
-                    cs = current.strip()
-                    if "DRAG HOOK END" in current:
-                        result.append(current)
-                        i += 1
-                        break
-                    if cs.startswith("if "):
-                        block = []
-                        depth = 0
-                        while i < n:
-                            b = lines[i]
-                            bs = b.strip()
-                            block.append(b)
-                            if bs.startswith("if "):
-                                depth += 1
-                            elif bs == "endif":
-                                depth -= 1
-                                if depth == 0:
-                                    i += 1
-                                    break
-                            i += 1
-                        block_text = "\n".join(block)
-                        if "CustomShaderDragBake" in block_text or "CustomShaderDragDetect" in block_text:
-                            continue
-                        result.extend(block)
-                        continue
-                    result.append(current)
-                    i += 1
-                continue
-            result.append(line)
-            i += 1
-        return result
-
-    @staticmethod
-    def _ttl_extract_drag_vb0(lines):
-        # 拖拽 Jiggle 影子缓冲当前形态为 TempVB0（R9 ShadowVB 直写链实机回归已回退）；
-        # 正则同时匹配两家族，兼容 ShadowVB 时代的旧生成物。
-        for line in lines:
-            match = re.search(r'\b(ResourceDragJiggle(?:ShadowVB|TempVB0)_[A-Za-z0-9_]+)\b', str(line or ""))
-            if match:
-                return match.group(1)
-        return None
-
-    @staticmethod
-    def _ttl_find_drag_vb0_global(all_sections):
-        """全表扫描 jiggle 换绑行，返回 (drag_vb0, 所在段 lines)，均无则 (None, None)。
-
-        排除 [CommandListSSMTTTLDraw_*] 段（那里只是引用，且可能是陈旧残留）。
-        优先当前形态 TempVB0：ShadowVB 资源段在重导出时会被拖拽侧清理，
-        命令表若引用它将悬空。
-        """
-        for family in ("TempVB0", "ShadowVB"):
-            pattern = r'\b(ResourceDragJiggle' + family + r'_[A-Za-z0-9_]+)\b'
-            for sec_name, sec_lines in all_sections.items():
-                if not isinstance(sec_lines, list):
-                    continue
-                if str(sec_name).startswith("[CommandListSSMTTTLDraw_"):
-                    continue
-                for line in sec_lines:
-                    match = re.search(pattern, str(line or ""))
-                    if match:
-                        return match.group(1), sec_lines
-        return None, None
-
-    @staticmethod
-    def _ttl_extract_ib(lines):
-        for line in lines:
-            stripped = str(line or "").strip()
-            match = re.match(r'^ib\s*=\s*([A-Za-z0-9_.]+)', stripped, re.IGNORECASE)
-            if match:
-                return match.group(1)
-        return None
-
-    @staticmethod
-    def _ttl_drawib_token(name):
-        """取名字里形如 8 位十六进制的 DrawIB 片段（小写）；取不到返回 None。"""
-        match = re.search(r'(?<![0-9A-Za-z])([0-9a-fA-F]{8})(?![0-9A-Za-z])', str(name or ""))
-        return match.group(1).lower() if match else None
-
-    @classmethod
-    def _ttl_drag_vb0_matches_section(cls, drag_vb0, header_lines, ib_resource):
-        """jiggle 影子 VB0 是否属于本 TTL 段所在的 DrawIB。
-
-        jiggle 影子缓冲是**按 DrawIB** 生成的（ResourceDragJiggleTempVB0_<drawib>_<实例>），
-        而命令列表会把它绑成 vb0 —— 只有同一 DrawIB 的 TTL 段才该接这根钩子。
-        判据优先级：段头 `hash = <drawib>`（权威）→ 段头 `ib = <资源名>` 里的 DrawIB
-        片段；两者都取不到（命名不是 8 位十六进制）时按「匹配」处理，不改变原有行为。
-        """
-        drag_token = cls._ttl_drawib_token(drag_vb0)
-        if not drag_token:
-            return True
-        for line in header_lines:
-            match = re.match(r'^hash\s*=\s*([0-9A-Za-z_.]+)', str(line or "").strip(), re.IGNORECASE)
-            if match:
-                section_token = cls._ttl_drawib_token(match.group(1))
-                return drag_token == section_token if section_token else True
-        ib_token = cls._ttl_drawib_token(ib_resource)
-        if ib_token:
-            return drag_token == ib_token
-        return True
-
-    @staticmethod
-    def _ttl_extract_drag_condition(lines, drag_vb0):
-        for index, line in enumerate(lines):
-            if drag_vb0 not in str(line or ""):
-                continue
-            depth = 0
-            cursor = index - 1
-            while cursor >= 0:
-                stripped = str(lines[cursor] or "").strip()
-                if stripped.casefold() == "endif":
-                    depth += 1
-                elif re.match(r'^if\s+', stripped, re.IGNORECASE):
-                    if depth == 0:
-                        return re.sub(r'^if\s+', '', stripped, flags=re.IGNORECASE).strip()
-                    depth -= 1
-                cursor -= 1
-            break
-        return None
 
     def _build_ttl_draw_lines(self, block_lines):
         ttl_lines = []
@@ -2040,51 +1957,25 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
                 i += 1
         return ttl_lines, found
 
-    def _ttl_section_name(self, mesh_name, all_sections, generated_names):
-        cleaned = self._replace_non_ascii_runs(str(mesh_name or "").strip())
-        cleaned = re.sub(r"[^0-9A-Za-z_]+", "_", cleaned).strip("_")
-        base = f"TextureOverride{cleaned}" if cleaned else "TextureOverride"
-        existing = {str(name or "").strip().strip('[]').casefold() for name in all_sections}
-        candidate = base
-        suffix = 2
-        while candidate.casefold() in existing or candidate.casefold() in generated_names:
-            candidate = f"{base}_{suffix}"
-            suffix += 1
-        generated_names.add(candidate.casefold())
-        return candidate
-
     def _process_ttl_sections(self, section_name, lines, all_sections, material_group_to_swapkey,
                               swap_key_prefix, next_swap_key_num, used_swap_keys, texture_folder):
         from ..utils.log_utils import LOG as _LOG
+        # 上一次导出留在段尾的 TTL 组先摘掉，避免重导出叠第二份。
+        self._strip_ttl_groups(lines)
         mesh_lines_info = [(i, self.extract_mesh_name(line)) for i, line in enumerate(lines) if self.extract_mesh_name(line)]
         if not mesh_lines_info:
             return next_swap_key_num
 
         first_mesh_index = mesh_lines_info[0][0]
-        first_block_start = self._ttl_find_block_start(lines, first_mesh_index)
-        header_lines = self._strip_drag_hook_blocks(lines[:first_block_start])
-        drag_vb0 = self._ttl_extract_drag_vb0(header_lines)
-        drag_vb0_lines = header_lines
-        if drag_vb0 is None:
-            # 回退：拖拽钩子只注入单一主绘制段（_inject_draw_hooks 只落 part.section），
-            # TTL copy 段头部无钩子块时全表扫描兄弟段；否则陈旧
-            # [CommandListSSMTTTLDraw_*] 段会被原样保留、引用已失效的 jiggle 资源
-            # → TTL 断链（2026-08-30 实机回归：TTL 层吃不到形态键/拖拽交互）。
-            drag_vb0, drag_vb0_lines = self._ttl_find_drag_vb0_global(all_sections)
-        ib_resource = self._ttl_extract_ib(header_lines)
-        # 全表回退（54c1a91）本意是给「同一 DrawIB 的兄弟 copy 段」补钩子，却把别的
-        # DrawIB 的 TTL 段也接了进来：那些段在拖拽激活时会绑上别人的 jiggle VB0，
-        # 而命令列表里的 ib 又会被最后写入者固化（2026-10-07 实机：洛克茜模组
-        # 身体/头发共用一个命令列表 → 头发爆炸、按住 ALT 更明显）。跨 DrawIB 一律
-        # 不接拖拽钩子，退回原生 run = CommandList\TTL\Draw，索引缓冲由段内自己的
-        # ib 行决定。
-        if drag_vb0 and not self._ttl_drag_vb0_matches_section(drag_vb0, header_lines, ib_resource):
-            drag_vb0 = None
-            drag_vb0_lines = header_lines
+        block_start = self._ttl_find_block_start(lines, first_mesh_index)
+        # 段头（ib / vb* / ps-t 绑定 + 拖拽钩子）原样抄进每个 TTL 组。
+        # 组要排到段尾，中间那些普通块改过什么绑定这里一概不知道，
+        # 不重抄就会用上一个 mesh 的缓冲和贴图去捕获。
+        # 钩子也一起抄：拖拽节点的 vb0 换绑于是对 TTL 绘制天然生效，
+        # 以前那套「命令列表 + 全表找 vb0」正是为了补这一个缺口才存在的。
+        header_lines = lines[:block_start]
 
-        generated_section_names = set()
-        ttl_sections_to_add = OrderedDict()
-        ttl_draw_command_lists = OrderedDict()
+        generated_groups = []
 
         if_stack = []
         if_endif_map = {}
@@ -2128,35 +2019,6 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
             if not draw_found:
                 _LOG.info(f"      TTL: 跳过 '{mesh_name}'（块内无 drawindexed）")
                 continue
-
-            if drag_vb0:
-                # 资源名家族前缀长度不等（TempVB0/ShadowVB 两代命名），按匹配结果取后缀
-                token = re.sub(r'^ResourceDragJiggle(?:ShadowVB|TempVB0)_', '', drag_vb0)
-                command_list_name = f"CommandListSSMTTTLDraw_{token}"
-                if command_list_name not in ttl_draw_command_lists:
-                    drag_condition = self._ttl_extract_drag_condition(drag_vb0_lines, drag_vb0)
-                    command_list_lines = []
-                    if drag_condition:
-                        # 仅在拖拽激活时绑定 jiggle 临时 VB0;其余情况不覆盖 vb0,
-                        # 让 TTL 二次绘制继承游戏当前已蒙皮/形态键的 SO 输出。
-                        # 严禁绑定 Position 基础输入(会丢失骨骼与蒙皮)。
-                        command_list_lines.append(f"if {drag_condition}")
-                        command_list_lines.append(f"    vb0 = {drag_vb0}")
-                        command_list_lines.append("endif")
-                    # 不写死 ib：每个 TTL copy 段段头本来就带自己的 ib 行（段头整段拷贝，
-                    # 见下方 header_lines 回写），而命令列表按 token 共用 —— 写死只会让
-                    # 最后写入者（文件靠后的 DrawIB/子网格）的 ib 覆盖其它调用段，
-                    # 索引缓冲与顶点缓冲错配 → 乱三角形（2026-10-07 实机：洛克茜模组
-                    # 身体/头发共用命令列表，头发爆炸、按住 ALT 更明显）。
-                    command_list_lines.append("run = CommandList{}TTL{}Draw".format(chr(92), chr(92)))
-                    ttl_draw_command_lists[command_list_name] = command_list_lines
-                ttl_draw_lines = [
-                    str(line).replace(
-                        "run = CommandList{}TTL{}Draw".format(chr(92), chr(92)),
-                        "run = CommandListSSMTTTLDraw_{}".format(token),
-                    )
-                    for line in ttl_draw_lines
-                ]
 
             new_lines = []
             object_to_diffuse_swapkey = {}
@@ -2225,20 +2087,24 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
             else:
                 new_lines.extend(ttl_draw_lines)
 
-            new_section_name = self._ttl_section_name(mesh_name, all_sections, generated_section_names)
-            ttl_sections_to_add[new_section_name] = new_lines
-            del lines[block_start:block_end]
+            generated_groups.append(
+                [_TTL_GROUP_MARKER.format(mesh_name), *new_lines, _TTL_GROUP_END]
+            )
+            # 段内只把这一笔绘制注释掉，块本身留在原位：mesh 注释与贴图绑定因此
+            # 继续受材质节点那条链路管（以前整块搬进 copy 段，copy 段又被段级早退
+            # 跳过，等于永久冻结）。参数留在注释里，重导出时就是这里的唯一来源。
+            for draw_index in range(block_start, block_end):
+                draw_line = str(lines[draw_index])
+                if _TTL_DRAW_TAKEN_RE.match(draw_line.strip()):
+                    continue
+                if self._ttl_parse_drawindexed(draw_line) is not None:
+                    lines[draw_index] = f"{_TTL_DRAW_TAKEN_PREFIX}{draw_line.strip()}"
 
-        self._cleanup_empty_if_blocks(lines)
-
-        for command_list_name, command_list_lines in ttl_draw_command_lists.items():
-            all_sections[f"[{command_list_name}]"] = command_list_lines
-
-        for new_section_name, new_section_lines in ttl_sections_to_add.items():
-            all_sections[f"[{new_section_name}]"] = new_section_lines
-
-        if not any(self.extract_mesh_name(line) for line in lines) and not any('drawindexed' in line for line in lines):
-            all_sections.pop(section_name, None)
+        # 全部排到段尾：TTL 的那几笔捕获会留下 ps=CaptureMask、不写深度、additive 混合
+        # 这些没人复位的东西（TTLib 只还 o\*、ps-t69 和常量），排在普通绘制后面，
+        # 段里就不会再有下一笔画在污染里。
+        for group in reversed(generated_groups):
+            lines.extend(group)
 
         return next_swap_key_num
 
@@ -2265,35 +2131,6 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
         if definition not in existing:
             all_sections[constants_key].append(definition)
         return var_name
-
-    @staticmethod
-    def _cleanup_empty_if_blocks(lines):
-        changed = True
-        while changed:
-            changed = False
-            i = 0
-            while i < len(lines):
-                stripped = str(lines[i]).strip()
-                if re.match(r'^if\s+', stripped, re.IGNORECASE):
-                    depth = 0
-                    j = i
-                    empty = True
-                    while j < len(lines):
-                        cur = str(lines[j]).strip()
-                        if re.match(r'^if\s+', cur, re.IGNORECASE):
-                            depth += 1
-                        elif cur.casefold() == 'endif':
-                            depth -= 1
-                            if depth == 0:
-                                break
-                        elif cur and not cur.startswith(';'):
-                            empty = False
-                        j += 1
-                    if depth == 0 and empty:
-                        del lines[i:j + 1]
-                        changed = True
-                        continue
-                i += 1
 
     @staticmethod
     def _efmi_ttl_library_present():
@@ -2474,8 +2311,9 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
             next_swap_key_num = int(match.group(2)) if match else 0
 
         lines = all_sections[section_name]
-        if any("CommandList\\TTL\\Draw" in str(line) for line in lines):
-            return next_swap_key_num
+        # 以前这里是段级早退：只要段里出现 TTL 的绘制就整段跳过。TTL 不再独立成段，
+        # 早退会把同段其它网格的材质一起冻结，所以改成只摘掉 TTL 组、其余照常处理。
+        self._strip_ttl_groups(lines)
         mesh_line = next((line for line in lines if self.extract_mesh_name(line)), "")
         section_mesh_name = self.extract_mesh_name(mesh_line) or ""
         section_obj = self.find_object_by_mesh_name(section_mesh_name) if section_mesh_name else None
@@ -2729,7 +2567,16 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
                 section_name, lines, all_sections, material_group_to_swapkey,
                 swap_key_prefix, next_swap_key_num, used_swap_keys, texture_folder)
 
-        mesh_lines_info_phase2 = [(i, self.extract_mesh_name(line)) for i, line in enumerate(lines) if self.extract_mesh_name(line)]
+        # TTL 组排在本段段尾，组内自带 `; [mesh:]` 锚点；phase2 的锚点扫描必须
+        # 跳过组内那些行，否则同一 mesh 会被当成两个块，组会被切碎搬进透明段。
+        ttl_group_spans = self._ttl_group_spans(lines)
+        mesh_lines_info_phase2 = [
+            (i, self.extract_mesh_name(line))
+            for i, line in enumerate(lines)
+            if self.extract_mesh_name(line)
+            and not any(start <= i <= end for start, end in ttl_group_spans)
+        ]
+
         # 段体内容 -> 段名：同一个 mesh 在一个段里会随物体切换分支出现多次，
         # 内容（材质 + drawindexed）完全一致时复用同一个透明段，不再生成
         # _2/_3… 这样内容逐字节重复的段。
@@ -2739,12 +2586,29 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
         for mesh_index, mesh_name in reversed(mesh_lines_info_phase2):
             transparency_shader_name, transparency_value = self.extract_transparency_info_from_mesh_name(mesh_name)
             if transparency_shader_name:
+                # TTL 接管过的块不再搬：混合已经由 TTL 库的绘制自己做，再搬一份
+                # 进透明段只会让 TTL 组跟着挪走（组必须留在原段段尾）。
+                taken_over = False
+                for i in range(mesh_index + 1, len(lines)):
+                    probe = lines[i].strip()
+                    if probe.startswith("; [SSMT-TTL]") or probe.startswith(_TTL_DRAW_TAKEN_PREFIX.strip()):
+                        taken_over = True
+                        break
+                    if self.extract_mesh_name(lines[i]) or (
+                        probe.startswith('[') and not probe.startswith('[mesh:')
+                    ):
+                        break
+                if taken_over:
+                    continue
                 start_move_idx = mesh_index + 1
                 end_move_idx = len(lines)
                 conditional_depth = 0
                 draw_seen = False
                 for i in range(start_move_idx, len(lines)):
                     stripped = lines[i].strip()
+                    if stripped.startswith("; [SSMT-TTL]"):
+                        end_move_idx = i
+                        break
                     if self.extract_mesh_name(lines[i]) or (
                         stripped.startswith('[') and not stripped.startswith('[mesh:')
                     ):
