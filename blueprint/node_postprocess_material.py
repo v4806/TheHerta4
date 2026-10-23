@@ -21,6 +21,31 @@ _TTL_MASK_INVERT_PREFIX = "${}TTL{}mask_invert".format(chr(92), chr(92)).casefol
 # 必须写在 if 条件块之外：TTLib 的 CommandListFrameReset 每帧把 $V 重置为 1.0，
 # 只有绘制前重新赋值才生效；不需要提亮的段落手动删掉这一行即可。
 _TTL_DEFAULT_BRIGHTNESS = "1.5"
+# ── EFMI 半透明（EFMITTL）──────────────────────────────────────────────
+# 末地 EFMI 没有 ZZMI/TTLib 那种「把这一笔改写成第二遍绘制」的 TTL；它的半透明由
+# 一个共享库接管**这一次**绘制：调用方只交出场参数（索引数 / 起始索引，可选 alpha
+# 与遮罩贴图），然后 run 库的命令列表，库按绘制通道（阴影 / 前向 / G-Buffer / 深度
+# 预通道 / 描边）自己决定画、捕获还是跳过。
+# 库自带启动声明：库文件是 Mods/EFMITTL/translucency.ini，命名空间 EFMITTL，
+# 命令列表 CommandList\EFMITTL\Draw，公开的变量与资源别名就是下面这几条。
+# 库在 Draw 结尾会把 alpha / mask_channel / mask_invert / Mask / count / first 全部
+# 复位，所以本仓只负责调用前赋值，不写复位行。
+_EFMITTL_KEY = "EFMITTL"
+_EFMITTL_LIBRARY_FILE = os.path.join(_EFMITTL_KEY, "translucency.ini")
+_EFMITTL_MASK_PARAM = "Resource\\EFMITTL\\Mask"
+_EFMITTL_DRAW_LINE = "run = CommandList\\EFMITTL\\Draw"
+# 遮罩默认读透明通道（3 = A）：库自己的默认是 0（R），我们不跟它，每次显式写 3。
+# 提取工具的透明通道贴图四个通道同值，所以 3 读到的就是那张遮罩本身；方向与 ZZMI
+# 的 TTL 一致：mask_invert = 1。
+_EFMITTL_MASK_CHANNEL_LINE = "$\\EFMITTL\\mask_channel = 3"
+_EFMITTL_MASK_INVERT_LINE = "$\\EFMITTL\\mask_invert = 1"
+_EFMITTL_DRAW_RE = re.compile(
+    r'^(?P<indent>\s*)drawindexed(?:instanced)?\s*=\s*(?P<args>[^;]+?)\s*$',
+    re.IGNORECASE,
+)
+# 库用 ``drawindexed = $count, $first, 0`` 出图：只画一个实例。EFMI 把实例绘制拆成
+# 「每次一个实例」的回调（$draw_call_instance_id），所以 mod 里的实例数就是这两者之一。
+_EFMITTL_SINGLE_INSTANCE_TOKENS = {"1", "instance_count"}
 # 拖拽物体显隐 flag 行（注入在绘制分支内；TTL 块重建必须原样保留，否则隐藏判定失效）
 _DRAG_OBJVIS_LINE_RE = re.compile(r'^\s*\$ssmtdrag_objvis_[\w]*\s*=\s*1\s*$')
 
@@ -2270,6 +2295,161 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
                         continue
                 i += 1
 
+    @staticmethod
+    def _efmi_ttl_library_present():
+        """EFMITTL 库是否躺在当前游戏的 Mods 目录里。
+
+        没装时**不能**改写绘制：``run = CommandList\\EFMITTL\\Draw`` 找不到命令列表，
+        这一笔就什么都不画，部件直接消失——比「继续按原来不透明画」糟得多。
+        所以这里只做「装没装」的判断，判断为没装就原样保留绘制并在日志里点名要装什么。
+        """
+        try:
+            mods_folder = GlobalConfig.path_mods_folder()
+        except Exception:
+            return False
+        mods_folder = str(mods_folder or "").strip()
+        if not mods_folder:
+            return False
+        return os.path.isfile(os.path.join(mods_folder, _EFMITTL_LIBRARY_FILE))
+
+    @classmethod
+    def _efmi_ttl_draw_args(cls, draw_args):
+        """把 ``drawindexed(instanced)`` 的参数拆成 EFMITTL 要的 ``(count, first)``。
+
+        库自己写死了 ``drawindexed = $count, $first, 0``，所以交接有三个前提，任何
+        一条不满足就返回 None（宁可保持原来的不透明绘制，也不画错）：
+
+        - 第三个数（base vertex）必须是 0，库没有 base vertex 的位置；
+        - 实例数必须是 1：库只画一个实例，而 EFMI 的实例绘制会被拆成每次一个实例
+          的回调，mod 里那句 ``INSTANCE_COUNT`` 就是这种形态；
+        - count / first 必须是数字。
+        """
+        fields = [field.strip() for field in str(draw_args or "").split(",")]
+        if len(fields) not in (3, 4, 5):
+            return None
+        if len(fields) == 3:
+            # drawindexed = count, first_index, base_vertex：实例数按 1 处理。
+            count, first, base_vertex = fields
+            instances = "1"
+        else:
+            # drawindexedinstanced = count, instances, first_index, base_vertex[, first_instance]
+            count, instances, first, base_vertex = fields[:4]
+        if not count or not first:
+            return None
+        if base_vertex not in ("0", ""):
+            return None
+        if instances.casefold() not in _EFMITTL_SINGLE_INSTANCE_TOKENS:
+            return None
+        if not count.isdigit() or not first.isdigit():
+            return None
+        return count, first
+
+    def _process_efmi_ttl_sections(self, section_name, lines, all_sections,
+                                   material_group_to_swapkey, swap_key_prefix,
+                                   next_swap_key_num, used_swap_keys, texture_folder):
+        """把带 TTLMap 材质的 mesh 的绘制交给 EFMITTL 库（EFMI 专用）。
+
+        与 ``_process_ttl_sections``（ZZMI）的根本区别：这里不新建段、也不做第二遍
+        绘制，只把这一段里那一行 ``drawindexed(instanced)`` 就地换成库的调用约定：
+
+        .. code-block:: ini
+
+            Resource\\EFMITTL\\Mask = ref ResourceTTLMap_Body
+            $\\EFMITTL\\mask_channel = 3
+            $\\EFMITTL\\mask_invert = 1
+            $\\EFMITTL\\count = 59679
+            $\\EFMITTL\\first = 0
+            run = CommandList\\EFMITTL\\Draw
+
+        所以索引缓冲、顶点缓冲、贴图槽都还是这一笔自己的绑定，不需要搬。
+        """
+        from ..utils.log_utils import LOG as _LOG
+        if any(_EFMITTL_DRAW_LINE.casefold() in str(line).casefold() for line in lines):
+            # 这个段已经交给库了：重复导出时别把参数行叠第二遍。
+            return next_swap_key_num
+        if not self._efmi_ttl_library_present():
+            _LOG.warning(
+                "      EFMI TTL: 未找到 EFMITTL 库（"
+                + os.path.join("Mods", _EFMITTL_LIBRARY_FILE)
+                + "），本次保留原绘制；装好库再导出即可生成 TTL"
+            )
+            return next_swap_key_num
+
+        mesh_lines_info = [(i, self.extract_mesh_name(line))
+                           for i, line in enumerate(lines) if self.extract_mesh_name(line)]
+        for mesh_index, mesh_name in reversed(mesh_lines_info):
+            obj = self.find_object_by_mesh_name(mesh_name)
+            if obj is None:
+                continue
+            ttl_materials = self.find_matching_materials(obj, "TTLMap")
+            if not ttl_materials:
+                continue
+            if self.find_matching_materials(obj, "FXMap"):
+                # 与 ZZMI 同一条规矩：一个物体不能同时走 FX 与半透明。
+                _LOG.warning(f"      EFMI TTL: 跳过 '{mesh_name}'（同一物体不能同时启用 FX 与 TTL）")
+                continue
+
+            block_end = len(lines)
+            for i in range(mesh_index + 1, len(lines)):
+                if self.extract_mesh_name(lines[i]):
+                    block_end = i
+                    break
+            draw_index = -1
+            draw_match = None
+            for i in range(mesh_index + 1, block_end):
+                match = _EFMITTL_DRAW_RE.match(str(lines[i]))
+                if match:
+                    draw_index, draw_match = i, match
+                    break
+            if draw_index < 0:
+                _LOG.info(f"      EFMI TTL: 跳过 '{mesh_name}'（块内无 drawindexed）")
+                continue
+
+            draw_args = self._efmi_ttl_draw_args(draw_match.group("args"))
+            if draw_args is None:
+                _LOG.info(
+                    f"      EFMI TTL: 跳过 '{mesh_name}'"
+                    f"（{draw_match.group('args').strip()} 不是可交接的单实例绘制）"
+                )
+                continue
+            count, first = draw_args
+
+            mask_lines, next_swap_key_num = self.generate_material_lines(
+                ttl_materials, _EFMITTL_MASK_PARAM, "TTLMap", obj, texture_folder, all_sections,
+                {}, material_group_to_swapkey, swap_key_prefix, next_swap_key_num, used_swap_keys)
+            # 材质没有贴图时 generate_material_lines 只回一行注释（多材质还会回一对
+            # if/endif），所以「有没有遮罩」按是否真的写出了 = ref 行来判断。
+            has_mask = any("= ref " in str(line) for line in mask_lines)
+            alpha_value = self._extract_transparency_value_from_mesh_name(mesh_name)
+            if not has_mask and not alpha_value:
+                _LOG.info(
+                    f"      EFMI TTL: 跳过 '{mesh_name}'（TTLMap 材质没有贴图，也没有 _透明 数值）"
+                )
+                continue
+
+            ttl_lines = []
+            if has_mask:
+                ttl_lines.extend(mask_lines)
+                ttl_lines.append(_EFMITTL_MASK_CHANNEL_LINE)
+                ttl_lines.append(_EFMITTL_MASK_INVERT_LINE)
+            if alpha_value:
+                # 不写 alpha 时库按「有遮罩 ⇒ 1，让遮罩决定」处理；写了就是整体乘一层。
+                ttl_lines.append("$\\EFMITTL\\alpha = {}".format(self._ttl_normalize_alpha(alpha_value)))
+            ttl_lines.append("$\\EFMITTL\\count = {}".format(count))
+            ttl_lines.append("$\\EFMITTL\\first = {}".format(first))
+            ttl_lines.append(_EFMITTL_DRAW_LINE)
+
+            # 原绘制在 if 分支里就要跟着缩进，参数行不能跑到条件块外面去。
+            indent = draw_match.group("indent") or ""
+            lines[draw_index:draw_index + 1] = [
+                indent + str(line) if str(line).strip() else line for line in ttl_lines
+            ]
+            _LOG.info(
+                f"      找到 '{mesh_name}'，EFMI TTL: count={count} first={first}"
+                + (f"，遮罩材质: {', '.join(str(m.name) for m in ttl_materials)}" if has_mask else "")
+            )
+        return next_swap_key_num
+
     def process_texture_override_section(self, section_name, all_sections,
                                           material_group_to_swapkey, swap_key_prefix=None, next_swap_key_num=None,
                                           used_swap_keys=None, transparency_sections_to_add=None):
@@ -2529,17 +2709,25 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
                 reset_insert_idx = self._find_mesh_block_reset_insert_index(lines, insert_index)
                 if reset_insert_idx != -1:
                     lines[reset_insert_idx:reset_insert_idx] = reset_lines
-        # TTL 是 ZZMI 专属的绘制重建协议；EFMI 等其它逻辑仅执行普通材质转资源
-        # 与 FX/Glowmap，不得因为某种 drawindexed 参数恰好能被正则解析就误入 TTL。
-        # 别和 HI3FX 的 TTLMap 混淆：那是**第二个遮罩通道**（抖动半透明），属于
-        # 普通材质转资源，由上面的 FX 段落产出，不涉及这里的绘制重建。
-        ttl_supported = GlobalConfig.logic_name == LogicName.ZZMI
-        if not debug_disable_fx_ttl and ttl_supported:
+        # 半透明生成有两套互不相干的协议，按游戏分派：
+        # - ZZMI：TTLib 的「把这一笔拆成第二遍绘制」，_process_ttl_sections 重建段；
+        # - EFMI：EFMITTL 共享库接管这一笔绘制，_process_efmi_ttl_sections 就地换掉
+        #   drawindexed 并交给库（不新建段、不改索引/顶点缓冲绑定）。
+        # 别的逻辑只做普通材质转资源与 FX/Glowmap，不得因为某种 drawindexed 参数恰好
+        # 能被正则解析就误入半透明链路。
+        # 别和 HI3FX 的 TTLMap 混淆：那是**第二个遮罩通道**（抖动半透明），属于普通
+        # 材质转资源，由上面的 FX 段落产出，不涉及这里的绘制接管。
+        logic_name = GlobalConfig.logic_name
+        if debug_disable_fx_ttl:
+            _LOG.info(f"      调试开关已开启，跳过 {section_name} 的 FX/TTL 生成")
+        elif logic_name == LogicName.ZZMI:
             next_swap_key_num = self._process_ttl_sections(
                 section_name, lines, all_sections, material_group_to_swapkey,
                 swap_key_prefix, next_swap_key_num, used_swap_keys, texture_folder)
-        elif debug_disable_fx_ttl:
-            _LOG.info(f"      调试开关已开启，跳过 {section_name} 的 FX/TTL 生成")
+        elif logic_name == LogicName.EFMI:
+            next_swap_key_num = self._process_efmi_ttl_sections(
+                section_name, lines, all_sections, material_group_to_swapkey,
+                swap_key_prefix, next_swap_key_num, used_swap_keys, texture_folder)
 
         mesh_lines_info_phase2 = [(i, self.extract_mesh_name(line)) for i, line in enumerate(lines) if self.extract_mesh_name(line)]
         # 段体内容 -> 段名：同一个 mesh 在一个段里会随物体切换分支出现多次，

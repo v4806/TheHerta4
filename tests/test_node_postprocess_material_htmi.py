@@ -2605,6 +2605,142 @@ class HTMIMaterialPostProcessTests(unittest.TestCase):
             self.assertNotIn(r"CommandList\TTL\Draw", result)
             self.assertNotIn("[Resource_TTLMap_Body]", result)
             node._process_ttl_sections.assert_not_called()
+            # 本机没装 EFMITTL 库（GlobalConfig 是裸 SimpleNamespace），所以 EFMI 的
+            # 半透明也不得改成库调用：绘制行必须原样留着，否则部件会直接消失。
+            self.assertNotIn(r"CommandList\EFMITTL\Draw", result)
+            self.assertNotIn(r"Resource\EFMITTL\Mask", result)
+
+    def _make_efmi_ttl_fixture(self, temp_dir, draw_args):
+        """造一个 EFMI 合并绘制回调段（带 TTLMap 材质的物体），返回段与段名。"""
+        diffuse_path = os.path.join(temp_dir, "diffuse.png")
+        with open(diffuse_path, "wb") as file_obj:
+            file_obj.write(b"diffuse")
+        ttl_path = os.path.join(temp_dir, "ttl.png")
+        with open(ttl_path, "wb") as file_obj:
+            file_obj.write(b"ttl")
+        object_name = "LOD0.drawhash-12-56.Body"
+        obj = _FakeObject(
+            object_name,
+            {
+                "ps-t0": {
+                    "mark_name": "DiffuseMap",
+                    "mark_type": "Slot",
+                    "mark_slot": "ps-t0",
+                }
+            },
+            [("DiffuseMap_Body", diffuse_path), ("TTLMap_Body", ttl_path)],
+        )
+        _fake_bpy.data.objects[obj.name] = obj
+        sys.modules[f"{PKG}.common.global_config"].GlobalConfig.logic_name = "EFMI"
+        callback_name = "CommandList_Draw_LOD0.drawhash_12_56"
+        sections = OrderedDict([
+            (f"[{callback_name}]", [
+                r"run = CommandList\EFMIv1\OverrideTextures",
+                "ib = Resource_LOD0.drawhash_12_56_Index",
+                "ps-t0 = Resource-old-DiffuseMap",
+                f"; [mesh:{object_name}] [vertex_count:77]",
+                f"drawindexedinstanced = {draw_args}",
+            ]),
+            ("_config_path", temp_dir),
+        ])
+        return sections, f"[{callback_name}]"
+
+    def _run_efmi_ttl(self, sections, section_name):
+        node = node_postprocess_material.SSMTNode_PostProcess_Material()
+        node.name = "MaterialNode"
+        node.material_to_resource_override = False
+        node.material_switch_var = "$swapkey150"
+        node.debug_disable_fx_ttl = False
+        node._process_ttl_sections = mock.Mock()
+        node.process_texture_override_section(
+            section_name, sections, material_group_to_swapkey={},
+            swap_key_prefix="$swapkey", next_swap_key_num=150, used_swap_keys=set(),
+            transparency_sections_to_add=OrderedDict(),
+        )
+        return node
+
+    def test_efmi_ttl_hands_draw_to_efmittl_library(self):
+        """装了 EFMITTL 时，EFMI 的绘制行换成库的调用约定，且不新建绘制段。"""
+        BS = chr(92)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sections, section_name = self._make_efmi_ttl_fixture(
+                temp_dir, "12,INSTANCE_COUNT,34,0,FIRST_INSTANCE")
+            with mock.patch.object(
+                node_postprocess_material.SSMTNode_PostProcess_Material,
+                "_efmi_ttl_library_present", return_value=True,
+            ):
+                node = self._run_efmi_ttl(sections, section_name)
+
+            body = "\n".join(str(line) for line in sections[section_name])
+            # 原来的绘制换成了库调用：库自己按通道决定阴影/前向/预通道怎么画。
+            self.assertNotIn("drawindexedinstanced", body)
+            self.assertIn(f"run = CommandList{BS}EFMITTL{BS}Draw", body)
+            # 索引数/起始索引来自原来那一笔，遮罩来自 TTLMap 材质。
+            self.assertIn(f"${BS}EFMITTL{BS}count = 12", body)
+            self.assertIn(f"${BS}EFMITTL{BS}first = 34", body)
+            self.assertIn(f"Resource{BS}EFMITTL{BS}Mask = ref Resource_TTLMap_Body", body)
+            self.assertIn(f"${BS}EFMITTL{BS}mask_channel = 3", body)
+            self.assertIn(f"${BS}EFMITTL{BS}mask_invert = 1", body)
+            self.assertIn("[Resource_TTLMap_Body]", sections)
+            # 没有 _透明 数值就不写 alpha：库按「有遮罩 ⇒ 1，交给遮罩决定」处理。
+            self.assertNotIn(f"${BS}EFMITTL{BS}alpha", body)
+            # 参数行必须排在库调用之前，顺序错了库就读不到。
+            self.assertLess(body.index(f"${BS}EFMITTL{BS}count"), body.index(f"run = CommandList{BS}EFMITTL{BS}Draw"))
+            self.assertLess(body.index(f"Resource{BS}EFMITTL{BS}Mask"), body.index(f"run = CommandList{BS}EFMITTL{BS}Draw"))
+            # EFMI 不重建段、也不走 ZZMI 的 TTL 链路。
+            node._process_ttl_sections.assert_not_called()
+            self.assertEqual(
+                sorted(name for name in sections if name.startswith("[")),
+                sorted([section_name, "[Resource_TTLMap_Body]",
+                        "[Resource_DiffuseMap_Body]"]),
+            )
+
+    def test_efmi_ttl_generation_is_idempotent(self):
+        """重复导出同一个回调段时，库调用块不会叠第二遍。"""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sections, section_name = self._make_efmi_ttl_fixture(
+                temp_dir, "12,INSTANCE_COUNT,34,0,FIRST_INSTANCE")
+            with mock.patch.object(
+                node_postprocess_material.SSMTNode_PostProcess_Material,
+                "_efmi_ttl_library_present", return_value=True,
+            ):
+                self._run_efmi_ttl(sections, section_name)
+                first = "\n".join(str(line) for line in sections[section_name])
+                self._run_efmi_ttl(sections, section_name)
+                second = "\n".join(str(line) for line in sections[section_name])
+
+        self.assertEqual(first, second)
+        self.assertEqual(second.count(r"CommandList\EFMITTL\Draw"), 1)
+
+    def test_efmi_ttl_is_skipped_when_library_missing(self):
+        """没装 EFMITTL 就保留原绘制并出声——不能把部件画没。"""
+        log_module = sys.modules[f"{PKG}.utils.log_utils"]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            sections, section_name = self._make_efmi_ttl_fixture(
+                temp_dir, "12,INSTANCE_COUNT,34,0,FIRST_INSTANCE")
+            with mock.patch.object(log_module.LOG, "warning") as warning_mock:
+                node = self._run_efmi_ttl(sections, section_name)
+
+            body = "\n".join(str(line) for line in sections[section_name])
+            self.assertIn("drawindexedinstanced = 12,INSTANCE_COUNT,34,0,FIRST_INSTANCE", body)
+            self.assertNotIn("EFMITTL", body)
+            self.assertTrue(warning_mock.called)
+            self.assertIn("EFMITTL", str(warning_mock.call_args))
+            node._process_ttl_sections.assert_not_called()
+
+    def test_efmi_ttl_draw_args_only_accepts_single_instance_draws(self):
+        """只有「单实例、无 base vertex、纯数字」的绘制才能交接给库。"""
+        parse = node_postprocess_material.SSMTNode_PostProcess_Material._efmi_ttl_draw_args
+        self.assertEqual(parse("59679,INSTANCE_COUNT,0,0,FIRST_INSTANCE"), ("59679", "0"))
+        self.assertEqual(parse("12, 1, 34, 0"), ("12", "34"))
+        self.assertEqual(parse("3,0,0"), ("3", "0"))        # 多实例：库只画一个实例，交接会丢掉其余的实例。
+        self.assertIsNone(parse("12,4,34,0,FIRST_INSTANCE"))
+        # base vertex 非 0：库把那一位写死成 0。
+        self.assertIsNone(parse("12,INSTANCE_COUNT,34,7,FIRST_INSTANCE"))
+        self.assertIsNone(parse("12,INSTANCE_COUNT,34,0,FIRST_INSTANCE,extra"))
+        # 非数字（循环/变量形式）：算不出 count/first。
+        self.assertIsNone(parse("$count,INSTANCE_COUNT,0,0,FIRST_INSTANCE"))
+        self.assertIsNone(parse(""))
 
     def test_ttl_parser_is_restricted_to_zzmi_logic(self):
         """TTL 协议只属于 ZZMI；其它所有当前逻辑都不得进入 TTL 解析器。"""
