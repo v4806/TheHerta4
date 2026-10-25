@@ -17,6 +17,10 @@ from ..common.global_config import GlobalConfig
 from ..common.global_key_count_helper import GlobalKeyCountHelper
 from ..common.global_properties import GlobalProterties
 from ..common.object_prefix_helper import ObjectPrefixHelper
+try:  # 纯文件装载的测试宿主可能没有贴图计划模块：退化为旧「先落盘再删除」流程
+    from ..common.texture_export_plan import TextureExportPlan
+except ImportError:  # pragma: no cover
+    TextureExportPlan = None
 from ..common.workspace_helper import WorkSpaceHelper
 from ..utils.log_utils import LOG
 from ..utils.timer_utils import TimerUtils
@@ -462,6 +466,16 @@ def _write_report(
 
 
 def _execute_supported_postprocess_nodes(blueprint_model: BluePrintModel, output_dir: str, exporter=None):
+    # 贴图计划：按本蓝图「资源合并」节点的开关初始化（跨轮次累积，收尾统一落盘）。
+    if TextureExportPlan is not None:
+        try:
+            TextureExportPlan.configure_from_tree(
+                getattr(blueprint_model, "_tree", None), output_dir
+            )
+        except Exception as plan_error:
+            LOG.warning(f"贴图计划初始化失败（按旧流程导出）: {plan_error}")
+            TextureExportPlan.reset()
+
     compatible_nodes = []
     for node in getattr(blueprint_model, "postprocess_nodes", []) or []:
         node_type = str(getattr(node, "bl_idname", "") or "")
@@ -537,6 +551,13 @@ def _execute_supported_postprocess_nodes(blueprint_model: BluePrintModel, output
                 execute_postprocess(output_dir)
         except NotImplementedError:
             LOG.warning(f"Skip postprocess node without implementation: {getattr(node, 'name', '')}")
+
+    # 贴图计划兜底落盘（资源合并节点已在自身开头落盘时幂等）
+    if TextureExportPlan is not None:
+        try:
+            TextureExportPlan.finalize(output_dir)
+        except Exception as plan_error:
+            LOG.warning(f"贴图计划落盘失败（不影响导出）: {plan_error}")
 
 
 def _sync_modimp_mirror_flags_after_preprocess(original_to_copy_map: dict[str, str]):

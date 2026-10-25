@@ -6,6 +6,10 @@ import bpy
 from ..common.global_config import GlobalConfig
 from ..common.global_key_count_helper import GlobalKeyCountHelper
 from ..common.global_properties import GlobalProterties
+try:  # 纯文件装载的测试宿主可能没有贴图计划模块：退化为旧「先落盘再删除」流程
+    from ..common.texture_export_plan import TextureExportPlan
+except ImportError:  # pragma: no cover
+    TextureExportPlan = None
 from ..utils.log_utils import LOG
 from ..utils.timer_utils import TimerUtils
 from . import export_progress
@@ -151,7 +155,7 @@ def _report_postprocess_node(node, status: str) -> None:
 #: 这些节点不进入主进程预计算的步骤预算，只用 ``count_step=False`` 更新
 #: ``stage.json`` 的 ``nodes`` 表，让 ``_sync_node_highlight`` 按阶段逐个上色。
 #: 收集物体 / 前处理阶段真正读取的节点（前处理本身没有专属节点，保持它 running）。
-_OBJECT_INFO_NODE_IDNAMES = ("SSMTNode_Object_Info",)
+_OBJECT_INFO_NODE_IDNAMES = ("SSMTNode_Object_Info", "SSMTNode_Object_Info_Pro")
 #: 解析蓝图 / 构建导出器时读取的节点：顶点组处理（model.py 里批量执行）、
 #: 物体组（处理链上的分组节点）、蓝图嵌套（展开嵌套蓝图）。
 _BLUEPRINT_PARSE_NODE_IDNAMES = (
@@ -820,6 +824,14 @@ class DirectExportSession:
                     execute_postprocess(mod_export_path)
                 _report_postprocess_node(postprocess_node, export_progress.STATE_DONE)
 
+            # 贴图计划兜底落盘：资源合并节点已在自身开头落盘，这里幂等；
+            # 蓝图没有资源合并节点（或它被禁用）时也能把贴图盘出来。
+            if TextureExportPlan is not None:
+                try:
+                    TextureExportPlan.finalize(GlobalConfig.path_generate_mod_folder())
+                except Exception as plan_error:
+                    LOG.warning(f"贴图计划落盘失败（不影响导出）: {plan_error}")
+
         finally:
             try:
                 PreProcessHelper.cleanup_copies()
@@ -889,6 +901,13 @@ def execute_direct_export(context, tree):
     previous_runtime_tree_name = BlueprintExportHelper.runtime_blueprint_tree_name
     BlueprintExportHelper.set_runtime_blueprint_tree(tree)
     GlobalKeyCountHelper.initialize()
+    # 贴图计划：直出流程同样按「资源合并」节点配置初始化（跨轮次累积，收尾统一落盘）。
+    if TextureExportPlan is not None:
+        try:
+            TextureExportPlan.configure_from_tree(tree, GlobalConfig.path_generate_mod_folder())
+        except Exception as plan_error:
+            LOG.warning(f"贴图计划初始化失败（按旧流程导出）: {plan_error}")
+            TextureExportPlan.reset()
     # 直出运行时开关：后处理在 session.run() 内部执行，所以整个会话期间都置真，
     # 结束后（异常也）复位，让普通 / 后台 / 并行导出看到的一直是「不是直出」。
     BlueprintExportHelper.set_direct_export_active(True)

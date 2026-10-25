@@ -29,6 +29,10 @@ import time
 import traceback
 
 from ..common.global_config import GlobalConfig
+try:  # 纯文件装载的测试宿主可能没有贴图计划模块：退化为旧「先落盘再删除」流程
+    from ..common.texture_export_plan import TextureExportPlan
+except ImportError:  # pragma: no cover
+    TextureExportPlan = None
 from ..utils.log_utils import LOG
 from ..utils.shapekey_utils import ShapeKeyUtils
 from . import export_progress
@@ -768,6 +772,14 @@ def _run_worker(manifest_path: str) -> None:
             if tree is None:
                 raise RuntimeError(f"未找到蓝图树: {tree_name}")
 
+        # 贴图计划：按本蓝图「资源合并」节点的开关初始化（跨轮次累积，收尾统一落盘）。
+        if TextureExportPlan is not None:
+            try:
+                TextureExportPlan.configure_from_tree(tree, output_dir)
+            except Exception as plan_error:
+                LOG.warning(f"贴图计划初始化失败（按旧流程导出）: {plan_error}")
+                TextureExportPlan.reset()
+
         # 步骤清单在**导出开始前一次算好**（与主进程预估同一个函数）：之后
         # total = len(清单) 固定不变，阶段/节点按清单推进，不再动态加步数。
         try:
@@ -851,6 +863,13 @@ def _run_worker(manifest_path: str) -> None:
             if blueprint_model is not None:
                 blueprint_model.execute_postprocess_nodes(output_dir)
 
+            # 贴图计划兜底落盘（资源合并节点已在自身开头落盘时幂等）
+            if TextureExportPlan is not None:
+                try:
+                    TextureExportPlan.finalize(output_dir)
+                except Exception as plan_error:
+                    LOG.warning(f"贴图计划落盘失败（不影响导出）: {plan_error}")
+
             result["warnings"] = _collect_ini_variable_warnings(output_dir)
             done_steps = export_progress.finish_steps()  # 收尾算最后一步（并补满）
             result["status"] = "success"
@@ -928,6 +947,13 @@ def _run_worker(manifest_path: str) -> None:
             if blueprint_model is not None:
                 blueprint_model.execute_postprocess_nodes(output_dir)
 
+            # 贴图计划兜底落盘（资源合并节点已在自身开头落盘时幂等）
+            if TextureExportPlan is not None:
+                try:
+                    TextureExportPlan.finalize(output_dir)
+                except Exception as plan_error:
+                    LOG.warning(f"贴图计划落盘失败（不影响导出）: {plan_error}")
+
             result["warnings"] = _collect_ini_variable_warnings(output_dir)
             done_steps = export_progress.finish_steps()  # 收尾算最后一步（并补满）
             result["status"] = "success"
@@ -953,6 +979,23 @@ def _run_worker(manifest_path: str) -> None:
     finally:
         try:
             uninstall_progress_bridge()
+        except Exception:
+            pass
+
+        # 保留阶段耗时，供后台性能分析；计时器可能包含相互嵌套的阶段。
+        try:
+            from ..utils.timer_utils import TimerUtils
+
+            timing_session = getattr(TimerUtils, "_session", None)
+            if timing_session is not None:
+                timings = [
+                    {"stage": name, "elapsed_s": timer.duration_seconds,
+                     "completed": timer.is_completed}
+                    for name in timing_session.stage_order
+                    for timer in [timing_session.stages[name]]
+                ]
+                _write_json(os.path.join(os.path.dirname(result_path), "timings.json"),
+                            {"stages": timings})
         except Exception:
             pass
 
