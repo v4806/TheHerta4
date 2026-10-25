@@ -13,6 +13,10 @@ from .logic_name import LogicName
 
 from .global_key_count_helper import GlobalKeyCountHelper
 from .workspace_helper import WorkSpaceHelper
+try:  # 纯文件装载的测试宿主 / 裁剪环境可能没有贴图计划模块：退化为旧「立即复制」
+    from .texture_export_plan import TextureExportPlan
+except Exception:  # pragma: no cover
+    TextureExportPlan = None
 from ..blueprint.export_helper import BlueprintExportHelper
 from ..utils.log_utils import LOG
 
@@ -404,6 +408,33 @@ class M_IniHelper:
 
 
 
+                    # 贴图计划（落盘前联合去重）：先登记得到最终文件名，文件落盘推迟到
+                    # 导出收尾的 TextureExportPlan.finalize()；未启用时保持原「立即复制」。
+                    planned_texture_handled = False
+                    if TextureExportPlan is not None and TextureExportPlan.enabled():
+                        planned_filename = TextureExportPlan.register(
+                            original_texture_file_path,
+                            texture_output_folder,
+                            hash_style_texture_filename,
+                            owner=TextureExportPlan.OWNER_BASE,
+                            owner_label="基础导出",
+                        )
+                        if planned_filename:
+                            if planned_filename != hash_style_texture_filename:
+                                print(
+                                    "M_IniHelper: Hash 贴图按去重结果复用 "
+                                    + hash_style_texture_filename
+                                    + " -> "
+                                    + planned_filename
+                                )
+                            hash_style_texture_filename = planned_filename
+                            planned_texture_handled = True
+                        else:
+                            print(
+                                "M_IniHelper: 贴图计划登记失败，回退立即复制: "
+                                + original_texture_file_path
+                            )
+
                     target_texture_file_path = GlobalConfig.path_generatemod_texture_folder(draw_ib=draw_ib) + hash_style_texture_filename
                     print("M_IniHelper: Hash 贴图目标路径: " + target_texture_file_path)
                     
@@ -426,12 +457,13 @@ class M_IniHelper:
                         ini_builder.append_section(resource_and_textureoverride_texture_section)
 
                     # copy only if target not exists avoid overwrite texture manually replaced by mod author.
-                    if not os.path.exists(target_texture_file_path):
-                        print("M_IniHelper: 开始复制 Hash 贴图文件: " + original_texture_file_path + " -> " + target_texture_file_path)
-                        shutil.copy2(original_texture_file_path,target_texture_file_path)
-                        print("M_IniHelper: 已复制 Hash 贴图文件: " + target_texture_file_path)
-                    else:
-                        print("M_IniHelper: Hash 贴图目标已存在，跳过复制: " + target_texture_file_path)
+                    if not planned_texture_handled:
+                        if not os.path.exists(target_texture_file_path):
+                            print("M_IniHelper: 开始复制 Hash 贴图文件: " + original_texture_file_path + " -> " + target_texture_file_path)
+                            shutil.copy2(original_texture_file_path,target_texture_file_path)
+                            print("M_IniHelper: 已复制 Hash 贴图文件: " + target_texture_file_path)
+                        else:
+                            print("M_IniHelper: Hash 贴图目标已存在，跳过复制: " + target_texture_file_path)
 
             # NTEMI 复用 WWMI 导出链路，这里同样需要保留全局 Hash 贴图风格。
             if GlobalConfig.logic_name not in (LogicName.WWMI, LogicName.NTEMI):
@@ -519,7 +551,21 @@ class M_IniHelper:
                             hash_style_texture_filename = hash_style_texture_filename + "." + texture_markup_info.mark_filename.split(".")[1]
 
                         target_texture_file_path = GlobalConfig.path_generatemod_texture_folder(draw_ib=draw_ib) + hash_style_texture_filename
-                        if not os.path.exists(target_texture_file_path):
+                        # 贴图计划（落盘前联合去重）：SameSlot 贴图的 ini 由本方法自己写，
+                        # 可以跟随去重结果改名；未启用时保持原「立即复制」。
+                        if TextureExportPlan is not None and TextureExportPlan.enabled():
+                            planned_filename = TextureExportPlan.register(
+                                original_texture_file_path,
+                                GlobalConfig.path_generatemod_texture_folder(draw_ib=draw_ib),
+                                hash_style_texture_filename,
+                                owner=TextureExportPlan.OWNER_BASE,
+                                owner_label="基础导出",
+                            )
+                            if planned_filename:
+                                hash_style_texture_filename = planned_filename
+                            elif not os.path.exists(target_texture_file_path):
+                                shutil.copy2(original_texture_file_path, target_texture_file_path)
+                        elif not os.path.exists(target_texture_file_path):
                             shutil.copy2(original_texture_file_path, target_texture_file_path)
 
                         hash_filename_cache[texture_markup_info.mark_hash] = hash_style_texture_filename
@@ -546,8 +592,32 @@ class M_IniHelper:
         if GlobalProterties.forbid_auto_texture_ini():
             return
 
+        # 贴图计划（落盘前联合去重）：Slot 文件名被各游戏后端的
+        # ``add_resource_texture_sections`` 写死进 ini 的 filename 行、不能跟随去重改名，
+        # 所以用 preferred_filename 固定文件名登记到计划，统一在 finalize 落盘一次。
+        # 这样「基础导出先复制 → 材质转资源pro 清除时删掉 → 收尾又复制」的中间落盘、
+        # 重复落盘就不会再发生（用户要求：算完之前不落盘，只最后写一次）。
+        try:
+            from .texture_export_plan import TextureExportPlan
+        except Exception:
+            TextureExportPlan = None
+
         marked_slot_count = cls._count_marked_textures(draw_ib_model, mark_type="Slot")
         print("M_IniHelper: 开始复制 Slot 贴图，DrawIB: " + draw_ib_model.draw_ib + "，标记数量: " + str(marked_slot_count))
+
+        # Prepare features in workers before serial registration fixes names and
+        # representatives. Keep the existing registration order and Slot names.
+        prewarm = getattr(TextureExportPlan, 'prewarm_sources', None)
+        if prewarm is not None and TextureExportPlan.enabled():
+            sources = []
+            for submesh in getattr(draw_ib_model, 'submesh_model_list', []):
+                part_name = draw_ib_model.get_submesh_part_name(submesh) or submesh.unique_str
+                for info in draw_ib_model.get_submesh_texture_markup_info_list(submesh) or ():
+                    if info.mark_type == 'Slot':
+                        source = cls._get_slot_texture_source_path(draw_ib_model, part_name, info)
+                        if source:
+                            sources.append(source)
+            prewarm(sources)
 
         for submesh_model in getattr(draw_ib_model, "submesh_model_list", []):
             texture_markup_info_list = draw_ib_model.get_submesh_texture_markup_info_list(submesh_model)
@@ -575,6 +645,26 @@ class M_IniHelper:
                 )
                 
                 # only overwrite when there is no texture file exists.
+                # 注意：Slot 风格的文件名被各游戏后端的 add_resource_texture_sections 写死进
+                # ini 的 ``filename`` 行（texture_markup_info.mark_filename），不能跟随联合
+                # 去重改名；这里用 preferred_filename 固定名字登记到计划，落盘统一在
+                # finalize 做（不再立即 copy2）。
+                if TextureExportPlan is not None and TextureExportPlan.enabled():
+                    if source_path == "":
+                        print("Skip missing texture file: " + texture_markup_info.mark_filename)
+                        continue
+                    planned = TextureExportPlan.register(
+                        source_path,
+                        texture_output_folder,
+                        texture_markup_info.mark_filename,
+                        owner=TextureExportPlan.OWNER_BASE,
+                        owner_label="M_IniHelper.Slot",
+                        spec=("copy",),
+                        overwrite_policy="skip",
+                    )
+                    if planned:
+                        print("M_IniHelper: Slot 贴图已登记计划（延迟到最终落盘）: " + planned)
+                        continue
                 if not os.path.exists(target_path):
                     if source_path == "":
                         print("Skip missing texture file: " + texture_markup_info.mark_filename)

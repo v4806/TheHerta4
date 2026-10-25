@@ -42,6 +42,10 @@ from ..blueprint.export_background import (
 from ..blueprint.sync import refresh_blueprint_sync_state
 from ..common.global_properties import GlobalProterties
 from ..common.logic_name import LogicName
+try:  # 纯文件装载的测试宿主可能没有贴图计划模块：退化为旧「先落盘再删除」流程
+    from ..common.texture_export_plan import TextureExportPlan
+except ImportError:  # pragma: no cover
+    TextureExportPlan = None
 
 
 def _raise_for_unknown_logic_name() -> None:
@@ -1156,6 +1160,10 @@ class SSMTGenerateModBlueprint(_BackgroundExportMixin, bpy.types.Operator):
         BlueprintExportHelper.reset_direct_export_runtime_state(clear_postprocess_caches=True)
         # 导出开始：清空上一次导出残留的 ini 段登记，条件后处理节点只应看到本次导出的段。
         _clear_export_section_registry()
+        # 贴图计划：按本蓝图「资源合并」节点的开关初始化（导出期间跨轮次累积，
+        # 由资源合并节点 / 本流程收尾统一落盘）。
+        if TextureExportPlan is not None:
+            TextureExportPlan.configure_from_tree(tree, GlobalConfig.path_generate_mod_folder())
         TimerUtils.end_stage("蓝图验证")
 
         LOG.start_collecting()
@@ -1346,6 +1354,10 @@ class SSMTGenerateModBlueprint(_BackgroundExportMixin, bpy.types.Operator):
                     ]
                 )
             blueprint_model.execute_postprocess_nodes(mod_export_path)
+            # 贴图计划兜底落盘：蓝图里没有「资源合并」节点（或它被禁用）时也要把贴图盘出来；
+            # 资源合并节点已在自身开头落盘，这里幂等，没有待落盘项时什么都不做。
+            if TextureExportPlan is not None:
+                TextureExportPlan.finalize(mod_export_path)
             TimerUtils.end_stage("后处理节点")
             self._validate_generated_ini_variables(mod_export_path)
             export_success = True
@@ -1661,6 +1673,12 @@ class SSMTQuickExportSelected(_BackgroundExportMixin, bpy.types.Operator):
             for obj in selected_meshes:
                 LOG.info(f"   - {self._safe_object_name(obj)}")
             temp_tree = self._build_temp_blueprint_tree(selected_meshes)
+            # 临时树只有 Object Info / Group / Output，不含后处理节点：贴图计划必定关闭。
+            # 仍然显式初始化一次，清掉上一次导出可能残留的计划状态。
+            if TextureExportPlan is not None:
+                TextureExportPlan.configure_from_tree(
+                    temp_tree, GlobalConfig.path_generate_mod_folder()
+                )
 
             round_plan = dict(QUICK_EXPORT_ROUND_PLAN)
 

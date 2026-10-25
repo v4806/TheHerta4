@@ -17,6 +17,17 @@ class SSMTNode_PostProcess_ResourceMerge(SSMTNode_PostProcess_Base):
     bl_label = '资源合并'
     bl_description = '通过计算DDS贴图内容的MD5哈希值，自动合并内容相同的资源引用并删除重复的DDS贴图'
 
+    pre_plan_dedup: bpy.props.BoolProperty(
+        name="落盘前联合去重",
+        description=(
+            "开启后，基础导出与「材质转资源pro」的贴图不再各自落盘：先登记成贴图计划，"
+            "由本节点的 MD5 / 像素级 / 相似度判定统一去重，导出收尾只落盘真正需要的那一份，"
+            "不再出现「先生成、再被删掉」的重复文件。"
+            "关闭则回到旧流程：各模块先落盘，再由本节点扫描删除重复文件"
+        ),
+        default=True,
+    )
+
     use_pixel_dedup: bpy.props.BoolProperty(
         name="像素级去重",
         description="开启后除MD5外还会解码DDS像素内容进行比对：像素完全相同的贴图（即使文件格式/编码不同）也判定为重复并合并删除。BC6H等暂不支持的格式自动跳过",
@@ -45,6 +56,12 @@ class SSMTNode_PostProcess_ResourceMerge(SSMTNode_PostProcess_Base):
     )  # type: ignore
 
     def draw_buttons(self, context, layout):
+        layout.prop(self, "pre_plan_dedup", icon='SEQUENCE')
+        if getattr(self, "pre_plan_dedup", False):
+            layout.label(text="贴图先登记、联合去重后只落盘一次", icon='INFO')
+        else:
+            layout.label(text="已关闭：回到「先落盘再删除」的旧流程", icon='INFO')
+        layout.separator()
         layout.label(text="计算DDS贴图文件MD5哈希值", icon='FILE_CACHE')
         layout.label(text="合并内容相同的DDS资源引用")
         layout.label(text="自动删除重复的DDS贴图文件")
@@ -65,6 +82,18 @@ class SSMTNode_PostProcess_ResourceMerge(SSMTNode_PostProcess_Base):
             layout.label(text="清理未被 ini 引用的孤儿 .dds", icon='INFO')
         layout.separator()
         layout.label(text="执行前会自动备份ini文件", icon='BACK')
+
+    @staticmethod
+    def _is_plan_managed(file_path):
+        """该文件是否已由「贴图落盘计划」联合去重（计划内文件不再二次去重）。"""
+        try:
+            from ..common.texture_export_plan import TextureExportPlan
+
+            if not TextureExportPlan.enabled():
+                return False
+            return bool(TextureExportPlan.manages_file(file_path))
+        except Exception:
+            return False
 
     def compute_file_hash(self, file_path, block_size=65536):
         if not os.path.exists(file_path):
@@ -191,6 +220,21 @@ class SSMTNode_PostProcess_ResourceMerge(SSMTNode_PostProcess_Base):
         print(f"[ResourceMerge] 开始执行，Mod导出路径: {mod_export_path}")
         print(f"[ResourceMerge] 路径是否存在: {os.path.exists(mod_export_path)}")
 
+        # 贴图计划收尾：先把握着的贴图落盘（去重决策已在登记时逐项完成），
+        # 再按原有逻辑扫描 ini 去重——计划内的文件此时已是最终集，扫描只会兜底
+        # 处理其它贴图节点（PS绑定 / 物体贴图 / 纯贴图 / 动画驱动…）的产物。
+        try:
+            from ..common.texture_export_plan import TextureExportPlan
+
+            if TextureExportPlan.enabled() and TextureExportPlan.has_pending():
+                plan_stats = TextureExportPlan.finalize(mod_export_path)
+                print(
+                    "[ResourceMerge] 贴图计划落盘完成: "
+                    + " ".join(f"{key}={value}" for key, value in plan_stats.items())
+                )
+        except Exception as exc:
+            print(f"[ResourceMerge] 贴图计划落盘失败（继续原有去重）: {exc}")
+
         ini_files = glob.glob(os.path.join(mod_export_path, "*.ini"))
         print(f"[ResourceMerge] 找到 {len(ini_files)} 个ini文件: {ini_files}")
         if not ini_files:
@@ -241,6 +285,12 @@ class SSMTNode_PostProcess_ResourceMerge(SSMTNode_PostProcess_Base):
             entry["_norm_path"] = os.path.normcase(os.path.realpath(file_path))
             if not os.path.isfile(file_path):
                 print(f"[ResourceMerge] 跳过 {section_name}: 文件不存在 {file_path}")
+                continue
+
+            if self._is_plan_managed(file_path):
+                # 计划内文件已在落盘前做过联合去重（含「同一切换组不合并」保护）。
+                # 再按相似度合并一次会把脸妆等刻意变体并掉，实机表现为切档显示同一张图。
+                print(f"[ResourceMerge] 跳过计划内文件（已联合去重）: {filename}")
                 continue
 
             file_hash = self.compute_file_hash(file_path)
