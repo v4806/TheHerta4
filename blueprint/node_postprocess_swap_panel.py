@@ -19,6 +19,7 @@ import glob
 import re
 import shutil
 import tempfile
+import time
 import uuid
 from collections import OrderedDict
 
@@ -748,10 +749,331 @@ def _combined_panel_preview_from_settings(node):
         return output
 
 
+def _panel_runtime_parse_globals(ini_text):
+    """解析 [Constants] 里的数值全局变量（不含表达式）。"""
+    values = {}
+    for match in re.finditer(
+        r"^\s*global(?:\s+persist)?\s+\$([A-Za-z_]\w*)\s*=\s*"
+        r"([-+]?(?:\d+(?:\.\d*)?|\.\d+))\s*$", ini_text, re.MULTILINE):
+        values[match.group(1)] = float(match.group(2))
+    return values
+
+
+def _panel_runtime_parse_resources(ini_text):
+    """解析 [Resource...] → ./res/xxx.png 的文件名映射。"""
+    mapping = {}
+    current = None
+    for line in ini_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            current = stripped[1:-1]
+            continue
+        if current and current.startswith("Resource") and stripped.lower().startswith("filename"):
+            value = stripped.split("=", 1)[1].strip().strip('"').replace("\\", "/")
+            if value:
+                if value.startswith("./res/"):
+                    value = value[len("./res/"):]
+                mapping[current] = value
+            current = None
+    return mapping
+
+
+def _panel_runtime_source_ini(node, slider_node):
+    """找一份可作临时导出底稿的 mod ini（面板段落已存在）。"""
+    candidates = []
+
+    def add(path):
+        path = (path or "").strip()
+        if path and os.path.isfile(path) and path not in candidates:
+            candidates.append(path)
+
+    add(getattr(node, "last_mod_ini_path", ""))
+    add(getattr(slider_node, "last_mod_ini_path", ""))
+    try:
+        from ..common.global_config import GlobalConfig
+
+        generate_dir = (GlobalConfig.path_generate_mod_folder() or "").strip()
+        root = os.path.dirname(os.path.normpath(generate_dir)) if generate_dir else ""
+        if root and os.path.isdir(root):
+            found = []
+            for current, dirs, files in os.walk(root):
+                depth = current[len(root):].count(os.sep)
+                if depth >= 2:
+                    dirs[:] = []
+                for name in files:
+                    if name.lower().endswith(".ini"):
+                        found.append(os.path.join(current, name))
+            found.sort(key=lambda item: os.path.getmtime(item), reverse=True)
+            for path in found:
+                add(path)
+    except Exception:
+        pass
+
+    namespace = ""
+    try:
+        namespace = str(node._ensure_namespace() or "")
+    except Exception:
+        namespace = str(getattr(node, "namespace", "") or "")
+
+    preferred = []
+    fallback = []
+    for path in candidates:
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                text = handle.read()
+        except OSError:
+            continue
+        if namespace and f"${namespace}_btn_w1" in text:
+            preferred.append(path)
+        elif "SSMTSwapPanel" in text or "SLIDER PANEL CUSTOM LOGIC" in text:
+            fallback.append(path)
+    return (preferred or fallback or candidates or [None])[0]
+
+
+def _panel_runtime_button_ns(ini_text):
+    match = re.search(r"^\s*global\s+\$(\w+)_btn_w1\s*=", ini_text, re.MULTILINE)
+    return match.group(1) if match else ""
+
+
+def _panel_runtime_slider_params(slider_node, values):
+    """按导出顺序还原每个滑块的默认参数（游戏加载时的初始位置）。"""
+    names = []
+    try:
+        collected = slider_node._collect_slider_freq_params()
+        freq_params = collected[0] if isinstance(collected, tuple) else collected
+        names = sorted(str(name) for name in (freq_params or []))
+    except Exception:
+        names = []
+    try:
+        from ..common.shapekey_weight_range import (
+            SLIDER_WINDOW_MIN,
+            SLIDER_WINDOW_MAX,
+            is_identity_window,
+            normalize_window,
+        )
+
+        window_min, window_max = normalize_window(
+            getattr(slider_node, "weight_min", SLIDER_WINDOW_MIN),
+            getattr(slider_node, "weight_max", SLIDER_WINDOW_MAX),
+        )
+        identity = is_identity_window(window_min, window_max)
+    except Exception:
+        window_min, window_max, identity = 0.0, 1.0, True
+
+    params = []
+    for index, name in enumerate(names):
+        freq = values.get(str(name).lstrip("$"), 0.0)
+        if identity:
+            param = freq
+        else:
+            param = (freq - window_min) / (window_max - window_min) if window_max > window_min else 0.0
+        params.append(param)
+    return params
+
+
+def _render_panel_runtime_image(node, ini_path, res_dir):
+    """按运行时几何 + 真实导出贴图合成面板（等同 3DMigoto 的 draw_2d 绘制顺序）。"""
+    with open(ini_path, "r", encoding="utf-8", errors="replace") as handle:
+        ini_text = handle.read()
+    values = _panel_runtime_parse_globals(ini_text)
+    resources = _panel_runtime_parse_resources(ini_text)
+
+    base_w0 = values.get("base_width0")
+    base_h0 = values.get("base_height0")
+    if not base_w0 or not base_h0:
+        return None
+    zoom0 = values.get("zoom0", 1.0) or 1.0
+    norm_w0, norm_h0 = base_w0 * zoom0, base_h0 * zoom0
+    img0_x = values.get("img0_x") or 0.0
+    img0_y = values.get("img0_y") or 0.0
+    if not img0_x and not img0_y:
+        img0_x = values.get("set_x0", 0.5) * (1.0 - norm_w0)
+        img0_y = values.get("set_y0", 0.5) * (1.0 - norm_h0)
+
+    def load(resource_name):
+        filename = resources.get(resource_name)
+        if not filename:
+            return None
+        path = os.path.join(res_dir, filename.replace("/", os.sep))
+        return path if os.path.isfile(path) else None
+
+    background_path = load("ResourceImageToRender0")
+    if not background_path:
+        return None
+    with PILImage.open(background_path) as source:
+        panel = source.convert("RGBA").copy()
+    canvas_w, canvas_h = panel.size
+    scale_x, scale_y = canvas_w / max(norm_w0, 1e-8), canvas_h / max(norm_h0, 1e-8)
+
+    def draw(resource_name, x, y, width, height):
+        if width <= 0 or height <= 0:
+            return
+        path = load(resource_name)
+        if not path:
+            return
+        try:
+            with PILImage.open(path) as source:
+                image = source.convert("RGBA")
+        except Exception:
+            return
+        target_w = max(1, int(round(width * scale_x)))
+        target_h = max(1, int(round(height * scale_y)))
+        upscale = max(target_w / max(1, image.width), target_h / max(1, image.height))
+        method = PILImage.NEAREST if upscale >= 1.0 else getattr(PILImage, "Resampling", PILImage).LANCZOS
+        image = image.resize((target_w, target_h), method)
+        dest_x = int(round((x - img0_x) * scale_x))
+        dest_y = int(round((y - img0_y) * scale_y))
+        crop_x, crop_y = max(0, -dest_x), max(0, -dest_y)
+        crop_right = max(0, dest_x + target_w - canvas_w)
+        crop_bottom = max(0, dest_y + target_h - canvas_h)
+        if crop_x or crop_y or crop_right or crop_bottom:
+            image = image.crop((crop_x, crop_y, target_w - crop_right, target_h - crop_bottom))
+            dest_x += crop_x
+            dest_y += crop_y
+        if image.width <= 0 or image.height <= 0:
+            return
+        layer = PILImage.new("RGBA", panel.size, (0, 0, 0, 0))
+        layer.alpha_composite(image, (dest_x, dest_y))
+        panel.alpha_composite(layer)
+
+    # ---- 滑块面板（与 shapekey_ext 的 Present 绘制顺序一致）----
+    slider_count = 0
+    while f"base_width{slider_count + 1}" in values and f"base_height{slider_count + 1}" in values:
+        slider_count += 1
+    params = _panel_runtime_slider_params(node._find_shape_ext_node(), values)
+    slider_geo = []
+    for index in range(1, slider_count + 1):
+        norm_w = values[f"base_width{index}"] * (values.get(f"zoom{index}", 1.0) or 1.0)
+        norm_h = values[f"base_height{index}"] * (values.get(f"zoom{index}", 1.0) or 1.0)
+        label_w = values.get(f"btn_width{index}", 0.0)
+        label_h = values.get(f"btn_height{index}", norm_h)
+        min_rel_x = label_w + 0.02
+        max_rel_x = norm_w0 * 0.95 - norm_w
+        span = max_rel_x - min_rel_x
+        param = params[index - 1] if index - 1 < len(params) else 0.0
+        rel_x = min(max(min_rel_x + param * span, min_rel_x), max_rel_x) if span > 0 else min_rel_x
+        rel_y = values.get(f"fixed_rel_y{index}", 0.5) * norm_h0 - norm_h / 2.0
+        img_x, img_y = img0_x + rel_x, img0_y + rel_y
+        slider_geo.append({
+            "index": index,
+            "img": (img_x, img_y, norm_w, norm_h),
+            "label": (
+                img0_x + min_rel_x - label_w - 0.01,
+                img_y + (norm_h - label_h) * 0.5,
+                label_w,
+                label_h,
+            ),
+            "left_bar": (img0_x + min_rel_x, img_y + norm_h * 0.25,
+                         (img_x + norm_w * 0.5) - (img0_x + min_rel_x), norm_h * 0.5),
+            "right_bar": (img_x + norm_w * 0.5, img_y + norm_h * 0.25,
+                          (img0_x + norm_w0 * 0.95) - (img_x + norm_w * 0.5), norm_h * 0.5),
+        })
+    for geo in slider_geo:
+        draw("ResourceLeftBar", *geo["left_bar"])
+        draw("ResourceRightBar", *geo["right_bar"])
+    for geo in slider_geo:
+        draw(f"ResourcePlayPauseButton{geo['index']}", *geo["label"])
+    for geo in slider_geo:
+        draw("ResourceSliderHandle", *geo["img"])
+
+    # ---- 切换按钮（组合面板附加块：集成在上方/下方）----
+    namespace = ""
+    try:
+        namespace = str(node._ensure_namespace() or "")
+    except Exception:
+        namespace = ""
+    if not namespace:
+        namespace = _panel_runtime_button_ns(ini_text)
+    button_count = 0
+    if namespace:
+        while f"{namespace}_btn_w{button_count + 1}" in values:
+            button_count += 1
+    if namespace and button_count:
+        per_row = max(1, min(int(getattr(node, "buttons_per_row", 4) or 4), button_count))
+        column_gap = float(getattr(node, "button_column_spacing", 0.02) or 0.0)
+        row_gap = float(getattr(node, "button_row_spacing", 0.02) or 0.0)
+        top_padding = float(getattr(node, "button_top_padding", 0.0) or 0.0)
+        widths = [values[f"{namespace}_btn_w{i}"] for i in range(1, button_count + 1)]
+        heights = [values.get(f"{namespace}_btn_h{i}", float(node.button_height)) for i in range(1, button_count + 1)]
+        rows = int(math.ceil(button_count / float(per_row)))
+        col_widths = [0.0] * per_row
+        for index, width in enumerate(widths):
+            col_widths[index % per_row] = max(col_widths[index % per_row], width)
+        col_offsets = []
+        cursor = 0.02
+        for width in col_widths:
+            col_offsets.append(cursor)
+            cursor += width + column_gap
+        render_h = heights[0] * zoom0
+        for index in range(button_count):
+            row, col = divmod(index, per_row)
+            offset = col_offsets[col] + (col_widths[col] - widths[index]) * 0.5
+            bx = img0_x + offset * zoom0
+            if getattr(node, "panel_mode", "") == "INTEGRATED_TOP":
+                by = img0_y + top_padding * zoom0 + row * (render_h + row_gap * zoom0)
+            else:
+                by = (img0_y + norm_h0 - rows * (render_h + row_gap * zoom0)
+                      + row * (render_h + row_gap * zoom0))
+            draw(f"ResourceSwapButton{index + 1}_{namespace}", bx, by,
+                 widths[index] * zoom0, heights[index] * zoom0)
+
+    margin = 24
+    output = PILImage.new("RGBA", (canvas_w + margin * 2, canvas_h + margin * 2), (30, 30, 30, 255))
+    output.alpha_composite(panel, (margin, margin))
+    return output
+
+
+def _combined_panel_preview_runtime(node):
+    """按 Mod 运行时数据生成预览：临时目录里真实跑一遍面板导出，再按 shader 绘制顺序合成。"""
+    if not PIL_AVAILABLE or node.panel_mode not in {"INTEGRATED_TOP", "INTEGRATED_BOTTOM"}:
+        return None
+    slider_node = node._find_shape_ext_node()
+    if slider_node is None or not bool(getattr(node, "slider_use_slider_panel", False)):
+        return None
+    source_ini = _panel_runtime_source_ini(node, slider_node)
+    if not source_ini:
+        return None
+    source_res = os.path.join(os.path.dirname(source_ini), "res")
+    if not os.path.isdir(source_res):
+        return None
+
+    saved_paths = []
+    for target in (node, slider_node):
+        saved_paths.append((target, getattr(target, "last_mod_ini_path", "")))
+    temp_root = tempfile.mkdtemp(prefix="ssmt_panel_runtime_preview_")
+    try:
+        temp_ini = os.path.join(temp_root, os.path.basename(source_ini))
+        shutil.copy2(source_ini, temp_ini)
+        shutil.copytree(source_res, os.path.join(temp_root, "res"))
+        slider_node._sync_combined_slider_config()
+        if not slider_node.execute_postprocess(temp_root, _in_place=True, _ini_path=temp_ini, _skip_backup=True):
+            return None
+        if not node.execute_postprocess(temp_root, _in_place=True, _ini_path=temp_ini, _skip_backup=True):
+            return None
+        image = _render_panel_runtime_image(node, temp_ini, os.path.join(temp_root, "res"))
+        if image is None:
+            return None
+        output = os.path.join(tempfile.gettempdir(), "ssmt_combined_panel_preview.png")
+        try:
+            image.convert("RGB").save(output)
+        except OSError:
+            output = os.path.join(tempfile.gettempdir(),
+                                  f"ssmt_combined_panel_preview_{int(time.time())}.png")
+            image.convert("RGB").save(output)
+        return output
+    finally:
+        for target, path in saved_paths:
+            try:
+                target.last_mod_ini_path = path
+            except Exception:
+                pass
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
 class SSMT_OT_CombinedPanel_Preview(bpy.types.Operator):
     bl_idname = "ssmt.combined_panel_preview"
     bl_label = "预览最终面板"
-    bl_description = "按当前切换与滑块设置生成面板效果预览图"
+    bl_description = "按 Mod 运行时数据生成面板效果预览图（临时导出面板后按游戏 shader 绘制顺序合成）"
     bl_options = {'REGISTER'}
     node_name: bpy.props.StringProperty()
 
@@ -764,14 +1086,14 @@ class SSMT_OT_CombinedPanel_Preview(bpy.types.Operator):
         try:
             if not PIL_AVAILABLE:
                 raise RuntimeError("预览需要 Pillow，当前环境未安装")
-            # Always prefer the current node's settings. An older exported INI
-            # can contain a different button set and must not masquerade as the
-            # preview of the current configuration.
-            preview_path = (_combined_panel_preview_from_settings(node)
+            # 优先：用插件内置导出组件在临时目录真实生成面板（与游戏运行时同资源/
+            # 同几何/同绘制顺序），旧的手绘/设置近似路径只作兜底。
+            preview_path = (_combined_panel_preview_runtime(node)
+                            or _combined_panel_preview_from_settings(node)
                             or _combined_panel_preview_image(node)
                             or _combined_panel_preview_from_export(node))
             bpy.ops.wm.path_open(filepath=preview_path)
-            self.report({'INFO'}, "已生成当前设置的面板预览图")
+            self.report({'INFO'}, "已按 Mod 运行时数据生成面板预览图")
             return {'FINISHED'}
         except Exception as error:
             self.report({'ERROR'}, f"生成预览失败：{error}")
