@@ -54,3 +54,5 @@ _verify/
 # 其中 family_x.py 与已就位的 common/himi_family_x.py 逐字节相同。
 # 需要留档某一份时用 git add -f 单独强加）
 notes/
+
+Microsoft/
