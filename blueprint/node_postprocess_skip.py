@@ -14,6 +14,10 @@
    （``common/export_section_registry``）—— 因此链上后面的「条件判断」节点
    能圈到新段，把 ``handling = skip`` 包进 ``if``：条件不通过时跳过失效，
    效果等同删掉跳过段。
+5. 节点上的**手动哈希**区（英文输入框 ``Hash`` / ``IndexCount`` / ``FirstIndex``
+   + 「添加」按钮 + 下方列表）不依赖物体列表：添加进列表的条目同样按条目追加
+   跳过段并登记。它主要用来跳过**没有导入 Blender** 的 IB（见下节），与选中
+   部件可以同时使用。
 
 无导出段的 IB（游戏原生绘制）
 --------------------------------
@@ -23,7 +27,32 @@
 被跳过（没有段可删，删除步骤为 0 段）。有导出段的 IB 仍走「先删段、再追加」，
 删除范围**仍按 draw_ib 集合**（不变）。
 
-跳过段形状（**优先用完整三元组**，来自物体名前缀，hash 统一小写）::
+手动哈希（没有导入 Blender 的 IB）
+----------------------------------
+「手动哈希」区有三行输入框：``Hash`` / ``IndexCount`` / ``FirstIndex``。填好后点
+「添加」把这一条加进下方列表（列表行内 X 可删除）。它不依赖物体列表，用来给
+**没有导入 Blender** 的绘制创建跳过——这类 IB 在本次导出里没有段，删除步骤自然
+为 0，只追加 ``handling = skip`` 段：
+
+- 只填 ``Hash``（后两行留空）：只 hash 跳过段，匹配该 IB 的全部绘制；
+- 三行都填：完整三段跳过段（``match_first_index = FirstIndex``、
+  ``match_index_count = IndexCount``）。
+
+``Hash`` 是 8 位十六进制（大小写不限，可带 ``0x`` 前缀）；``IndexCount`` /
+``FirstIndex`` 必须是非负整数（``IndexCount`` 还要大于 0），且**要么都填、要么
+都留空**——只填一项或填非数字时「添加」会被拒绝。添加时按
+``(hash, indexCount, firstIndex)`` 去重，重复条目不会重复加入。
+
+列表条目与选中物体**可以同时使用**：两边的条目按
+``(hash, indexCount, firstIndex)`` 去重后统一追加进同一个 SKIP 块。
+
+手动哈希在导出段登记里查得到段时（用户填的哈希**恰好**也属于本次导出的某个
+IB），这些段仍按节点语义先删除、再追加跳过段，避免同一 hash 上同时存在正常
+绘制段与跳过段；查不到（正常情况：该 IB 没有导入 Blender）时删除步骤为 0。
+手动哈希不依赖 ``BlueprintExportHelper.get_current_blueprint_model()``：导出模型
+不可用时选中部件不处理，但手动哈希的跳过段仍会照常追加。
+
+跳过段形状（**优先用完整三元组**，来自物体名前缀或手动哈希，hash 统一小写）::
 
     ; --- AUTO-APPENDED SKIP BLOCK ---
     ; skip <hash>_<indexCount>_<firstIndex>
@@ -36,10 +65,12 @@
 **为什么要三段**：只写 ``hash`` 的跳过段在部分游戏里不生效（同一 IB hash 被
 多次绘制、或需要按 index 区间区分绘制批次），必须同时匹配 ``match_first_index``
 与 ``match_index_count`` 才能稳定跳过。三元组来自物体名前缀
-（``LOD0.999bff94-6462-17946.前发`` -> ``999bff94`` / ``6462`` / ``17946``），
-解析实现见 :func:`_parse_part_draw`。
+（``LOD0.999bff94-6462-17946.前发`` -> ``999bff94`` / ``6462`` / ``17946``）或
+手动哈希列表（``Hash = 999bff94`` / ``IndexCount = 6462`` / ``FirstIndex = 17946``），
+解析实现见 :func:`_parse_part_draw` / :func:`_normalize_manual_hash_item`。
 
-物体名解析不出三段时（例如老工程里的 ``Body_copy``）**回退为只 hash 的旧形式**::
+物体名解析不出三段时（例如老工程里的 ``Body_copy``）或手动条目只填了 ``Hash``
+时**回退为只 hash 的旧形式**::
 
     ; skip <hash>
     [TextureOverride_IB_<hash>]
@@ -115,6 +146,13 @@ _PART_LOD_PREFIX_RE = re.compile(r"^LOD\d+[.]", re.IGNORECASE)
 _PART_HASH_PREFIX_RE = re.compile(r"^[0-9a-fA-F]{8}")
 _PART_HASH_FALLBACK_RE = re.compile(r"(?<![0-9a-fA-F])([0-9a-fA-F]{8})(?=[-_.]|$)")
 
+#: 手动哈希输入框里的合法哈希值：8 位十六进制（大小写不限，调用方先剥 ``0x``）。
+_MANUAL_HASH_VALUE_RE = re.compile(r"^[0-9a-fA-F]{8}$")
+
+#: 不参与跳过删除的段名前缀（小写比较）：资源声明段与条件判断节点的检测段
+#: （与 ``node_postprocess_condition._EXCLUDED_SECTION_PREFIXES`` 同口径，改动要同步）。
+_EXCLUDED_SECTION_PREFIXES = ("resource", "textureoverridecheckhash")
+
 
 # --------------------------------------------------------------------------- #
 # 纯函数（不依赖 bpy，便于 headless 测试）
@@ -176,6 +214,118 @@ def _parse_part_hash(name):
         return match.group(0).lower()
     fallback = _PART_HASH_FALLBACK_RE.search(value)
     return fallback.group(1).lower() if fallback else ""
+
+
+def _normalize_manual_hash_item(hash_text, index_count_text="", first_index_text=""):
+    """校验一条手动哈希输入，返回 ``(entry, error)``。
+
+    成功时 ``entry`` 是 ``(hash, index_count|None, first_index|None)``（hash 统一
+    小写；``index_count`` / ``first_index`` 为 ``None`` 表示只 hash 条目），``error``
+    为空串；失败时 ``entry`` 为 ``None``，``error`` 是给用户看的中文原因。
+
+    规则（与节点三行输入框一一对应）::
+
+        Hash       8 位十六进制，大小写不限，可带 ``0x`` / ``0X`` 前缀
+        IndexCount 可选；填了就必须是大于 0 的十进制整数
+        FirstIndex 可选；填了就必须是非负十进制整数
+        IndexCount / FirstIndex 要么都填、要么都留空（只填一项算无效条目）
+
+    样例::
+
+        >>> _normalize_manual_hash_item("0X7FBBCF0D")
+        (('7fbbcf0d', None, None), '')
+        >>> _normalize_manual_hash_item("999bff94", "1260", "9402")
+        (('999bff94', 1260, 9402), '')
+        >>> _normalize_manual_hash_item("999bff94", "1260")
+        (None, 'IndexCount 与 FirstIndex 要么都填、要么都留空')
+    """
+    raw_hash = str(hash_text or "").strip()
+    if not raw_hash:
+        return None, "Hash 不能为空"
+    if raw_hash[:2].lower() == "0x":
+        raw_hash = raw_hash[2:].strip()
+    if not _MANUAL_HASH_VALUE_RE.match(raw_hash):
+        return None, "Hash 必须是 8 位十六进制"
+
+    count_text = str(index_count_text or "").strip()
+    first_text = str(first_index_text or "").strip()
+    if not count_text and not first_text:
+        return (raw_hash.lower(), None, None), ""
+    if not count_text or not first_text:
+        return None, "IndexCount 与 FirstIndex 要么都填、要么都留空"
+    if not count_text.isdigit() or not first_text.isdigit():
+        return None, "IndexCount 与 FirstIndex 必须是非负十进制整数"
+    index_count = int(count_text)
+    first_index = int(first_text)
+    if index_count <= 0:
+        return None, "IndexCount 必须大于 0"
+    return (raw_hash.lower(), index_count, first_index), ""
+
+
+def _collect_manual_hash_entries(items):
+    """把节点上的手动哈希列表整理成跳过条目，返回 ``(entries, invalid)``。
+
+    ``entries`` 为去重后的 ``[(hash, index_count|None, first_index|None)]``（保序）；
+    ``invalid`` 为 ``[(位置, 原始哈希文本, 原因)]``（位置从 1 开始），由调用方提示
+    用户——不静默吞掉，也不制造垃圾段。
+    """
+    entries = []
+    invalid = []
+    seen = set()
+    for position, item in enumerate(items or (), start=1):
+        entry, error = _normalize_manual_hash_item(
+            getattr(item, "hash", ""),
+            getattr(item, "index_count", ""),
+            getattr(item, "first_index", ""),
+        )
+        if entry is None:
+            invalid.append(
+                (position, str(getattr(item, "hash", "") or "").strip(), error)
+            )
+            continue
+        if entry in seen:
+            continue
+        seen.add(entry)
+        entries.append(entry)
+    return entries, invalid
+
+
+def _manual_hash_item_label(item):
+    """列表行的显示文本：``hash`` / ``hash_count_first``；无效条目带原因。"""
+    entry, error = _normalize_manual_hash_item(
+        getattr(item, "hash", ""),
+        getattr(item, "index_count", ""),
+        getattr(item, "first_index", ""),
+    )
+    if entry is None:
+        raw_hash = str(getattr(item, "hash", "") or "").strip()
+        return f"{raw_hash or '<空>'}（无效：{error}）"
+    return _format_skip_entry(entry)
+
+
+def _add_manual_hash_item(node, hash_text, index_count_text="", first_index_text=""):
+    """把一条手动哈希输入追加到节点的 ``manual_hash_items`` 列表。
+
+    返回 ``(ok, message)``：``ok`` 为真时 ``message`` 是格式化后的条目写法；否则
+    是拒绝原因（输入不合法 / 与已有条目重复）。列表非法 / 重复时保持不变。
+    """
+    entry, error = _normalize_manual_hash_item(
+        hash_text, index_count_text, first_index_text
+    )
+    if entry is None:
+        return False, error
+
+    existing_entries, _invalid = _collect_manual_hash_entries(
+        getattr(node, "manual_hash_items", None)
+    )
+    if entry in existing_entries:
+        return False, f"条目已存在（{_format_skip_entry(entry)}）"
+
+    item = node.manual_hash_items.add()
+    item.hash = entry[0]
+    item.index_count = "" if entry[1] is None else str(entry[1])
+    item.first_index = "" if entry[2] is None else str(entry[2])
+    return True, _format_skip_entry(entry)
 
 
 def _normalize_skip_entries(entries):
@@ -559,6 +709,55 @@ def _describe_cross_ib_shared(shared):
     return "、".join(parts)
 
 
+def _collect_manual_target_section_names(manual_hashes, ini_path):
+    """按手动哈希反查它们在本次导出里登记过的段名，返回 ``set`` 或 ``None``。
+
+    手动哈希的用途是跳过**没有导入 Blender 的 IB**：这类 IB 在本次导出里没有段，
+    查不到时返回空集，删除步骤自然为 0。若用户填的哈希**恰好**也属于本次导出
+    （例如同一 IB 的其它部件没有加进跳过列表），查到的段仍按节点语义先删除再
+    追加跳过段，避免同一 hash 上同时存在正常绘制段与跳过段。
+
+    与条件判断节点同口径：只读导出期段登记，排除 ``Resource*`` 资源声明段与
+    ``TextureOverrideCheckHash*`` 检测段。登记表不可用 / 查询异常时返回 ``None``
+    （调用方按「无段可删」处理）。
+    """
+    hashes = []
+    seen = set()
+    for value in manual_hashes or ():
+        hash_val = str(value or "").strip().lower()
+        if not hash_val or hash_val in seen:
+            continue
+        seen.add(hash_val)
+        hashes.append(hash_val)
+    if not hashes:
+        return set()
+
+    registry = _get_section_registry()
+    if registry is None:
+        return None
+
+    try:
+        ini_abs = os.path.abspath(ini_path) if ini_path else ""
+    except (OSError, ValueError):
+        ini_abs = str(ini_path or "")
+
+    try:
+        entries = registry.get_sections_for_draw_ibs(hashes, ini_abs) or []
+    except Exception as exc:  # noqa: BLE001 - 登记表查询失败只提示，不阻断导出
+        _log_warning(f"跳过部件：按手动哈希查询导出段失败（{exc}）")
+        return None
+
+    names = set()
+    for entry in entries:
+        name = str((entry or {}).get("name") or "").strip()
+        if not name:
+            continue
+        if name.casefold().startswith(_EXCLUDED_SECTION_PREFIXES):
+            continue
+        names.add(name)
+    return names
+
+
 def _find_sibling_ini_sections(target_ini, section_names):
     """在目标 ini **同目录的其它配置表**里找同名段，返回 ``[(文件名, [段名...])]``。
 
@@ -625,20 +824,64 @@ class SSMT_UL_SKIP_OBJECTS(bpy.types.UIList):
         op_remove.index = index
 
 
+class SSMT_ManualHashItem(bpy.types.PropertyGroup):
+    """手动哈希列表的一条：8 位 hash + 可选的三段绘制区间。"""
+
+    hash: bpy.props.StringProperty(name="Hash", default="")  # type: ignore
+    index_count: bpy.props.StringProperty(name="IndexCount", default="")  # type: ignore
+    first_index: bpy.props.StringProperty(name="FirstIndex", default="")  # type: ignore
+
+
+class SSMT_UL_MANUAL_HASHES(bpy.types.UIList):
+    """手动哈希列表（行内显示 hash / 三段，X 按钮按 index 删除对应项）。"""
+
+    bl_idname = "SSMT_UL_MANUAL_HASHES"
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        entry, error = _normalize_manual_hash_item(
+            getattr(item, "hash", ""),
+            getattr(item, "index_count", ""),
+            getattr(item, "first_index", ""),
+        )
+        row = layout.row(align=True)
+        row.label(text=_manual_hash_item_label(item), icon='HASH' if entry else 'ERROR')
+        op_remove = row.operator("ssmt.skip_manual_hash_remove", text="", icon='X')
+        op_remove.node_name = getattr(data, "name", "")
+        op_remove.index = index
+
+
 class SSMTNode_PostProcess_Skip(SSMTNode_PostProcess_Base):
     bl_idname = NODE_IDNAME
     bl_label = NODE_LABEL
     bl_description = (
         "圈定选中部件所属 IB 的全部导出段并从 ini 删除，再追加 handling = skip 跳过段"
-        "（跳过段已登记，可被后面的条件判断节点加条件）"
+        "（跳过段已登记，可被后面的条件判断节点加条件）；"
+        "「手动哈希」可直接跳过没有导入 Blender 的 IB"
     )
 
     skip_objects: bpy.props.CollectionProperty(type=SSMT_SkipObjectItem)  # type: ignore
     active_skip_object: bpy.props.IntProperty(default=0)  # type: ignore
 
+    manual_hash_items: bpy.props.CollectionProperty(type=SSMT_ManualHashItem)  # type: ignore
+    active_manual_hash: bpy.props.IntProperty(default=0)  # type: ignore
+    temp_manual_hash: bpy.props.StringProperty(  # type: ignore
+        name="Hash",
+        description="要跳过但没有导入 Blender 的 IB 哈希（8 位十六进制）",
+        default="",
+    )
+    temp_index_count: bpy.props.StringProperty(  # type: ignore
+        name="IndexCount",
+        description="可选：绘制区间的索引数量；留空表示匹配该 IB 的全部绘制",
+        default="",
+    )
+    temp_first_index: bpy.props.StringProperty(  # type: ignore
+        name="FirstIndex",
+        description="可选：绘制区间的起始索引；与 IndexCount 要么都填、要么都留空",
+        default="",
+    )
+
     def draw_buttons(self, context, layout):
-        layout.label(text="删除该部件所属 IB 的全部导出段，并追加跳过段", icon='HIDE_ON')
-        layout.label(text="与条件判断节点同一套 IB 圈定机制（不扫描 ini 关键词）", icon='INFO')
+        layout.label(text="删除 IB hash 所属的全部导出段，并追加跳过段", icon='HIDE_ON')
 
         box = layout.box()
         box.label(text=f"跳过部件 ({len(self.skip_objects)})", icon='OBJECT_DATA')
@@ -649,8 +892,6 @@ class SSMTNode_PostProcess_Skip(SSMTNode_PostProcess_Base):
                 self, "active_skip_object",
                 rows=max(2, min(len(self.skip_objects), 6)),
             )
-        else:
-            box.label(text="列表为空：导出时不会修改 ini", icon='ERROR')
 
         row = box.row(align=True)
         row.operator("ssmt.skip_parts_add_selected", text="添加选中物体", icon='ADD').node_name = self.name
@@ -658,6 +899,40 @@ class SSMTNode_PostProcess_Skip(SSMTNode_PostProcess_Base):
         op_remove.node_name = self.name
         op_remove.index = int(self.active_skip_object)
         row.operator("ssmt.skip_parts_clear", text="清空", icon='TRASH').node_name = self.name
+
+        manual_box = layout.box()
+        manual_box.label(text="手动哈希", icon='TEXT')
+        input_col = manual_box.column(align=True)
+        input_col.prop(self, "temp_manual_hash", text="Hash")
+        input_col.prop(self, "temp_index_count", text="IndexCount")
+        input_col.prop(self, "temp_first_index", text="FirstIndex")
+        manual_box.operator(
+            "ssmt.skip_manual_hash_add", text="添加", icon='ADD'
+        ).node_name = self.name
+
+        if self.manual_hash_items:
+            manual_box.template_list(
+                "SSMT_UL_MANUAL_HASHES", "",
+                self, "manual_hash_items",
+                self, "active_manual_hash",
+                rows=max(2, min(len(self.manual_hash_items), 6)),
+            )
+            row = manual_box.row(align=True)
+            op_remove = row.operator(
+                "ssmt.skip_manual_hash_remove", text="移除", icon='REMOVE'
+            )
+            op_remove.node_name = self.name
+            op_remove.index = int(self.active_manual_hash)
+            row.operator(
+                "ssmt.skip_manual_hash_clear", text="清空", icon='TRASH'
+            ).node_name = self.name
+
+        invalid_manual_items = _collect_manual_hash_entries(self.manual_hash_items)[1]
+        if invalid_manual_items:
+            manual_box.label(
+                text=f"{len(invalid_manual_items)} 条手动哈希无效（导出时忽略）",
+                icon='ERROR',
+            )
 
     # ------------------------------------------------------------------
     # 导出
@@ -713,23 +988,83 @@ class SSMTNode_PostProcess_Skip(SSMTNode_PostProcess_Base):
             return False
 
         selected_names = self._selected_part_names()
-        if not selected_names:
-            _log_info("跳过部件：节点未选择任何部件，跳过")
+        manual_entries, invalid_manual_items = _collect_manual_hash_entries(
+            getattr(self, "manual_hash_items", None)
+        )
+        if invalid_manual_items:
+            details = "、".join(
+                f"第 {position} 条「{hash_text or '空'}」{reason}"
+                for position, hash_text, reason in invalid_manual_items[:5]
+            )
+            if len(invalid_manual_items) > 5:
+                details += "…"
+            _log_warning(
+                f"跳过部件：手动哈希有 {len(invalid_manual_items)} 条无效、已忽略：{details}"
+            )
+        if not selected_names and not manual_entries:
+            _log_info("跳过部件：节点未选择任何部件、也没有有效的手动哈希，跳过")
             return True
 
         # ---- 结构化圈定（与条件判断节点同一套机制） ----
-        model, draw_ibs, target_names = self._collect_targets(selected_names, target_ini)
-        if model is None:
-            _log_warning("跳过部件：未获取到本次导出的蓝图模型（导出期段登记不可用），跳过")
+        # 手动哈希不依赖选中物体 / 导出模型：它是给**没有导入 Blender** 的 IB 用的，
+        # 这类 IB 在本次导出里没有段（删除步骤为 0），只追加跳过段即可。选中部件
+        # 这条路仍要求导出模型可用，避免半边删除逻辑（旧行为：模型不可用就整节点跳过）。
+        model = None
+        draw_ibs = set()
+        target_names = set()
+        selected_entries = []
+        if selected_names:
+            model, draw_ibs, target_names = self._collect_targets(selected_names, target_ini)
+            manual_note = "；仍会追加手动哈希的跳过段" if manual_entries else ""
+            if model is None:
+                _log_warning(
+                    "跳过部件：未获取到本次导出的蓝图模型（导出期段登记不可用），"
+                    f"跳过选中部件{manual_note}"
+                )
+            elif not draw_ibs:
+                _log_warning(
+                    "跳过部件：选定的部件未匹配到任何 DrawIB（物体名与导出对象不一致），"
+                    f"跳过选中部件{manual_note}"
+                )
+            else:
+                # 导出期段登记里没有这些 DrawIB 的段**不再早退**：这类 IB 是游戏原生绘制、
+                # 不在本 mod 的接管范围里，没有段可删；用户既然把它加进跳过列表，就应当
+                # 直接追加完整跳过段（hash + match_first_index + match_index_count +
+                # handling = skip）让原生绘制被跳过（删除步骤自然 0 段）。有导出段的 IB
+                # 仍走「先删段、再追加」。
+                selected_entries = _entries_from_names(selected_names)
+                if not selected_entries:
+                    selected_entries = _hash_only_entries(draw_ibs)
+                    if selected_entries:
+                        _log_warning(
+                            "跳过部件：物体名里没有可完整解析的 <hash>-<indexCount>-<firstIndex>，"
+                            "回退为只 hash 的跳过段"
+                        )
+        if not selected_entries and not manual_entries:
+            # 选中部件这条路不可用（模型缺失 / 对不上任何 DrawIB）且没有手动哈希：
+            # 保持旧行为——本次不改写配置表。
             return True
-        if not draw_ibs:
-            _log_warning("跳过部件：选定的部件未匹配到任何 DrawIB（物体名与导出对象不一致），跳过")
-            return True
-        # 导出期段登记里没有这些 DrawIB 的段**不再早退**：这类 IB 是游戏原生绘制、
-        # 不在本 mod 的接管范围里，没有段可删；用户既然把它加进跳过列表，就应当
-        # 直接追加完整跳过段（hash + match_first_index + match_index_count +
-        # handling = skip）让原生绘制被跳过（删除步骤自然 0 段）。有导出段的 IB
-        # 仍走「先删段、再追加」。
+
+        # 手动哈希在导出段登记里查得到段时（填的哈希恰好也属于本次导出），按节点
+        # 语义先删除这些段再追加跳过段，避免同一 hash 上正常绘制段与跳过段并存。
+        manual_hashes = [entry[0] for entry in manual_entries]
+        if manual_hashes:
+            manual_target_names = _collect_manual_target_section_names(manual_hashes, target_ini)
+            if manual_target_names:
+                target_names = set(target_names) | set(manual_target_names)
+                _log_info(
+                    f"跳过部件：手动哈希在本次导出登记里有 {len(manual_target_names)} 个段，"
+                    "按节点语义先删除再追加跳过段"
+                )
+
+        # 追加条目 = 选中物体名前缀条目 + 手动哈希条目（去重、保序）
+        entries = list(selected_entries)
+        seen_entries = set(entries)
+        for entry in manual_entries:
+            if entry in seen_entries:
+                continue
+            seen_entries.add(entry)
+            entries.append(entry)
 
         try:
             with open(target_ini, "rb") as handle:
@@ -746,24 +1081,20 @@ class SSMTNode_PostProcess_Skip(SSMTNode_PostProcess_Base):
             return False
 
         # ---- 删除 + 追加 ----
-        # 追加条目来自**选中物体名的前缀三段**（hash / indexCount / firstIndex）：
-        # 只写 hash 的跳过段在部分游戏里不生效，必须带 match_first_index /
-        # match_index_count。解析不出三段的名字回退为只 hash 条目；全都解析不出时
-        # 再退回 draw_ib 的只 hash 条目（避免整节点变成空操作）。
-        entries = _entries_from_names(selected_names)
-        if not entries:
-            entries = _hash_only_entries(draw_ibs)
-            if entries:
-                _log_warning(
-                    "跳过部件：物体名里没有可完整解析的 <hash>-<indexCount>-<firstIndex>，"
-                    "回退为只 hash 的跳过段"
-                )
+        # entries 已在上面合并好：选中物体名前缀条目优先（完整三段），手动哈希条目
+        # 追加在后。只写 hash 的跳过段在部分游戏里不生效，所以能解析出三段的都用
+        # 完整段（match_first_index + match_index_count + handling = skip）。
         entry_list = ", ".join(_format_skip_entry(entry) for entry in entries)
+        manual_entry_list = ", ".join(
+            _format_skip_entry(entry) for entry in manual_entries
+        )
 
         # 跨 IB 共用段保护：删同名段前先确认它是否仍被本次删除范围之外的 draw_ib 登记。
         # CrossIBPresent / CrossIBShaderOverride / CrossIBTextureOverride 这类段在设计上
         # 就由多个 IB 共享，删掉当前 IB 那一份会连带毁掉别的 IB 的绘制。
-        shared_sections = _collect_cross_ib_shared_names(target_names, draw_ibs)
+        # 本次要删的 draw_ib = 选中部件圈定的 + 手动哈希（查得到段时才必须删）。
+        keep_draw_ibs = set(draw_ibs) | set(manual_hashes)
+        shared_sections = _collect_cross_ib_shared_names(target_names, keep_draw_ibs)
         registry_note = "" if shared_sections is not None else _REGISTRY_UNAVAILABLE_NOTE
 
         # 先剥掉本节点上一次追加的块：否则第二次执行会把旧跳过段当成目标段重复删 / 计数。
@@ -833,33 +1164,35 @@ class SSMTNode_PostProcess_Skip(SSMTNode_PostProcess_Base):
 
         # ---- 日志：区分「有导出段（删段+追加）」与「无导出段（只追加）」 ----
         ib_list = ", ".join(sorted(str(value) for value in draw_ibs))
+        source_parts = []
+        if selected_names:
+            if selected_entries:
+                source_parts.append(
+                    f"选中 {len(selected_names)} 个部件、圈定 IB {len(draw_ibs)} 个"
+                    f"（{ib_list}）"
+                )
+            else:
+                source_parts.append(f"选中 {len(selected_names)} 个部件（未圈定到可用段）")
+        if manual_entries:
+            source_parts.append(
+                f"手动哈希 {len(manual_entries)} 个（{manual_entry_list}）"
+            )
+        source_text = "；".join(source_parts)
         suffix = "" if written else "（配置表已是最新，未改写）"
         if deleted_names:
-            message = (
-                f"跳过部件：选中 {len(selected_names)} 个部件、圈定 IB {len(draw_ibs)} 个"
-                f"（{ib_list}）；"
-                f"删除段 {len(deleted_names)} 个（{'、'.join(deleted_names)}）；"
-                f"新增跳过段 {len(entries)} 个（{entry_list}）{suffix} -> {target_ini}"
-            )
+            delete_text = f"删除段 {len(deleted_names)} 个（{'、'.join(deleted_names)}）"
         elif preserved_names:
-            message = (
-                f"跳过部件：选中 {len(selected_names)} 个部件、圈定 IB {len(draw_ibs)} 个"
-                f"（{ib_list}）；"
-                f"同名段全部被跨 IB 共用保护拦下、未删除；"
-                f"新增跳过段 {len(entries)} 个（{entry_list}）{suffix} -> {target_ini}"
-            )
+            delete_text = "同名段全部被跨 IB 共用保护拦下、未删除"
+        elif registry is None:
+            delete_text = "导出段登记表不可用，无法确认这些 IB 的段（无段可删）"
+        elif manual_entries and not selected_entries:
+            delete_text = "手动哈希不在本次导出中（无段可删）"
         else:
-            no_section_reason = (
-                "导出段登记表不可用，无法确认这些 IB 的段（无段可删）"
-                if registry is None
-                else "这些 IB 不在本次导出中（无段可删）"
-            )
-            message = (
-                f"跳过部件：选中 {len(selected_names)} 个部件、圈定 IB {len(draw_ibs)} 个"
-                f"（{ib_list}）；"
-                f"{no_section_reason}，只追加跳过段 {len(entries)} 个"
-                f"（{entry_list}）{suffix} -> {target_ini}"
-            )
+            delete_text = "这些 IB 不在本次导出中（无段可删）"
+        message = (
+            f"跳过部件：{source_text}；{delete_text}；"
+            f"新增跳过段 {len(entries)} 个（{entry_list}）{suffix} -> {target_ini}"
+        )
         notes = []
         if registry_note:
             notes.append(registry_note)
@@ -872,15 +1205,18 @@ class SSMTNode_PostProcess_Skip(SSMTNode_PostProcess_Base):
         _log_info(message)
         try:
             from . import export_progress
+            ib_count_text = f"{len(draw_ibs)} 个IB"
+            selected_text = f"{len(selected_names)} 个部件"
+            manual_text = f" / 手动哈希 {len(manual_entries)} 个" if manual_entries else ""
             if deleted_names:
                 export_progress.report_stage(
-                    f"跳过部件：{len(draw_ibs)} 个IB / 删除 {len(deleted_names)} 段 / "
-                    f"新增 {len(entries)} 段（{entry_list}）/ {len(selected_names)} 个部件"
+                    f"跳过部件：{ib_count_text} / 删除 {len(deleted_names)} 段 / "
+                    f"新增 {len(entries)} 段（{entry_list}）/ {selected_text}{manual_text}"
                 )
             else:
                 export_progress.report_stage(
-                    f"跳过部件：{len(draw_ibs)} 个IB / 无导出段可删 / "
-                    f"新增 {len(entries)} 段（{entry_list}）/ {len(selected_names)} 个部件"
+                    f"跳过部件：{ib_count_text} / 无导出段可删 / "
+                    f"新增 {len(entries)} 段（{entry_list}）/ {selected_text}{manual_text}"
                 )
         except Exception:
             pass
@@ -985,13 +1321,97 @@ class SSMT_OT_PostProcess_ClearSkipObjects(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class SSMT_OT_PostProcess_AddManualHash(bpy.types.Operator):
+    bl_idname = "ssmt.skip_manual_hash_add"
+    bl_label = "添加手动哈希"
+    bl_description = "把 Hash / IndexCount / FirstIndex 输入框里的条目加入手动哈希列表"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    node_name: bpy.props.StringProperty()  # type: ignore
+
+    def execute(self, context):
+        node = _resolve_skip_node(context, self.node_name)
+        if node is None:
+            self.report({'ERROR'}, "请选择跳过节点")
+            return {'CANCELLED'}
+
+        ok, message = _add_manual_hash_item(
+            node,
+            getattr(node, "temp_manual_hash", ""),
+            getattr(node, "temp_index_count", ""),
+            getattr(node, "temp_first_index", ""),
+        )
+        if not ok:
+            self.report({'WARNING'}, message)
+            return {'CANCELLED'}
+
+        node.temp_manual_hash = ""
+        node.temp_index_count = ""
+        node.temp_first_index = ""
+        node.active_manual_hash = max(0, len(node.manual_hash_items) - 1)
+        self.report({'INFO'}, f"已添加手动哈希：{message}")
+        return {'FINISHED'}
+
+
+class SSMT_OT_PostProcess_RemoveManualHash(bpy.types.Operator):
+    bl_idname = "ssmt.skip_manual_hash_remove"
+    bl_label = "移除手动哈希"
+    bl_description = "从手动哈希列表中移除指定项"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    node_name: bpy.props.StringProperty()  # type: ignore
+    index: bpy.props.IntProperty(default=-1)  # type: ignore
+
+    def execute(self, context):
+        node = _resolve_skip_node(context, self.node_name)
+        if node is None:
+            self.report({'ERROR'}, "请选择跳过节点")
+            return {'CANCELLED'}
+
+        if 0 <= self.index < len(node.manual_hash_items):
+            node.manual_hash_items.remove(self.index)
+            node.active_manual_hash = max(
+                0, min(int(node.active_manual_hash), len(node.manual_hash_items) - 1)
+            )
+            return {'FINISHED'}
+
+        self.report({'WARNING'}, "列表中没有这一项")
+        return {'CANCELLED'}
+
+
+class SSMT_OT_PostProcess_ClearManualHashes(bpy.types.Operator):
+    bl_idname = "ssmt.skip_manual_hash_clear"
+    bl_label = "清空手动哈希"
+    bl_description = "清空手动哈希列表"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    node_name: bpy.props.StringProperty()  # type: ignore
+
+    def execute(self, context):
+        node = _resolve_skip_node(context, self.node_name)
+        if node is None:
+            self.report({'ERROR'}, "请选择跳过节点")
+            return {'CANCELLED'}
+
+        while len(node.manual_hash_items) > 0:
+            node.manual_hash_items.remove(len(node.manual_hash_items) - 1)
+        node.active_manual_hash = 0
+        self.report({'INFO'}, "已清空手动哈希列表")
+        return {'FINISHED'}
+
+
 classes = (
     SSMT_SkipObjectItem,
     SSMT_UL_SKIP_OBJECTS,
+    SSMT_ManualHashItem,
+    SSMT_UL_MANUAL_HASHES,
     SSMTNode_PostProcess_Skip,
     SSMT_OT_PostProcess_AddSkipObject,
     SSMT_OT_PostProcess_RemoveSkipObject,
     SSMT_OT_PostProcess_ClearSkipObjects,
+    SSMT_OT_PostProcess_AddManualHash,
+    SSMT_OT_PostProcess_RemoveManualHash,
+    SSMT_OT_PostProcess_ClearManualHashes,
 )
 
 

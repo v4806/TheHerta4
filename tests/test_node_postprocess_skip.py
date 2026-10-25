@@ -8,7 +8,10 @@
   且登记表不可用时退化为「按段名全文删除」并在摘要里说明这一退化；
 - 分文件（multifile）同名段只提示、不改动分文件；
 - 追加块能被 node_postprocess_base 识别为自动追加尾段；
-- 导出执行：删段 + 追加跳过段 + 登记新段；再次执行不再改写文件。
+- 导出执行：删段 + 追加跳过段 + 登记新段；再次执行不再改写文件；
+- 手动哈希（没有导入 Blender 的 IB）：Hash / IndexCount / FirstIndex 校验、
+  「添加」去重、只追加不删段、导出现在登记里的段先删后追加、导出模型缺失时仍生效、
+  与选中部件条目合并。
 """
 import importlib.util
 import os
@@ -269,14 +272,52 @@ def _make_model(object_name=PART_NAME, draw_ib=DRAW_IB):
     )
 
 
-def _make_node(part_names=None):
+def _make_node(part_names=None, manual_items=None):
+    """构造节点替身；``part_names=None`` 用默认部件，传 ``[]`` 表示不选任何部件。
+
+    ``manual_items`` 为 ``[(hash, index_count, first_index)]`` 列表，写入
+    ``manual_hash_items``（与真实 PropertyGroup 同形：三个字符串字段）。
+    """
     node = module.SSMTNode_PostProcess_Skip()
     node.name = "跳过"
+    values = [PART_NAME] if part_names is None else list(part_names)
     node.skip_objects = [
-        types.SimpleNamespace(object_name=value)
-        for value in (part_names or [PART_NAME])
+        types.SimpleNamespace(object_name=value) for value in values
     ]
+    node.manual_hash_items = [
+        types.SimpleNamespace(hash=hash_text, index_count=count, first_index=first)
+        for hash_text, count, first in (manual_items or [])
+    ]
+    node.active_manual_hash = 0
+    node.temp_manual_hash = ""
+    node.temp_index_count = ""
+    node.temp_first_index = ""
     return node
+
+
+class _FakeManualHashCollection(list):
+    """替身集合：模拟 bpy CollectionProperty 的 ``add()``（返回可写条目）。"""
+
+    def add(self):
+        item = types.SimpleNamespace(hash="", index_count="", first_index="")
+        self.append(item)
+        return item
+
+
+class _FakeManualHashNode:
+    """只承载 ``manual_hash_items`` 的节点替身（``_add_manual_hash_item`` 用）。"""
+
+    def __init__(self):
+        self.manual_hash_items = _FakeManualHashCollection()
+
+
+def _prepare_export_state(directory, model=None):
+    """在临时目录写一份配置表并设置导出态；返回配置表路径。"""
+    path = os.path.join(directory, "mod.ini")
+    Path(path).write_text(INI_BODY, encoding="utf-8")
+    _ExportState.target_ini = path
+    _ExportState.model = model
+    return path
 
 
 class _RegistryPatch:
@@ -465,11 +506,7 @@ class SkipExecuteTests(unittest.TestCase):
         _ExportState.stages = []
 
     def _prepare(self, directory, model=None):
-        path = os.path.join(directory, "mod.ini")
-        Path(path).write_text(INI_BODY, encoding="utf-8")
-        _ExportState.target_ini = path
-        _ExportState.model = model or _make_model()
-        return path
+        return _prepare_export_state(directory, model=model or _make_model())
 
     def test_execute_deletes_sections_appends_block_and_registers(self):
         registry = _FakeRegistry(
@@ -561,6 +598,301 @@ class SkipExecuteTests(unittest.TestCase):
             # 登记表不可用时圈不到任何段：目标段原样保留，只追加跳过段。
             self.assertIn("drawindexed = 1260", updated)
             self.assertIn(f"[{SKIP_SECTION}]", updated)
+
+
+# ---------------------------------------------------------------------------
+# 手动哈希（没有导入 Blender 的 IB）
+# ---------------------------------------------------------------------------
+
+class ManualHashEntryTests(unittest.TestCase):
+    def test_normalize_hash_only_accepts_case_and_0x_prefix(self):
+        self.assertEqual(
+            (("7fbbcf0d", None, None), ""),
+            module._normalize_manual_hash_item(" 0X7FBbcf0D "),
+        )
+        self.assertEqual(
+            (("1234abcd", None, None), ""),
+            module._normalize_manual_hash_item("1234ABCD"),
+        )
+
+    def test_normalize_full_triple(self):
+        self.assertEqual(
+            (("999bff94", 1260, 9402), ""),
+            module._normalize_manual_hash_item("999BFF94", "1260", "9402"),
+        )
+        # FirstIndex 允许 0，IndexCount 不能为 0
+        self.assertEqual(
+            (("38b3bd13", 4086, 0), ""),
+            module._normalize_manual_hash_item("38b3bd13", "4086", "0"),
+        )
+
+    def test_normalize_rejects_invalid_hash(self):
+        entry, error = module._normalize_manual_hash_item("")
+        self.assertIsNone(entry)
+        self.assertIn("不能为空", error)
+
+        entry, error = module._normalize_manual_hash_item("nope")
+        self.assertIsNone(entry)
+        self.assertIn("8 位十六进制", error)
+
+        entry, error = module._normalize_manual_hash_item("1234567")
+        self.assertIsNone(entry)
+        self.assertIn("8 位十六进制", error)
+
+        entry, error = module._normalize_manual_hash_item("123456789")
+        self.assertIsNone(entry)
+        self.assertIn("8 位十六进制", error)
+
+    def test_normalize_rejects_half_or_non_numeric_range(self):
+        entry, error = module._normalize_manual_hash_item("7fbbcf0d", "1260")
+        self.assertIsNone(entry)
+        self.assertIn("要么都填", error)
+
+        entry, error = module._normalize_manual_hash_item("7fbbcf0d", "", "0")
+        self.assertIsNone(entry)
+        self.assertIn("要么都填", error)
+
+        entry, error = module._normalize_manual_hash_item("7fbbcf0d", "12a", "0")
+        self.assertIsNone(entry)
+        self.assertIn("非负十进制整数", error)
+
+        entry, error = module._normalize_manual_hash_item("7fbbcf0d", "0", "0")
+        self.assertIsNone(entry)
+        self.assertIn("必须大于 0", error)
+
+    def test_collect_entries_dedupes_and_reports_invalid_positions(self):
+        items = [
+            types.SimpleNamespace(hash="7fbbcf0d", index_count="", first_index=""),
+            types.SimpleNamespace(hash="7FBBCF0D", index_count="", first_index=""),
+            types.SimpleNamespace(hash="nope", index_count="", first_index=""),
+            types.SimpleNamespace(hash="999bff94", index_count="1260", first_index="9402"),
+        ]
+
+        entries, invalid = module._collect_manual_hash_entries(items)
+
+        self.assertEqual(
+            [("7fbbcf0d", None, None), ("999bff94", 1260, 9402)], entries
+        )
+        self.assertEqual(1, len(invalid))
+        position, hash_text, reason = invalid[0]
+        self.assertEqual((3, "nope"), (position, hash_text))
+        self.assertIn("8 位十六进制", reason)
+
+    def test_collect_entries_handles_empty(self):
+        self.assertEqual(([], []), module._collect_manual_hash_entries(None))
+        self.assertEqual(([], []), module._collect_manual_hash_entries([]))
+
+    def test_item_label_for_valid_and_invalid_entries(self):
+        valid = types.SimpleNamespace(hash="7fbbcf0d", index_count="", first_index="")
+        triple = types.SimpleNamespace(
+            hash="7fbbcf0d", index_count="1260", first_index="9402"
+        )
+        invalid = types.SimpleNamespace(hash="nope", index_count="", first_index="")
+
+        self.assertEqual("7fbbcf0d", module._manual_hash_item_label(valid))
+        self.assertEqual("7fbbcf0d_1260_9402", module._manual_hash_item_label(triple))
+        self.assertIn("无效", module._manual_hash_item_label(invalid))
+
+    def test_add_manual_hash_item_appends_and_rejects_duplicate_or_invalid(self):
+        node = _FakeManualHashNode()
+
+        ok, message = module._add_manual_hash_item(node, "7FBBCF0D")
+        self.assertTrue(ok)
+        self.assertEqual("7fbbcf0d", message)
+        self.assertEqual(1, len(node.manual_hash_items))
+        self.assertEqual("7fbbcf0d", node.manual_hash_items[0].hash)
+        self.assertEqual("", node.manual_hash_items[0].index_count)
+        self.assertEqual("", node.manual_hash_items[0].first_index)
+
+        ok, message = module._add_manual_hash_item(node, "7fbbcf0d")
+        self.assertFalse(ok)
+        self.assertIn("已存在", message)
+        self.assertEqual(1, len(node.manual_hash_items))
+
+        ok, message = module._add_manual_hash_item(node, "999bff94", "1260", "9402")
+        self.assertTrue(ok)
+        self.assertEqual("999bff94_1260_9402", message)
+        self.assertEqual("1260", node.manual_hash_items[1].index_count)
+        self.assertEqual("9402", node.manual_hash_items[1].first_index)
+
+        ok, message = module._add_manual_hash_item(node, "nope")
+        self.assertFalse(ok)
+        self.assertIn("8 位十六进制", message)
+        self.assertEqual(2, len(node.manual_hash_items))
+
+    def test_manual_triple_builds_full_skip_section(self):
+        entries, _invalid = module._collect_manual_hash_entries(
+            [types.SimpleNamespace(hash="ab12cd34", index_count="1260", first_index="9402")]
+        )
+
+        lines = _stripped_lines(module._build_skip_block(entries))
+        self.assertIn("[TextureOverride_IB_ab12cd34_1260_9402]", lines)
+        self.assertIn("match_first_index = 9402", lines)
+        self.assertIn("match_index_count = 1260", lines)
+
+    def test_collect_manual_target_sections_skips_resource_and_detect_sections(self):
+        registry = _FakeRegistry(
+            {
+                os.path.join("mods", "mod.ini"): [
+                    {"name": "TextureOverride_IB_ab12cd34", "type": "", "draw_ib": "ab12cd34"},
+                    {"name": "ResourceDiffuseab12cd34", "type": "", "draw_ib": "ab12cd34"},
+                    {"name": "TextureOverrideCheckHash_ab12cd34", "type": "", "draw_ib": "ab12cd34"},
+                ]
+            }
+        )
+
+        with _RegistryPatch(registry):
+            names = module._collect_manual_target_section_names(["ab12cd34"], "")
+
+        self.assertEqual({"TextureOverride_IB_ab12cd34"}, names)
+
+    def test_collect_manual_target_sections_without_registry_returns_none(self):
+        with _RegistryPatch(None):
+            self.assertIsNone(
+                module._collect_manual_target_section_names(["ab12cd34"], "")
+            )
+
+
+class ManualHashExecuteTests(unittest.TestCase):
+    def setUp(self):
+        _log.records.clear()
+        _ExportState.target_ini = ""
+        _ExportState.model = None
+        _ExportState.stages = []
+
+    def test_manual_hash_only_appends_without_selected_objects(self):
+        registry = _FakeRegistry()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _prepare_export_state(tmp)
+            node = _make_node(
+                part_names=[],
+                manual_items=[("ab12cd34", "", ""), ("999bff94", "1260", "9402")],
+            )
+
+            with _RegistryPatch(registry):
+                self.assertTrue(node.execute_postprocess(tmp))
+                first = Path(path).read_text(encoding="utf-8")
+                self.assertTrue(node.execute_postprocess(tmp))
+                second = Path(path).read_text(encoding="utf-8")
+
+            self.assertEqual(first, second)
+            self.assertIn("[TextureOverride_IB_ab12cd34]", first)
+            self.assertIn("[TextureOverride_IB_999bff94_1260_9402]", first)
+            self.assertIn("match_first_index = 9402", first)
+            self.assertIn("match_index_count = 1260", first)
+            # 没有选中部件：配置表原有段原样保留，只追加跳过段
+            self.assertIn("drawindexed = 1260", first)
+            self.assertEqual(
+                [
+                    ("TextureOverride_IB_ab12cd34", "TextureOverrideIB", "ab12cd34"),
+                    (
+                        "TextureOverride_IB_999bff94_1260_9402",
+                        "TextureOverrideIB",
+                        "999bff94",
+                    ),
+                ],
+                registry.registered[:2],
+            )
+            self.assertTrue(
+                any("手动哈希 2 个" in text for text in _log.texts("info")),
+                _log.records,
+            )
+
+    def test_manual_hash_with_exported_sections_is_deleted_then_skipped(self):
+        registry = _FakeRegistry(
+            {
+                os.path.join("mods", "mod.ini"): [
+                    {"name": TARGET_SECTION, "type": "", "draw_ib": DRAW_IB},
+                ]
+            }
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _prepare_export_state(tmp)
+            node = _make_node(part_names=[], manual_items=[(DRAW_IB, "", "")])
+
+            with _RegistryPatch(registry):
+                self.assertTrue(node.execute_postprocess(tmp))
+
+            updated = Path(path).read_text(encoding="utf-8")
+            self.assertNotIn("drawindexed = 1260", updated)
+            # 删掉正常绘制段后用同名只 hash 跳过段接管
+            self.assertEqual(1, updated.count(f"[{TARGET_SECTION}]"))
+            self.assertIn("; skip 7fbbcf0d", updated)
+            self.assertIn("handling = skip", updated)
+            self.assertTrue(
+                any("删除段 1 个" in text for text in _log.texts("info")), _log.records
+            )
+
+    def test_manual_hash_applies_when_blueprint_model_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _prepare_export_state(tmp, model=None)
+            # 默认还带着选中的部件（PART_NAME）；模型缺失时它应被跳过，手动哈希照常生效。
+            node = _make_node(manual_items=[("ab12cd34", "", "")])
+
+            with _RegistryPatch(_FakeRegistry()):
+                self.assertTrue(node.execute_postprocess(tmp))
+
+            updated = Path(path).read_text(encoding="utf-8")
+            self.assertIn("[TextureOverride_IB_ab12cd34]", updated)
+            self.assertNotIn("; skip 7fbbcf0d", updated)
+            warnings = _log.texts("warning")
+            self.assertTrue(
+                any("蓝图模型" in text and "手动哈希" in text for text in warnings),
+                warnings,
+            )
+
+    def test_invalid_manual_items_warn_but_valid_ones_apply(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _prepare_export_state(tmp)
+            node = _make_node(
+                part_names=[],
+                manual_items=[("nope", "", ""), ("ab12cd34", "", ""), ("123", "", "")],
+            )
+
+            with _RegistryPatch(_FakeRegistry()):
+                self.assertTrue(node.execute_postprocess(tmp))
+
+            updated = Path(path).read_text(encoding="utf-8")
+            self.assertIn("[TextureOverride_IB_ab12cd34]", updated)
+            self.assertNotIn("nope", updated)
+            warnings = _log.texts("warning")
+            self.assertTrue(
+                any(
+                    "无效" in text and "nope" in text and "第 1 条" in text
+                    for text in warnings
+                ),
+                warnings,
+            )
+
+    def test_selected_parts_and_manual_hashes_merge(self):
+        registry = _FakeRegistry(
+            {
+                os.path.join("mods", "mod.ini"): [
+                    {"name": TARGET_SECTION, "type": "", "draw_ib": DRAW_IB},
+                ]
+            }
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _prepare_export_state(tmp, model=_make_model())
+            node = _make_node(manual_items=[("ab12cd34", "", "")])
+
+            with _RegistryPatch(registry):
+                self.assertTrue(node.execute_postprocess(tmp))
+
+            updated = Path(path).read_text(encoding="utf-8")
+            self.assertNotIn("drawindexed = 1260", updated)
+            self.assertIn(f"[{SKIP_SECTION}]", updated)
+            self.assertIn("[TextureOverride_IB_ab12cd34]", updated)
+            self.assertEqual(
+                [
+                    (SKIP_SECTION, "TextureOverrideIB", DRAW_IB),
+                    ("TextureOverride_IB_ab12cd34", "TextureOverrideIB", "ab12cd34"),
+                ],
+                registry.registered,
+            )
+            info_text = "\n".join(_log.texts("info"))
+            self.assertIn("选中 1 个部件、圈定 IB 1 个", info_text)
+            self.assertIn("手动哈希 1 个", info_text)
 
 
 if __name__ == "__main__":
