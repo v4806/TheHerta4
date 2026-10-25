@@ -68,6 +68,26 @@ class WorkSpaceHelper:
         return normalized_bare_name
 
     @staticmethod
+    def strip_identity_custom_suffix(bare_unique_str: str) -> str:
+        """丢掉身份后面的自定义后缀（第一个点号之后的一切）。
+
+        身份本体是 ``drawib-indexcount-firstindex``（LOD 前缀由
+        :meth:`parse_lod_unique_str` 单独剥掉），点号之后一律是**显示名**：
+        Blender 重名自动加的 ``.001``、复制物体留下的尾巴、手工加的备注
+        （``LOD0.077983c9-10524-0.rthft001ygjyytfj中文``）。显示名不属于身份，
+        拿它去匹配工作空间数据必然查不到 —— 实盘 2026-10-24 的
+        ``unique_str 'LOD0.077983c9-10524-0.001' 没有找到对应的提取数据`` 即此。
+
+        **只在查数据的地方用**（目录解析、Import.json 选型、导出侧身份解析）。
+        :meth:`parse_lod_unique_str` 故意不剥：显示名链路
+        （:meth:`get_object_display_name` / :meth:`get_display_submesh_name`）
+        把点号之后当成别名，剥掉会把物体已有的别名一起删了。
+        """
+        text = str(bare_unique_str or "").strip()
+        dot_index = text.find(".")
+        return text if dot_index < 0 else text[:dot_index]
+
+    @staticmethod
     def parse_lod_unique_str(unique_str: str) -> tuple[str, str]:
         normalized_unique_str = str(unique_str or "").strip()
         if normalized_unique_str.upper().startswith("LOD") and "." in normalized_unique_str:
@@ -100,26 +120,40 @@ class WorkSpaceHelper:
         永远对不上，导出会以「没有找到对应的提取数据」直接中止。
         """
         lod_name, bare_unique_str = WorkSpaceHelper.parse_lod_unique_str(unique_str)
+        # 目录名带别名是既有约定（`aaaabbbb-100-0.Face`，见 get_display_submesh_name），
+        # 所以**先按原样找**；找不到再剥掉点号之后那段显示名重试 —— Blender 重名
+        # 后缀（`.001`）、复制尾巴、手工备注都只是显示名，磁盘上只有身份本身
+        # （实盘 2026-10-24：`LOD0.077983c9-10524-0.001` ⇒ `077983c9-10524-0`）。
+        bare_candidates: List[str] = []
+        for candidate_bare in (
+            bare_unique_str,
+            WorkSpaceHelper.strip_identity_custom_suffix(bare_unique_str),
+        ):
+            if candidate_bare and candidate_bare not in bare_candidates:
+                bare_candidates.append(candidate_bare)
         workspace_folder = GlobalConfig.path_workspace_folder()
         candidate_base_paths = [workspace_folder, *WorkSpaceHelper.get_workspace_partition_folderpath_list()]
 
         if lod_name:
             for base_path in candidate_base_paths:
-                candidate_path = os.path.join(base_path, lod_name, bare_unique_str)
-                if os.path.isdir(candidate_path):
-                    return candidate_path
+                for candidate_bare in bare_candidates:
+                    candidate_path = os.path.join(base_path, lod_name, candidate_bare)
+                    if os.path.isdir(candidate_path):
+                        return candidate_path
             return os.path.join(workspace_folder, lod_name, bare_unique_str)
 
         for base_path in candidate_base_paths:
-            candidate_path = os.path.join(base_path, bare_unique_str)
-            if os.path.isdir(candidate_path):
-                return candidate_path
+            for candidate_bare in bare_candidates:
+                candidate_path = os.path.join(base_path, candidate_bare)
+                if os.path.isdir(candidate_path):
+                    return candidate_path
 
         for base_path in candidate_base_paths:
-            candidate_path = os.path.join(base_path, WorkSpaceHelper.DEFAULT_LOD_NAME, bare_unique_str)
-            if os.path.isdir(candidate_path):
-                WorkSpaceHelper._report_lod0_fallback(workspace_folder, unique_str, candidate_path)
-                return candidate_path
+            for candidate_bare in bare_candidates:
+                candidate_path = os.path.join(base_path, WorkSpaceHelper.DEFAULT_LOD_NAME, candidate_bare)
+                if os.path.isdir(candidate_path):
+                    WorkSpaceHelper._report_lod0_fallback(workspace_folder, unique_str, candidate_path)
+                    return candidate_path
 
         return os.path.join(workspace_folder, bare_unique_str)
 

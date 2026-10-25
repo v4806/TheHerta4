@@ -56,6 +56,14 @@ def check_and_get_submesh_json_path(unique_str: str) -> tuple[bool, str, str]:
     lod_name, bare_unique_str = WorkSpaceHelper.parse_lod_unique_str(unique_str)
     unique_str_folder = WorkSpaceHelper.get_submesh_folder_path(unique_str)
     if not os.path.exists(unique_str_folder):
+        resolved_unique_str = WorkSpaceHelper._compose_lod_name(
+            lod_name, WorkSpaceHelper.strip_identity_custom_suffix(bare_unique_str)
+        )
+        suffix_hint = (
+            f"按身份前缀解析: {resolved_unique_str}（点号之后视为显示名，不参与匹配）\n"
+            if resolved_unique_str and resolved_unique_str != str(unique_str or "").strip()
+            else ""
+        )
         tried_hint = (
             f"已尝试: 裸身份目录 与 默认 {DEFAULT_LOD_NAME} 目录（{unique_str_folder}）\n"
             if not lod_name
@@ -64,17 +72,28 @@ def check_and_get_submesh_json_path(unique_str: str) -> tuple[bool, str, str]:
         return False, (
             f"unique_str '{unique_str}' 没有找到对应的提取数据。\n"
             + tried_hint
+            + suffix_hint
             + "请确保已从游戏中提取模型并执行「一键导入当前工作空间内容」操作。"
         ), ""
+
+    # 磁盘上的目录名就是身份（含别名后缀），后面所有查找都以它为准：输入名里点号
+    # 之后可能是显示名（`LOD0.077983c9-10524-0.001`），剥掉之后才命中这个目录。
+    folder_bare_unique_str = os.path.basename(unique_str_folder.rstrip("\\/")) or bare_unique_str
+    folder_unique_str = WorkSpaceHelper._compose_lod_name(lod_name, folder_bare_unique_str)
+    suffix_hint = (
+        f"按身份前缀解析: {folder_unique_str}（点号之后视为显示名，不参与匹配）\n"
+        if folder_unique_str and folder_unique_str != str(unique_str or "").strip()
+        else ""
+    )
 
     workspace_import_json_path = os.path.join(workspace_folder, "Import.json")
     workspace_import_json = JsonUtils.LoadFromFile(workspace_import_json_path) if os.path.exists(workspace_import_json_path) else {}
     gametype_name = _get_import_gametype_name(
-        workspace_import_json, unique_str, bare_unique_str, lod_name
+        workspace_import_json, folder_unique_str, folder_bare_unique_str, lod_name
     )
 
     if gametype_name:
-        submesh_json_path = os.path.join(unique_str_folder, "TYPE_" + gametype_name, bare_unique_str + ".json")
+        submesh_json_path = os.path.join(unique_str_folder, "TYPE_" + gametype_name, folder_bare_unique_str + ".json")
         if os.path.exists(submesh_json_path):
             return True, "", submesh_json_path
 
@@ -84,7 +103,7 @@ def check_and_get_submesh_json_path(unique_str: str) -> tuple[bool, str, str]:
         if not dirname.startswith("TYPE_"):
             continue
 
-        submesh_json_path = os.path.join(unique_str_folder, dirname, bare_unique_str + ".json")
+        submesh_json_path = os.path.join(unique_str_folder, dirname, folder_bare_unique_str + ".json")
         if os.path.exists(submesh_json_path):
             found_type_paths.append(submesh_json_path)
             found_types.append(dirname.replace("TYPE_", ""))

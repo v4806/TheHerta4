@@ -4,6 +4,7 @@ from .d3d11_gametype import D3D11GameType
 
 from .texture_metadata_helper import TextureMetadataResolver
 from .submesh_metadata import SubmeshMetadataResolver
+from .object_prefix_helper import IndexValueError, coerce_index
 
 import numpy
 
@@ -79,6 +80,21 @@ class DrawIBModel:
             self.obj_name_draw_offset = obj_name_draw_offset
             self.index_count = total_index_count
 
+    @staticmethod
+    def _coerce_first_index(raw_first_index) -> int | None:
+        """把 first_index 归一成 int；认不出来返回 None（薄包装，规则只在 `coerce_index`）。
+
+        物体名被 Blender 加了 `.001` 之后第三段会变成 `0.001` 这种文本（复制物体、
+        或「快速局部导出」重跑时再现同前缀副本），旧代码直接 `int()` 会让整轮导出抛
+        `ValueError: invalid literal for int() with base 10: '0.001'`。剥后缀/认整数
+        的规则只有一份，在 `common/object_prefix_helper.coerce_index`；这里保留这个
+        静态方法只是为了「读不出来就 None」的调用约定。
+        """
+        try:
+            return coerce_index(raw_first_index, field="match_first_index")
+        except IndexValueError:
+            return None
+
     def _load_import_metadata_from_first_submesh(self):
         if not self.submesh_model_list:
             print("DrawIBModel: submesh_model_list 为空，无法读取导入元数据")
@@ -100,7 +116,21 @@ class DrawIBModel:
             for submesh_model in self.submesh_model_list:
                 workspace_unique_str = getattr(submesh_model, "workspace_unique_str", "") or submesh_model.unique_str
                 submesh_metadata = SubmeshMetadataResolver.resolve(workspace_unique_str)
-                self.match_first_index_partname_dict[int(submesh_model.match_first_index)] = submesh_metadata.part_name or submesh_model.unique_str
+                # first_index 是**对象名**里的第三段；名字末段可能带 Blender 的去重后缀
+                # （`.001`~`.999`：复制物体或重跑「快速局部导出」时自动追加），于是这一段
+                # 会变成 `0.001` 这种小数文本。读整数只走 `coerce_index`：`"0.001"` 认成 0；
+                # 缺段/非法文本会抛出带字段名与对象名的错，这里显式报出来并跳过该 submesh
+                # ——**不静默当 0**（错位部件比崩溃更难查）。
+                try:
+                    normalized_first_index = coerce_index(
+                        submesh_model.match_first_index,
+                        field="match_first_index",
+                        context=workspace_unique_str,
+                    )
+                except IndexValueError as first_index_error:
+                    print("DrawIBModel: 跳过 first_index 不可用的 submesh——" + str(first_index_error))
+                    continue
+                self.match_first_index_partname_dict[normalized_first_index] = submesh_metadata.part_name or submesh_model.unique_str
             self.vshash_list = list(self.import_json_dict.get("VSHashList", []))
             self.submesh_texturemarkinfolist_dict = TextureMetadataResolver.load_submesh_texture_markup_info_from_all_submeshes(
                 draw_ib_model=self,
@@ -295,7 +325,9 @@ class DrawIBModel:
 
     def get_part_name_by_match_first_index(self, match_first_index: int | str) -> str | None:
         try:
-            normalized_match_first_index = int(match_first_index)
+            # 同一个字段、同一套规则：`"0.001"`（名字尾的 Blender 去重后缀）也要能查到
+            # part 名，否则那个部件会被当成「没有 part」，贴图标记整段丢失。
+            normalized_match_first_index = coerce_index(match_first_index, field="match_first_index")
         except (TypeError, ValueError):
             return None
 

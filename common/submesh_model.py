@@ -27,6 +27,19 @@ from concurrent.futures import ThreadPoolExecutor
 from time import perf_counter
 
 
+def _strip_duplicate_suffix_name(text: str) -> str:
+    """剥掉 Blender 给重名顶点组追加的 ``.001`` 后缀。
+
+    复制物体时顶点组名一起被去重（``12`` → ``12.001``）；它仍然是数字骨骼组，
+    判「非数字组」之前必须先还原，否则这条骨会被静默删掉。
+    """
+    value = str(text or "").strip()
+    head, separator, tail = value.rpartition(".")
+    if separator and head and len(tail) == 3 and tail.isdigit():
+        return head
+    return value
+
+
 @dataclass
 class SubMeshModel:
     # 初始化时需要填入此属性
@@ -95,6 +108,11 @@ class SubMeshModel:
         # 因为列表里的每个DrawCallModel的draw_ib,first_index,index_count都是一样的，所以直接取第一个就行了
         if len(self.drawcall_model_list) > 0:
             self.match_draw_ib = self.drawcall_model_list[0].match_draw_ib
+            # 这三个索引字段一律按**字符串**继承，不在这里转 int：它们的出处是对象名
+            # `<draw_ib>-<index_count>-<first_index>`，名字末段可能带 Blender 去重后缀
+            # （复制物体/重跑导出产生 `.001`~`.999`）。需要整数时用
+            # `common/object_prefix_helper.coerce_index(值, field=…, context=…)`——
+            # 那是全仓唯一允许的转换入口，别在这个字段上再写一次 int()。
             self.match_first_index = self.drawcall_model_list[0].match_first_index
             self.match_index_count = self.drawcall_model_list[0].match_index_count
             self.workspace_unique_str = self.drawcall_model_list[0].get_workspace_unique_str()
@@ -884,6 +902,26 @@ class SubMeshModel:
             vg for vg in obj.vertex_groups
             if re.fullmatch(r"[0-9]+", str(vg.name)) is None
         ]
+        # 复制物体时 Blender 会把顶点组名也加去重后缀（``12`` → ``12.001``）。这种组
+        # **是**数字骨骼组，先剥后缀再判，否则会被当成「非数字」静默删掉 ⇒ 少一根骨。
+        recovered_groups = []
+        for vg in list(non_numeric_groups):
+            cleaned = _strip_duplicate_suffix_name(str(vg.name))
+            if re.fullmatch(r"[0-9]+", cleaned) is None:
+                continue
+            try:
+                vg.name = cleaned
+            except Exception:  # noqa: BLE001 - 重名冲突时保留原样，走下面的移除路径
+                continue
+            if str(vg.name) != cleaned:
+                continue
+            non_numeric_groups.remove(vg)
+            recovered_groups.append(cleaned)
+        if recovered_groups:
+            print(
+                f"[骨骼合并] {obj.name}: {len(recovered_groups)} 个顶点组从 Blender "
+                f"去重后缀还原为数字组 {recovered_groups}"
+            )
         for vg in non_numeric_groups:
             obj.vertex_groups.remove(vg)
         if non_numeric_groups:

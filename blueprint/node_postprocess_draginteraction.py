@@ -15,7 +15,7 @@ except ImportError:
 from .node_postprocess_base import SSMTNode_PostProcess_Base
 from . import deform_chain
 from .variable_registry import normalize_variable_name
-from ..common.object_prefix_helper import ObjectPrefixHelper
+from ..common.object_prefix_helper import ObjectPrefixHelper, coerce_index
 from ..common.mod_path_compat import (
     find_base_position_resource_name,
     ensure_resource_alias_section,
@@ -2220,8 +2220,15 @@ class SSMTNode_PostProcess_DragInteraction(SSMTNode_PostProcess_Base):
                     if prefix_info:
                         prefix_parts = ObjectPrefixHelper.parse_prefix_parts(prefix_info[0])
                         pending_mesh_owner = str(prefix_parts.get("draw_ib", "") or "").strip() or None
+                        # `int()` 只走 `coerce_index`：注释里的对象名可能带着 Blender 去重后缀
+                        # （`…-10524-0.001`，复制物体或重跑导出时自动追加），裸 int() 会抛
+                        # ValueError 把整段解析打断；去重后缀剥掉后仍是同一个 first_index。
                         try:
-                            pending_mesh_first_index = int(prefix_parts.get("first_index", ""))
+                            pending_mesh_first_index = coerce_index(
+                                prefix_parts.get("first_index", ""),
+                                field="first_index",
+                                context=mesh_match.group("object_name"),
+                            )
                         except (TypeError, ValueError):
                             pending_mesh_first_index = None
                     continue

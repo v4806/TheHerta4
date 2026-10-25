@@ -239,6 +239,36 @@ class Lod0FallbackTests(unittest.TestCase):
         self.assertEqual(json_path, "")
         self.assertIn("没有找到对应的提取数据", error_msg)
         self.assertIn("LOD0", error_msg)
+    # ---------------- 身份自定义后缀：点号之后是显示名 ----------------
+
+    def test_parse_lod_unique_str_keeps_the_dot_segment(self):
+        # 共用解析不剥点号段：显示名链路把它当别名（见 get_display_submesh_name）。
+        self.assertEqual(
+            WorkSpaceHelper.parse_lod_unique_str(f"LOD0.{BARE}.我的别名"), ("LOD0", f"{BARE}.我的别名")
+        )
+        self.assertEqual(WorkSpaceHelper.parse_lod_unique_str(f"LOD1.{BARE}"), ("LOD1", BARE))
+
+    def test_suffixed_identity_still_resolves_the_folder(self):
+        lod0 = self._make_submesh(f"LOD0/{BARE}")
+        for identity in (f"LOD0.{BARE}.001", f"LOD0.{BARE}.rthft001ygjyytfj中文", f"{BARE}.001"):
+            resolved = WorkSpaceHelper.get_submesh_folder_path(identity)
+            self.assertEqual(os.path.normcase(resolved), os.path.normcase(str(lod0)), identity)
+    def test_alias_folder_is_still_found_by_its_full_name(self):
+        # 别名后缀是既有约定（`aaaabbbb-100-0.Face`）：整名命中时不许被剥成身份再兜底。
+        alias_folder = self._make_submesh(f"LOD0/{BARE}.Face")
+        resolved = WorkSpaceHelper.get_submesh_folder_path(f"LOD0.{BARE}.Face")
+        self.assertEqual(os.path.normcase(resolved), os.path.normcase(str(alias_folder)))
+
+    def test_import_json_key_matches_by_prefix_when_suffixed(self):
+        folder = self._make_submesh(f"LOD0/{BARE}", gametype="GPU-X", extra_type="GPU-Y")
+        self._write_import_json({f"LOD0.{BARE}": "GPU-X"})
+
+        exists, error_msg, json_path = check_and_get_submesh_json_path(f"LOD0.{BARE}.001")
+        self.assertTrue(exists, error_msg)
+        self.assertEqual(
+            os.path.normcase(json_path),
+            os.path.normcase(str(folder / "TYPE_GPU-X" / (BARE + ".json"))),
+        )
 
     # ---------------- EFMI 骨骼合并侧的同一口径 ----------------
 
