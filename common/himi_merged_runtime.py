@@ -642,7 +642,7 @@ def validate_resource_decl(decl: HIMIResourceDecl) -> None:
         if decl.ini_format != BORROW_MAP_INI_FORMAT:
             raise HIMIResourceDeclError(
                 f"借用表 {decl.name} 必须声明 format = {BORROW_MAP_INI_FORMAT}"
-                "（4×u32 视图；写成 float 会把槽号解释成小数 ⇒ 全行作废）"
+                "（4 分量 typed 视图，分量数必须与 HLSL 的 uint4 元素一致；1 分量视图 + 4 分量元素 = 跨显卡未定义区，实测 GetDimensions 只回 60/216 行；写成 float 会把槽号解释成小数）"
             )
         if int(decl.stride or 0) != BORROW_MAP_STRIDE:
             raise HIMIResourceDeclError(
@@ -1490,7 +1490,7 @@ def borrow_slot_problems(parts, ranges, *, limit: int = 8) -> list:
     return problems
 
 
-def family_blend_scope_problems(indices_by_family, ranges, *, limit: int = 8) -> list:
+def family_blend_scope_problems(indices_by_family, ranges, *, limit: int = 8, host_family: str = "") -> list:
     """【判据】每个**权重 > 0** 的 Blend 索引必须落在「本族块 ∪ 本族借用槽」内（空 = 通过）。
 
     ``indices_by_family``：``{族: {该族 Blend 里权重 > 0 的索引}}``。块 = 注册槽
@@ -1498,6 +1498,7 @@ def family_blend_scope_problems(indices_by_family, ranges, *, limit: int = 8) ->
     :func:`borrow_map_layout_problems` 单独钉住）。块外任何值都是错的，哪怕它本身是别族的
     合法全局槽（那正是「顶点查到别人的槽」）。报错点名**族 + 该族的具体索引**。
 
+    宿主族（``host_family``）承载了全部件的合并网格，合法槽位涵盖整个合并骨架（:func:`family_block_slots`）。
     族不在 ``ranges`` 里、或族没有自己的块（``own_block=False``）⇒ 不判：那时索引本来就
     是局部编号 / 由拥有者的块写入。
     """
@@ -1521,6 +1522,8 @@ def family_blend_scope_problems(indices_by_family, ranges, *, limit: int = 8) ->
         allowed.update(
             int(dict(row).get("target_slot", -1)) for row in (info.get("borrow") or ())
         )
+        if host_family and family == host_family:
+            allowed.update(family_block_slots(ranges))
         outside = sorted({int(value) for value in values if int(value) not in allowed})
         if not outside:
             continue
@@ -3516,9 +3519,13 @@ ATTACH_RANGE_DEFAULT_FOLDER = MERGED_SKELETON_DEFAULT_FOLDER
 BORROW_MAP_RESOURCE_PREFIX = "ResourceHI3BorrowMap_"
 #: 资源形态（``validate_resource_decl`` 与 ini 发射共用）。
 BORROW_MAP_KIND = "borrow_map"
-#: ini 形状：``Buffer`` + ``R32_UINT`` + ``stride = 16``（一行 4×u32）+ ``array = 行数``。
+#: ini 形状：``Buffer`` + ``R32G32B32A32_UINT`` + ``stride = 16``（一行 4×u32）+ ``array = 行数``。
+#: format **必须写满 4 个 R32_UINT 分量**（= ``R32G32B32A32_UINT``），不能写 ``R32_UINT``：
+#: HLSL 元素是 ``uint4``（16 B）⇒ typed 视图的分量数必须与元素类型一致（A1 教义）。
+#: 「1 分量视图 + 4 分量 HLSL 元素」落进跨显卡未定义区，实测 ``GetDimensions()`` 只回 60 行
+#: （应 216）⇒ 216 行借用表里只有前 60 行执行，块尾借用槽一半写裸 P_源、一半根本没写。
 BORROW_MAP_INI_TYPE = "Buffer"
-BORROW_MAP_INI_FORMAT = "R32_UINT"
+BORROW_MAP_INI_FORMAT = "R32G32B32A32_UINT"
 BORROW_MAP_STRIDE = 16
 #: 一行 = 4×u32 = ``(目标槽, 来源族序号, 源局部槽, 0)``。
 BORROW_MAP_ROW_BYTES = 16
@@ -3682,7 +3689,7 @@ def build_borrow_map_decl(
     folder: str = MERGED_SKELETON_DEFAULT_FOLDER,
     filename: str = "",
 ) -> HIMIResourceDecl:
-    """``[ResourceHI3BorrowMap_<fam>]`` 声明（``Buffer`` + ``R32_UINT`` + ``stride = 16``）。
+    """``[ResourceHI3BorrowMap_<fam>]`` 声明（``Buffer`` + ``R32G32B32A32_UINT`` + ``stride = 16``）。
 
     ``array`` 是**行数**（不是字节）；空表也至少 1 行（哨兵），见 :func:`borrow_map_payload`。
     ``filename`` 显式给出时以它为准（导出侧按当前缓冲目录名拼），否则用 ``folder`` + 文件名。
@@ -3706,6 +3713,9 @@ def build_borrow_map_decl(
 
 def borrow_map_ini_lines(family: str, filename: str, row_count: int = 0) -> list:
     """BorrowMap 的 ``[Resource…]`` 段体（``type`` / ``format`` / ``stride`` / ``array`` / ``filename``）。
+
+    ``format = R32G32B32A32_UINT``（4 分量 typed，与 HLSL 的 ``uint4`` 元素同宽），
+    ``array`` = 行数。
 
     字段顺序由 :data:`RESOURCE_INI_FIELD_ORDER` 统一决定（与其它资源同源，不另写一遍）。
     """
@@ -3755,7 +3765,9 @@ def borrow_map_layout_problems(ranges, maps) -> list:
     return problems
 
 
-def borrow_blend_remap_problems(ledger, indices_by_family, ranges, *, limit: int = 8) -> list:
+def borrow_blend_remap_problems(
+    ledger, indices_by_family, ranges, *, limit: int = 8, host_family: str = ""
+) -> list:
     """【t93】Blend 重定到新块之后的**两条硬判据**（空 = 通过）。
 
     * **无未映射通道**：``ledger["unmapped"] > 0`` 意味着有通道既不落在本族注册槽、
@@ -3763,7 +3775,8 @@ def borrow_blend_remap_problems(ledger, indices_by_family, ranges, *, limit: int
       布局一旦带借用槽，旧编号就再也不是合法编号了，所以这条必须响，不能只警告。
     * **无块外索引**：每个权重 > 0 的通道，索引必须落在**本族块**
       ``[base, base + block_slots)`` 里 —— 注册槽在块头、借用槽在块尾；块外任何值
-      都是错的（哪怕它本身是别族的合法全局槽）。
+      都是错的（哪怕它本身是别族的合法全局槽）。对于宿主族（``host_family``），
+      承载全部件网格时合法槽位为整个合并骨架范围。
 
     ``indices_by_family``：``{family: 该族重定后仍被引用的索引}``。族不在 ``ranges`` 里
     （普通路径 / 未参与合并）⇒ 不判 —— 那时索引本来就是局部编号。
@@ -3788,7 +3801,9 @@ def borrow_blend_remap_problems(ledger, indices_by_family, ranges, *, limit: int
             )
             continue
     # 块外判定只有一条口径（本族块 ∪ 借用槽），与 :func:`family_blend_scope_problems` 共用。
-    problems += family_blend_scope_problems(indices_by_family, ranges, limit=limit)
+    problems += family_blend_scope_problems(
+        indices_by_family, ranges, limit=limit, host_family=host_family
+    )
     # 上面两段对「没有块」的族会各报一次，去重后返回。
     unique: list = []
     for item in problems:
