@@ -15,9 +15,10 @@
    能圈到新段，把 ``handling = skip`` 包进 ``if``：条件不通过时跳过失效，
    效果等同删掉跳过段。
 5. 节点上的**手动哈希**区（英文输入框 ``Hash`` / ``IndexCount`` / ``FirstIndex``
-   + 「添加」按钮 + 下方列表）不依赖物体列表：添加进列表的条目同样按条目追加
-   跳过段并登记。它主要用来跳过**没有导入 Blender** 的 IB（见下节），与选中
-   部件可以同时使用。
+   + 「添加到跳过部件」按钮）不依赖物体列表：条目**直接加入同一个「跳过部件」
+   列表**（与选中物体共用列表、移除/清空），同样按条目追加跳过段并登记。
+   它主要用来跳过**没有导入 Blender** 的 IB（见下节），与选中部件可以同时使用；
+   旧工程里单独的 ``manual_hash_items`` 列表会在首次绘制/导出时自动并入。
 
 无导出段的 IB（游戏原生绘制）
 --------------------------------
@@ -30,7 +31,8 @@
 手动哈希（没有导入 Blender 的 IB）
 ----------------------------------
 「手动哈希」区有三行输入框：``Hash`` / ``IndexCount`` / ``FirstIndex``。填好后点
-「添加」把这一条加进下方列表（列表行内 X 可删除）。它不依赖物体列表，用来给
+「添加到跳过部件」把这一条**直接加入上方的「跳过部件」列表**（行内 X 可删除，
+也可以选中后点「移除」/「清空」）。它不依赖物体列表，用来给
 **没有导入 Blender** 的绘制创建跳过——这类 IB 在本次导出里没有段，删除步骤自然
 为 0，只追加 ``handling = skip`` 段：
 
@@ -40,8 +42,8 @@
 
 ``Hash`` 是 8 位十六进制（大小写不限，可带 ``0x`` 前缀）；``IndexCount`` /
 ``FirstIndex`` 必须是非负整数（``IndexCount`` 还要大于 0），且**要么都填、要么
-都留空**——只填一项或填非数字时「添加」会被拒绝。添加时按
-``(hash, indexCount, firstIndex)`` 去重，重复条目不会重复加入。
+都留空**——只填一项或填非数字时会提示原因并拒绝。添加时按
+``(hash, indexCount, firstIndex)`` 去重，重复条目静默忽略。
 
 列表条目与选中物体**可以同时使用**：两边的条目按
 ``(hash, indexCount, firstIndex)`` 去重后统一追加进同一个 SKIP 块。
@@ -326,6 +328,119 @@ def _add_manual_hash_item(node, hash_text, index_count_text="", first_index_text
     item.index_count = "" if entry[1] is None else str(entry[1])
     item.first_index = "" if entry[2] is None else str(entry[2])
     return True, _format_skip_entry(entry)
+
+
+def _is_manual_skip_item(item):
+    """统一的「跳过部件」列表项是否是手动哈希条目。"""
+    return bool(getattr(item, "is_manual", False)) or bool(
+        str(getattr(item, "manual_hash", "") or "").strip()
+    )
+
+
+def _normalize_manual_skip_item(item):
+    """校验统一列表里的手动哈希条目，返回 ``(entry, error)``（与旧列表同口径）。"""
+    return _normalize_manual_hash_item(
+        getattr(item, "manual_hash", ""),
+        getattr(item, "manual_index_count", ""),
+        getattr(item, "manual_first_index", ""),
+    )
+
+
+def _manual_skip_item_label(item):
+    """统一列表行的手动条目显示文本。"""
+    entry, error = _normalize_manual_skip_item(item)
+    if entry is None:
+        raw_hash = str(getattr(item, "manual_hash", "") or "").strip()
+        return f"手动哈希 {raw_hash or '<空>'}（无效：{error}）"
+    return f"手动哈希 {_format_skip_entry(entry)}"
+
+
+def _add_manual_skip_item(node, hash_text, index_count_text="", first_index_text=""):
+    """把手动哈希条目加入节点统一的 ``skip_objects`` 列表（与选中部件同一列表）。"""
+    entry, error = _normalize_manual_hash_item(
+        hash_text, index_count_text, first_index_text
+    )
+    if entry is None:
+        return False, error
+
+    existing_entries, _invalid = _collect_node_manual_entries(node)
+    if entry in existing_entries:
+        # 重复点击不再弹警告（用户反馈：正常重复添加也应静默处理）。
+        return True, f"条目已存在，未重复添加（{_format_skip_entry(entry)}）"
+
+    collection = getattr(node, "skip_objects", None)
+    add = getattr(collection, "add", None)
+    if not callable(add):
+        # 兼容测试用的假节点：退回旧列表。
+        return _add_manual_hash_item(node, hash_text, index_count_text, first_index_text)
+
+    item = collection.add()
+    item.is_manual = True
+    item.manual_hash = entry[0]
+    item.manual_index_count = "" if entry[1] is None else str(entry[1])
+    item.manual_first_index = "" if entry[2] is None else str(entry[2])
+    return True, _format_skip_entry(entry)
+
+
+def _migrate_legacy_manual_hashes(node):
+    """把旧版 ``manual_hash_items`` 列表原地并入统一的 ``skip_objects`` 列表。
+
+    兼容旧工程：新版 UI 只在统一列表里显示手动哈希，旧数据第一次绘制/导出时迁移。
+    返回迁移条数。
+    """
+    legacy = getattr(node, "manual_hash_items", None)
+    target = getattr(node, "skip_objects", None)
+    if legacy is None or target is None:
+        return 0
+    if not hasattr(target, "add") or not hasattr(legacy, "remove"):
+        return 0
+    moved = 0
+    while len(legacy) > 0:
+        item = legacy[0]
+        new_item = target.add()
+        new_item.is_manual = True
+        new_item.manual_hash = str(getattr(item, "hash", "") or "").strip()
+        new_item.manual_index_count = str(getattr(item, "index_count", "") or "").strip()
+        new_item.manual_first_index = str(getattr(item, "first_index", "") or "").strip()
+        try:
+            legacy.remove(0)  # bpy CollectionProperty：按索引删除
+        except (TypeError, ValueError):
+            del legacy[0]  # 测试用 list：按索引切片删除
+        moved += 1
+    return moved
+
+
+def _collect_node_manual_entries(node):
+    """收集节点上所有手动哈希条目（统一列表 + 未迁移的旧列表），去重保序。"""
+    entries = []
+    invalid = []
+    seen = set()
+    position = 0
+    for item in getattr(node, "skip_objects", []) or []:
+        if not _is_manual_skip_item(item):
+            continue
+        position += 1
+        entry, error = _normalize_manual_skip_item(item)
+        if entry is None:
+            invalid.append(
+                (position, str(getattr(item, "manual_hash", "") or "").strip(), error)
+            )
+            continue
+        if entry in seen:
+            continue
+        seen.add(entry)
+        entries.append(entry)
+
+    legacy_entries, legacy_invalid = _collect_manual_hash_entries(
+        getattr(node, "manual_hash_items", None)
+    )
+    for entry in legacy_entries:
+        if entry in seen:
+            continue
+        seen.add(entry)
+        entries.append(entry)
+    invalid.extend(legacy_invalid)
+    return entries, invalid
 
 
 def _normalize_skip_entries(entries):
@@ -808,24 +923,40 @@ def _find_sibling_ini_sections(target_ini, section_names):
 # --------------------------------------------------------------------------- #
 
 class SSMT_SkipObjectItem(bpy.types.PropertyGroup):
+    """「跳过部件」列表的一条：选中物体，或手动输入的 IB 哈希。
+
+    两种条目共用一个列表（按用户要求）：``is_manual`` 为真 / ``manual_hash``
+    非空时按手动哈希条目处理，``object_name`` 条按选中物体处理。
+    """
+
     object_name: bpy.props.StringProperty(name="物体名称", default="")  # type: ignore
+    is_manual: bpy.props.BoolProperty(name="手动哈希条目", default=False)  # type: ignore
+    manual_hash: bpy.props.StringProperty(name="手动 Hash", default="")  # type: ignore
+    manual_index_count: bpy.props.StringProperty(name="手动 IndexCount", default="")  # type: ignore
+    manual_first_index: bpy.props.StringProperty(name="手动 FirstIndex", default="")  # type: ignore
 
 
 class SSMT_UL_SKIP_OBJECTS(bpy.types.UIList):
-    """已选跳过部件列表（行内 X 按钮按 index 删除对应项）。"""
+    """统一跳过列表：选中部件 + 手动哈希（行内 X 按钮按 index 删除对应项）。"""
 
     bl_idname = "SSMT_UL_SKIP_OBJECTS"
 
     def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
         row = layout.row(align=True)
-        row.label(text=str(item.object_name or ""), icon='OBJECT_DATA')
+        if _is_manual_skip_item(item):
+            entry, _error = _normalize_manual_skip_item(item)
+            # 注意：'HASH' 不是 Blender 5.2 的合法图标枚举（会导致列表绘制报错），
+            # 手动条目统一用 'TEXT' / 'ERROR'。
+            row.label(text=_manual_skip_item_label(item), icon='TEXT' if entry else 'ERROR')
+        else:
+            row.label(text=str(item.object_name or ""), icon='OBJECT_DATA')
         op_remove = row.operator("ssmt.skip_parts_remove", text="", icon='X')
         op_remove.node_name = getattr(data, "name", "")
         op_remove.index = index
 
 
 class SSMT_ManualHashItem(bpy.types.PropertyGroup):
-    """手动哈希列表的一条：8 位 hash + 可选的三段绘制区间。"""
+    """旧版手动哈希列表的一条（仅用于迁移到统一的「跳过部件」列表）。"""
 
     hash: bpy.props.StringProperty(name="Hash", default="")  # type: ignore
     index_count: bpy.props.StringProperty(name="IndexCount", default="")  # type: ignore
@@ -833,7 +964,7 @@ class SSMT_ManualHashItem(bpy.types.PropertyGroup):
 
 
 class SSMT_UL_MANUAL_HASHES(bpy.types.UIList):
-    """手动哈希列表（行内显示 hash / 三段，X 按钮按 index 删除对应项）。"""
+    """旧版手动哈希列表（保留注册以兼容旧数据，不再由节点 UI 使用）。"""
 
     bl_idname = "SSMT_UL_MANUAL_HASHES"
 
@@ -844,7 +975,7 @@ class SSMT_UL_MANUAL_HASHES(bpy.types.UIList):
             getattr(item, "first_index", ""),
         )
         row = layout.row(align=True)
-        row.label(text=_manual_hash_item_label(item), icon='HASH' if entry else 'ERROR')
+        row.label(text=_manual_hash_item_label(item), icon='TEXT' if entry else 'ERROR')
         op_remove = row.operator("ssmt.skip_manual_hash_remove", text="", icon='X')
         op_remove.node_name = getattr(data, "name", "")
         op_remove.index = index
@@ -883,6 +1014,12 @@ class SSMTNode_PostProcess_Skip(SSMTNode_PostProcess_Base):
     def draw_buttons(self, context, layout):
         layout.label(text="删除 IB hash 所属的全部导出段，并追加跳过段", icon='HIDE_ON')
 
+        # 旧工程的手动哈希列表并入统一列表后再显示（只在真实节点上迁移）。
+        try:
+            _migrate_legacy_manual_hashes(self)
+        except Exception:
+            pass
+
         box = layout.box()
         box.label(text=f"跳过部件 ({len(self.skip_objects)})", icon='OBJECT_DATA')
         if self.skip_objects:
@@ -890,7 +1027,7 @@ class SSMTNode_PostProcess_Skip(SSMTNode_PostProcess_Base):
                 "SSMT_UL_SKIP_OBJECTS", "",
                 self, "skip_objects",
                 self, "active_skip_object",
-                rows=max(2, min(len(self.skip_objects), 6)),
+                rows=max(2, min(len(self.skip_objects), 8)),
             )
 
         row = box.row(align=True)
@@ -900,36 +1037,20 @@ class SSMTNode_PostProcess_Skip(SSMTNode_PostProcess_Base):
         op_remove.index = int(self.active_skip_object)
         row.operator("ssmt.skip_parts_clear", text="清空", icon='TRASH').node_name = self.name
 
-        manual_box = layout.box()
-        manual_box.label(text="手动哈希", icon='TEXT')
-        input_col = manual_box.column(align=True)
-        input_col.prop(self, "temp_manual_hash", text="Hash")
-        input_col.prop(self, "temp_index_count", text="IndexCount")
-        input_col.prop(self, "temp_first_index", text="FirstIndex")
-        manual_box.operator(
-            "ssmt.skip_manual_hash_add", text="添加", icon='ADD'
+        # 手动哈希不再单独成列表：填好后直接加入上面的「跳过部件」列表。
+        box.separator()
+        manual_col = box.column(align=True)
+        manual_col.label(text="手动哈希（直接加入上方列表，跳过没导入 Blender 的 IB）", icon='TEXT')
+        manual_col.prop(self, "temp_manual_hash", text="Hash")
+        manual_col.prop(self, "temp_index_count", text="IndexCount")
+        manual_col.prop(self, "temp_first_index", text="FirstIndex")
+        box.operator(
+            "ssmt.skip_manual_hash_add", text="添加到跳过部件", icon='ADD'
         ).node_name = self.name
 
-        if self.manual_hash_items:
-            manual_box.template_list(
-                "SSMT_UL_MANUAL_HASHES", "",
-                self, "manual_hash_items",
-                self, "active_manual_hash",
-                rows=max(2, min(len(self.manual_hash_items), 6)),
-            )
-            row = manual_box.row(align=True)
-            op_remove = row.operator(
-                "ssmt.skip_manual_hash_remove", text="移除", icon='REMOVE'
-            )
-            op_remove.node_name = self.name
-            op_remove.index = int(self.active_manual_hash)
-            row.operator(
-                "ssmt.skip_manual_hash_clear", text="清空", icon='TRASH'
-            ).node_name = self.name
-
-        invalid_manual_items = _collect_manual_hash_entries(self.manual_hash_items)[1]
+        invalid_manual_items = _collect_node_manual_entries(self)[1]
         if invalid_manual_items:
-            manual_box.label(
+            box.label(
                 text=f"{len(invalid_manual_items)} 条手动哈希无效（导出时忽略）",
                 icon='ERROR',
             )
@@ -939,10 +1060,12 @@ class SSMTNode_PostProcess_Skip(SSMTNode_PostProcess_Base):
     # ------------------------------------------------------------------
 
     def _selected_part_names(self):
-        """收集节点上选定的部件名（去空、去重、保持顺序）。"""
+        """收集节点上选定的部件名（去空、去重、保持顺序；跳过手动哈希条目）。"""
         names = []
         seen = set()
         for item in self.skip_objects:
+            if _is_manual_skip_item(item):
+                continue
             name = str(getattr(item, "object_name", "") or "").strip()
             if not name or name in seen:
                 continue
@@ -988,9 +1111,12 @@ class SSMTNode_PostProcess_Skip(SSMTNode_PostProcess_Base):
             return False
 
         selected_names = self._selected_part_names()
-        manual_entries, invalid_manual_items = _collect_manual_hash_entries(
-            getattr(self, "manual_hash_items", None)
-        )
+        # 旧工程的手动哈希列表先并入统一列表（后台导出没有 UI 也会迁移一次）。
+        try:
+            _migrate_legacy_manual_hashes(self)
+        except Exception:
+            pass
+        manual_entries, invalid_manual_items = _collect_node_manual_entries(self)
         if invalid_manual_items:
             details = "、".join(
                 f"第 {position} 条「{hash_text or '空'}」{reason}"
@@ -1335,7 +1461,7 @@ class SSMT_OT_PostProcess_AddManualHash(bpy.types.Operator):
             self.report({'ERROR'}, "请选择跳过节点")
             return {'CANCELLED'}
 
-        ok, message = _add_manual_hash_item(
+        ok, message = _add_manual_skip_item(
             node,
             getattr(node, "temp_manual_hash", ""),
             getattr(node, "temp_index_count", ""),
@@ -1348,8 +1474,11 @@ class SSMT_OT_PostProcess_AddManualHash(bpy.types.Operator):
         node.temp_manual_hash = ""
         node.temp_index_count = ""
         node.temp_first_index = ""
-        node.active_manual_hash = max(0, len(node.manual_hash_items) - 1)
-        self.report({'INFO'}, f"已添加手动哈希：{message}")
+        try:
+            node.active_skip_object = max(0, len(node.skip_objects) - 1)
+        except Exception:
+            pass
+        self.report({'INFO'}, f"已加入跳过部件：{message}")
         return {'FINISHED'}
 
 

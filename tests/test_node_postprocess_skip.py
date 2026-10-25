@@ -311,6 +311,30 @@ class _FakeManualHashNode:
         self.manual_hash_items = _FakeManualHashCollection()
 
 
+class _FakeSkipCollection(list):
+    """统一「跳过部件」列表替身：模拟 bpy CollectionProperty 的 add()/remove()。"""
+
+    def add(self):
+        item = types.SimpleNamespace(
+            object_name="", is_manual=False, manual_hash="",
+            manual_index_count="", manual_first_index="",
+        )
+        self.append(item)
+        return item
+
+    def remove(self, index):
+        del self[index]
+
+
+class _FakeUnifiedSkipNode:
+    """统一列表节点替身：``skip_objects`` + 旧版 ``manual_hash_items``。"""
+
+    def __init__(self):
+        self.skip_objects = _FakeSkipCollection()
+        self.manual_hash_items = _FakeManualHashCollection()
+        self.active_skip_object = 0
+
+
 def _prepare_export_state(directory, model=None):
     """在临时目录写一份配置表并设置导出态；返回配置表路径。"""
     path = os.path.join(directory, "mod.ini")
@@ -720,6 +744,69 @@ class ManualHashEntryTests(unittest.TestCase):
         self.assertIn("8 位十六进制", message)
         self.assertEqual(2, len(node.manual_hash_items))
 
+    def test_add_manual_hash_goes_into_unified_skip_list(self):
+        """手动哈希直接加入统一的「跳过部件」列表，不再单独成列表。"""
+        node = _FakeUnifiedSkipNode()
+
+        ok, message = module._add_manual_skip_item(node, "7FBBCF0D")
+        self.assertTrue(ok)
+        self.assertEqual("7fbbcf0d", message)
+        self.assertEqual(1, len(node.skip_objects))
+        item = node.skip_objects[0]
+        self.assertTrue(item.is_manual)
+        self.assertEqual("7fbbcf0d", item.manual_hash)
+        self.assertEqual("", item.manual_index_count)
+        self.assertEqual("", item.manual_first_index)
+        self.assertIn("手动哈希 7fbbcf0d", module._manual_skip_item_label(item))
+
+        # 重复添加：静默提示，不再弹警告，也不重复入列
+        ok, message = module._add_manual_skip_item(node, "7fbbcf0d")
+        self.assertTrue(ok)
+        self.assertIn("已存在", message)
+        self.assertEqual(1, len(node.skip_objects))
+
+        ok, _message = module._add_manual_skip_item(node, "999bff94", "1260", "9402")
+        self.assertTrue(ok)
+        self.assertEqual(2, len(node.skip_objects))
+        self.assertEqual("1260", node.skip_objects[1].manual_index_count)
+        self.assertEqual("9402", node.skip_objects[1].manual_first_index)
+
+        entries, invalid = module._collect_node_manual_entries(node)
+        self.assertEqual(
+            [("7fbbcf0d", None, None), ("999bff94", 1260, 9402)], entries
+        )
+        self.assertEqual([], invalid)
+
+    def test_migrate_legacy_manual_hashes_moves_into_unified_list(self):
+        """旧工程的 manual_hash_items 首次绘制/导出时并入统一列表。"""
+        node = _FakeUnifiedSkipNode()
+        legacy = node.manual_hash_items.add()
+        legacy.hash = "28e05a59"
+        legacy.index_count = ""
+        legacy.first_index = ""
+
+        moved = module._migrate_legacy_manual_hashes(node)
+
+        self.assertEqual(1, moved)
+        self.assertEqual(0, len(node.manual_hash_items))
+        self.assertEqual(1, len(node.skip_objects))
+        self.assertTrue(node.skip_objects[0].is_manual)
+        self.assertEqual("28e05a59", node.skip_objects[0].manual_hash)
+        entries, _invalid = module._collect_node_manual_entries(node)
+        self.assertEqual([("28e05a59", None, None)], entries)
+
+    def test_unified_manual_invalid_row_reported(self):
+        node = _FakeUnifiedSkipNode()
+        item = node.skip_objects.add()
+        item.is_manual = True
+        item.manual_hash = "nope"
+
+        entries, invalid = module._collect_node_manual_entries(node)
+        self.assertEqual([], entries)
+        self.assertEqual(1, len(invalid))
+        self.assertEqual("nope", invalid[0][1])
+        self.assertIn("无效", module._manual_skip_item_label(item))
+
     def test_manual_triple_builds_full_skip_section(self):
         entries, _invalid = module._collect_manual_hash_entries(
             [types.SimpleNamespace(hash="ab12cd34", index_count="1260", first_index="9402")]
@@ -759,6 +846,27 @@ class ManualHashExecuteTests(unittest.TestCase):
         _ExportState.target_ini = ""
         _ExportState.model = None
         _ExportState.stages = []
+
+    def test_unified_list_manual_hash_only_appends(self):
+        """统一「跳过部件」列表里的手动哈希条目也能正常导出。"""
+        registry = _FakeRegistry()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _prepare_export_state(tmp)
+            node = _make_node(part_names=[])
+            node.skip_objects = _FakeSkipCollection()
+            ok, _message = module._add_manual_skip_item(node, "ab12cd34")
+            self.assertTrue(ok)
+
+            with _RegistryPatch(registry):
+                self.assertTrue(node.execute_postprocess(tmp))
+
+            updated = Path(path).read_text(encoding="utf-8")
+            self.assertIn("[TextureOverride_IB_ab12cd34]", updated)
+            self.assertIn("handling = skip", updated)
+            self.assertTrue(
+                any("手动哈希 1 个" in text for text in _log.texts("info")),
+                _log.records,
+            )
 
     def test_manual_hash_only_appends_without_selected_objects(self):
         registry = _FakeRegistry()
