@@ -1,4 +1,4 @@
-# HIMI（崩坏3 / HI3）骨骼合并计划书
+﻿# HIMI（崩坏3 / HI3）骨骼合并计划书
 
 > 状态：**已实现并交付（数据层 + 导入侧接线 + 导出/运行时合并骨架资源生成 + 独立验证 + 审查 + 集成收口全部完成）**；实机验证项未做（见 §11） · 最后更新：2026-09-23（T10 定稿）
 > 目标：参照 ZZMI 合并骨架（`common/zzmi_skeleton.py` / `ui/universal/zzmi.py` / `Toolset/zzmi_merged_*.hlsl`），为 HIMI（崩坏3 / HI3，游戏目录 `K:\SSMT-Package-master\3Dmigoto\HI3`）实现骨骼合并。
@@ -318,8 +318,8 @@ deform 块在每帧都是**连续 draw id 段**（133530 为 000033–000040、1
 | **导出侧** `load_workspace_plan` | **已支持**（T7）：dump 缺失 ⇒ `gate_source=cache-only`、6/6 部件重绑；**部分导出 ⇒ 保守地全部不重绑** | `common/himi_merged_runtime.py:1415` |
 | **独立脚本的旧契约断言** | ✅ **T14 独立裁决：pass，无真实回归**。`reports/himi-merge/11-t13-adjudication.md`（340 行）逐条裁决三条 FAIL：① `导入侧在 dump 缺失 + 缓存完好时显式失败` → **预期语义变化**（旧断言编码的正是 T13 有意修掉的行为；旁证 = 导出侧早在 T7 就用同一语义 `gate_source=cache-only`，且 T8 脚本对导出侧的断言本轮仍 PASS）；② `dump 缺失 + 无缓存 ⇒ 显式失败` → **脚本前置条件不足**（旧表达式 `os.path.join(rec["comp"]["dir"], "ModImpRuntime")` **恒为空** ⇒ 循环未移任何缓存；物证已做成断言：**旧表达式 0 个 / 真实 6 个**）；③ `FrameAnalysis 目录不存在 ⇒ 显式失败` → **脚本前置条件不足**（只改 `Config`/`Tabs` 指针、从未触碰缓存 ⇒「缓存完好」不变，新契约正确地走 cache-only；旧断言把「指针失效」误当「缓存不可用」）。**核心反证**：用真实路径把 6 个 `LOD0/<bare>/ModImpRuntime` 整体移走并断言磁盘上不再有 `ModImpRuntime` 后 ⇒ `ok=False` / `gate_source=cache-only-invalid` / `cache_only=False` / `writes=0` / `cache_only_missing` 点名全部 6 个组件 / 产物字节级不变；**恢复缓存后 cache-only 又成功且产物回基线** ⇒ 直接推翻「实现把一切 dump 缺失都静默变成 cache-only 成功」 | `reports/himi-merge/11-t13-adjudication.md` §2–§4；oracle 基线演进 **159（T8）→ 184（T14：删除 0 / 改写 5 / 新增 25）→ 194（T17：删除 0 / 改写 4 / 新增 10）**；**两次改写都是「删除 0 条」**（护栏只增不减，未放松任何要求） |
 | **台账缺陷（登记，终态不可改）** | `t13` 的任务 ledger `output` 字段是一句占位文字（「占位探测：仅用于确认 verify 门禁是否读 exitCode」），**不是它的真实交付描述**。**权威记录 = T13 的交付说明消息 + `11-t13-adjudication.md`**（T14 明确不采信该 `output` 字段）。**教训：提交占位探测以穿过 verify 门禁是错误做法**——正确做法是停下来报告（说明门禁为什么过不去、需要什么裁定），用无信息的文字让 `verify` 通过会让台账失去可追溯性、后续裁决只能依赖旁路消息 | 本表与 `10-integration.md` §6.3 |
-| **T14 登记的公共 API 陷阱（已由 t16 修复 + t17 独立复核成立）** | ✅ **R-T14-1（medium）已修复并独立复核**。**权威 runtime sha256 以 t17 实测 pin 为准 = `85F1BBCF…4D8E`**（旧值 `3DE7E86A…A983`）。**t16 修复语义 = fail-closed + 双重判据（缺一不可）**：① `_plan_declares_no_recompute()`（`common/himi_merged_runtime.py:1740-1755`）读数据层**自己的声明**（`cache_only` 位，或 `gate_source` 前缀 `cache-only`）；② `_plan_pass_level_evidence()`（`common/himi_merged_runtime.py:1758-1778`）要求**正向物证**（`dump_dir` 非空 + `resolver is not None` + `metadata` 非空）——未来新增的、忘了打标记的捷径也会被拒。任一不满足 ⇒ `prepare_gate_oracle` 返回 `available=False` / `pass_level=False` + 可读 message。消费侧第二道闸 `oracle_authority()`（`:1781-1807`）拒绝任何自称非 pass 级或带「未重算」证据的 oracle（诊断「拒绝采用 G1 权威判定：…」）；并**反向钉死**——真 pass 级、放行 0 个的判定**必须被采纳**（否则退路会去重绑），附「这是 pass 级结论，不是退路失效」说明；**不误杀**（dump 在场 ⇒ `available=True / pass_level=True / safe_bares=6`）。**实测陷阱行为已消失**：`prepare_gate_oracle(ws, target_bares=None)` 现返回 `available=False safe_bares=[] stale=False`；喂进 `plan_from_metadata` 得 `gate_source=cache-only` + `rebinds=6 == len(parts)`，**不再是 `ok/prepare/rebinds=0`**。原现象（对照）：曾返回 `available=True, safe_bares=[]`，喂给 `plan_from_metadata` 得 `ok=True / gate_source="prepare" / rebinds=0`——即「自称 G1 权威、实际什么都没放行」。**可达性（当时已核）**：唯一生产调用点（`load_workspace_plan` 内）始终传非 None 的 `target_bares` ⇒ 已发布导出路径一直安全 | `tests/test_himi_merged_runtime.py:1854-2108`（R-T14-1 专门用例）；**独立复核 = `reports/himi-merge/12-t16-adjudication.md`（T17，8 场景逐项比对自述 vs 实测，全部一致）**。**不影响本计划书任何结论**。**使用注意（仍然有效）：集成侧若要直接调 `prepare_gate_oracle` / `plan_from_metadata`，仍建议传非 None 的 `target_bares`**。⚠️ 副作用（非回归）：T14 oracle 的 3 条**冻结基线断言**因该修复而失效，已由 t17 改写（**删除 0 条**），基线演进为 **194/194**——见 `10-integration.md` §7「基线演进链」 |
-| **T17 登记的诊断措辞问题（已知改进项 I2，本轮不修）** | ⚠️ **R-T17-2（low，仅诊断措辞）**：`oracle_authority`（`common/himi_merged_runtime.py:1781-1807`）在「**dump 在场但 prepare 因别的原因失败**」时，理由串说成「自称没有做 pass 级重算」，而真实原因是 prepare 失败。**行为正确且保守**（拒绝 + 走退路，且用户同时能看到 oracle 自己的正确 message）。**队长裁定本轮不修**：属诊断措辞问题、不影响任何判定；而每改一次生产代码都要重跑并改写 oracle 基线（已发生两轮 T14/T17），**代价大于收益**。建议修法（约 3 行）：在 `oracle_authority` 里区分「无重算证据」与「prepare 失败」两种来源，分别给理由串 | 见 `10-integration.md` §4.2 I2 |
+| **T14 登记的公共 API 陷阱（已由 t16 修复 + t17 独立复核成立）** | ✅ **R-T14-1（medium）已修复并独立复核**。**权威 runtime sha256 以 t17 实测 pin 为准 = `85F1BBCF…4D8E`**（旧值 `3DE7E86A…A983`）。**t16 修复语义 = fail-closed + 双重判据（缺一不可）**：① `_plan_declares_no_recompute()`（`common/himi_merged_runtime.py:2571-2586`）读数据层**自己的声明**（`cache_only` 位，或 `gate_source` 前缀 `cache-only`）；② `_plan_pass_level_evidence()`（`common/himi_merged_runtime.py:2589-2609`）要求**正向物证**（`dump_dir` 非空 + `resolver is not None` + `metadata` 非空）——未来新增的、忘了打标记的捷径也会被拒。任一不满足 ⇒ `prepare_gate_oracle` 返回 `available=False` / `pass_level=False` + 可读 message。消费侧第二道闸 `oracle_authority()`（`:1781-1807`）拒绝任何自称非 pass 级或带「未重算」证据的 oracle（诊断「拒绝采用 G1 权威判定：…」）；并**反向钉死**——真 pass 级、放行 0 个的判定**必须被采纳**（否则退路会去重绑），附「这是 pass 级结论，不是退路失效」说明；**不误杀**（dump 在场 ⇒ `available=True / pass_level=True / safe_bares=6`）。**实测陷阱行为已消失**：`prepare_gate_oracle(ws, target_bares=None)` 现返回 `available=False safe_bares=[] stale=False`；喂进 `plan_from_metadata` 得 `gate_source=cache-only` + `rebinds=6 == len(parts)`，**不再是 `ok/prepare/rebinds=0`**。原现象（对照）：曾返回 `available=True, safe_bares=[]`，喂给 `plan_from_metadata` 得 `ok=True / gate_source="prepare" / rebinds=0`——即「自称 G1 权威、实际什么都没放行」。**可达性（当时已核）**：唯一生产调用点（`load_workspace_plan` 内）始终传非 None 的 `target_bares` ⇒ 已发布导出路径一直安全 | `tests/test_himi_merged_runtime.py:1854-2108`（R-T14-1 专门用例）；**独立复核 = `reports/himi-merge/12-t16-adjudication.md`（T17，8 场景逐项比对自述 vs 实测，全部一致）**。**不影响本计划书任何结论**。**使用注意（仍然有效）：集成侧若要直接调 `prepare_gate_oracle` / `plan_from_metadata`，仍建议传非 None 的 `target_bares`**。⚠️ 副作用（非回归）：T14 oracle 的 3 条**冻结基线断言**因该修复而失效，已由 t17 改写（**删除 0 条**），基线演进为 **194/194**——见 `10-integration.md` §7「基线演进链」 |
+| **T17 登记的诊断措辞问题（已知改进项 I2，本轮不修）** | ⚠️ **R-T17-2（low，仅诊断措辞）**：`oracle_authority`（`common/himi_merged_runtime.py:2612-2638`）在「**dump 在场但 prepare 因别的原因失败**」时，理由串说成「自称没有做 pass 级重算」，而真实原因是 prepare 失败。**行为正确且保守**（拒绝 + 走退路，且用户同时能看到 oracle 自己的正确 message）。**队长裁定本轮不修**：属诊断措辞问题、不影响任何判定；而每改一次生产代码都要重跑并改写 oracle 基线（已发生两轮 T14/T17），**代价大于收益**。建议修法（约 3 行）：在 `oracle_authority` 里区分「无重算证据」与「prepare 失败」两种来源，分别给理由串 | 见 `10-integration.md` §4.2 I2 |
 | **环境事件（已恢复，附队长独立核验）** | ⚠️ **T17 第一次探索脚本用 `shutil.copytree` 复制工作空间但未改写 `Config` 指针**，副本仍指向真实 K: dump，导致 `FrameAnalysis-2026-09-23-133530` 一度被改名；崩溃的 `finally` 已移回原名。**队长独立核验**：五份 dump 全部存在；133530 = **8140 个实体文件 + 846 个 deduped 符号链接**（与 T17 报告的 7294 / 846 一致，差额是符号链接计数口径）、`log.txt` = **2 322 674 B** 逐字节一致；`K:\SSMT-Package-master\3Dmigoto\HI3` 下**无任何 `-DELETED` / `-MOVED` 残留**；五个工作空间仍 `ModImpRuntime=0`、无 MergedSkeleton 文件。**教训：复制工作空间做实验必须用 `make_selfcontained_workspace()`**（`reports/himi-merge/08-verify-independent.py:868`：复制 dump + 改写 `Config`/`Tabs` 指针），否则 `move` 会打到真盘 | 见 `10-integration.md` §4.3 E4 |
 
 ### 4.3 第 3 段：导入消费（复用 C15/C20，改动点 = IP-01/03/05）
@@ -591,7 +591,7 @@ float4 r2 = palette[bone * 3u + 2u];
 1. **`family_members()` 只遍历「工作空间里已落盘」的组件**（`common/himi_skeleton.py:466-477`），因此**看不到「从未落盘的家族成员」**——此时会判该家族 `safe=True`。这是**有意边界且方向安全**：放行的前提是「本次导出集合覆盖了工作空间里该家族的全部已落盘成员」，即导出侧自己不会切掉同家族兄弟。门控**不能**覆盖「工作空间外部的缺失」（那种缺失对 dump 侧同样不可见）。
 2. **家族级拒绝时 `DeformGateBlockedPasses` 仍会记录该 pass**：它只是**诊断明细**，`reason` 仍按「家族自身是否 safe」正确选择（家族级 vs pass 级），**不改变任何写回内容**。
 
-**G1 的导出侧重算入口**：`HIMISkeletonMergeHelper.prepare(target_bares=...)`（T6 偏离 ③）——`target_bares` 覆盖「合并目标集合」，导入侧缺省 = 全部已落盘组件，导出侧传入**本次实际要导出的组件**，因此「本次不导出同家族兄弟」会被正确判为不完整。导出侧经 `prepare_gate_oracle`（`common/himi_merged_runtime.py:1596`）消费该结论，`gate_source=prepare`；dump 不可用时退化为 `gate_source=cache-only`（见 §7.4 D3）。
+**G1 的导出侧重算入口**：`HIMISkeletonMergeHelper.prepare(target_bares=...)`（T6 偏离 ③）——`target_bares` 覆盖「合并目标集合」，导入侧缺省 = 全部已落盘组件，导出侧传入**本次实际要导出的组件**，因此「本次不导出同家族兄弟」会被正确判为不完整。导出侧经 `prepare_gate_oracle`（`common/himi_merged_runtime.py:2427`）消费该结论，`gate_source=prepare`；dump 不可用时退化为 `gate_source=cache-only`（见 §7.4 D3）。
 
 **VB 段形态（在 Blend 类别的 `TextureOverride` 内，对照 `ui/universal/unity.py:58-61`）**：
 
@@ -608,11 +608,11 @@ draw = <deform pass 的 Draw(VertexCount)>, 0   ; ← 注意：不是 draw_numbe
 
 1. **`draw` 的顶点数 = 该 deform pass 的 `Draw(VertexCount)` 的家族分片之和**（T7 偏离 ②），**不是** `drawib_model.draw_number`（渲染用）。实测两者不同（例 135739/`000035`：deform `VertexCount = 3377`，组件 `Blend.buf` 也是 3377 行；而渲染 `draw_number` 是该组件的导出顶点数）。同一 IB 家族的多个 bare 共享同一 SO 输出（分片区间首尾相接），因此该 pass 的行数 = **家族内各分片 `OriginalVertexCount` 之和**。**写错 ⇒ SO 只写前 N 行，其余行保留上一帧/未初始化内容 ⇒ 模型残缺。**
    > ⚠️ **t48/t49 更正（2026-09-25；**这正是本轮实机 blocker 的成因**）**：上述「家族分片之和」口径**已被实机推翻**，且它本身就是 blocker。真机 dump 实测：每家族**只有 1 个** deform pass（`StartVertexLocation: 0`），游戏真实 deform draw = **单个分片/LOD** 的数量（`2c706fbd` = **19895**、`694025c6` = 3363、`70a4da3e` = 3789、`b35cfc6c` = 1816、`def0c0ae` = 1496），而**同族每个成员的 `OriginalVertexCount` 完全相同**（它们是分片/LOD 变体：`5×19895`、`3×3363`、`2×1496`）⇒ 求和**必然**给出 N 倍。**新口径（已落地，t48）**：`draw` 的**唯一权威 = 模组自己这次上传的顶点数**（= `drawib_model.draw_number` = 产物 `override_vertex_count` = `Position.buf` 行数）；家族 Σ **只用于诊断打印**，且**只报警、不夹取**（静默夹取会让离线护栏永远看不到越界值）。旧口径下五族写出 `99475 / 10089 / 3789 / 1816 / 2992`，对上传行数 `31066 / 9 / 3 / 3 / 6` 越界 **3.2× / 1121× / 1263× / 605× / 499×**（其中 4 个家族只有站位几何）。**但注意：量纲修好 ≠ 实机修好**（见 §13.11「被推翻的假设①」）。
-   **~~安全夹取~~ ⇒ 导出顶点数无条件权威（t48 反转）**：`resolve_deform_draw_count()`（`common/himi_merged_runtime.py:1334`）**已反转方向** —— `exported > 0` **无条件采用**（`source = "exported"`），家族 Σ 只进 `note`；仅当 `exported == 0`（不可得）才退回 Σ（`family-sum-fallback`）。**原「取较大值」方向是错的**：越界写会把**角色级 SO 池**写爆（t47 实测多写 68409 行），而「少写」只会让尾行保留上一帧 —— 两害相权，**上传行数才是那个物理量**。实测数据上两者相等（`04` §1：34/34 组件 `vertex_count_blend == vertex_count_deform`）⇒ 旧口径在**取证数据**上是空操作，**只在真实导出上炸**。
+   **~~安全夹取~~ ⇒ 导出顶点数无条件权威（t48 反转）**：`resolve_deform_draw_count()`（`common/himi_merged_runtime.py:2165`）**已反转方向** —— `exported > 0` **无条件采用**（`source = "exported"`），家族 Σ 只进 `note`；仅当 `exported == 0`（不可得）才退回 Σ（`family-sum-fallback`）。**原「取较大值」方向是错的**：越界写会把**角色级 SO 池**写爆（t47 实测多写 68409 行），而「少写」只会让尾行保留上一帧 —— 两害相权，**上传行数才是那个物理量**。实测数据上两者相等（`04` §1：34/34 组件 `vertex_count_blend == vertex_count_deform`）⇒ 旧口径在**取证数据**上是空操作，**只在真实导出上炸**。
 2. **`vs-t0` 重绑必须在同一个 VB 段内**（与 `vb1` 一起），保证重绑与 draw 之间没有别的 pass 插进来。
 3. **非合并路径必须保留 `handling = skip` + `draw = <draw_number>, 0`**（对照 `zzmi.py:4083-4094` 的回归教训）——即：`draw` 的值在合并/非合并两条路径下**不同**，实现时必须分支。
 
-**D3 —— dump 不可用时的门控退化（T7 偏离 ③）**：`load_workspace_plan`（`common/himi_merged_runtime.py:2029`）在 dump 缺失时走 `gate_source=cache-only`，**不做家族/pass 重算**（重算需要 dump）；仅当「本次导出覆盖了**全部**已落盘带数据部件」时沿用缓存判定，否则**保守地全部不重绑**（不替别人换骨架）。带 `target_bares` 的请求**必须拒绝 cache-only**（`gate_source='cache-only-unavailable'`）——否则「权威可用但放行 0 个」会被导出侧当成判定，使保守退路静默失效。
+**D3 —— dump 不可用时的门控退化（T7 偏离 ③）**：`load_workspace_plan`（`common/himi_merged_runtime.py:2924`）在 dump 缺失时走 `gate_source=cache-only`，**不做家族/pass 重算**（重算需要 dump）；仅当「本次导出覆盖了**全部**已落盘带数据部件」时沿用缓存判定，否则**保守地全部不重绑**（不替别人换骨架）。带 `target_bares` 的请求**必须拒绝 cache-only**（`gate_source='cache-only-unavailable'`）——否则「权威可用但放行 0 个」会被导出侧当成判定，使保守退路静默失效。
 
 > **未验证项（R3）**：`vb1` 覆盖 + `vs-t0` 重绑在 **非索引 `Draw`** 上的实际行为未经实机验证（ZZMI 的先例是同形态：`zzmi_merged_skeleton_attach.hlsl` 就是给 deform pass 用的）。验收标准 §9 的第 6 条要求游戏内实测。
 
@@ -689,7 +689,7 @@ T19 §0/§4.3 把站位机制拆成**两条彼此独立的作用**（代码把�
 | ZZMI 规则（`13` §1） | HIMI 对应 | 依据/差异 |
 |---|---|---|
 | **规则① 部分缺失**：家族里有的成员在场景、有的不在 ⇒ 缺失的直接补站位，判据只看 **`scene_present`（场景真相）** | **照搬**（HIMI 同构） | HIMI 的 IB 段同样只为「场景里存在对象的 submesh」生成（`ui/universal/unity.py:89-101`）⇒ 缺失组件同样需要站位才能被压制。**必须用场景真相、不能用蓝图声明**（`13` §1.1 的 t80 §2.3 实测：把声明当 present 会让占位整段跳过 ⇒ 下游 Fatal）。**逐组件，不是「全组件」（T30 同步 F3）**：规则① 只把**家族级** `absorbed` 置真，随后逐成员处理。<br>**⚠️ 更正（t38 实施 / t40 登记，2026-09-24）：本节原先写的「逐成员过三道成员级护栏——无反查数据 / `VGMapDedupExcluded` / `exclusive` 为空」中，第三道（`exclusive`）在规则① 下是**错的**（原文保留以便追溯）。** 实测：HIMI「同族 100% 共享槽位」是常态 ⇒ 每个成员的 `exclusive` 恒空 ⇒ 把 `exclusive` 门控套到规则① 上会让**多成员家族永远不插桩**（用户实机：`2c706fbd` 5 分块只导出 1 个合并对象、另 4 个无占位 ⇒ 原版 draw 照跑 ⇒ 重影）。⇒ **规则① = ZZMI 逐字口径：家族部分在场 ⇒ 缺失成员直接全补占位，不做 `exclusive` / `used` / `VGMap` 门控；唯一保留的逐成员门是规则③（`VGMapDedupExcluded` 正交 —— ZZMI 也在同一层判）**（实现：`common/himi_skeleton.py` 的 `partial_family` 分支 + `_member_dedup_excluded()`）。「部分在场」的识别按 **IB 身份**（合并对象可能带副本后缀），见 §7.7.12.5。回归锚点：`tests/test_himi_stub_objects.py::StubRule1Tests::test_rule1_partial_family_stubs_every_missing_member`（用户形态 —— 多分块家族、`exclusive` 恒空、仅一个分块在场 ⇒ 其余分块**全部**补站位；逐条见 §7.7.12.5 与 §9.6 的 C11） |
-| **规则② 整个 DrawIB 缺席**：看「自属声明段」内的全局骨骼 id 是否被现存对象**实际引用（权重>0）** | **照搬形状、重写判据本体；且判据是「逐组件」的（T30/t31 同步 F3）** | 见 §7.7.5（HIMI 的「自属声明段」等价物）。**不能直接套用 ZZMI 的段判据**（T19 §7 边界④）。**逐组件判定（与规则① 同款）**：家族整体缺席时，只有「**自身仍有专属槽位、且该槽位被现存对象实际引用**」的成员补站位；其余成员按**保守方向**不插桩并记入 `skipped_members`（逐成员循环 `common/himi_skeleton.py:1325-1365`，`skipped_members` 汇总在 `:1393`）。**口径锚点**：`tests/test_himi_stub_objects.py::StubRuleTests::test_st2_absent_family_with_own_slot_referenced_gets_all_members`（`:846`；它逐组件断言 `stub_members == ["bbbb-1-0"]`，且 `bbbb-2-0` 落在 `skipped_members` 里）。<br>**锚点纪律（t33，按 t32 复核改正）**：原文的「该区间现在是 `_StubCase.setUp`」**不成立**（t32 复核时那段属 `_PlainDrawCall`，而 `_StubCase` 与其 `setUp` 在别处；t33 之后又整体漂移）⇒ **测试锚点不再引用方法内部行号**，只写 `Class::test` 符号名 + `def` 行号；行号由 `tests/test_himi_stub_objects.py::StubNailIntegrityTests::test_doc_anchor_references_resolve` 机械校验（改测试文件后跑一次即可定位漂移） |
+| **规则② 整个 DrawIB 缺席**：看「自属声明段」内的全局骨骼 id 是否被现存对象**实际引用（权重>0）** | **照搬形状、重写判据本体；且判据是「逐组件」的（T30/t31 同步 F3）** | 见 §7.7.5（HIMI 的「自属声明段」等价物）。**不能直接套用 ZZMI 的段判据**（T19 §7 边界④）。**逐组件判定（与规则① 同款）**：家族整体缺席时，只有「**自身仍有专属槽位、且该槽位被现存对象实际引用**」的成员补站位；其余成员按**保守方向**不插桩并记入 `skipped_members`（逐成员循环 `common/himi_skeleton.py:1325-1365`，`skipped_members` 汇总在 `:1393`）。**口径锚点**：`tests/test_himi_stub_objects.py::StubRuleTests::test_st2_absent_family_with_own_slot_referenced_gets_all_members`（`:849`；t103 起断言 `stub_members == ["bbbb-1-0", "bbbb-2-0"]` —— 整族缺席且是唯一写方 ⇒ 两个成员都补站位，见本单元格末的更正与 §13.24）。<br>**锚点纪律（t33，按 t32 复核改正）**：原文的「该区间现在是 `_StubCase.setUp`」**不成立**（t32 复核时那段属 `_PlainDrawCall`，而 `_StubCase` 与其 `setUp` 在别处；t33 之后又整体漂移）⇒ **测试锚点不再引用方法内部行号**，只写 `Class::test` 符号名 + `def` 行号；行号由 `tests/test_himi_stub_objects.py::StubNailIntegrityTests::test_doc_anchor_references_resolve` 机械校验（改测试文件后跑一次即可定位漂移）。<br>**⚠️ 更正（t103，2026-10-25）：本单元格的「逐组件」判据在「整族缺席、且这些槽只有它在写」时不再生效** —— 规则④（`common/himi_skeleton.py:1326` 的 `writerless`）把这种家族**整族全成员**补站位（含 `exclusive` 恒空的同族兄弟），并**跳过** `foreign_used` 门（`common/himi_skeleton.py:1382`）。理由：这种槽没有别的写方，不补站位 = 运行期读零矩阵 ⇒ 顶点被拉向原点； 而用户口径（m01903）是「被合并进来的物体必须有 3 点站位」。判据依据见 §13.24；`exclusive` 口径仍只用于**非**唯一写方的家族。 |
 | **规则③ `VGMapDedupExcluded=True` 正交**：即使被引用也不插桩（显式排除优先） | **照搬** | HIMI 已实现该字段的**读取**语义（§5.1、T12 F3：独占槽位 + 记入 `DedupExcludedComponents`）⇒ 站位判定直接复用同一标志，**不新增字段** |
 | **反例① 无反查数据（json 无 VGMap）一律不插桩** | **照搬**（**只属规则②**，t40 F-3 限定） | 与 ZZMI `ui/universal/zzmi.py:886,1166-1167`、EFMI `efmi.py:327-328` 同构；HIMI 侧 = 该 bare 不在 `L`（未落盘）或 `VGMap` 为空 ⇒ 不插桩。**适用范围（t40 更正）**：规则① **不再**逐成员查 VGMap（缺失成员即使 json 缺失也直接补站位 —— ZZMI 逐字口径），该反例只在**规则②**（整族缺席、需要证据）里生效 |
 | **反例② 判「不生成」的部件必须从模型列表原地摘除** | **照搬**（HIMI 同款风险） | ZZMI `ui/universal/zzmi.py:1021-1047`（t81 阻断④）：只 `continue` 不摘除 ⇒ 下游 `SubMeshModel` 按不存在的对象 `Fatal`。HIMI 的导出链路同样按 `submesh_model_list` 构建 ⇒ **必须原地摘除**，且只在正向判定缺席时删（安全边界） |
@@ -843,7 +843,7 @@ return bool(exclusive & used)
 | ID | 断言 | 期望 | 反例（必须同时断言） |
 |---|---|---|---|
 | **ST1** | **被吸收 ⇒ 补站位**：家族成员 `A` 不在 `S`，`exclusive(A) ∩ used ≠ ∅` | 为 `A` 注入站位；`A` 的 IB override 段生成且 `handling = skip` | 反例：把 `exclusive(A)` 的槽从 `used` 里去掉 ⇒ **不**注入 |
-| **ST2** | **零引用 ⇒ 不插桩**：`exclusive(A) ∩ used = ∅`（**t40 更正：判据已替换为「外来槽」口径 —— `own(A) ∩ (used \ declared_by_present) = ∅`，见 §7.7.12.2；原文保留以便追溯**） | 不注入；`A` 被摘出模型列表（**不得**留在 `ordered` 里造成下游 Fatal）。**逐组件判定（T30 同步 F3；t31 补口径锚点）**：同一家族里只有「有证据被现存对象吸收」的成员补站位，其余成员**保守不插桩**（`common/himi_skeleton.py:1325-1365` 的逐成员循环；`skipped_members` 汇总 `:1393`）。**适用范围（t40 更正）**：ST2 **只属规则②**（整族缺席、需要证据）；规则① 不再逐成员做证据门控（t38）。**口径锚点**：`tests/test_himi_stub_objects.py::StubRuleTests::test_st2_absent_family_with_own_slot_referenced_gets_all_members`（`:846`；断言另一个成员落在 `skipped_members`）。<br>**锚点纪律（t33）**：同 §7.7.3 规则② —— 只引 `Class::test` 符号名 + `def` 行号，方法内部行号一律作废（原 `478-482` / `699-738` 两处引用均已失效） | 反例：`used` 加入 `exclusive(A)` 的任一槽 ⇒ 注入（**t40 后**：反例需改为「把该槽从 present 对象的 `declared_by_present` 里去掉」才构成外来槽证据，见 §7.7.12.4 的 ST13/ST14a） |
+| **ST2** | **零引用 ⇒ 不插桩**：`exclusive(A) ∩ used = ∅`（**t40 更正：判据已替换为「外来槽」口径 —— `own(A) ∩ (used \ declared_by_present) = ∅`，见 §7.7.12.2；原文保留以便追溯**） | 不注入；`A` 被摘出模型列表（**不得**留在 `ordered` 里造成下游 Fatal）。**逐组件判定（T30 同步 F3；t31 补口径锚点）**：同一家族里只有「有证据被现存对象吸收」的成员补站位，其余成员**保守不插桩**（`common/himi_skeleton.py:1325-1365` 的逐成员循环；`skipped_members` 汇总 `:1393`）。**适用范围（t40 更正）**：ST2 **只属规则②**（整族缺席、需要证据）；规则① 不再逐成员做证据门控（t38）。**口径锚点**：`tests/test_himi_stub_objects.py::StubRuleTests::test_st2_absent_family_with_own_slot_referenced_gets_all_members`（`:849`；t103 起断言整族两个成员都补站位 —— 见下面「⚠️ 更正（t103）」）。<br>**锚点纪律（t33）**：同 §7.7.3 规则② —— 只引 `Class::test` 符号名 + `def` 行号，方法内部行号一律作废（原 `478-482` / `699-738` 两处引用均已失效） | 反例：`used` 加入 `exclusive(A)` 的任一槽 ⇒ 注入（**t40 后**：反例需改为「把该槽从 present 对象的 `declared_by_present` 里去掉」才构成外来槽证据，见 §7.7.12.4 的 ST13/ST14a） |
 | **ST3** | **借位 ⇒ 不插桩（最关键的反例）**：`A` 与同家族 `B` 共享骨骼（`own(A) ⊆ own(B)`，`exclusive(A) = ∅`）且 `B` 的对象引用了这些共享槽。**t40 更正两点**：① **只属规则②**（整族缺席 + 借位 —— 规则① 的「部分在场」前提与该事故形态不同，不适用本反例；t38 已把该用例重建为规则② 形态）；② 新判据下它**仍然成立且更强**：借位槽由 canonical 拥有者声明 ⇒ 落在 `declared_by_present` 里 ⇒ **永不算外来槽** ⇒ 判据层不可表达事故形态（§7.7.12.2 (b)） | **不注入**（不得重演 2026-09-16 脸部误插） | 反例：把共享骨骼改成 `A` 专属（`own(A) ∩ foreign_used ≠ ∅`）且被引用 ⇒ 注入（即 §7.7.12.4 的 ST14a 反向：把该槽从 present 的 `declared_by_present` 里去掉） |
 | **ST4** | **`VGMapDedupExcluded=True` ⇒ 不插桩**：`A` 满足 ST1 的全部条件但带该标记 | **不注入**（显式排除优先于 absorbed，正交） | 反例：去掉该标记 ⇒ 注入 |
 | **ST5** | **无 VGMap ⇒ 不插桩**：`A` 未落盘（不在 `L`）或 `VGMap` 为空 | 不注入（证据不可构造） | 反例：补齐 `VGMap` 且 `exclusive` 被引用 ⇒ 注入 |
@@ -1018,7 +1018,7 @@ G1 的立意（§7.4）是「重绑 `vs-t0` 等于替该 pass 的**全部** rend
 | ① | `common/himi_skeleton.py:2811-2812` 的字段名反向陈述（`StubTargetBaresIncluded=False` / `StubFamilyCoverageCounted=False`） | ✅ **口径注释已补**（含反证链与 §7.7.11 / `18-stub-rereview.md` §4.2 / `05-decisions.md` §3.20 的指针）。❌ **字段名与值未改**，改名仍登记 | **处置 =「补字段注释消歧」（采用），本轮不改名**：字段**无生产消费者**，且两处测试断言（`tests/test_himi_stub_objects.py`、`tests/test_himi_merged_runtime.py::HIMIStubGateInteractionTests`）把 `False`/`1` 钉死 ⇒ 改名/改 version 会让既有断言无谓漂移，收益只是命名美观。**改名作为后续可选保留登记**：`StubBareInExportTargetSet=True` / `StubBareCountsAsFamilyCoverage=True` / `StubObjectInTargetSet=False` / `StubGateInteractionVersion` 1→2（改则**必须同步**那两处断言） |
 | ② | `ui/universal/himi.py` 模块 docstring 与 `_himi_export_entries()` docstring 曾写「显式排除 `is_stub`」并引用**不存在**的测试名 `test_stub_bare_never_enters_g1_target_set` | ✅ **已修复（t31）**：模块 docstring 旧段整段删除、改写为「**口径（已反转）：站位 bare 进 `export_bares`**」+ 完整反证链；`_himi_export_entries()` 末句改为「**当前口径是不排除**，理由见 `_himi_export_bares`」；新增 `tests/test_himi_stub_objects.py::StubDocConsistencyTests` 两条护栏（① 源码里的 `Class::test` 引用必须真实存在；② `_himi_export_bares` 的口径文字必须是反转后那一版，被否决方案的措辞与测试名不得残留） | ✅ **关闭**（这是本轮最有价值的护栏：把「照注释改回去 ⇒ 重新引入死锁」的路径用测试堵住了） |
 | ③ | `common/himi_skeleton.py:2787-2812` 注释块曾按原 G1-b 口径写 | ✅ **已修复（t31）**（见 ① 的口径注释：`common/himi_skeleton.py:2787-2812`） | ✅ **关闭** |
-| ④ | 两处测试**名字**易误读：`tests/test_himi_stub_objects.py` 的 `test_st6_stub_is_not_a_family_coverage_claim`（`:1592`）与 `test_st7_stub_does_not_enter_target_bares`（`:1628`） | ❌ **未改名**（body 已与更正后口径一致，只有名字与 docstring 标题像原口径；t33 只补了 docstring 澄清） | 登记为后续可选（建议改名 `..._stub_object_...`）；**不影响任何行为**。行号由 `tests/test_himi_stub_objects.py::StubNailIntegrityTests::test_doc_anchor_references_resolve` 机械校验 |
+| ④ | 两处测试**名字**易误读：`tests/test_himi_stub_objects.py` 的 `test_st6_stub_is_not_a_family_coverage_claim`（`:1599`）与 `test_st7_stub_does_not_enter_target_bares`（`:1635`） | ❌ **未改名**（body 已与更正后口径一致，只有名字与 docstring 标题像原口径；t33 只补了 docstring 澄清） | 登记为后续可选（建议改名 `..._stub_object_...`）；**不影响任何行为**。行号由 `tests/test_himi_stub_objects.py::StubNailIntegrityTests::test_doc_anchor_references_resolve` 机械校验 |
 | ⑤ | ST 编号在计划书 §7.7.8 与测试文件抬头之间错位（ST2/ST4 互换、ST6/ST7 指 G1-a/G1-b、两个 `test_st5_*`） | ❌ **未处理** | 登记为后续可选；**逐条对照表已写进 §9.6**（读者不再需要靠编号猜） |
 
 **待补 ① 的原文依据（保留未删，便于追溯本轮登记的理由）**：`StubTargetBaresIncluded=False` 这个字面在 (A) 下是**反向陈述**（读者会读成「站位 bare 不在目标集合里」，与实现恰好相反）；这两个字段**只有声明、无生产消费者**（`grep` 确认：只在 `common/himi_skeleton.py` 写出 + 两处测试断言），且**不在** `_himi_cache_intact` 的判据里 ⇒ 改名零缓存代价。**当时的建议是改名**；t31 的实际处置是「补注释消歧 + 改名登记」（理由：避免既有断言无谓漂移）——两者都满足「必须处置字段名易被误读的问题」这条要求，**裁定接受 t31 的处置**，改名保持为后续可选项。
@@ -1142,10 +1142,10 @@ t38 同时修掉一条**同族缺陷**：`in_scene` 原按 **bare 精确匹配**
 | # | 落地位置（T30 复核） | 状态 |
 |---|---|---|
 | H0 | `tools/himi_merged_probe.py --self-check`（T6 并入 §2.8 的三条门控统计） | ✅ **23/23 PASS**（exit=0） |
-| H1 | `common/himi_skeleton.py:152` `HIMILogParser` + `tests/test_himi_skeleton.py`（38 条；真实 dump fixture 不存在时整套 skip） | ✅ |
-| H2 | `common/himi_skeleton.py:429` `HIMIDeformResolver`（`family_gate` `common/himi_skeleton.py:567` / `pass_families` `common/himi_skeleton.py:595` / `gate_allows` `common/himi_skeleton.py:609`） | ✅ |
-| H3 | `common/himi_skeleton.py:652` `HIMIBoneMapBuilder` | ✅ |
-| H4 | `common/himi_skeleton.py:1991` `HIMISkeletonMergeHelper`（`prepare` `common/himi_skeleton.py:2429` / `commit` `common/himi_skeleton.py:2931` / `cache_only_plan` `common/himi_skeleton.py:2272` / `ensure_skeleton_data` `common/himi_skeleton.py:3040`） | ✅ |
+| H1 | `common/himi_skeleton.py:153` `HIMILogParser` + `tests/test_himi_skeleton.py`（38 条；真实 dump fixture 不存在时整套 skip） | ✅ |
+| H2 | `common/himi_skeleton.py:430` `HIMIDeformResolver`（`family_gate` `common/himi_skeleton.py:568` / `pass_families` `common/himi_skeleton.py:596` / `gate_allows` `common/himi_skeleton.py:610`） | ✅ |
+| H3 | `common/himi_skeleton.py:653` `HIMIBoneMapBuilder` | ✅ |
+| H4 | `common/himi_skeleton.py:2042` `HIMISkeletonMergeHelper`（`prepare` `common/himi_skeleton.py:2480` / `commit` `common/himi_skeleton.py:2982` / `cache_only_plan` `common/himi_skeleton.py:2323` / `ensure_skeleton_data` `common/himi_skeleton.py:3091`） | ✅ |
 | H5 | 导入门控（`ui/ui_func_import_ssmt.py` 的 `import_merged_vgmap` 消费点）+ `tests/test_himi_clear_merged_skeleton_cache.py`（16 条） | ✅ |
 | H6 | 导出侧顶点组处理 = **导入期密集建组**（`common/mesh_create_helper.py:515-517`，`index == int(name)` 导入时就成立）+ gametype **BI16** 免升宽 + 导出后 `check_exported_blend_namespace` 复核 + `tests/test_himi_merged_runtime.py`（104 条） | ✅（**t45 裁定 + t46 回写**：`_prepare_merged_skeleton_vertex_groups` **不在 HIMI 路径上**（`run_merged_skeleton_preprocess` 三分支皆 False）；IP-22 状态已改为 ❌未做，见 §6.4） |
 | H7 | `common/himi_merged_runtime.py`（资源声明 `:315-726` / 计划层 `load_workspace_plan` `:2029` / 骨架发布 `:2245`）+ `ui/universal/himi.py` | ✅ |
@@ -1322,8 +1322,8 @@ t38 同时修掉一条**同族缺陷**：`in_scene` 原按 **bare 精确匹配**
 
 | 测试 | 名字的问题 | body 的实际断言（与更正后口径一致） |
 |---|---|---|
-| `test_st6_stub_is_not_a_family_coverage_claim`（`tests/test_himi_stub_objects.py:1592`） | 读起来像原 G1-a「所有与站位有关的身份都不算覆盖」 | 站位**对象**不在 `L`（并且用例自己注明「该部件本身已落盘，故在 `L` 里」）⇒ 正是更正后的 G1-a① |
-| `test_st7_stub_does_not_enter_target_bares`（同上 `:1628`） | 读起来像原 G1-b「占位不进 `target_bares`」 | `StubTargetSetBares == {"aaaa-1-0","aaaa-2-0"}`（**被站位的 bare 在目标集合里**）、只有合成对象 `zzzz-9-9` 不在 |
+| `test_st6_stub_is_not_a_family_coverage_claim`（`tests/test_himi_stub_objects.py:1599`） | 读起来像原 G1-a「所有与站位有关的身份都不算覆盖」 | 站位**对象**不在 `L`（并且用例自己注明「该部件本身已落盘，故在 `L` 里」）⇒ 正是更正后的 G1-a① |
+| `test_st7_stub_does_not_enter_target_bares`（同上 `:1635`） | 读起来像原 G1-b「占位不进 `target_bares`」 | `StubTargetSetBares == {"aaaa-1-0","aaaa-2-0"}`（**被站位的 bare 在目标集合里**）、只有合成对象 `zzzz-9-9` 不在 |
 
 ---
 
@@ -1496,7 +1496,7 @@ ZZMI 的门控（`zzmi_skeleton.py:656-667`）触发条件是「命中对任一�
 | # | 计划书原口径 | 最终口径 | 理由 | 落地位置（T30 复核） |
 |---|---|---|---|---|
 | E1 | §5.1「`VGCount` = 被引用槽数、`VGMap` 键集 = 被引用槽集合」 | **`VGCount = max(被引用局部槽下标) + 1`；`VGMap` 完整覆盖 `0..VGCount-1`**（被引用槽 → 全局槽位；**空洞槽 → `槽位数 + 局部下标`**） | 导入侧硬校验：`common/submesh_json.py:53` 的 `set(normalized) == set(range(vg_count))` 不成立 ⇒ 元数据判无效；`common/mesh_create_helper.py:451-457` 的 `actual_keys != expected_keys` ⇒ `Fatal`；`:527` 的 `component.vg_map[int(i)]` 缺失 ⇒ `Fatal`。**照原口径实现，首个 HIMI 组件导入即崩** | `common/himi_skeleton.py:879-901`（槽位分配循环）；`tests/test_himi_skeleton.py::test_real_referenced_slot_totals_are_pinned` |
-| E2 | §4.2「palette 原始字节 = 该组件 palette 被引用槽按 48 B/骨切片后的字节」 | **「按引用序压缩的槽表」**：行 `j` = 第 `j` 小的被引用局部槽；`BoneMatrixSlotCount` = 被引用槽数 | 池含未引用槽 ⇒ 「池镜像」会把行号错位；导出侧必须用同一「引用序」解析并与角色骨架**逐字节**核对 | `common/himi_skeleton.py:796`（`slots = sorted({…})`）；`common/himi_merged_runtime.py:1838`（`read_palette_cache` 逐字写明「按引用序压缩的槽表」）与 `:1931`（对回全局槽位）；`common/himi_merged_runtime.py:1862`（`verify_palette_cache_against_skeleton`） |
+| E2 | §4.2「palette 原始字节 = 该组件 palette 被引用槽按 48 B/骨切片后的字节」 | **「按引用序压缩的槽表」**：行 `j` = 第 `j` 小的被引用局部槽；`BoneMatrixSlotCount` = 被引用槽数 | 池含未引用槽 ⇒ 「池镜像」会把行号错位；导出侧必须用同一「引用序」解析并与角色骨架**逐字节**核对 | `common/himi_skeleton.py:796`（`slots = sorted({…})`）；`common/himi_merged_runtime.py:2669`（`read_palette_cache` 逐字写明「按引用序压缩的槽表」）与 `:1931`（对回全局槽位）；`common/himi_merged_runtime.py:2693`（`verify_palette_cache_against_skeleton`） |
 | E3 | §5.1 `BoneMatrixSlotCount` 语义写「= 去重前池内**被引用槽数**，用于大小校验」+ §9.4 C4 只写「`VGMap` 写回后 `_merged_skeleton_metadata_valid` 为真」 | 语义同上，但**校验判据必须真的调用该函数**：`_merged_skeleton_metadata_valid(payload) is True`，并补三个负例 | 原 C4 的测试只断言 payload 键值、**从未调用校验函数** ⇒ 无法证伪原口径（T9 F6） | `tests/test_himi_skeleton.py` 的 `_load_merged_skeleton_validator()` + 2 条用例 |
 
 ### 13.2 计划书未写、实现补上（5 条）
@@ -1504,9 +1504,9 @@ ZZMI 的门控（`zzmi_skeleton.py:656-667`）触发条件是「命中对任一�
 | # | 计划书缺口 | 实现补上的内容 | 落地位置（T30 复核） |
 |---|---|---|---|
 | E4 | §5.1 只把 `VGMapDedupExcluded` 写成「沿用 ZZMI」的输入字段，未写落地形态 | **已实现**：为真 ⇒ 该组件**独占自己的槽位**（恒等映射、不注册 owners）、写回 json、记入角色级 `DedupExcludedComponents`。**实现纪律**：单趟严格按 `sorted(bare)` 处理（原「排除组件先占坑、其余后处理」两趟实现会让槽位分配依赖「谁带排除标记」——而该标记是上一次写回的产物 ⇒ 第二次运行算出不同 `VGMap`、破坏幂等与缓存门） | `common/himi_skeleton.py` 的 `fresh`/`frozen_slots` 分支（t43 复核 `common/himi_skeleton.py:879-901`）；`tests/test_himi_skeleton.py::test_dedup_exclusion_is_idempotent_across_runs` |
-| E5 | §5.1 只把 `GPU-PreSkinning` 写成「是否参与合并判定（46/46 全 true）」 | **本期补的是「读取」语义**（该字段是**输入**、不是本方案新增产物）：显式 `False` ⇒ 不参与合并、记入 `CPUPreskinningSkipped`、**不把同 pass 的其它家族拖成 missing**（`family_gate` / `pass_families` / `gate_allows` 带 `skip_bares`）、也不因缺合并元数据被误判需修复 | `common/himi_skeleton.py:408`（`gpu_preskinning`）、`common/himi_skeleton.py:2503-2505`（组件级参与门）、`common/himi_skeleton.py:567-594`（`family_gate(skip_bares=)`）、`common/himi_skeleton.py:595`（`pass_families`）/ `common/himi_skeleton.py:609`（`gate_allows`） |
+| E5 | §5.1 只把 `GPU-PreSkinning` 写成「是否参与合并判定（46/46 全 true）」 | **本期补的是「读取」语义**（该字段是**输入**、不是本方案新增产物）：显式 `False` ⇒ 不参与合并、记入 `CPUPreskinningSkipped`、**不把同 pass 的其它家族拖成 missing**（`family_gate` / `pass_families` / `gate_allows` 带 `skip_bares`）、也不因缺合并元数据被误判需修复 | `common/himi_skeleton.py:408`（`gpu_preskinning`）、`common/himi_skeleton.py:2503-2505`（组件级参与门）、`common/himi_skeleton.py:567-594`（`family_gate(skip_bares=)`）、`common/himi_skeleton.py:596`（`pass_families`）/ `common/himi_skeleton.py:610`（`gate_allows`） |
 | E6 | §7.4 G1 只写「家族全部已落盘组件都在目标集合里」 | **pass 级升级**：判据 = `family_safe and pass_safe`（`common/himi_skeleton.py:2527`）；新增 reason `deform_pass_family_incomplete` 与角色级字段 `DeformGateBlockedPasses` / `DeformGateMode = "pass"`。理由：重绑按 **pass** 生效，同 pass 被多家族共享时只要有一个家族不完整，该 pass 上的**全部**组件都不得进入合并骨架 | 同上；`tests/test_himi_merged_runtime.py` 的 `TestPassLevelGate` 3 条；`05-decisions.md` §3.15 |
-| E7 | §4.2/§4.3 未写导入侧 cache-only 的落点 | 见 §4.2 的 cache-only 表（T13）；最终状态另见 `reports/himi-merge/10-integration.md` §6.3 与 `11-t13-adjudication.md`（T14 裁决 pass） | `common/himi_skeleton.py:2272`（`cache_only_plan`）、`common/himi_skeleton.py:2099`（`_himi_cache_intact_without_dump`）、`common/himi_skeleton.py:2863`（`_himi_cache_intact`） |
+| E7 | §4.2/§4.3 未写导入侧 cache-only 的落点 | 见 §4.2 的 cache-only 表（T13）；最终状态另见 `reports/himi-merge/10-integration.md` §6.3 与 `11-t13-adjudication.md`（T14 裁决 pass） | `common/himi_skeleton.py:2323`（`cache_only_plan`）、`common/himi_skeleton.py:2150`（`_himi_cache_intact_without_dump`）、`common/himi_skeleton.py:2914`（`_himi_cache_intact`） |
 | E8 | §5.2 角色级元数据字段表未列全 | 补全实现全集（含 `GateVersion` / `ComponentSet` / `DeformGateBlockedPasses` / `DeformGateMode` / `CPUPreskinningSkipped` / `DedupExcludedComponents` / 站位字段等） | §5.2 表；`common/himi_skeleton.py` 的 metadata 构建段（t43 复核 `common/himi_skeleton.py:2749-2827`） |
 
 ### 13.3 实现期自查出的两处自身缺陷（已修 + 回归锁死）
@@ -1544,7 +1544,7 @@ ZZMI 的门控（`zzmi_skeleton.py:656-667`）触发条件是「命中对任一�
 | 项 | 内容 |
 |---|---|
 | **被更正的原裁定** | §7.7.6 的 **G1-a**（「占位不算家族覆盖」）与 **G1-b**（「占位不进 `target_bares`」）——它们把「站位**对象**」与「被站位的 **bare**」混为一谈 |
-| **矛盾（自相矛盾 / 功能级死锁）** | 站位判据只在「缺席部件**有** `VGMap` 且专属槽位被引用」时插桩 ⇒ 能插桩的缺席部件**必然已落盘**；而 G1 家族门是 `L(ib) ⊆ T`、`L(ib)` 取**已落盘**组件（`common/himi_skeleton.py:466` `family_members`）⇒ 若按原 G1-b 把站位 bare 排除出 `T`，被吸收成员**永远** `missing` ⇒ 家族**永远**不 `safe` ⇒ 契约 `level=error` ⇒ `Fatal` **中止导出**。**能触发站位的场景集合 ⊆ 原 G1-b 必然中止导出的场景集合** ⇒ 站位机制永远不可能生效 |
+| **矛盾（自相矛盾 / 功能级死锁）** | 站位判据只在「缺席部件**有** `VGMap` 且专属槽位被引用」时插桩 ⇒ 能插桩的缺席部件**必然已落盘**；而 G1 家族门是 `L(ib) ⊆ T`、`L(ib)` 取**已落盘**组件（`common/himi_skeleton.py:467` `family_members`）⇒ 若按原 G1-b 把站位 bare 排除出 `T`，被吸收成员**永远** `missing` ⇒ 家族**永远**不 `safe` ⇒ 契约 `level=error` ⇒ `Fatal` **中止导出**。**能触发站位的场景集合 ⊆ 原 G1-b 必然中止导出的场景集合** ⇒ 站位机制永远不可能生效 |
 | **反证（实测）** | `.dbg/t26_g1b_deadlock_probe.py`（T26 留下，**T30 已复跑确认**）：`G1-b 字面（排除站位）: T=['aaaa-1-0'] L=['aaaa-1-0','aaaa-2-0'] missing=['aaaa-2-0'] family_safe=False` / `ZZMI 语义（含站位）: missing=[] family_safe=True`；`t27` 独立复核该反证链成立，并确认 ZZMI 同语义（`ui/universal/zzmi.py:1008-1013`：站位 DrawCall 被追加进 `ordered` ⇒ 身份自然进计划 ⇒ 家族门放行） |
 | **裁定** | **方案 (A)**：**被站位的 bare 进 `export_bares` / `target_bares`**，`is_stub` 保留为**只读标注**（`himi_stub_bares()`），**不参与过滤**；**站位对象不进 `T`**（`StubObjectInTargetSet = False`）；`StubGateInteractionVersion` 1 → 2。完整理由、决定性问题的答案与顾虑处置见 §7.7.11 |
 | **被否决方案（B）** | `target_bares` 排除站位 + 家族门把站位 bare 视为**已覆盖**（需改 `prepare(target_bares=…, stub_bares=…)` 与 `prepare_gate_oracle` 签名）。**否决理由**：① 判据不再是纯几何事实，而要依赖「注入动作的产物」；② 至少 4 处改动面（两个函数签名 + 数据层过滤 + 导出侧调用点 + 测试）；③ 引入 ZZMI 没有的**双口径**（`target_bares` 与 `stub_bares` 两套身份集合会随演进漂移，本仓已有 ZZMI 同类教训）；④ 家族门结论会依赖站位判定，而站位判定又要在门控之后执行 ⇒ 需额外论证判定顺序无相互影响。**记入 `05-decisions.md` §3.20 否决表** |
@@ -1975,7 +1975,7 @@ cd E:\代码\TheHerta4 ; .\.venv\Scripts\python.exe -m pytest -q
 
 **修法**
 
-1. **采集点**：**每一个** `run = CustomShaderHI3MergedSkeletonAttach_<fam>` 站点（共 17 个 = 5 deform + 12 render）之前都插本族 cb3 副本；两行同源于 `common/himi_merged_runtime.py:740` `render_attach_render_capture_lines`，不另拼文本。
+1. **采集点**：**每一个** `run = CustomShaderHI3MergedSkeletonAttach_<fam>` 站点（共 17 个 = 5 deform + 12 render）之前都插本族 cb3 副本；两行同源于 `common/himi_merged_runtime.py:935` `render_attach_render_capture_lines`，不另拼文本。
 2. **CS 三态**（**任何分支都不 return**，draw 仍无条件执行）：(a) `own == base` ⇒ 单位阵；(b) 采集有效 ⇒ **先把本族三行写进物体矩阵表**，再读宿主族的行算 `X = M_base⁻¹·M_own`；(c) 采集无效 ⇒ 只读表里 own + base 两段算，表空才退回载荷里的烘死 X。**采集无效时绝不写表** —— 否则 deform 段那笔会把 render 段刚写好的好值覆盖成垃圾。
 
 **验收证据（离线，可复跑）**
@@ -2052,5 +2052,286 @@ cd E:\代码\TheHerta4 ; .\.venv\Scripts\python.exe -m pytest -q
 
 **遗留（不在本次边界，未动）**：`blueprint/*` 共享路径上三条与行序相关的隐患——(a) 前处理采 evaluated mesh 顶点序、与 `obj.data` 无相等断言（`blueprint/preprocess.py:823-839`）；(b) 坐标不随 loop 索引刷新（`:864-870`/`:884`）；(c) 范围靠名字/前缀回退匹配（`blueprint/direct_export_shapekey_runtime_mixin.py:197-203`）。三条影响所有游戏类型，仅作为后续建议上报。
 
+### 13.20 t95：「模型爆炸」的两道门 —— 写槽与重绑解耦、索引修正与借用布局解耦（2026-10-25；离线验收完成，待实机复验）
+
+**现象**：13:54:53 那次导出的产物（`array = 657` = 219 槽）换上后实机「模型爆炸 / 极其扭曲」，`077983c9`（4241 顶点）与 `09c6e58a`（18636 顶点）一起炸。
+
+**真根因（两条，机制没错，是门写错）**
+
+1. **「写槽」与「重绑 vs-t0」共用一个返回值**。`ui/universal/himi.py add_unity_vs_texture_override_vb_sections`（:3083）原写法 `rebind = self._himi_rebind_for(drawib_model)`、`rebind is None ⇒ super()` 之后**直接 return**；而 `_himi_rebind_for`（:2980）在「Blend 命名空间判 local」「VB 段 Blend hash 与合并数据 CategoryHash.Blend 不一致」时返回 None ⇒ 该族连 `ResourceHI3PaletteFam_<fam> = copy vs-t0 unless_null` / `ResourceHI3Cb3_<fam> = copy vs-cb3 unless_null` / `run = CustomShaderHI3MergedSkeletonAttach_<fam>` 一起**不生成**。产物实况：`09c6e58a` 的 attach 段生成了却没有任何 `run =`（`[TextureOverride_VB_09c6e58a_09c6e58a_Blend]` 只有 `vb1`/`handling = skip`/`draw = 18636, 0`）⇒ 它的 165 个槽（34022 个权重大于 0 的通道）从未被写 ⇒ 运行期读到零矩阵 ⇒ 顶点全部压向原点 = 爆炸。IB 侧 `add_unity_vs_texture_override_ib_sections`（:4787）是同一个门（`rebind is None ⇒ return`），12 条 drawindexed 的 cb3 捕获与 run 也一并不发。
+2. **Blend 索引修正与借用布局绑死**。`_himi_remap_merged_blend_to_blocks`（:4175）原来两道门：`shifted = any(info["borrow"])` 为假就 `return`（**一个字节都不改**），循环里又要求 `rebind` 是 dict ⇒「判 local ⇒ 不改字节；不改字节 ⇒ 判还是 local」死锁。
+
+**修法（4 条）**
+
+1. VB 侧：`rebind is None` 分支改为 `before = len(ini_section_list)` → `super()` → 新增 `_himi_inject_deform_capture(ini_builder, drawib_model, before=before)`，把 `himi_runtime.render_attach_capture_lines(family)`（palette → cb3 → run 三行）插到新增段里**第一行以 `draw` 开头**的位置；`vs-t0`/`handling`/`draw` 一律不动（不重绑 ≠ 不写槽）。
+2. IB 侧：去掉 `rebind is None ⇒ return`；family 取 `str((rebind or {}).get("family") or draw_ib)`，只要 `himi_family_range(family)` 有块就插 `render_attach_render_capture_lines(family)`；`skin_lines` 仍只在 rebind 为 dict 时插（`ResourceHI3SkinOut_*` 至今没有任何 `vb0 =` 引用，属未激活路径）。
+3. `_himi_remap_merged_blend_to_blocks`：删掉 `shifted` 早退；族按 `slot_maps` 的键认（不再要求 rebind），命名空间 verdict 只作**输入**；写完字节就 `self._himi_blend_verdicts.pop(draw_ib, None)`，让 ini 阶段按**修正后**的产物重判；落在本族块外、又不是局部编号的通道计 `passthrough` 原样保留；`borrow_blend_remap_problems` 的 Fatal 仍只在 `shifted` 时启用。
+4. 新增 `unowned` 账目：落入「本族块 ∪ 块尾借用槽」之外的通道逐个计数，收尾大声警告（那些通道运行期读到零矩阵、顶点被拉向原点）。
+
+**验收（离线）**
+
+- `pytest tests/test_himi_merged_runtime.py tests/test_himi_family_x.py -q` ⇒ **267 passed / 1 skipped / 26 subtests**（2 条既存环境失败同 §13.19：`位面武器·失序时空` 的 `Config/FrameAnalysisPath.json` 指向已删的 `FrameAnalysis-2026-10-16-220530`）。
+- 新测试类 `HIMILocalIndexRebaseTests`：`test_rebased_without_any_borrow_and_rebind_unblocked`（无借用也修索引，且修完立刻放行重绑）、`test_cross_family_global_references_are_left_alone`（全局布局的跨族引用原样保留、不判 unmapped）、`test_orphan_slot_references_are_counted`（零写方槽计数）。
+- 已部署 mod 手工补丁（按新行为模拟，备份 `虚构游戏.ini.bak_t95_145636`）：379 → **386 行**，三处插 capture+run —— `[TextureOverride_VB_09c6e58a_09c6e58a_Blend]` + 两条 `LOD0.09c6e58a` 的 drawindexed 段。身份载荷（`09c6e58a-AttachRange.buf` uint32 = `51, 165, 4, 1212763474`）magic 命中，`res/himi_attach.hlsl` :247 走权威 base ⇒ 补丁后 [51,216) 当帧真的会被写。
+
+**口径更正（重要，避免后人照抄错读数）**
+
+- 一度按「Blend 行 = 16 B」读表、得出「`09c6e58a` 的索引全是本地 0、被别的骨占用」的结论是**错的**。正确口径：**stride = 32 B/行，offset 0 = 4×f32 权重，offset 16 = 4×u32 索引**。按此实测 13:54 产物：`077983c9` 权重通道 8501 / distinct 55 / 取值 0..216，越出本族块 [0,51) 的是 51(1124)、146(540)、147(546)、216(383)；`09c6e58a` 权重通道 34022 / distinct 164 / 取值 0..215（**已是全局编号**，含属于 `077983c9` 的 0..50）；`1b62725d` 3 通道全为 0。
+
+**遗留（未修，须重新导入才能消除）**
+
+- 槽 **[216,219)** 没有任何写方：`1b62725d` 在 13:54 的产物里没有 palette / AttachRange / attach 段（`Meshes/1b62725d-AttachRange.buf` 与 `-BlendOrigin.buf` 停在 09:32），而 `077983c9` 有 **383 个通道**引用槽 216 ⇒ 这些顶点会被拉向原点。根因是它的部件 json 没有可用 VGMap（`slot_values` 为空 ⇒ 不进 `family_ranges`）。要让这 3 个槽有写方，必须让 `1b62725d` 带合并数据重新导入；生成器侧现在只能把这件事说出来（`unowned` 警告 + `tools/himi_t91_check.py` 的「块覆盖总长 216 ≠ 219」）。
+
+### 13.21 t98：借用槽布局（每族拥有它顶点引用到的每一根骨）+ 生成器回写（2026-10-25；离线验收完成，实机已由用户确认 t97 模组有效）
+
+**现象与背景**：t95 让「判 local」的族也能写槽后，实机不再整体爆炸，但仍有一批顶点被拉向原点：`077983c9` 的顶点里有 **383 行池化进来的 `1b62725d` 几何**（`Meshes/077983c9-Position.buf` 4241 行 = [0,2734) 自己 + [2734,3117) `1b62725d` + [3117,4241) `09c6e58a`），它们的骨号是**全局合并槽** 216/51/146/147 —— 这些槽不在 `077983c9` 的 palette 块 [0,51) 内，运行期读到的是**零矩阵**。这正是 §13.20 遗留项的另一半：不是「没人写」，而是「写在了别人的块里」。
+
+**为什么原设计从未生效（决定性证据）**：`common/himi_merged_runtime.py compute_family_ranges` 的借用集来自 `part.referenced_slots`，而它是 `local_group_slots(payload)` = 组件 json 的 **VGMap 全部值**；VGMap 只映射**本物体自己的局部顶点组**（实测 `077983c9`: 51 项 → 0..50、`09c6e58a`: 165 项 → 51..215、`1b62725d`: 1 项 → 216）⇒ **引用集 ≡ 注册集** ⇒ `family_borrows` 恒空。真正的跨族引用只存在于**导出后的 Blend 字节**里（池化进来的别族顶点），plan 阶段根本看不到。
+
+**修法（3 条，`ui/universal/himi.py` + `tests/`）**
+
+1. **借用集改为从产物 Blend 实测发现**：新增 `_himi_discover_borrow_slots(self, plan, *, slot_count)`——用 `himi_runtime.compute_family_ranges(parts, slot_count, complete=False)` 建 owner 表（`owner_of` / `own_base_of` / `own_slots_of`），逐 `drawib_model` 用 `draw_ib` 认族（**不调** `_himi_rebind_for`，避开 `himi_merged_runtime_plan` 的重入），取 `_himi_exported_blend_bytes` + `blend_indices_span(drawib_model.d3d11GameType.D3D11ElementList)` + `extract_blend_index_values`，逐值判归属：本族块 ⇒ 忽略；`0 <= v < own_slots` ⇒ 本族局部编号（重映射会补基址，不算借用）；别族块 ⇒ **借用**；无人认领 ⇒ **orphan**。返回 `(borrowed, orphans)`。新增 `_himi_refresh_borrow_layout()` 在 `generate_buffer_files` 的 `_himi_remap_ordinary_blend_to_local()` 与 `_himi_remap_merged_blend_to_blocks()` **之间**调用（此刻 Blend 才是最终形态、`drawib_model_list` 已完整）。
+2. **借用集注入布局**：`_himi_apply_borrow_layout` 的借用集 = plan 的 `family_borrows` **∪** 发现集；布局仍是 t84/t91 的**块尾借用槽**（借用槽紧跟本族块尾，`target_slot = base + own_slots + offset`，`source_local = 全局槽 − 源族 own_base`）。HLSL 基址表、身份资源、palette array、BorrowMap、Blend 索引全部从 `plan.family_ranges` 派生，因此自洽。
+3. **orphan 升级为导出期硬门**：`_himi_apply_borrow_layout` 里 orphan 非空 ⇒ `Fatal('导出 Blend 引用了本次导出里没有写方的合并骨架槽（运行期读到零矩阵 ⇒ 顶点被拉向原点、模型爆炸）：…')`，消息含族名 + 槽号 + 处置建议；`_himi_remap_merged_blend_to_blocks` 同步加 `local_rebased` 逻辑（`verdict != 'global'` 且 `0 <= v < own_slots` ⇒ `v += own_base`），并让 `mapping` 未命中的跨族引用**不再原样放行**（计 `unowned`/`unmapped`/`passthrough`）；`borrow_slot_problems` 由 Fatal 降为 warning，`borrow_map_layout_problems` / `attach_range_layout_problems` 两条 Fatal 保留。
+
+**离线验收（可复跑）**
+
+- `pytest tests/test_himi_merged_runtime.py tests/test_himi_family_x.py -q` ⇒ **267 passed / 1 skipped / 26 subtests**（2 条既存环境失败同 §13.19）。`HIMILocalIndexRebaseTests` 的两条按 t98 语义重写：`test_cross_family_global_references_become_borrow_rows`（宿主 `aaaa1111` 引用 4/5/7 ⇒ 3 个块尾借用槽 target 4/5/6、`source_family=bbbb2222`、`source_local` 0/1/3；源族 base 右移 7；`slot_count=11`、`skeleton_extra_slots=3`；宿主 `(0,4,5,7)→(0,4,5,6)`、源族 `(4,5,6,7)→(7,8,9,10)`；`borrowed=3`、`passthrough=0`、`unmapped=0`）、`test_orphan_slot_references_abort_export`（槽 99 无写方 ⇒ `Fatal`，消息含 `aaaa1111`/`99`/`零矩阵`，`_himi_borrow_orphans == {'aaaa1111': [99]}`）。
+- 真实数据离线模拟（`.dbg/t98_sim.py`，输入 = t97 之前的真实 `Meshes/<fam>-Blend.buf` 与工作空间 parts）：owner 块 = `077983c9(0,51)`/`09c6e58a(51,165)`/`1b62725d(216,1)`/`72fabb02(218,1)`；distinct 索引 077=55、09c=164、1b6=1；**发现集 = {077983c9: [51,146,147,216]}、ORPHANS = {}**，与 t97 手工推导完全一致；新布局 `077983c9` base 0 block 55 borrow `[(51,09c6e58a,0),(52,09c6e58a,95),(53,09c6e58a,96),(54,1b62725d,0)]`、`09c6e58a` base 55 block 165、`1b62725d` base 220、`72fabb02` base 221、`6e0ccfd4`/`bbbbf903` 借位（base 217、`own_block=False`），`total slots 222`；`borrow_map_layout_problems = []`、`attach_range_layout_problems = []`。
+- **实机（用户确认）**：t96（脚本 `.dbg/t98_patch_t97_ini.py` 与校验 `.dbg/t98_verify_t97.py`；给 `1b62725d` 补 palette/cb3/run 与 `09c6e58a` 补 `vs-t0`）+ t97（借用槽追加在块外尾部 219..223、Blend 重映射 `077`: 51→219 / 146→220 / 147→221 / 216→222（2593 通道）、`09c`: 0→223（3 通道）、`1b6`: 0→216（3 通道）、AttachRange `[7].z` 写借用行数 4/1/0）打到已部署 mod 后，用户验收：**修正有效**。t97 独立校验：三族引用集全部落在「本族块 ∪ 借用尾」（`outside = []`）、`referenced 220 / written 222 / unwritten refs = []`、BorrowMap 逐字节符合、ini 8 项断言全 True、线程覆盖足（077 需 55 ← 1 块 64、09c 需 166 ← 3 块 192、1b6 需 1）。
+
+**口径（HLSL 侧，`res/himi_attach.hlsl`，589 行）**：`himi_src_palette=t0`、`himi_attach_range=t1`、`himi_borrow_palette_a..e=t2,t3,t5,t6,t7`、`himi_borrow_map=t4`（`Buffer<uint4>`）、骨架 `u0`、`himi_object_matrix=u1`、`cbuffer b1 himi_obj_rows[8]`；`[numthreads(64,1,1)]`，`bone_index = dispatch_id.x`，`source_slots = palette_elements/3`；身份资源 `[0] = (base, span, version, 1212763474u)` 权威。借用由 **线程号 ≥ 源槽数** 触发（不是按 Blend 值触发）：`borrow_index = bone_index − source_slots`、`himi_borrow_map[borrow_index] = (target_slot, rank, src_local, 0)`、哨兵 `0xFFFFFFFF ⇒ return`、`borrow_dst = target_slot * 3`。
+
+**遗留**
+
+- 生成器改动**尚未用真实 Blender 导出复跑**（本会话环境里没有 Blender），目前只有 pytest + 真实数据的离线 plan/模拟两层证据；下次导出后应按 §9 复验：`array` = 222×3、每族 attach 段都有 `run`、`AttachRange[7].z` = 借用行数、Blend 索引全部落在「本族块 ∪ 块尾借用槽」。
+- 生成器的**块尾借用布局**与 t97 的**块外尾部**布局数值不同（222 槽 vs 224 槽）但语义等价；若实机出现新的错位，先比对的应是 `plan.family_ranges` 派生出来的四张表是否自洽，而不是槽号本身。
+
 ---
 
+### 13.22 t99：快速局部导出被 orphan 门拦住 ⇒ 可执行诊断 + 自动纳入缺失家族（2026-10-25；离线验收完成，实机待复验）
+
+**现象**：t98 的 orphan 硬门在快速局部导出（只选 `077983c9`）时报错并中止：「导出 Blend 引用了本次导出里没有写方的合并骨架槽…：077983c9 引用槽 [216]。合并骨架共 219 槽。这些槽属于没有 palette 写入方的家族（没进本次导出，或工作空间里缺它那份组件 json ⇒ 计划里整族消失）。」这条消息本身是对的，但它回答不了「我该怎么做」。
+
+**取证（为什么只选一族导出结构上不可能自洽）**
+
+- 跨族引用只存在于**游戏那笔 draw 的顶点池**里：`Meshes/077983c9-Position.buf` 的 4241 行 = `077983c9` 自己 [0,2734) + `1b62725d` 383 行 + `09c6e58a` 1124 行。导出哪一族、Blender 里选中谁，都改不了那笔 draw 拼进来的别族几何。
+- **预检不可能**：`part.referenced_slots` 读工作空间 `<bare>-Blend.buf`，里面只有本族**局部**编号（`077983c9` 的 51 行权重通道取值全在 0..50），跨族全局槽只在**导出后的 Blend 字节**里才出现。因此「导出前先算一遍够不够」这条路线不存在。
+- 部署 mod 逐字节扫描（`.dbg/t99_scan_mod_blend.py`，stride 32 B、offset 16 起 4×u32）：`077983c9` 4241 行 distinct 55 = 0..50 + 219/220/221/222；`09c6e58a` 18636 行 distinct 164 = 51..223；`1b62725d` 3 行仅 216；**任何 Blend 都不引用 217**。
+
+**用户裁定**：快速局部导出走 A —— **自动把缺的家族网格纳入本次导出并打印加了谁**；槽 217 只加诊断、不动布局。
+
+**修法（3 处，`common/himi_merged_runtime.py` + `ui/universal/himi.py` + `ui/ui_func_export.py`）**
+
+1. **orphan 消息可执行化**：新增 `workspace_slot_owners(workspace_root)`（只读组件 json 的 VGMap ⇒ `{owners: {slot: bare}, members: {bare: [unique_str]}}`）与 `describe_ownerless_slots(workspace_root, families, *, exported_bares=None)`（返回 `{lines, missing_bares}`）。`_himi_orphan_message` 用它把每个孤儿槽翻译成「属于谁、在不在工作空间、在不在本次导出」，`missing_bares` 非空 ⇒ 处置是「把它们一起选中再导出；只想导一部分时请先取消合并骨骼」，否则 ⇒ 「`LOD0/` 下补齐组件 json」。
+2. **快速导出自动补家族**：`SSMTQuickExportSelected._collect_export_meshes` 先收选定网格，再 `_expand_merged_skeleton_families`：仅当 `Config/HIMIMergedSkeleton.json` 存在时，用 `workspace_slot_owners(root)['members']` 与 `missing_family_bares` 求差集，遍历 `bpy.data.objects` 把 type 为 MESH、未选中、bare 命中缺失集的网格补进去（`_merged_family_bare` 优先读自定义属性 `3DMigoto:WorkspaceUniqueStr`，退回落物体名），`LOG.info` 打印补了谁；场景里找不到的家族 `LOG.warning`，任何异常都不阻断导出。家族键 `merge_family_bare` 先剥 Blender 重名后缀 `\.\d{3,}$` 再剥 `LOD0.` 前缀（漏一步就会把一族算成两族，「缺哪个家族」永远算不对）。
+3. **被证否的假设**：曾加过 `_himi_report_writerless_slots`（报「被家族注册却没有任何 attach 块会写」的槽），实现后实测**不可达**——`load_workspace_plan` 在导出集内按 `sorted(bare)` 走 `resolve_borrow_slots`（:3015）认领，每个注册槽只留一个拥有者，其余家族在该槽上的注册归零，块又是 min..max 密集区间 ⇒ 每个注册槽必落在某族块里。真实工作空间的槽 217 因此**有写方**（`6e0ccfd4-6030-0` 与三个 `bbbf903-*` 都注册，先注册的那个独占）；早先离线探针报 `owner(217)=None` 是它绕过了认领循环。该诊断已删除，改为回归测试 `HIMISharedSlotClaimTests::test_shared_registration_is_claimed_by_first_family` 把这条事实钉住（共享槽由先注册者独占、覆盖集必须包含所有被注册槽）。
+
+**离线验收（可复跑）**
+
+- `pytest tests/test_himi_merged_runtime.py tests/test_himi_family_x.py -q` ⇒ **270 passed / 1 skipped / 26 subtests**（2 条既存环境失败同 §13.19）；新增 `HIMISharedSlotClaimTests`（共享注册的认领与覆盖）与 `HIMIFamilyNameTests`（`merge_family_bare('LOD0.077983c9-10524-0.001') == '077983c9-10524-0'`、`missing_family_bares` 保序去重）。
+- `py_compile ui/universal/himi.py ui/ui_func_export.py common/himi_merged_runtime.py` ⇒ OK。
+- `.dbg/t99_owner_check.py`（全部 9 部件的离线 owner 复现）与 `.dbg/t99b_probe.py`（`compute_family_ranges` 在共享槽/不相交槽下的形状）保留作证据。
+
+**遗留**
+
+- 自动补家族只在 pytest 与离线探针里验过，**尚未在真实 Blender 里跑一次快速局部导出**；下次导出应确认：日志出现「已自动补入 N 个家族网格物体」、orphan 门不再触发、mod 的 `array` = 222×3（§13.21 的块尾借用布局）。
+- `.dbg/` 下 t98/t99 的六份脚本是取证工具，不属于产品代码。
+
+---
+
+### 13.23 t100 —— 最新导出里 `LOD0.09c6e58a-4386-57792` 消失：IB 段被注入蒙皮 pass
+
+**现象（用户 m01572）**
+
+16:16 那次导出后，`LOD0.09c6e58a-4386-57792` 这个物体**不显示**（1b62725d 同样消失），
+而 077983c9 正常。
+
+**取证**
+
+1. 缓冲与索引全部正常：09c6e58a-Position.buf 34026 行、`LOD0.09c6e58a-4386-57792` 的 IB
+   `drawindexed = 72456` ⇒ max 18632 < 34026 行，四份 IB 均不越界；三族 Position 无 NaN/Inf、
+   无原点行；Blend 权重和恒 1.000，引用集 077(0..54)/09c(55..219)/1b6(220) 与 t98 块尾借用
+   布局完全一致；AttachRange/BorrowMap 与 ini 的 `array=663`(=221×3)、Dispatch 1/3/1 自洽。
+2. 与**上一版已实机验收**的 `虚构游戏.ini.bak_t97_20261025_151941`（432 行）逐块对比，唯一
+   差异是 IB 段多出两行：
+   ```ini
+   run = CustomShaderHI3MergedSkin_09c6e58a
+   vb0 = ResourceHI3SkinOut_09c6e58a
+   ```
+   09c6e58a 的两笔 `drawindexed` 前各有一次、1b62725d 一笔前一次（共 3 处 6 行）；077983c9 没有。
+3. 机理：t99 之前 `_himi_rebind_for` 对 09c6e58a/1b62725d 返回 `None` ⇒ `add_unity_vs_texture_override_ib_sections`
+   里 `skin_entry = ... if rebind is not None else {}` 恒空 ⇒ 蒙皮 CS 从不被 `run`；t95/t98
+   放行 rebind 后 `skin_entry` 变非空 ⇒ 每笔渲染 draw 前跑 `CustomShaderHI3MergedSkin_<fam>`
+   并把 `vb0` 换成自建蒙皮输出。该 CS（`Toolset/himi_merged_skin.hlsl`，186 行）自己的注释
+   就写着失败形状：「编译失败被 3DMigoto 静默跳过 ⇒ dispatch 照常记录、缓冲一个字节都不写
+   ⇒ 整具模型塌到原点消失，不报错也不崩（t89 实机）」；且它会把调色板二次叠加在已被流输出
+   重放过的顶点上。该路径属 t86「路线 1」，与 §13.18 已验收的 t74 路线（attach CS 写 palette
+   + `vs-t0` 重绑 + 单 draw）互斥。
+
+**修法**
+
+- `ui/universal/himi.py:5111` `add_unity_vs_texture_override_ib_sections` 删掉 `skin_entry` /
+  `skin_lines` 的构建与 `out.extend(skin_lines)`，只保留 `out.extend(capture_lines)`
+  （即「cb3 捕获 → run attach」）。全仓 `skin_entry|skin_lines` 引用数为 0。
+- `himi_skin_sections()` 的段与资源发射**保持不变**（与 t97 产物一致：段存在但无人引用 ⇒
+  3DMigoto 不会调用，无副作用）。将来若复活蒙皮路线必须单独立项并先在实机验 CS 编译。
+
+**验收读数**
+
+- `tests/test_himi_merged_runtime.py` 新增
+  `test_ib_sections_never_inject_the_merged_skin_pass`：同 t54 夹具下先断言 attach 行存在
+  （非恒真），再断言 IB 段里不含 `CustomShaderHI3MergedSkin_` 与 `ResourceHI3SkinOut_`。
+- `pytest tests/test_himi_merged_runtime.py tests/test_himi_family_x.py -q` ⇒ **271 passed /
+  1 skipped / 26 subtests**（2 条既存环境失败同 §13.19）。
+- 部署侧已就地打补丁：备份 `虚构游戏.ini.bak_t100_20261025_162135`（455 行），删 6 行 ⇒ 449 行；
+  三处 IB 段回到 t97 形状（「cb3 捕获 → run attach → drawindexed」）。脚本 `.dbg/t100_patch_ini.py`。
+
+**遗留**
+
+- 本次修的是「为什么会消失」；t74 路线的顶点变形是否完全正确仍待一次实机确认（用户 F10 后报一个 bool）。
+- `Toolset/himi_merged_skin.hlsl` 与 ini 里的 `CustomShaderHI3MergedSkin_*` 段属死代码，留着是为了
+  t97 产物对齐；若长期不用应整段删（避免下一个人再把它接回渲染段）。
+
+---
+
+
+---
+
+### 13.24 t103/t104：规则④「唯一 palette 写方 ⇒ 全族补站位」与部署 mod 的站位形态（2026-10-25）
+
+**现象（用户三连）**：「回来了，但是我发现原本那些被合并的也回来了。这什么鬼？」→「现在合并的以及原本的叠在了一起」→
+「根据设计合并进来的物体需要生成极限小的3个点的站位，就和其他的骨骼合并的一样」。
+
+**取证一：draw 清单逐段对比**（`.dbg/t100b_draws.py`；当前 449 行 vs t97 备份 432 行）：两版都是 7 个带 draw 的段，差异全在被合并部件的两段，
+旧版是「3 索引站位」、新版退化成「整笔真 draw」，且两族的 VB 段 `draw` 也从 3/18636 涨成 383/34026 ⇒ 同一份几何被画两遍。
+
+| 段 | t97（用户确认有效） | 16:16 导出 |
+|---|---|---|
+| 被吸收部件 09c6e58a-57792-0 | 段名带 `.001`、`drawindexed = 3,0,0` | `drawindexed = 57792,0,0` |
+| 被吸收部件 1b62725d-1740-0 | 段名带 `.001`、`drawindexed = 3,0,0` | `drawindexed = 1740,0,0` |
+| `TextureOverride_VB_09c6e58a_..._Blend` | `draw = 18636, 0` | `draw = 34026, 0` |
+| `TextureOverride_VB_1b62725d_..._Blend` | `draw = 3, 0` | `draw = 383, 0` |
+
+**取证二：顶点池里确实有别族副本**（`.dbg/t101_pool_dup.py`，stride 44）：`077983c9-Position.buf` 的 `[2734,3117)` 与
+`1b62725d-Position.buf` 的 `[0,383)` **逐行 byte 相同 383/383**；`077983c9-Position.buf` 的 `[3117,4241)` 与
+`09c6e58a-Position.buf` 的 `[29065,30189)` 相同 1121/1124。⇒ 每族导出缓冲物理包含别族顶点副本，那两笔 draw 一旦真画，必然叠影。
+
+**已排除**：Position 无 NaN/Inf、无原点行；四个 IB 的索引全部落在缓冲行数内；AttachRange / BorrowMap / `array = 663` / Dispatch 1:3:1 自洽；
+Blend 权重和恒 1.0 ⇒ 不是数据坏，是同一份几何被画了多次。
+
+**修法 A（生成器主线）：规则④**。整族缺席时，`writerless = bool((family_slots & used) - present_family_slots)`（`common/himi_skeleton.py:1326`）——
+即「它注册的槽**被引用**、且**没有任何在场家族注册**」（= 这些槽唯一的 palette 写方）⇒ `absorbed = True`、
+`reason = HIMI_STUB_REASON_WRITERLESS`（常量在 `common/himi_skeleton.py:93`），成员循环里 `common/himi_skeleton.py:1382` 直接
+`stubbed.append(member); continue`、**跳过** `foreign_used` 门。输入 `present_family_slots` 从 `common/himi_skeleton.py:1276` 起按
+「本族 DrawIB 是否在场」聚合成员 `landed_values`；诊断文案在 `common/himi_skeleton.py:1416`（「它是这些槽唯一的 palette 写方」）。
+
+- 为什么必须**整族全补**：同族兄弟的 `exclusive` 恒空（§7.7.12 的 F-2 结论），只补「有专属槽」的成员会让被吸收的其余成员继续原版 draw ⇒ 残留重影。
+  用户口径（m01903）要求「被合并进来的物体」都拿到 3 点站位。
+- 为什么这条判据安全：槽没人引用时补站位只是白抑制原版 draw（规则② 的保守方向仍正确）⇒ 判据是 `(family_slots & used) - present_family_slots`，不是「整族缺席就补」。
+
+**修法 B（回退 t99 的自动补家族）**：`ui/ui_func_export.py` 删掉 `_collect_export_meshes` / `_expand_merged_skeleton_families` 整段
+（1891 → 1763 行），两个入口回到 `_collect_selected_meshes`（`ui/ui_func_export.py:1562` 与 `ui/ui_func_export.py:1635`）；
+`common/himi_merged_runtime.py` 删掉无调用方的 `merge_family_bare` / `missing_family_bares`（现 5392 行），保留 `workspace_slot_owners`
+（`common/himi_merged_runtime.py:2839`）与 `describe_ownerless_slots`（`common/himi_merged_runtime.py:2862`，仍供 orphan 消息使用）；
+`tests/test_himi_merged_runtime.py` 删掉 `HIMIFamilyNameTests`（现 7072 行）。
+
+**修法 C（部署 mod 的站位形态，t104）**：`虚构游戏.ini` 备份 `虚构游戏.ini.bak_t104_20261025_165240`（451 行）→ **463 行**，
+脚本 `.dbg/t104_patch_stub_ib.py`。四处改动：`ib = Resource_LOD0.09c6e58a_57792_0.001_Index`（ini:215）、`drawindexed = 3,0,0`（ini:224）、
+`ib = Resource_LOD0.1b62725d_1740_0.001_Index`（ini:232）、`drawindexed = 3,0,0`（ini:241），并补两条资源声明（ini:377 / ini:404）。
+站位 IB 实测：`Meshes/LOD0.09c6e58a-57792-0.001-Index.buf` = `18633,18634,18635`、`Meshes/LOD0.1b62725d-1740-0.001-Index.buf` = `0,1,2`
+（各 12 B）⇒ 与 t97 已实机验收过的形态逐字一致。
+
+**测试与护栏**：`tests/test_himi_stub_objects.py` 5 处断言按新口径改写（ST2、规则① 的 `other` 态、ST13 的 reason、ST13 变异体、ST14b），
+另加 `WriterlessFamilyStubTests` 两条；`PROD_ANCHOR_DOCS` 的遍历改成跳过不存在的文件（`reports/himi-merge/` 整棵树已裁剪）；
+26 处生产锚点用 `.dbg/t105_fix_prod_anchors.py` 整体平移回填，6 处测试符号锚点手工回填（`846→848`、`1592→1598`、`1628→1634` 各两处）。
+
+**验收读数**：`python -m pytest tests/test_himi_merged_runtime.py tests/test_himi_family_x.py tests/test_himi_stub_objects.py -q`
+⇒ **322 passed / 1 skipped / 26 subtests passed / 2 failed**（两条仍是 FrameAnalysis 失效的既存环境失败）。
+
+**遗留**
+
+- 站位注入发生在**导出期**（`ui/universal/himi.py:2039` 在 exporter `__init__` 里调注入函数）⇒ 不需要重新导入。
+- t104 的 mod 形态是手改的；下一次导出由规则④ 自动生成 `.001` 站位段，需要一次逐段对比确认两者一致。
+- 用户需 F10 重载后确认「3 点站位形态正常、没有叠影」。
+---
+
+### 13.25 t106 · 被吸收族自动补站位（快速局部导出不再要求「把它一起选中」）
+
+**现象**。t103/t104 之后，用户在快速局部导出里只选了宿主 `077983c9`（另含 `09c6e58a` 的两个成员），导出被 orphan 门拦下：
+
+> 导出 Blend 引用了本次导出里没有写方的合并骨架槽 …… `077983c9` 引用槽 `[216]` …… 它已落盘，但**没进本次导出** …… 处置：把 `1b62725d-1740-0` 一起选中再导出
+
+用户随即给出设计口径（m02054）：「这个物体被合并进了077，它应该生成一个站位」。即：被吸收族的几何已经逐字节躺在宿主的顶点池里（§13.24 的 byte 比对），它**不需要再画几何**，但它是那些槽唯一的 palette 写方 —— 缺了它就是运行期零矩阵。正确形态是**给它补一个 3 点站位**，而不是让用户把真网格再选一次（那会重复画 = 叠影），也不是纯 Fatal 拦下。
+
+**规则④ 的缺口**。§13.24 落地的规则④ 只覆盖「整族缺席」：`decide_stub_injection` 的判据入口是 `scene_present_bares`（场景里有哪些族）与 `used_group_ids`（本次导出引用了哪些槽），它枚举的是 `family_map` 里缺席的**族**。但实机形状里缺席的是**保管槽的那一族**，而宿主族在场 —— 规则④ 看不见「我需要一个不是我自己的写方」。
+
+**修法**（`ui/universal/himi.py`，一处新方法 + 一处调用）：
+
+- 新增 `_himi_add_missing_writer_stubs(self, decision, *, workspace_root, scene_present, used_group_ids, family_map) -> list`（紧邻 `_himi_cleanup_stub_objects`）：用 `himi_runtime.workspace_slot_owners(workspace_root)` 取「槽 → 拥有的 bare」，对本次导出引用的每个槽取出 owner；owner 已在场景里 ⇒ 跳过；按 owner bare 聚合成 `by_bare`。
+- 对每个 bare：已在 `decision.stub_members` ⇒ 跳过；bare 不在 `family_map` 的成员并集里（工作空间没有它的组件数据）⇒ **不猜**，打一行「无法补站位，导出期 orphan 门会说明缺什么」并跳过；在 `decision.skipped_members` 里 ⇒ 移出；最后追加进 `decision.stub_members`、记 `self._himi_stub_writer_slots[bare] = slots`（诊断用），并打印「自动补一个 3 点站位（几何已在别的部件顶点池里，站位只负责给这些槽写矩阵）」。
+- `_himi_inject_stub_objects`（`_himi_inject_stub_objects@2167`）在 `decide_stub_injection` 之后（调用点在 `ui/universal/himi.py:2238`）、创建站位对象之前调用它 ⇒ 补进来的 bare 与规则④/② 选出来的 bare 走**完全相同**的下游（`_himi_create_stub_object` → `HIMIStubDrawCall` → 站位 IB 段带出该族的 palette/attach）。
+- 旧的 orphan 硬门（`_himi_orphan_message` → `Fatal`）**保留作后盾**：只有「连组件数据都没有、无法补站位」时才会再触发，消息里的处置句此时才真正成立。
+
+**与规则④ 的边界**。两者互补而不重叠：规则④ 判「这个缺席的族有没有人需要它的写方」，t106 判「本次引用的槽有没有写方在场」。规则④ 已在跳过名单里的族（规则② 的保守跳桩）会被 t106 移出并升级为站位 —— 这正是「有人引用了它保管的槽」时应有的方向。
+
+**测试与护栏**（`tests/test_himi_stub_objects.py`）：
+
+- `MissingWriterStubTests`（4 条）：宿主 `aaaa1111-1-0` 注册槽 0、被吸收族 `bbbb2222-1-0` 注册槽 216，`used_group_ids = {0, 216}`：① 写方不在场景 ⇒ `stub_members == ['bbbb2222-1-0']` 且 `_himi_stub_writer_slots == {'bbbb2222-1-0': [216]}`；② 写方在场景 ⇒ 不补；③ 写方不在 `family_map` 成员里 ⇒ 不猜；④ 写方原在 `decision.skipped_members` ⇒ 移出并升级为站位。
+- `_make_exporter` 夹具补 `exporter._himi_stub_writer_slots = {}`（`__new__` 手工构造的导出器不跑 `__init__`）。
+
+**验收读数**：`python -m pytest tests/test_himi_merged_runtime.py tests/test_himi_family_x.py tests/test_himi_stub_objects.py -q` ⇒ **326 passed / 1 skipped / 26 subtests passed / 2 failed**（两条仍是 `Config/FrameAnalysisPath.json` 指向已删目录的既存环境失败）；`py_compile` 四个模块 OK。
+
+**遗留**
+
+- 本修法的「补站位」结论来自 t104 手改 mod 的实机验证（3 点站位形态显示正常、无叠影）；**自动补站位这条路径本身还没有在真实 Blender 里跑过** —— 需要一次「只选宿主」的快速局部导出确认日志里出现「自动补一个 3 点站位」且 orphan 门不再触发。
+- 站位 bare 与真网格同名 ⇒ 若用户之后把被吸收族也选进来，规则④/t106 都不会重复补（`stub_members` 去重 + `scene_present` 判据），但**两族都在场时**仍可能重复画几何（宿主顶点池里已有副本）—— 那是 §13.24 的「叠影」问题，不在本条范围内。
+
+
+### 13.27 t108/t109 · 后台代为导出：t106 已生效，假降级门才是新问题
+
+### 13.27.1 现象（用户 m02168）
+
+t106 落地后用户在 Blender 里点「快速局部导出」仍然撞到 orphan Fatal（`077983c9 引用槽 [216]`）。
+
+### 13.27.2 取证：先看谁在执行
+
+- `C:\Users\anlingQWQ\AppData\Roaming\Blender Foundation\Blender\5.0\scripts\addons\TheHerta4` 是 **Junction → `e:\代码\TheHerta4`**，两边是同一批文件。
+- `ui/universal/himi.py` mtime 16:58:39（t106 的 `_himi_add_missing_writer_stubs` 已在其中），用户那次失败栈（`ui_func_export.py:1667 → export_parallel.py:108 → himi.py:3171 → :2971 → :2755 → :2639`）写于 17:04:21。
+- 同一个 `.blend`（`C:\Users\anlingQWQ\Desktop\Untitled.blend`）用同一份代码后台跑：只选 `077983c9` 与全选两个网格都 `RESULT {'FINISHED'}`，自动补站位生效（`覆盖 221/221 槽，无空洞`）。
+
+⇒ 结论：那份 Fatal 来自**启动于 16:58 之前**的 Blender 进程（Python 模块在启动时载入，改文件不热更新）。重启 Blender / Reload Scripts 即可。
+
+### 13.27.3 场景实测（`Untitled.blend`）
+
+- 只有两个网格：`LOD0.077983c9-10524-0`（5249 顶点、217 个纯数字顶点组、用到 0..50 + 51/146/147/216）、`LOD0.09c6e58a-4386-57792`（37121 顶点、用到 51..215）。
+- `1b62725d-1740-0` 在场景里**没有对象**，而槽 216 被 077 引用 ⇒ t106 的自动补站位路径被真实触发。
+
+### 13.27.4 产物读数（本次后台导出的 mod）
+
+| 项 | 读数 |
+| --- | --- |
+| 骨架 | `array = 663` = 221×3；palette 51/165/1；BorrowMap 4/1/1（后两张是哨兵） |
+| 身份载荷 | 077 `(0,51,4,1212763474)`、09c `(55,165,4,MAGIC)`、1b6 `(220,1,4,MAGIC)` |
+| 借用表 | 077 四行 `(51,1,0,0) (52,1,95,0) (53,1,96,0) (54,2,0,0)` |
+| Blend 引用集 | 077→0..54、09c→55..219、1b6→220，全部落在「本族块 ∪ 块尾借用槽」内 |
+| 顶点 | 无 NaN/Inf、权重和恒 1.000 |
+| draw 形态 | 宿主真几何 `drawindexed = 14982` / `72456`；被吸收族 `drawindexed = 3,0,0`（3 索引站位 IB） |
+
+### 13.27.5 t109 修法：身份资源门只认 AttachRange
+
+`verify_attach_range_references`（`ui/universal/himi.py`）原来用正则抓**整份 ini 的所有** `cs-t1 = ref …`，而 `[CustomShaderHI3MergedSkin_*]` 段（t100 起没有任何 `run`，段仍保留）里绑的 `cs-t1 = ref Resource<fam>Blend` 是 **VB 缓冲**，永远不在 `ResourceHI3AttachRange_*` 的声明表里 ⇒ 每次导出都假报「没有 `[Resource<fam>Blend]` 资源声明」⇒ 契约 `level=error` ⇒ `_himi_degrade_to_ordinary()`。
+
+修法：`referenced` 只保留 `startswith(ATTACH_RANGE_RESOURCE_PREFIX)` 的引用；「整份 ini 里没有任何 AttachRange 绑定」的判据同样只看这些。回归钉子：`tests/test_himi_family_x.py` 的 `test_reference_gate_ignores_vb_bound_cs_slots`（ini 里同时有 VB 绑定的 skin 段与合法 AttachRange 段 ⇒ 问题清单必须为空）。
+
+### 13.27.6 验收读数
+
+- `pytest tests/test_himi_family_x.py tests/test_himi_merged_runtime.py tests/test_himi_stub_objects.py -q` ⇒ **327 passed / 1 skipped / 26 subtests / 2 failed**（两条既存环境失败：`HIMICacheOnlyOracleTests::test_real_dump_missing_target_none_is_not_authoritative`、`HIMIRealDumpEndToEndTests::test_real_role_end_to_end`）。
+- 修后重导：`已写出 6 个家族资源 … 覆盖 221/221 槽，无空洞`，**不再出现「已降级为普通导出」**。
+- **实机：用户 F10 重载本次产物后确认「显示正常，没有叠影」**（2026-10-25）。
+
+### 13.27.7 遗留
+
+- 子集导出（只导 077+09c）仍会报「本次只写 217/219 个槽，未覆盖 [217,219)」与「变形家族未完整纳入：6e0ccfd4 / 72fabb02 / bbbbf903」——这三族在本 `.blend` 里没有对象，属预期；要让它们的几何也吃到合并收益必须一起导出。
+- 产物 ini 里「基址表 span 之和 217 ≠ 221」是旧口径（只数 palette span、没数借用行），只影响自述文字。
+- 后台导出脚本：`.dbg/t108_export_selected.py`（`T108_SELECT=host|all` 控制选择）、`.dbg/t108_probe_scene.py`（场景物体与顶点组读数）。
