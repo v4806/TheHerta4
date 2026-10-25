@@ -583,7 +583,10 @@ class ObjBufferHelper:
 
     @staticmethod
     def parse_elementname_data_dict(
-        mesh: bpy.types.Mesh, d3d11_game_type: D3D11GameType, vertex_group_names=None
+        mesh: bpy.types.Mesh,
+        d3d11_game_type: D3D11GameType,
+        vertex_group_names=None,
+        object_name: str = "",
     ):
         '''
         - 注意这里是从mesh.loops中获取数据，而不是从mesh.vertices中获取数据
@@ -731,6 +734,10 @@ class ObjBufferHelper:
                 mesh=mesh,
                 normalize_weights=normalize_weights,
                 vertex_group_names=vertex_group_names,   # 【t66】按组名解析槽号（仅 HIMI）
+                # 【t88】HIMI 合并路线 fail-closed：组名不是纯数字就终止导出，
+                # 不再静默退回「取列表序号」——那条路会绑错骨而且没有任何提示。
+                strict_group_names=vertex_group_names is not None,
+                object_name=object_name,
             )
 
 

@@ -753,27 +753,59 @@ class VertexGroupUtils:
     # 组名的语义（t58 已证）：合并路径里组名就是**全局骨骼槽号的十进制写法**；
     # 把 87/88/93/94 合并成一个组时，组名会被写成合并后的目标槽（例如 `275`）⇒
     # 按名解析才拿得到"作者想要的那个槽"，按序号只会拿到列表位置。
-    # 非十进制名（其它游戏/旧工作空间的 `Bone.001` 之类）**回退旧行为**（= 取序号），
-    # 因此对"索引 == 名字"的正常产物，本改动**逐字节等价**。
+    # 非十进制名（其它游戏/旧工作空间的 `Bone.001` 之类）在默认情形下**回退旧行为**
+    # （= 取序号），因此对"索引 == 名字"的正常产物，本改动**逐字节等价**。
+    # 【t88】**但 HIMI 合并路线必须 fail-closed**：那里组名就是槽号的唯一依据，
+    # 取序号会绑错骨且无声无息，所以 strict=True 时非十进制名直接抛 Fatal 终止导出。
     @staticmethod
-    def resolve_group_slot(vertex_group_names, group_index: int) -> int:
+    def resolve_group_slot(
+        vertex_group_names,
+        group_index: int,
+        strict: bool = False,
+        object_name: str = "",
+    ) -> int:
         """``vertex_group_names`` = ``[vg.name for vg in obj.vertex_groups]``（可为 None）。
 
-        组名是十进制整数 ⇒ 用它当槽号；否则回退 ``group_index``（旧行为）。
+        组名是十进制整数 ⇒ 用它当槽号；非十进制名在 ``strict`` 下抛 ``Fatal``
+        （终止导出），否则回退 ``group_index``（旧行为）。
         """
         try:
             index = int(group_index)
         except (TypeError, ValueError):
             return int(group_index or 0)
+        if strict and not vertex_group_names:
+            who = f"物体「{object_name}」的" if object_name else ""
+            raise Fatal(
+                f"{who}导出时没有拿到顶点组名，无法按组名解析骨骼槽号。"
+                "合并骨架路线不允许退回「取列表序号」；请检查该物体的顶点组是否完整。"
+            )
         if vertex_group_names and 0 <= index < len(vertex_group_names):
             name = str(vertex_group_names[index]).strip()
             if name.isdigit():
                 return int(name)
+            if strict:
+                who = f"物体「{object_name}」的" if object_name else ""
+                raise Fatal(
+                    f"{who}顶点组 #{index} 的名字是「{name}」，不是纯数字。"
+                    "合并骨架只认「组名 = 骨骼槽号的十进制写法」；"
+                    "请把该组改成数字名，或关闭「使用融合统一顶点组」后重新导出。"
+                )
+        elif strict:
+            who = f"物体「{object_name}」的" if object_name else ""
+            raise Fatal(
+                f"{who}顶点组序号 #{index} 超出了顶点组名列表长度"
+                f"（{len(vertex_group_names)}）。导出中止，避免按错误槽号绑定骨骼。"
+            )
         return index
 
     @classmethod
     def get_blendweights_blendindices_v3(
-        cls, mesh, normalize_weights: bool = False, vertex_group_names=None
+        cls,
+        mesh,
+        normalize_weights: bool = False,
+        vertex_group_names=None,
+        strict_group_names: bool = False,
+        object_name: str = "",
     ):
         mesh_loops = mesh.loops
         mesh_loops_length = len(mesh_loops)
@@ -817,8 +849,15 @@ class VertexGroupUtils:
         for v_idx, groups in enumerate(sorted_groups):
             count = min(len(groups), total_groups)
             # 【t66】按**组名**解析槽号（组名 = 全局槽的十进制写法）；非十进制名回退序号。
+            # 【t88】`strict_group_names=True` 时不再回退：非十进制名 ⇒ 抛 Fatal。
             all_groups[v_idx, :count] = [
-                cls.resolve_group_slot(vertex_group_names, g.group) for g in groups
+                cls.resolve_group_slot(
+                    vertex_group_names,
+                    g.group,
+                    strict=strict_group_names,
+                    object_name=object_name,
+                )
+                for g in groups
             ][:count]
             all_weights[v_idx, :count] = [g.weight for g in groups][:count]
 

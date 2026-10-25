@@ -113,6 +113,8 @@ class ExportUtils:
                 vertex_group_names=[
                     vg.name for vg in (getattr(resolved_obj, "vertex_groups", None) or ())
                 ] or None,
+                # 【t88】把物体名带下去：组名不合规时报错要能指名道姓。
+                object_name=getattr(resolved_obj, "name", "") or "",
             )
 
         return ObjElementContext(
