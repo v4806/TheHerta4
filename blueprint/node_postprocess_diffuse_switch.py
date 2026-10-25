@@ -715,7 +715,7 @@ class SSMTNode_PostProcess_DiffuseSwitch(SSMTNode_PostProcess_Base):
                 continue
             visited.add(tree.name)
             for node in tree.nodes:
-                if node.bl_idname != "SSMTNode_PostProcess_SwapPanel" or node.mute:
+                if node.bl_idname not in {"SSMTNode_PostProcess_SwapPanel", "SSMTNode_PostProcess_CombinedPanel"} or node.mute:
                     continue
                 if not bool(getattr(node, "gui_only", False)):
                     continue

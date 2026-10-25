@@ -4,10 +4,12 @@ import glob
 import re
 import math
 import shutil
+import tempfile
 import uuid
 from collections import OrderedDict
 
 from .node_postprocess_base import SSMTNode_PostProcess_Base
+from ..common.ui_image_color import mark_png_as_srgb
 from ..common.shapekey_weight_range import (
     SHAPEKEY_WEIGHT_MIN,
     SHAPEKEY_WEIGHT_MAX,
@@ -813,6 +815,50 @@ class SSMT_OT_ShapeKeyUnassignFromGroup(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class SSMT_OT_ShapeKeyExt_AddActiveObject(bpy.types.Operator):
+    bl_idname = "ssmt.shapekey_ext_add_active_object"
+    bl_label = "添加选中物体"
+    bl_description = "将当前活动物体设为滑块目标，并自动解析哈希值和 IndexCount"
+    bl_options = {'REGISTER', 'INTERNAL'}
+    node_name: bpy.props.StringProperty()
+
+    def execute(self, context):
+        space_data = getattr(context, "space_data", None)
+        tree = (getattr(space_data, "edit_tree", None) or getattr(space_data, "node_tree", None)) if space_data else None
+        node = tree.nodes.get(self.node_name) if tree else None
+        if node is None or node.bl_idname not in {
+            'SSMTNode_PostProcess_ShapeKeyExt', 'SSMTNode_PostProcess_CombinedPanel'
+        }:
+            self.report({'WARNING'}, "无法找到形态键滑块设置节点")
+            return {'CANCELLED'}
+
+        obj = getattr(context, "active_object", None)
+        if obj is None:
+            obj = getattr(getattr(context, "view_layer", None), "objects", None)
+            obj = getattr(obj, "active", None)
+        if obj is None:
+            self.report({'WARNING'}, "当前没有选中活动物体")
+            return {'CANCELLED'}
+
+        if node.bl_idname == 'SSMTNode_PostProcess_ShapeKeyExt':
+            node.target_object = obj.name
+            node._update_from_object()
+            self.report({'INFO'}, f"已添加选中物体：{obj.name}")
+            return {'FINISHED'}
+
+        node.slider_target_object = obj.name
+        shape_node = node._find_shape_ext_node()
+        if shape_node is not None:
+            shape_node.target_object = obj.name
+            shape_node._update_from_object()
+            node.slider_detect_hash = shape_node.detect_hash
+            node.slider_detect_index_count = shape_node.detect_index_count
+            self.report({'INFO'}, f"已添加选中物体并解析：{obj.name}")
+        else:
+            self.report({'INFO'}, f"已添加选中物体：{obj.name}（连接形态键扩展配置节点后可解析）")
+        return {'FINISHED'}
+
+
 class SSMT_OT_ShapeKeyExt_ParseSliderObject(bpy.types.Operator):
     bl_idname = "ssmt.shapekey_ext_parse_slider_object"
     bl_label = "解析物体"
@@ -829,6 +875,15 @@ class SSMT_OT_ShapeKeyExt_ParseSliderObject(bpy.types.Operator):
                     node._update_from_object()
                     self.report({'INFO'}, f"已解析物体 '{node.target_object}' -> 哈希: {node.detect_hash}, IndexCount: {node.detect_index_count}")
                     return {'FINISHED'}
+                if node and node.bl_idname == 'SSMTNode_PostProcess_CombinedPanel':
+                    shape_node = node._find_shape_ext_node()
+                    if shape_node is not None:
+                        shape_node.target_object = node.slider_target_object
+                        shape_node._update_from_object()
+                        node.slider_detect_hash = shape_node.detect_hash
+                        node.slider_detect_index_count = shape_node.detect_index_count
+                        self.report({'INFO'}, f"已解析物体 '{node.slider_target_object}' -> 哈希: {node.slider_detect_hash}, IndexCount: {node.slider_detect_index_count}")
+                        return {'FINISHED'}
         self.report({'WARNING'}, "无法找到形态键扩展配置节点")
         return {'CANCELLED'}
 
@@ -910,7 +965,7 @@ KEY_PICKER_ARROW_ROWS = (
 )
 KEY_PICKER_NUMPAD_ROWS = (
     (("PrtSc", "VK_SNAPSHOT", 1.0), ("ScrLk", "VK_SCROLL", 1.0), ("Pause", "VK_PAUSE", 1.0)),
-    (("NumLock", "VK_NUMLOCK", 1.0),),
+    (("", "", 1.0), ("NumLock", "VK_NUMLOCK", 1.0), ("", "", 1.0)),
     (("÷", "VK_DIVIDE", 1.0), ("×", "VK_MULTIPLY", 1.0), ("−", "VK_SUBTRACT", 1.0)),
     (("7", "VK_NUMPAD7", 1.0), ("8", "VK_NUMPAD8", 1.0), ("9", "VK_NUMPAD9", 1.0),
      ("+", "VK_ADD", 1.0)),
@@ -1108,7 +1163,7 @@ class SSMT_OT_KeyPicker(bpy.types.Operator):
         wm.ssmt_kp_node = self.node_name
         wm.ssmt_kp_tree = self.node_tree_name
         wm.ssmt_kp_combo = key_picker_format(*key_picker_parse(current))
-        return wm.invoke_props_dialog(self, width=1000)
+        return wm.invoke_props_dialog(self, width=760)
 
     def execute(self, context):
         wm = context.window_manager
@@ -1311,6 +1366,12 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
         max=1.0,
         precision=4,
     )
+    auto_crop_background: bpy.props.BoolProperty(
+        name="自动裁剪背景",
+        description="按滑块与切换按钮的实际占用范围裁切背景图，保持图像比例",
+        default=False,
+        options={'HIDDEN'},
+    )
 
     def _update_target_object(self, context):
         self._update_from_object()
@@ -1473,13 +1534,40 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
             self.namespace = "skx_" + uuid.uuid4().hex[:8]
         return self.namespace
 
+    def _adopt_namespace_from_ini(self, ini_path):
+        """兼容旧工程：节点命名空间丢失时沿用目标 INI 中唯一的旧标识。"""
+        if not ini_path or not os.path.isfile(ini_path):
+            return False
+        try:
+            with open(ini_path, "r", encoding="utf-8") as stream:
+                content = stream.read()
+        except Exception:
+            return False
+
+        marker_pattern = re.compile(
+            r"^\s*;\s*@@ShapeKeyExt:BLOCK:BEGIN:(skx_[A-Za-z0-9_]+)@@\s*$",
+            re.MULTILINE,
+        )
+        namespaces = list(dict.fromkeys(marker_pattern.findall(content)))
+        if len(namespaces) != 1:
+            return False
+        current = str(self.namespace or "").strip()
+        existing = namespaces[0]
+        if current and current == existing:
+            return False
+        if current and self.BLOCK_BEGIN.format(ns=current) in content:
+            return False
+        self.namespace = existing
+        print(f"[形态键扩展配置] 沿用目标 INI 中的旧命名空间: {existing}")
+        return True
+
     def copy(self, node):
         # 复制节点时重置命名空间，避免共用同一套标识注释
         self.namespace = ""
 
     def init(self, context):
         super().init(context)
-        self.width = 700
+        self.width = 460
         if len(self.play_group_settings) == 0:
             s = self.play_group_settings.add()
             s.group_index = 1
@@ -2002,7 +2090,9 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
         也没有 ``$img0_x`` / ``$zoom0`` 等共用变量。依赖这些变量的节点（物体切换面板的
         附加模式）必须按本方法的结论决定能不能复用它们，否则会引用到不存在的变量。
         """
-        if not bool(getattr(self, "use_slider_panel", False)):
+        combined = self._find_combined_slider_panel()
+        enabled = getattr(combined, "slider_use_slider_panel", False) if combined is not None else getattr(self, "use_slider_panel", False)
+        if not bool(enabled):
             return False
         try:
             _unassigned_names, masked_vars = self._collect_unassigned_masked_vars()
@@ -2381,6 +2471,37 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
                 pass
         return fallback
 
+    @staticmethod
+    def _crop_background_to_aspect(image_path, target_aspect):
+        """只裁切输出副本的空白边缘，不缩放或拉伸背景图。"""
+        if not PIL_AVAILABLE or not image_path or not os.path.isfile(image_path):
+            return False
+        try:
+            target_aspect = float(target_aspect)
+            if target_aspect <= 0.0:
+                return False
+            with Image.open(image_path) as source:
+                image = source.convert('RGBA')
+            width, height = image.size
+            if width <= 0 or height <= 0:
+                return False
+            current_aspect = width / height
+            if abs(current_aspect - target_aspect) <= 0.002:
+                return True
+            if current_aspect > target_aspect:
+                crop_width = max(1, min(width, int(round(height * target_aspect))))
+                left = (width - crop_width) // 2
+                image = image.crop((left, 0, left + crop_width, height))
+            else:
+                crop_height = max(1, min(height, int(round(width / target_aspect))))
+                top = (height - crop_height) // 2
+                image = image.crop((0, top, width, top + crop_height))
+            image.save(image_path)
+            return True
+        except Exception as error:
+            print(f"[形态键扩展] 自动裁剪背景失败：{error}")
+            return False
+
     def _generate_background_image(self, dest_path, panel_w, panel_h, use_existing=False):
         """生成/处理面板背景图（圆角 + 边框）。panel_w/panel_h 为面板在屏幕单位的宽高。
 
@@ -2686,7 +2807,7 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
 
             shader_src = os.path.join(source_asset_dir, "draw_2d.hlsl")
             shader_dst = os.path.join(dest_res_dir, "draw_2d.hlsl")
-            if os.path.exists(shader_src) and not os.path.exists(shader_dst):
+            if os.path.exists(shader_src):
                 shutil.copy2(shader_src, shader_dst)
 
             image_mappings = [("0.png", self.background_image), ("1.png", self.slider_handle_image),
@@ -2695,8 +2816,13 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
                 dest_path = os.path.join(dest_res_dir, std_name)
                 if custom_path and os.path.isfile(custom_path):
                     shutil.copy2(custom_path, dest_path)
+                elif std_name == "0.png":
+                    default_path = os.path.join(source_asset_dir, std_name)
+                    if os.path.isfile(default_path):
+                        shutil.copy2(default_path, dest_path)
                 else:
                     self._copy_default_image(std_name, dest_res_dir, source_asset_dir)
+                mark_png_as_srgb(dest_path)
 
             btn_w_list = []
             max_btn_w = 0.0
@@ -2721,6 +2847,7 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
                     dest_path = os.path.join(dest_res_dir, dest_name)
                     if os.path.normpath(src_btn) != os.path.normpath(dest_path):
                         shutil.copy2(src_btn, dest_path)
+                    mark_png_as_srgb(dest_path)
 
                     btn_w_i = btn_h_fixed * 3.0 * SCREEN_RATIO_CORRECTION  # 缺省按 3:1
                     if PIL_AVAILABLE:
@@ -2749,12 +2876,146 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
         spacing = 0.02
         total_slider_height = num_sliders * child_height
         total_spacing_height = max(0, (num_sliders - 1) * spacing)
-        parent_height = total_slider_height + total_spacing_height + (top_bottom_padding * 2)
-        # 面板最小高度：自动计算高度过小时使用设置值
-        parent_height = max(parent_height, self.panel_min_height)
+        slider_content_height = total_slider_height + total_spacing_height + (top_bottom_padding * 2)
+        auto_crop = bool(self.auto_crop_background and PIL_AVAILABLE)
+        slider_top_padding = top_bottom_padding
+        integrated_switch_height = 0.0
+        integrated_switch_width = 0.0
+        integrated_switch_hitboxes = []
 
-        # 背景尺寸：宽 = 自动计算高度 × 背景图片宽高比 × 屏幕校正（保持图片比例）
+        combined = self._find_combined_slider_panel() if auto_crop else None
+        if (combined is not None
+                and getattr(combined, "panel_mode", "") in {"INTEGRATED_TOP", "INTEGRATED_BOTTOM"}):
+            switch_entries = list(getattr(combined, "swap_panel_entries", []) or [])
+            switch_buttons = None
+            if PIL_AVAILABLE and callable(getattr(combined, "_build_button_list", None)):
+                try:
+                    switch_buttons = combined._build_button_list(target_ini_file)
+                except Exception as error:
+                    print(f"[形态键扩展] 读取集成切换按钮尺寸失败，回退节点列表: {error}")
+            switch_count = len(switch_buttons) if switch_buttons is not None else len(switch_entries)
+            if switch_count:
+                switch_height = float(getattr(combined, "button_height", 0.05) or 0.05)
+                switch_row_spacing = float(getattr(combined, "button_row_spacing", 0.02) or 0.0)
+                switch_column_spacing = float(getattr(combined, "button_column_spacing", 0.02) or 0.0)
+                switch_top_padding = float(getattr(combined, "button_top_padding", 0.03) or 0.0)
+                switch_per_row = max(1, min(int(getattr(combined, "buttons_per_row", 1) or 1), switch_count))
+                switch_rows = int(math.ceil(switch_count / float(switch_per_row)))
+                switch_widths = []
+                if switch_buttons is not None and PIL_AVAILABLE:
+                    try:
+                        addon_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                        source_asset_dir = os.path.join(addon_dir, "Toolset")
+                        with tempfile.TemporaryDirectory(prefix="ssmt_switch_widths_") as measure_dir:
+                            os.makedirs(os.path.join(measure_dir, "res"), exist_ok=True)
+                            button_ns = combined._ensure_namespace()
+                            for index, button in enumerate(switch_buttons, start=1):
+                                image_path = combined._ensure_button_image(
+                                    os.path.join(measure_dir, "res"), button_ns, index,
+                                    source_asset_dir, button, style_src=self,
+                                )
+                                if not image_path or not os.path.isfile(image_path):
+                                    raise RuntimeError(f"无法生成第 {index} 个切换按钮尺寸图")
+                                with Image.open(image_path) as image:
+                                    aspect = image.width / max(1, image.height)
+                                explicit_width = float(getattr(combined, "button_width", 0.0) or 0.0)
+                                width = explicit_width if explicit_width > 0.0 else switch_height * aspect * SCREEN_RATIO_CORRECTION
+                                switch_widths.append(width)
+                    except Exception as error:
+                        print(f"[形态键扩展] 测量集成切换按钮尺寸失败，回退图片比例: {error}")
+                        switch_widths.clear()
+                if not switch_widths:
+                    image_entries = list(getattr(combined, "swap_panel_button_entries", []) or [])
+                    fallback_image = getattr(combined, "button_image", "") or ""
+                    for index in range(switch_count):
+                        explicit_width = float(getattr(combined, "button_width", 0.0) or 0.0)
+                        if explicit_width > 0.0:
+                            switch_widths.append(explicit_width)
+                            continue
+                        image_path = ""
+                        if index < len(image_entries):
+                            image_path = getattr(image_entries[index], "image_path", "") or ""
+                        image_path = image_path or fallback_image
+                        aspect = 3.0
+                        if image_path and os.path.isfile(image_path):
+                            try:
+                                with Image.open(image_path) as image:
+                                    if image.height > 0:
+                                        aspect = image.width / image.height
+                            except Exception:
+                                pass
+                        switch_widths.append(switch_height * aspect * SCREEN_RATIO_CORRECTION)
+                switch_columns = [0.0] * switch_per_row
+                for index, width in enumerate(switch_widths):
+                    switch_columns[index % switch_per_row] = max(switch_columns[index % switch_per_row], width)
+                if len(switch_widths) == switch_count:
+                    switch_column_offsets = []
+                    running_x = 0.02
+                    for column_width in switch_columns:
+                        switch_column_offsets.append(running_x)
+                        running_x += column_width + switch_column_spacing
+                    for index, button_width in enumerate(switch_widths):
+                        column_index = index % switch_per_row
+                        row_index = index // switch_per_row
+                        x_offset = switch_column_offsets[column_index] + (
+                            switch_columns[column_index] - button_width
+                        ) * 0.5
+                        if combined.panel_mode == "INTEGRATED_TOP":
+                            y_offset = (
+                                f"$img0_y + {switch_top_padding:.4f} * $zoom0 + {row_index} * "
+                                f"({switch_height:.4f} * $zoom0 + {switch_row_spacing:.4f} * $zoom0)"
+                            )
+                        else:
+                            y_offset = (
+                                f"$img0_y + $norm_height0 - {switch_rows} * "
+                                f"({switch_height:.4f} * $zoom0 + {switch_row_spacing:.4f} * $zoom0) + {row_index} * "
+                                f"({switch_height:.4f} * $zoom0 + {switch_row_spacing:.4f} * $zoom0)"
+                            )
+                        integrated_switch_hitboxes.append(
+                            f"cursor_x > $img0_x + {x_offset:.4f} * $zoom0 && "
+                            f"cursor_x < $img0_x + {x_offset + button_width:.4f} * $zoom0 && "
+                            f"cursor_y > {y_offset} && "
+                            f"cursor_y < {y_offset} + {switch_height:.4f} * $zoom0"
+                        )
+                integrated_switch_width = (
+                    0.02 + sum(switch_columns)
+                    + max(0, switch_per_row - 1) * switch_column_spacing + 0.02
+                )
+                integrated_switch_height = (
+                    switch_rows * switch_height
+                    + max(0, switch_rows - 1) * switch_row_spacing
+                    + switch_top_padding + 0.02
+                )
+                if combined.panel_mode == "INTEGRATED_TOP":
+                    slider_top_padding += integrated_switch_height
+
+        parent_height = slider_content_height + integrated_switch_height
+        if not auto_crop:
+            # 面板最小高度：自动计算高度过小时使用设置值。
+            parent_height = max(parent_height, self.panel_min_height)
+
+        # 背景图按滑块、播放按钮及集成切换按钮的实际占用范围裁切。
+        # 裁切发生在 mod 输出副本上，原始用户图片不受影响。
         bg_aspect = self._measure_image_aspect(dest_res_dir, "0.png")
+        if auto_crop:
+            min_slider_width = max(
+                (button_width + 0.02 + slider_w * 2.5) / 0.95
+                for button_width in btn_w_list
+            ) if btn_w_list else slider_w * 2.5
+            content_width = max(min_slider_width, integrated_switch_width)
+            target_aspect = content_width / max(parent_height * SCREEN_RATIO_CORRECTION, 1e-6)
+            if self._crop_background_to_aspect(
+                os.path.join(dest_res_dir, "0.png"), target_aspect
+            ):
+                bg_aspect = self._measure_image_aspect(dest_res_dir, "0.png")
+            else:
+                auto_crop = False
+                parent_height = max(slider_content_height + integrated_switch_height, self.panel_min_height)
+                slider_top_padding = top_bottom_padding + (
+                    integrated_switch_height if combined is not None and combined.panel_mode == "INTEGRATED_TOP" else 0.0
+                )
+
+        # 背景尺寸：宽 = 背景比例 × 面板高度 × 屏幕校正。
         panel_bg_width_auto = parent_height * bg_aspect * SCREEN_RATIO_CORRECTION
 
         # 生成/处理面板背景（圆角+边框）：无论是否自定义背景图都生效
@@ -2762,6 +3023,7 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
         self._generate_background_image(os.path.join(dest_res_dir, "0.png"),
                                         panel_bg_width_auto, parent_height,
                                         use_existing=bool(bg_custom))
+        mark_png_as_srgb(os.path.join(dest_res_dir, "0.png"))
 
         help_key = self.help_key.strip() or "home"
         reset_key = self.reset_key.strip() or "ctrl home"
@@ -2785,7 +3047,7 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
             "global $set_x0 = 0.5", "global $set_y0 = 0.5",
         ])
         for i in range(1, num_sliders + 1):
-            current_y_offset = top_bottom_padding + (i - 1) * (child_height + spacing) + (child_height / 2)
+            current_y_offset = slider_top_padding + (i - 1) * (child_height + spacing) + (child_height / 2)
             relative_y = current_y_offset / parent_height
             btn_w_i = btn_w_list[i-1]
             constants_additions.extend([
@@ -2957,6 +3219,13 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
             present_additions.append(f"            $btn_pressed{i} = 1")
             present_additions.append(f"            $btn_click_processed = 1")
             present_additions.append(f"        endif")
+        # Integrated switch buttons lie inside the slider panel background.
+        # Mark their press before the panel drag check so the background does
+        # not consume the same click before the switch handler runs.
+        for hitbox in integrated_switch_hitboxes:
+            present_additions.append(f"        if {hitbox}")
+            present_additions.append("            $btn_click_processed = 1")
+            present_additions.append("        endif")
         present_additions.append("    else")
         present_additions.append("        if $is_dragging == 0")
         for i in range(1, num_sliders + 1):
@@ -2988,7 +3257,7 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
             present_additions.append(f"            {prefix} cursor_x > $img{i}_x && cursor_x < $img{i}_x + $norm_width{i} && cursor_y > $img{i}_y && cursor_y < $img{i}_y + $norm_height{i}")
             present_additions.append(f"                $is_dragging = {i + 1}")
             present_additions.append(f"                $drag_x = cursor_x - $img{i}_x")
-        present_additions.append("            else if cursor_x > $img0_x && cursor_x < $img0_x + $norm_width0 && cursor_y > $img0_y && cursor_y < $img0_y + $norm_height0")
+        present_additions.append("            else if cursor_x > $img0_x && cursor_x < $img0_x + $norm_width0 && cursor_y > $img0_y && cursor_y < $img0_y + $norm_height0 && $btn_click_processed == 0")
         present_additions.append("                $is_dragging = 1")
         present_additions.append("                $drag_x = cursor_x - $img0_x")
         present_additions.append("                $drag_y = cursor_y - $img0_y")
@@ -3172,18 +3441,9 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
         return True
 
     def draw_buttons(self, context, layout):
-        # 顶部：原地刷新（应用设置到Mod，无需重新导出）
-        box_top = layout.box()
-        box_top.operator("ssmt.shapekey_ext_refresh", text="应用设置到Mod（原地更新）", icon='FILE_TICK').node_name = self.name
-        box_top.prop(self, "ini_file_path", text="INI文件（可选，留空用上次导出）")
-        box_top.label(text="修改设置后点上方按钮即可原地更新，无需重新导出", icon='INFO')
-        layout.separator()
-        # 左右两列布局：左=形态键扩展配置，右=滑块面板-自定义
-        split = layout.split(factor=0.5)
-        col_left = split.column()
-        col_right = split.column()
-        self._draw_shapekey_ui(col_left)
-        self._draw_slider_ui(col_right)
+        # Slider-panel configuration and in-place apply now live exclusively on
+        # CombinedPanel. Keep this node focused on shape-key data and groups.
+        self._draw_shapekey_ui(layout)
 
     def _draw_shapekey_ui(self, layout):
         # --- 顶部：主容器 ---
@@ -3293,120 +3553,165 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
         row.prop(self, "auto_play_toggle_key", text="自动播放")
         box.prop(self, "auto_play_key_global", text="全局生效")
 
-    def _draw_slider_ui(self, layout):
-        layout.prop(self, "use_slider_panel", text="启用滑块面板")
-        if not self.use_slider_panel:
+    def _draw_slider_ui(self, layout, config_node=None, property_map=None, columns=None,
+                        show_enable=True, show_backup=True, show_background_image=True):
+        config_node = config_node or self
+        property_map = property_map or {}
+        display_property_map = {legacy_name: combined_name for combined_name, legacy_name in property_map.items()}
+        prop_name = lambda name: property_map.get(name, display_property_map.get(name, name))
+        main_layout, resource_layout = columns if columns else (layout, layout)
+        resource_body = resource_layout
+        if columns:
+            main_header = main_layout.box()
+            main_row = main_header.row(align=True)
+            if show_enable:
+                main_row.prop(config_node, prop_name("use_slider_panel"), text="启用滑块面板")
+            else:
+                main_row.label(text="滑块控制", icon='FULLSCREEN_ENTER')
+            main_row.prop(
+                config_node,
+                "ui_show_slider_controls",
+                text="滑块控制详情",
+                icon='PROPERTIES',
+                toggle=True,
+            )
+            if bool(getattr(config_node, "ui_show_slider_controls", False)):
+                main_layout = main_header.column()
+            else:
+                main_layout = None
+
+            resource_header = resource_layout.box()
+            resource_header.prop(
+                config_node,
+                "ui_show_slider_appearance",
+                text="滑块图片资源",
+                icon='TEXTURE',
+                toggle=True,
+            )
+            if bool(getattr(config_node, "ui_show_slider_appearance", False)):
+                resource_body = resource_header.column()
+            else:
+                resource_body = None
+        elif show_enable:
+            main_layout.prop(config_node, prop_name("use_slider_panel"), text="启用滑块面板")
+        if not getattr(config_node, prop_name("use_slider_panel")):
             return
+        if main_layout is not None:
+            if show_backup:
+                box = main_layout.box()
+                box.label(text="滑块面板-自定义", icon='GRIP')
+                box.prop(config_node, prop_name("create_cumulative_backup"))
 
-        box = layout.box()
-        box.label(text="滑块面板-自定义", icon='GRIP')
-        box.prop(self, "create_cumulative_backup")
-
-        # 形态键强度行程：默认 0~1（与放开 clamp 前的行为一致）。
-        # 改宽之后滑块就能把权重推到 1 以上 / 0 以下；超出窗口的键值仍然合法
-        # （shader 侧硬边界 ±4），只是滑块会停在端点。
-        box = layout.box()
-        box.label(text="形态键强度行程", icon='ARROW_LEFTRIGHT')
-        col = box.column(align=True)
-        col.prop(self, "weight_min", text="下限")
-        col.prop(self, "weight_max", text="上限")
-        window_min, window_max = normalize_window(
-            getattr(self, "weight_min", SLIDER_WINDOW_MIN),
-            getattr(self, "weight_max", SLIDER_WINDOW_MAX),
-        )
-        if is_identity_window(window_min, window_max):
-            box.label(
-                text=f"默认 0 ~ 1；shader 硬边界 {SHAPEKEY_WEIGHT_MIN:g} ~ {SHAPEKEY_WEIGHT_MAX:g}",
-                icon='INFO',
+            # 形态键强度行程：默认 0~1（与放开 clamp 前的行为一致）。
+            # 改宽之后滑块就能把权重推到 1 以上 / 0 以下；超出窗口的键值仍然合法
+            # （shader 侧硬边界 ±4），只是滑块会停在端点。
+            box = main_layout.box()
+            box.label(text="形态键强度行程", icon='ARROW_LEFTRIGHT')
+            col = box.column(align=True)
+            col.prop(config_node, prop_name("weight_min"), text="下限")
+            col.prop(config_node, prop_name("weight_max"), text="上限")
+            window_min, window_max = normalize_window(
+                getattr(config_node, prop_name("weight_min"), SLIDER_WINDOW_MIN),
+                getattr(config_node, prop_name("weight_max"), SLIDER_WINDOW_MAX),
             )
-        else:
-            box.label(
-                text=(f"当前 {window_min:g} ~ {window_max:g}；"
-                      f"硬边界 {SHAPEKEY_WEIGHT_MIN:g} ~ {SHAPEKEY_WEIGHT_MAX:g}"),
-                icon='INFO',
-            )
+            if is_identity_window(window_min, window_max):
+                box.label(
+                    text=f"默认 0 ~ 1；shader 硬边界 {SHAPEKEY_WEIGHT_MIN:g} ~ {SHAPEKEY_WEIGHT_MAX:g}",
+                    icon='INFO',
+                )
+            else:
+                box.label(
+                    text=(f"当前 {window_min:g} ~ {window_max:g}；"
+                          f"硬边界 {SHAPEKEY_WEIGHT_MIN:g} ~ {SHAPEKEY_WEIGHT_MAX:g}"),
+                    icon='INFO',
+                )
 
-        box = layout.box()
-        box.label(text="快捷键设置", icon='KEYINGSET')
-        col = box.column(align=True)
-        row = col.row(align=True)
-        op = row.operator("ssmt.key_picker", text="选键", icon='KEYINGSET')
-        op.node_name = self.name
-        op.node_tree_name = self.id_data.name
-        op.target_prop = "help_key"
-        row.prop(self, "help_key", text="显隐面板")
-        row = col.row(align=True)
-        op = row.operator("ssmt.key_picker", text="选键", icon='KEYINGSET')
-        op.node_name = self.name
-        op.node_tree_name = self.id_data.name
-        op.target_prop = "reset_key"
-        row.prop(self, "reset_key", text="重置位置")
-        row = col.row(align=True)
-        op = row.operator("ssmt.key_picker", text="选键", icon='KEYINGSET')
-        op.node_name = self.name
-        op.node_tree_name = self.id_data.name
-        op.target_prop = "zoom_in_key"
-        row.prop(self, "zoom_in_key", text="放大")
-        row = col.row(align=True)
-        op = row.operator("ssmt.key_picker", text="选键", icon='KEYINGSET')
-        op.node_name = self.name
-        op.node_tree_name = self.id_data.name
-        op.target_prop = "zoom_out_key"
-        row.prop(self, "zoom_out_key", text="缩小")
-        row = col.row(align=True)
-        op = row.operator("ssmt.key_picker", text="选键", icon='KEYINGSET')
-        op.node_name = self.name
-        op.node_tree_name = self.id_data.name
-        op.target_prop = "drag_key"
-        row.prop(self, "drag_key", text="拖拽键")
+        if resource_body is None:
+            return
+        resource_layout = resource_body
 
-        box = layout.box()
-        box.label(text="UI尺寸设置", icon='PROPERTIES')
-        col = box.column(align=True)
-        col.prop(self, "panel_default_scale", text="面板默认缩放")
-        col.separator()
-        col.prop(self, "slider_height", text="滑块高度")
-        col.prop(self, "button_height", text="按钮高度")
-        col.prop(self, "panel_min_height", text="面板最小高度")
-        col.label(text="背景/滑块/按钮宽度按高度×图片比例自动计算", icon='INFO')
-
-        box = layout.box()
-        box.label(text="角色检测设置", icon='VIEWZOOM')
-        row = box.row(align=True)
-        row.prop_search(self, "target_object", bpy.data, "objects", text="物体", icon='OBJECT_DATA')
-        row.operator("ssmt.shapekey_ext_parse_slider_object", text="", icon='FILE_REFRESH').node_name = self.name
-        box.prop(self, "detect_hash", text="哈希值")
-        box.prop(self, "detect_index_count", text="IndexCount")
-
-        box = layout.box()
+        box = resource_layout.box()
         box.label(text="滑块图片资源（自定义）", icon='TEXTURE')
-        box.prop(self, "background_image", text="背景")
-        box.prop(self, "slider_handle_image", text="滑块")
-        box.prop(self, "left_bar_image", text="左进度条")
-        box.prop(self, "right_bar_image", text="右进度条")
-        box.prop(self, "button_image", text="按钮")
+        if show_background_image:
+            box.prop(config_node, prop_name("background_image"), text="背景")
+        box.prop(config_node, prop_name("slider_handle_image"), text="滑块")
+        box.prop(config_node, prop_name("left_bar_image"), text="左进度条")
+        box.prop(config_node, prop_name("right_bar_image"), text="右进度条")
+        box.prop(config_node, prop_name("button_image"), text="按钮")
         box.label(text="留空则使用插件内置默认图片", icon='INFO')
 
-        box = layout.box()
-        box.label(text="文字按钮样式", icon='COLOR')
-        col = box.column(align=True)
-        row = col.row(align=True)
-        row.prop(self, "button_bg_color", text="背景色")
-        row.prop(self, "button_border_color", text="边框色")
-        col.prop(self, "button_border_width", text="边框宽度")
-        col.prop(self, "button_opacity", text="透明度")
-        col.label(text="背景/边框紧贴文字，内边距极小不发糊", icon='INFO')
+    def _find_combined_slider_panel(self):
+        own_tree = getattr(self, "id_data", None)
+        tree_candidates = list(getattr(bpy.data, "node_groups", []) or [])
+        if own_tree is not None and own_tree not in tree_candidates:
+            tree_candidates.append(own_tree)
+        self_pointer = self.as_pointer() if hasattr(self, "as_pointer") else id(self)
+        for tree in tree_candidates:
+            for node in getattr(tree, "nodes", []) or []:
+                if (getattr(node, "bl_idname", "") != "SSMTNode_PostProcess_CombinedPanel"
+                        or getattr(node, "mute", False)):
+                    continue
+                find_slider = getattr(node, "_find_shape_ext_node", None)
+                slider = find_slider() if callable(find_slider) else None
+                slider_pointer = slider.as_pointer() if slider is not None and hasattr(slider, "as_pointer") else id(slider)
+                if slider is not None and slider_pointer == self_pointer:
+                    return node
+        return None
 
-        box = layout.box()
-        box.label(text="面板背景样式（圆角/边框）", icon='MATERIAL')
-        col = box.column(align=True)
-        col.prop(self, "background_corner_radius", text="背景圆角")
-        col.prop(self, "background_border_color", text="边框色")
-        col.prop(self, "background_border_width", text="边框宽度")
-        col.prop(self, "background_opacity", text="透明度")
-        col.label(text="未自定义背景图片时生效", icon='INFO')
+    def _sync_combined_slider_config(self):
+        combined = self._find_combined_slider_panel()
+        property_map = getattr(combined, "SLIDER_CONFIG_MAP", {}) if combined is not None else {}
+        if combined is not None:
+            # The CombinedPanel now owns the shared detection, scale and style
+            # controls. Mirror those canonical values into its legacy slider
+            # properties before syncing the legacy ShapeKeyExt node below.
+            shared_to_slider = {
+                "auto_crop_background": "slider_auto_crop_background",
+                "help_key": "slider_help_key",
+                "reset_key": "slider_reset_key",
+                "zoom_in_key": "slider_zoom_in_key",
+                "zoom_out_key": "slider_zoom_out_key",
+                "drag_key": "slider_drag_key",
+                "target_object": "slider_target_object",
+                "detect_hash": "slider_detect_hash",
+                "detect_index_count": "slider_detect_index_count",
+                "panel_default_scale": "slider_panel_scale",
+                "button_bg_color": "slider_play_button_bg_color",
+                "button_border_color": "slider_play_button_border_color",
+                "button_border_width": "slider_play_button_border_width",
+                "button_opacity": "slider_play_button_opacity",
+                "background_corner_radius": "slider_panel_corner_radius",
+                "background_border_color": "slider_panel_border_color",
+                "background_border_width": "slider_panel_border_width",
+                "background_opacity": "slider_panel_opacity",
+            }
+            for shared_prop, slider_prop in shared_to_slider.items():
+                try:
+                    setattr(combined, slider_prop, getattr(combined, shared_prop))
+                except Exception:
+                    pass
+            # CombinedPanel exposes one shared backup toggle and one shared ini path.
+            try:
+                self.create_cumulative_backup = bool(combined.create_cumulative_backup)
+                self.ini_file_path = combined.ini_file_path
+            except Exception:
+                pass
+        for combined_prop, legacy_prop in property_map.items():
+            try:
+                setattr(self, legacy_prop, getattr(combined, combined_prop))
+            except Exception:
+                pass
+        if combined is not None:
+            try:
+                # These two values are shared in the combined node; keep the legacy
+                # ShapeKeyExt data processor aligned when its refresh/export runs.
+                self.create_cumulative_backup = bool(combined.create_cumulative_backup)
+                self.ini_file_path = combined.ini_file_path
+            except Exception:
+                pass
+        return combined
 
-    def execute_postprocess(self, mod_export_path, _in_place=False, _ini_path=None):
+    def execute_postprocess(self, mod_export_path, _in_place=False, _ini_path=None, _skip_backup=False):
         """生成 / 原地刷新 形态键扩展配置（含合并的滑块面板）。
 
         - 导出（_in_place=False）：在 mod ini 中生成配置（带专有标识注释）。
@@ -3420,8 +3725,12 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
                 return False
             target_ini_file = ini_files[0]
 
+        if _in_place:
+            self._adopt_namespace_from_ini(target_ini_file)
+
         print(f"[形态键扩展配置] {'原地刷新' if _in_place else '开始执行'}: {target_ini_file}")
 
+        self._sync_combined_slider_config()
         ns = self._ensure_namespace()
         self.last_mod_ini_path = target_ini_file
 
@@ -3435,7 +3744,7 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
             except Exception:
                 pass
 
-        if self.create_cumulative_backup:
+        if self.create_cumulative_backup and not _skip_backup:
             self._create_cumulative_backup(target_ini_file, mod_export_path)
 
         result = self._read_ini_to_ordered_dict(target_ini_file)
@@ -3729,7 +4038,7 @@ classes = (
     SSMT_OT_ShapeKeyAssignToCurrentGroup, SSMT_OT_ShapeKeyUnassignFromGroup,
     SSMT_OT_ShapeKeyGroupAdd, SSMT_OT_ShapeKeyGroupDuplicate, SSMT_OT_ShapeKeyGroupRemove,
     SSMT_OT_ShapeKeyGroupMoveUpDown,
-    SSMT_OT_ShapeKeyExt_ParseSliderObject, SSMT_OT_ShapeKeyExt_Refresh,
+    SSMT_OT_ShapeKeyExt_AddActiveObject, SSMT_OT_ShapeKeyExt_ParseSliderObject, SSMT_OT_ShapeKeyExt_Refresh,
     SSMT_OT_KeyPicker, SSMT_OT_KeyPickerPick,
 )
 

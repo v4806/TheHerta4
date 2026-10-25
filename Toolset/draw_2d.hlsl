@@ -50,6 +50,26 @@ void main(
 #ifdef PIXEL_SHADER
 Texture2D<float4> tex : register(t100);
 
+// The game backbuffer used by the 3Dmigoto overlay is not an sRGB render
+// target. Texture sampling converts the PNG's sRGB RGB values to linear, so
+// encode them back before writing the overlay or the UI appears too dark.
+float linear_to_srgb_channel(float value)
+{
+    value = max(value, 0.0f);
+    if (value <= 0.0031308f)
+        return value * 12.92f;
+    return 1.055f * pow(value, 1.0f / 2.4f) - 0.055f;
+}
+
+float3 linear_to_srgb(float3 value)
+{
+    return float3(
+        linear_to_srgb_channel(value.r),
+        linear_to_srgb_channel(value.g),
+        linear_to_srgb_channel(value.b)
+    );
+}
+
 // 线性采样器（用于缩小/抗锯齿）
 sampler linearSampler : register(s0) = sampler_state
 {
@@ -85,5 +105,6 @@ void main(vs2ps input, out float4 result : SV_Target0)
     } else {
         result = tex.Sample(linearSampler, input.uv);
     }
+    result.rgb = linear_to_srgb(result.rgb);
 }
 #endif
