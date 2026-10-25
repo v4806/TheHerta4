@@ -22,7 +22,12 @@ from collections import OrderedDict
 from .node_postprocess_material import (
     MATERIAL_DETECT_PRESETS,
     SSMTNode_PostProcess_MaterialBase,
+    resolve_keyswap_key,
 )
+try:  # pragma: no cover - 纯文件装载的测试宿主可能没有 common 包
+    from ..common.texture_export_plan import TextureExportPlan
+except ImportError:  # pragma: no cover
+    TextureExportPlan = None
 
 #: 「段 → if/endif 块 → 行分类 → 绘制单元」的结构化圈定（纯函数，不依赖 bpy）。
 #: 正常插件导入走相对导入；纯 Python 单测按文件路径装载本模块时包结构不完整
@@ -132,6 +137,80 @@ _ACTIVATION_FLAG_DECL_RE = re.compile(
     re.IGNORECASE,
 )
 _ACTIVATION_FLAG_SET_RE = re.compile(r"^[ \t]*(\$[A-Za-z_]\w*)[ \t]*=[ \t]*1[ \t]*$")
+
+
+#: 「纯贴图模式」段：目标物体**不在导出链**（本次导出没有产出它的网格段）时，
+#: 由本节点凭空生成的只贴图片段。前缀刻意与「纯贴图替换」节点不同，两个节点并存时
+#: 各自清理自己的段，不会互删。
+_MATERIAL_PURE_TEXTURE_SECTION_PREFIX = "TextureOverride_MaterialPureTexture_"
+_MATERIAL_PURE_TEXTURE_SECTION_MARKER = (
+    "; --- 纯贴图替换（无网格修改）：由「材质转资源pro」节点生成 ---"
+)
+#: 纯贴图段登记进 ``common/export_section_registry`` 时使用的段类型。
+#: 「条件判断」节点据此把这类凭空生成的段也纳入门控（正常导出段由 M_IniBuilder 登记）。
+_MATERIAL_PURE_TEXTURE_SECTION_TYPE = "TextureOverrideMaterialPureTexture"
+#: ZZMI / EFMI 贴图槽位映射（与基础导出口径一致）。
+_MATERIAL_PURE_TEXTURE_SLOTS_ZZMI = OrderedDict(
+    (
+        ("DiffuseMap", r"Resource\ZZMI\Diffuse"),
+        ("NormalMap", r"Resource\ZZMI\NormalMap"),
+        ("LightMap", r"Resource\ZZMI\LightMap"),
+        ("MaterialMap", r"Resource\ZZMI\MaterialMap"),
+    )
+)
+_MATERIAL_PURE_TEXTURE_SET_TEXTURES_ZZMI = r"run = CommandList\ZZMI\SetTextures"
+_MATERIAL_PURE_TEXTURE_SLOTS_EFMI = OrderedDict(
+    (
+        ("DiffuseMap", r"Resource\RabbitFx\Diffuse"),
+        ("NormalMap", r"Resource\RabbitFx\NormalMap"),
+        ("LightMap", r"Resource\RabbitFx\LightMap"),
+    )
+)
+_MATERIAL_PURE_TEXTURE_SET_TEXTURES_EFMI = r"run = CommandList\RabbitFx\SetTextures"
+
+#: 物体名里的三段绘制信息 ``<hash>-<indexCount>-<firstIndex>``（与纯贴图节点同口径）。
+_PART_DRAW_RE = re.compile(r"^([0-9a-fA-F]{8})-(\d+)-(\d+)(?:[._\-]|$)")
+_PART_LOD_PREFIX_RE = re.compile(r"^LOD\d+[.]", re.IGNORECASE)
+_PART_HASH_PREFIX_RE = re.compile(r"^[0-9a-fA-F]{8}")
+_PART_HASH_FALLBACK_RE = re.compile(r"(?<![0-9a-fA-F])([0-9a-fA-F]{8})(?=[-_.]|$)")
+
+
+def _parse_part_draw_name(name):
+    """从物体名解析 ``(hash, indexCount, firstIndex)``；完全解析不出返回 ``None``。"""
+    text = str(name or "").strip()
+    if not text:
+        return None
+    short = _PART_LOD_PREFIX_RE.sub("", text)
+    match = _PART_DRAW_RE.match(short) or _PART_DRAW_RE.search(text)
+    if match:
+        return (match.group(1).lower(), int(match.group(2)), int(match.group(3)))
+    match = _PART_HASH_PREFIX_RE.match(short) or _PART_HASH_FALLBACK_RE.search(short)
+    if match:
+        return (match.group(0).lower(), None, None)
+    return None
+
+
+def _is_material_pure_texture_section(section_name) -> bool:
+    """本节点「纯贴图模式」生成的段。"""
+    return str(section_name or "").strip().startswith(
+        f"[{_MATERIAL_PURE_TEXTURE_SECTION_PREFIX}"
+    )
+
+
+def _is_pure_texture_section_name(section_name) -> bool:
+    """该段是否是纯贴图段：本节点的纯贴图模式段，或旧版纯贴图节点遗留的段。
+
+    这类段只有贴图槽绑定、没有 ``; [mesh:...]`` 与任何网格修改。材质转资源pro 的
+    生成逻辑会先 ``_strip_generated_material_lines`` 把 ``Resource\\<ns>\\Xxx = ref ...``
+    剥离，对这类段会把绑定行整批删掉（全局模式下尤其明显）。所以这里在入口直接跳过：
+    纯贴图段的匹配、切换、KeySwap 全部由生成它的节点自己负责。
+
+    ``[TextureOverride_PureTexture_`` 前缀是已删除的「纯贴图替换」节点留下的旧产物，
+    用户还没重新导出的 ini 里可能仍有这些段 —— 按前缀跳过，交给它自己，不要误伤。
+    """
+    if _is_material_pure_texture_section(section_name):
+        return True
+    return str(section_name or "").strip().startswith("[TextureOverride_PureTexture_")
 
 
 def _is_slot_style_param(param) -> bool:
@@ -434,8 +513,16 @@ class SSMT_OT_CustomMaterialAssignAddSelected(bpy.types.Operator):
     bl_description = "将当前选中的所有网格物体加入材质转资源 Pro 节点"
     bl_options = {"REGISTER", "UNDO", "INTERNAL"}
 
+    node_name: bpy.props.StringProperty()
+
     def execute(self, context):
-        node = _find_material_assign_node_from_blueprint(context)
+        # 面板按钮会传 node_name：直接定位到当前节点的编辑树；没有则回退到全蓝图查找
+        # （旧入口 / 菜单调用仍可用）。
+        node = (
+            _find_node(context, self.node_name)
+            if self.node_name
+            else _find_material_assign_node_from_blueprint(context)
+        )
         if node is None:
             self.report({"WARNING"}, "没有找到材质转资源节点")
             return {"CANCELLED"}
@@ -443,6 +530,9 @@ class SSMT_OT_CustomMaterialAssignAddSelected(bpy.types.Operator):
             self.report({"WARNING"}, "全局指定模式下不支持添加")
             return {"CANCELLED"}
         selected = [obj for obj in (getattr(context, "selected_objects", None) or []) if getattr(obj, "type", "") == "MESH"]
+        if not selected:
+            self.report({"WARNING"}, "未选中任何网格物体")
+            return {"CANCELLED"}
         existing = {item.target_object for item in node.target_items if item.target_object}
         added = 0
         for obj in selected:
@@ -711,6 +801,9 @@ def _collect_connected_object_names(start_node):
         if not getattr(node, "mute", False):
             if node_type == "SSMTNode_Object_Info":
                 add_name(getattr(node, "object_name", ""))
+            elif node_type == "SSMTNode_Object_Info_Pro":
+                for item in getattr(node, "object_list", []) or []:
+                    add_name(getattr(item, "object_name", ""))
             elif node_type == "SSMTNode_MultiFile_Export":
                 for item in getattr(node, "object_list", []) or []:
                     add_name(getattr(item, "object_name", ""))
@@ -1102,6 +1195,7 @@ def _connected_blueprint_object_names(tree):
     }
     SOURCE_IDS = {
         "SSMTNode_Object_Info",
+        "SSMTNode_Object_Info_Pro",
         "SSMTNode_MultiFile_Export",
     }
 
@@ -1162,6 +1256,11 @@ def _connected_blueprint_object_names(tree):
                 object_name = str(getattr(node, "object_name", "") or "")
                 if object_name:
                     result_names.append(object_name)
+            elif node.bl_idname == "SSMTNode_Object_Info_Pro":
+                for item in getattr(node, "object_list", []) or []:
+                    object_name = str(getattr(item, "object_name", "") or "")
+                    if object_name:
+                        result_names.append(object_name)
             elif node.bl_idname == "SSMTNode_MultiFile_Export":
                 for item in getattr(node, "object_list", []) or []:
                     object_name = str(getattr(item, "object_name", "") or "")
@@ -1382,7 +1481,9 @@ class SSMT_OT_CustomMaterialScanSwitches(bpy.types.Operator):
                 group.merge_group_id = variable
                 group.state_count = max(len(names) for names in groups.values())
                 group.bindings = json.dumps(
-                    [sorted(names) for names in groups.values()],
+                    # ``_collect_switch_prefix_groups`` 按材质槽顺序收集；保留该顺序，
+                    # 才能让同一类型材质的第 N 档对应物体槽位里的第 N 套。
+                    [list(names) for names in groups.values()],
                     ensure_ascii=False,
                 )
                 metadata = old_data or old_by_variable.get(variable)
@@ -2236,13 +2337,19 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
                 }
 
     def _prepare_material_group_switch_map(self, material_group_to_swapkey):
+        # 同时记录每个切换组的档位顺序（扫描时的 bindings 顺序）：导出生成 if 档位时
+        # 要按用户配置的顺序排，否则「第 N 档」会和面板/热键的档位错开。
+        self._material_group_order = {}
         for spec in self._iter_switch_group_defs():
             for binding in spec["bindings"]:
                 if binding:
+                    key = tuple(binding)
                     material_group_to_swapkey.setdefault(
-                        tuple(binding),
+                        key,
                         spec["variable"],
                     )
+                    self._material_group_order.setdefault(key, list(binding))
+                    self._material_group_order.setdefault(tuple(sorted(binding)), list(binding))
 
     def _max_ui_switch_number(self):
         prefix, _ = _parse_switch_var_base(self)
@@ -2276,10 +2383,15 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
         lines = []
         if spec["comment"]:
             lines.append(f"; {spec['comment']}")
+        # 多个切换组共用同一个键时顺延（衣服/身体都填 N → 身体改 M），避免一次按键
+        # 同时 cycle 两个组。只影响本次导出的 ini，不改用户节点里的按键配置。
+        effective_key = resolve_keyswap_key(
+            sections, section_name, spec["key"], log_prefix="材质转资源pro"
+        )
         lines.extend(
             [
                 f"condition = {condition}",
-                f"key = {spec['key']}",
+                f"key = {effective_key}",
                 "type = cycle",
                 f"${variable} = {values}",
             ]
@@ -3061,6 +3173,10 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
         if next_swap_key_num is None or next_swap_key_num is Ellipsis:
             next_swap_key_num = 0
 
+        # 纯贴图替换节点生成的段：只有贴图绑定、没有 mesh 单元，本节点不处理。
+        if _is_pure_texture_section_name(section_name):
+            return next_swap_key_num
+
         if bool(getattr(self, "use_global_assign", False)):
             self._prepare_material_group_switch_map(material_group_to_swapkey)
             max_ui_number = self._max_ui_switch_number()
@@ -3234,7 +3350,9 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
         )
         scan.node_name = self.name
         add = header.operator(
-            "ssmt.custom_material_assign_add_target", text="添加", icon="ADD"
+            "ssmt.custom_material_assign_add_selected",
+            text="添加选中",
+            icon="ADD",
         )
         add.node_name = self.name
         clear_targets = header.operator(
@@ -3428,6 +3546,10 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
             layout.label(
                 text="导出 Mod 时自动执行；未指定部件对应的 INI 段不会被修改",
                 icon="TIME",
+            )
+            layout.label(
+                text="列表里不在导出链的物体：只生成贴图替换段（无网格修改）",
+                icon="TEXTURE",
             )
         self.draw_material_detection_panel(context, layout)
 
@@ -3646,6 +3768,9 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
             for section_name in list(sections.keys()):
                 if not str(section_name).startswith("[TextureOverride_"):
                     continue
+                # 纯贴图替换节点的段：不参与「清除未指定部件贴图」（它本来就没有 mesh 单元）。
+                if _is_pure_texture_section_name(section_name):
+                    continue
                 lines = sections[section_name]
                 mesh_bindings = self._collect_mesh_binding_lines(lines)
                 if not mesh_bindings:
@@ -3773,11 +3898,16 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
                 handle.write(new_content)
 
         removed_files = 0
+        dropped_plans = 0
         if freed_filenames:
             still_referenced = self._collect_filename_references(ini_files)
             for relative in sorted(freed_filenames):
                 if relative.lower() in still_referenced:
                     continue
+                # 贴图计划（落盘前联合去重）：还没落盘的贴图直接取消计划项，
+                # 不再「复制出来再删掉」；已落盘的（上次导出的旧文件）走下面的删除。
+                if TextureExportPlan is not None:
+                    dropped_plans += TextureExportPlan.drop_by_ini_filename(relative)
                 target_path = self._resolve_mod_relative_path(mod_export_path, relative)
                 if target_path is None or not os.path.isfile(target_path):
                     continue
@@ -3787,12 +3917,13 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
                 except OSError as exc:
                     print(f"[材质转资源pro] 删除贴图失败 {target_path}: {exc}")
 
-        if removed_bindings or removed_sections or removed_files:
+        if removed_bindings or removed_sections or removed_files or dropped_plans:
             print(
                 f"[材质转资源pro] 已清除未指定部件贴图：回退绑定行 {removed_bindings}"
                 f"（删除槽位绑定 {removed_slot_lines} 行、别名置空 "
                 f"{removed_bindings - removed_slot_lines} 行）、"
                 f"资源定义段 {removed_sections}、贴图文件 {removed_files}"
+                f"、取消未落盘计划 {dropped_plans}"
             )
         if skipped_sections:
             print(
@@ -3815,11 +3946,333 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
                 print(f"    - {mesh_name}")
         return removed_bindings + removed_sections + removed_files
 
+    # ---- 纯贴图模式（目标物体不在导出链） ---------------------------------
+    #
+    # 物体列表里的物体**本次导出没有产出网格段**（不在导出链上）时，按纯贴图替换模式
+    # 处理：只生成贴图槽绑定段，不写任何 ib / vb0 / drawindexed。切换组直接用本节点
+    # 目标部件上的 switch_groups（变量/按键/档数/备注与常规路径共用同一套数据）。
+
+    @staticmethod
+    def _pure_texture_slot_layout():
+        """当前游戏执行逻辑的贴图槽位映射；不支持时返回 ``(None, None)``。"""
+        try:
+            from ..common.global_config import GlobalConfig
+            from ..common.logic_name import LogicName
+
+            logic_name = getattr(GlobalConfig, "logic_name", "") or ""
+        except Exception:
+            return None, None
+        if LogicName.is_zzmi_family(logic_name):
+            return (
+                _MATERIAL_PURE_TEXTURE_SLOTS_ZZMI,
+                _MATERIAL_PURE_TEXTURE_SET_TEXTURES_ZZMI,
+            )
+        if logic_name == LogicName.EFMI:
+            return (
+                _MATERIAL_PURE_TEXTURE_SLOTS_EFMI,
+                _MATERIAL_PURE_TEXTURE_SET_TEXTURES_EFMI,
+            )
+        return None, None
+
+    @staticmethod
+    def _pure_texture_main_ini(mod_export_path):
+        """导出目录里含 TextureOverride 段最多的那个 ini（主配置表）。"""
+        ini_files = sorted(glob.glob(os.path.join(mod_export_path, "*.ini")))
+        if not ini_files:
+            return ""
+        best = ""
+        best_score = -1
+        for ini_file in ini_files:
+            try:
+                with open(ini_file, "r", encoding="utf-8") as handle:
+                    content = handle.read()
+            except OSError:
+                continue
+            score = content.count("[TextureOverride_") + (
+                10 if "[Constants]" in content else 0
+            )
+            if score > best_score:
+                best = ini_file
+                best_score = score
+        return best or ini_files[0]
+
+    @staticmethod
+    def _pure_texture_conflict_with_export(sections, ib_hash):
+        """该 IB 是否在本次导出里产出了网格段（= 物体在导出链上）。"""
+        try:
+            from ..common import export_section_registry
+
+            registered = (
+                list(export_section_registry.get_sections_for_draw_ib(ib_hash) or [])
+                + list(export_section_registry.get_sections_for_draw_ib(ib_hash.upper()) or [])
+            )
+            for entry in registered:
+                name = str((entry or {}).get("name") or "").strip()
+                # 本节点「纯贴图模式」自己登记的段不是网格段：否则同一进程里第二次
+                # 生成时会把上一次的产物当成冲突，删完旧段后不再重新生成。
+                if name.startswith(_MATERIAL_PURE_TEXTURE_SECTION_PREFIX):
+                    continue
+                if name:
+                    return True
+        except Exception:
+            pass
+        lowered = str(ib_hash or "").lower()
+        if not lowered:
+            return False
+        patterns = (
+            re.compile(
+                rf"^\[TextureOverride_IB_{re.escape(lowered)}(?:\]|_)", re.IGNORECASE
+            ),
+            re.compile(
+                rf"^\[TextureOverride_{re.escape(lowered)}_\d+_\d+\]$",
+                re.IGNORECASE,
+            ),
+            re.compile(
+                rf"^\[TextureOverride_VB_{re.escape(lowered)}(?:\]|_)", re.IGNORECASE
+            ),
+        )
+        for section_name in sections:
+            if _is_pure_texture_section_name(section_name):
+                continue
+            text = str(section_name or "").strip()
+            if any(pattern.match(text) for pattern in patterns):
+                return True
+        return False
+
+    @staticmethod
+    def _register_pure_texture_section(section_label, draw_ib, ini_file):
+        """把凭空生成的纯贴图段登记进导出期段登记表。
+
+        「条件判断」节点只按导出期段登记反查「物体 → DrawIB → 段名」；这类段不是
+        ``M_IniBuilder`` 写的，不登记就永远查不到、不会被门控。登记失败只忽略：
+        它只是后处理附加信息，绝不能反过来让纯贴图段生成失败。
+        """
+        name = str(section_label or "").strip()
+        if name.startswith("[") and name.endswith("]"):
+            name = name[1:-1]
+        if not name:
+            return
+        try:
+            from ..common import export_section_registry
+        except Exception:
+            return
+        try:
+            export_section_registry.register_section(
+                name,
+                section_type=_MATERIAL_PURE_TEXTURE_SECTION_TYPE,
+                draw_ib=str(draw_ib or ""),
+                ini_path=ini_file,
+            )
+        except Exception:
+            pass
+
+    def _build_pure_texture_lines(
+        self,
+        obj,
+        sections,
+        texture_folder,
+        slot_map,
+        material_group_to_swapkey,
+        object_to_diffuse_swapkey,
+        swap_key_prefix,
+        next_swap_key_num,
+        used_swap_keys,
+    ):
+        """生成一个物体的贴图绑定行；返回 ``(lines, next_swap_key_num, 类型列表)``。"""
+        lines = []
+        matched_types = []
+        for texture_type, param_name in slot_map.items():
+            matching_materials = self.find_matching_materials(obj, texture_type)
+            if not matching_materials:
+                continue
+            generated, next_swap_key_num = self.generate_material_lines(
+                matching_materials,
+                param_name,
+                texture_type,
+                obj,
+                texture_folder,
+                sections,
+                object_to_diffuse_swapkey,
+                material_group_to_swapkey,
+                swap_key_prefix,
+                next_swap_key_num,
+                used_swap_keys,
+            )
+            if generated:
+                lines.extend(generated)
+                matched_types.append(texture_type)
+        return lines, next_swap_key_num, matched_types
+
+    def _apply_pure_texture_sections(self, mod_export_path):
+        """对「不在导出链」的目标物体生成纯贴图段；返回生成的段数。"""
+        if bool(getattr(self, "use_global_assign", False)):
+            return 0
+        objects = [
+            item.target_object
+            for item in getattr(self, "target_items", []) or []
+            if getattr(item, "target_object", None) is not None
+        ]
+        if not objects:
+            return 0
+        slot_map, set_textures_line = self._pure_texture_slot_layout()
+        if slot_map is None:
+            print(
+                "[材质转资源pro] 纯贴图模式：当前游戏执行逻辑不支持"
+                "（只支持 ZZMI 家族 / EFMI），已跳过"
+            )
+            return 0
+        ini_file = self._pure_texture_main_ini(mod_export_path)
+        if not ini_file:
+            return 0
+
+        with open(ini_file, "r", encoding="utf-8") as handle:
+            content = handle.read()
+        preserved_driver_content, content = self.split_anim_driver_block_content(content)
+        content = self._strip_previous_transparency_sections(content)
+        content, preserved_tail_content = self.split_auto_appended_tail_content(content)
+        preamble_lines, sections = self._parse_ini_content(content)
+
+        # 幂等：先删掉上一次本节点生成的纯贴图模式段（前缀与「纯贴图替换」节点不同）
+        removed = 0
+        for section_name in list(sections.keys()):
+            if _is_material_pure_texture_section(section_name):
+                del sections[section_name]
+                removed += 1
+
+        material_group_to_swapkey = {}
+        self._prepare_material_group_switch_map(material_group_to_swapkey)
+        swap_key_prefix, next_swap_key_num = _parse_switch_var_base(self)
+        max_ui_number = self._max_ui_switch_number()
+        if max_ui_number >= next_swap_key_num:
+            next_swap_key_num = max_ui_number + 1
+        used_swap_keys = set()
+        object_to_diffuse_swapkey = {}
+        texture_folder = os.path.join(mod_export_path, "Textures")
+        generated_sections = []
+        handled_names = []
+        warnings = []
+
+        for obj in objects:
+            ib = _parse_part_draw_name(obj.name)
+            if ib is None:
+                warning = f"{obj.name}：解析不出 DrawIB（应形如 LOD0.7fbbcf0d-7116-0.部件名）"
+                warnings.append(warning)
+                continue
+            ib_hash = ib[0]
+            if self._pure_texture_conflict_with_export(sections, ib_hash):
+                # 该物体在导出链上：网格段由常规路径处理，这里不重复生成
+                continue
+            lines, next_swap_key_num, matched_types = self._build_pure_texture_lines(
+                obj,
+                sections,
+                texture_folder,
+                slot_map,
+                material_group_to_swapkey,
+                object_to_diffuse_swapkey,
+                swap_key_prefix,
+                next_swap_key_num,
+                used_swap_keys,
+            )
+            if not lines:
+                warning = (
+                    f"{obj.name}：没有可用的贴图材质"
+                    "（材质名前缀需为 DiffuseMap_/NormalMap_/LightMap_/MaterialMap_）"
+                )
+                warnings.append(warning)
+                continue
+            base_name = f"[{_MATERIAL_PURE_TEXTURE_SECTION_PREFIX}{ib_hash}]"
+            unique_name = base_name
+            suffix = 2
+            while unique_name in sections:
+                unique_name = (
+                    f"[{_MATERIAL_PURE_TEXTURE_SECTION_PREFIX}{ib_hash}_{suffix}]"
+                )
+                suffix += 1
+            body = [
+                _MATERIAL_PURE_TEXTURE_SECTION_MARKER,
+                f"; 物体: {obj.name}",
+                f"hash = {ib_hash}",
+            ]
+            # 安全置空（条件判断门控的前提）：本段可能被「条件判断」节点整体门控
+            # （条件不满足时跳过所有 ``= ref``）。先把实际绑定的槽位置顶层
+            # ``= null``（SlotFix 用 unless_null，源为 null 不覆盖槽位 ⇒ 原生贴图），
+            # 避免条件关闭时槽位残留同帧别的部件赋过的 mod 贴图。条件节点把
+            # ``Resource\<ns>\Xxx = null`` 归为「必须留顶层」，只门控 ``= ref``。
+            slot_null_lines = []
+            seen_slots = set()
+            for texture_type in matched_types:
+                param_name = slot_map.get(texture_type)
+                if not param_name or param_name in seen_slots:
+                    continue
+                seen_slots.add(param_name)
+                slot_null_lines.append(f"{param_name} = null")
+            body.extend(slot_null_lines)
+            texture_lines = list(lines)
+            while texture_lines and not str(texture_lines[-1]).strip():
+                texture_lines.pop()
+            body.extend(texture_lines)
+            if set_textures_line:
+                body.append(set_textures_line)
+            sections[unique_name] = body
+            # 登记给「条件判断」等后处理节点：这类段不是导出器写的，不登记的话
+            # 条件节点按「物体 → DrawIB → 段名」反查永远查不到，无法门控。
+            self._register_pure_texture_section(unique_name, ib_hash, ini_file)
+            generated_sections.append(unique_name)
+            handled_names.append(obj.name)
+            print(
+                f"[材质转资源pro] 纯贴图模式：生成 {unique_name}"
+                f"（{obj.name}，贴图类型 {', '.join(matched_types)}）"
+            )
+
+        if generated_sections and used_swap_keys:
+            self.define_swapkeys_in_sections(sections, used_swap_keys)
+            chosen = OrderedDict()
+            for spec in self._iter_switch_group_defs():
+                if not spec["enabled"] or not spec["key"]:
+                    continue
+                if spec["variable"] not in used_swap_keys:
+                    continue
+                if f"[KeySwap_Diffuse_{spec['variable'].lstrip('$')}]" in sections:
+                    continue
+                chosen.setdefault(spec["variable"], spec)
+            for spec in chosen.values():
+                self._write_keyswap_section(sections, spec)
+
+        if not generated_sections and not removed:
+            return 0
+
+        new_content = self._serialize_ini_content(
+            preamble_lines,
+            sections,
+            preserved_tail_content=preserved_tail_content,
+            preserved_driver_content=preserved_driver_content,
+        )
+        with open(ini_file, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(new_content)
+
+        summary = (
+            f"纯贴图模式：{len(generated_sections)} 个物体不在导出链，已生成只贴图段"
+            f"（{', '.join(handled_names) if handled_names else '无'}）"
+        )
+        if removed:
+            summary += f"；清理上一次的 {removed} 段"
+        if warnings:
+            summary += f"；{len(warnings)} 个跳过/告警"
+        print(f"[材质转资源pro] {summary}")
+        for warning in warnings:
+            print(f"[材质转资源pro]     - {warning}")
+        return len(generated_sections)
+
     def execute_postprocess(self, mod_export_path, exporter=None):
         if not bool(getattr(self, "use_global_assign", False)) and not self._target_object_set():
             print("[材质转资源pro] 未指定任何目标部件，跳过")
             return
         result = super().execute_postprocess(mod_export_path, exporter=exporter)
+        # 目标部件里不在导出链的那些：按纯贴图替换模式补段（只贴图、无网格修改）
+        try:
+            self._apply_pure_texture_sections(mod_export_path)
+        except Exception as exc:
+            print(f"[材质转资源pro] 纯贴图模式生成失败: {exc}")
         if bool(getattr(self, "clear_non_target_textures", False)) and not bool(
             getattr(self, "use_global_assign", False)
         ):

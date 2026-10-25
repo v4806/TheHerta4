@@ -1,4 +1,18 @@
 import bpy
+from contextvars import ContextVar
+from functools import wraps
+
+_material_lookup_cache = ContextVar('herta_material_lookup_cache', default=None)
+
+def _material_lookup_scope(method):
+    @wraps(method)
+    def scoped(self, *args, **kwargs):
+        token = _material_lookup_cache.set({})
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            _material_lookup_cache.reset(token)
+    return scoped
 import os
 import glob
 import hashlib
@@ -8,7 +22,11 @@ import shutil
 
 from ..common.global_config import GlobalConfig
 from ..common.logic_name import LogicName
-from ..toolkit.tt_dds_conversion import convert_texture_to_dds_cached
+try:  # 纯文件装载的测试宿主 / 裁剪环境可能没有 common 包：退化为旧「立即复制」路径
+    from ..common.texture_export_plan import TextureExportPlan
+except ImportError:  # pragma: no cover
+    TextureExportPlan = None
+from ..toolkit.tt_dds_conversion import convert_texture_to_dds_cached, is_dds_file
 from . import fx_namespace
 from .node_postprocess_base import SSMTNode_PostProcess_Base
 
@@ -50,6 +68,45 @@ _FX_RESET_PARAM_LINES = tuple(
     f"{profile.param('brightness')} = 0" for profile in fx_namespace.ALL_PROFILES
 )
 _FX_RUN_LINES = tuple(profile.run_line for profile in fx_namespace.ALL_PROFILES)
+
+#: 同一次导出里多个切换组填同一个按键时的顺延候选。
+#: 实机现象：衣服（$swapkey150）与身体（$swapkey151）都填 ``N``，按一次 N 两个组
+#: 同时 cycle，衣服和身体一起变、档位互相错位。导出期把后写入的组顺延到这里。
+KEYSWAP_FALLBACK_KEYS = ("M", "B", "V", "K", "L", "J", "H", "G", "T", "Y")
+
+
+def used_keyswap_keys(sections, skip_section=""):
+    """配置表里已被其它 KeySwap 段占用的按键（小写，不含 ``skip_section`` 自己）。"""
+    used = set()
+    for name, lines in (sections or {}).items():
+        if skip_section and str(name) == str(skip_section):
+            continue
+        if not str(name).startswith("[KeySwap"):
+            continue
+        for line in lines or ():
+            match = re.match(r"^\s*key\s*=\s*(.+?)\s*$", str(line), re.IGNORECASE)
+            if match:
+                used.add(match.group(1).strip().casefold())
+                break
+    return used
+
+
+def resolve_keyswap_key(sections, section_name, requested_key, log_prefix=""):
+    """多个切换组共用同一个键时顺延到候选键（不改用户节点里的按键配置）。"""
+    key = str(requested_key or "").strip()
+    if not key:
+        return key
+    used = used_keyswap_keys(sections, skip_section=section_name)
+    if key.casefold() not in used:
+        return key
+    for candidate in KEYSWAP_FALLBACK_KEYS:
+        if candidate.casefold() not in used:
+            print(
+                f"[{log_prefix or 'KeySwap'}] 切换按键冲突：{section_name} 的 key={key} "
+                f"已被同表其它切换组占用，本次导出改用 {candidate}"
+            )
+            return candidate
+    return key
 
 
 def _fx_profile_for_param(param_name):
@@ -234,7 +291,7 @@ class SSMT_OT_MaterialDetect(bpy.types.Operator):
         visited.add(node_key)
 
         detect_nodes = []
-        if node.bl_idname in {'SSMTNode_Object_Info', 'SSMTNode_MultiFile_Export'}:
+        if node.bl_idname in {'SSMTNode_Object_Info', 'SSMTNode_Object_Info_Pro', 'SSMTNode_MultiFile_Export'}:
             detect_nodes.append(node)
 
         if node.bl_idname == 'SSMTNode_Blueprint_Nest':
@@ -272,6 +329,11 @@ class SSMT_OT_MaterialDetect(bpy.types.Operator):
                 obj_name = getattr(detect_node, 'object_name', '')
                 if obj_name:
                     yield obj_name
+            elif node_type == 'SSMTNode_Object_Info_Pro':
+                for item in getattr(detect_node, 'object_list', []):
+                    obj_name = getattr(item, 'object_name', '')
+                    if obj_name:
+                        yield obj_name
             elif node_type == 'SSMTNode_MultiFile_Export':
                 for item in getattr(detect_node, 'object_list', []):
                     obj_name = getattr(item, 'object_name', '')
@@ -494,7 +556,12 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
 
     material_to_resource_override: bpy.props.BoolProperty(
         name="覆盖现有资源",
-        description="如果资源已存在，则覆盖它",
+        description=(
+            "给之前导出过旧版本 Mod 的情况用：允许本次导出的贴图覆盖 Mod 目录里上次留下的同名文件。"
+            "开启「资源合并 → 落盘前联合去重」时按内容智能判定：与旧文件内容重复"
+            "（MD5 / 像素级 / 相似度任一命中）就不覆盖、也不重新转 DDS；内容不一样才覆盖。"
+            "未开启联合去重时保持旧行为：无条件覆盖并强制重新转换"
+        ),
         default=False
     )
     debug_disable_fx_ttl: bpy.props.BoolProperty(
@@ -626,6 +693,23 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
         return stripped_names
 
     def find_object_by_mesh_name(self, mesh_name, object_filter=None):
+        # Names/mappings and scene objects stay fixed during this INI pass.
+        # Cache ordered candidates, not a filtered result: per-section material
+        # filters and Pro's target whitelist still run on every call.
+        cache = _material_lookup_cache.get()
+        if cache is None:
+            return self._find_object_by_mesh_name_uncached(mesh_name, object_filter)
+        key = (id(self), mesh_name)
+        if key not in cache:
+            candidates = []
+            def collect(candidate):
+                candidates.append(candidate)
+                return False
+            self._find_object_by_mesh_name_uncached(mesh_name, collect)
+            cache[key] = candidates
+        return next((obj for obj in cache[key] if object_filter is None or object_filter(obj)), None)
+
+    def _find_object_by_mesh_name_uncached(self, mesh_name, object_filter=None):
         from ..utils.log_utils import LOG as _LOG
         _LOG.debug(f"[find_object_by_mesh_name] 输入 mesh_name: '{mesh_name}'")
         
@@ -1113,15 +1197,33 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
         output_filename = self._workspace_material_output_filename(material, source_path=source_path)
         target_path = os.path.join(texture_folder, output_filename)
 
-        try:
-            source_abs = os.path.abspath(source_path)
-            target_abs = os.path.abspath(target_path)
-            if source_abs != target_abs:
-                if self.material_to_resource_override or not os.path.exists(target_path):
-                    shutil.copy2(source_path, target_path)
-        except Exception as e:
-            print(f"复制工作空间贴图失败: {e}")
-            return None, None
+        # 贴图计划（落盘前联合去重）：这条路径不转 DDS（spec=copy），与基础导出同规格，
+        # 内容重复时复用代表文件；未启用时保持原来的立即复制。
+        if TextureExportPlan is not None and TextureExportPlan.enabled():
+            planned_filename = TextureExportPlan.register(
+                source_path,
+                texture_folder,
+                output_filename,
+                owner=TextureExportPlan.OWNER_MATERIAL,
+                owner_label=str(getattr(self, "name", "") or ""),
+                spec=("copy",),
+                overwrite_policy=(
+                    "overwrite" if self.material_to_resource_override else "skip"
+                ),
+            )
+            if not planned_filename:
+                return None, None
+            output_filename = planned_filename
+        else:
+            try:
+                source_abs = os.path.abspath(source_path)
+                target_abs = os.path.abspath(target_path)
+                if source_abs != target_abs:
+                    if self.material_to_resource_override or not os.path.exists(target_path):
+                        shutil.copy2(source_path, target_path)
+            except Exception as e:
+                print(f"复制工作空间贴图失败: {e}")
+                return None, None
 
         resource_name = self._workspace_material_resource_name(material)
         resource_section_name = f"[{resource_name}]"
@@ -1220,7 +1322,7 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
         texture_type_lower = texture_type.lower()
 
         def find_in_object(target_obj):
-            result = OrderedDict()
+            result = []
             for material_slot in getattr(target_obj, "material_slots", []):
                 material = material_slot.material
                 if not material:
@@ -1231,10 +1333,13 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
                     continue
                 material_first_word = material.name.split('_')[0].lower()
                 if material_first_word == texture_type_lower:
-                    signature = self._build_material_signature(material)
-                    if signature not in result:
-                        result[signature] = material
-            return list(result.values())
+                    # 多档切换里每个材质占一档，不能按"材质签名"去重：去重会让某个槽位
+                    # 的档数少于其它槽位（实机：同一个身体 Diffuse 5 档 / Normal 4 档 /
+                    # Light 3 档），切到高档位时缺失的槽位沿用上一档贴图 → 贴图错乱。
+                    # 同图材质由 ``create_resource_entry`` 的签名缓存复用同一资源，
+                    # 不会重复复制，也不会多出重复的 Resource 段。
+                    result.append(material)
+            return result
         
         if obj:
             obj_materials = find_in_object(obj)
@@ -1378,8 +1483,63 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
         except Exception:
             pass
 
+    def _register_texture_plan_entry(self, source_path, target_folder, stem, file_extension,
+                                     material, forced_filename=None, workspace_source_path=None,
+                                     needs_convert=False, dedup_group=None):
+        """把材质贴图登记进「贴图落盘计划」并返回 ini 应写的文件名。
+
+        与 ``copy_texture_file`` 的旧逻辑一一对应：
+        - 需要转 DDS：首选名 ``stem.dds``，转换参数交给计划器（落盘时只转一次）；
+        - 不需要转换：沿用 ``forced_filename`` / 源扩展名；
+        - 落盘规格（spec）只按贴图类型区分：同一类型内按资源合并节点设置的模式
+          （MD5 / 像素级 / 相似度）判定为重复就合并，**不看源文件名 / MD5 / 格式**；
+          不同类型绝不合并（``("dds", "LightMap")`` 与 ``("dds", "MaterialMap")`` 分开，
+          线性贴图与 sRGB 贴图内容相同也不能共用一个 DDS）。
+        内容与已登记项重复时计划器直接返回代表文件名，本张不再复制也不再转换。
+        """
+        is_overwrite = bool(getattr(self, "material_to_resource_override", False))
+        if TextureExportPlan is None:
+            return None
+        texture_type = str(getattr(material, "name", "") or "").strip().split("_")[0]
+
+        if needs_convert:
+            preferred_filename = f"{stem}.dds"
+            # 规格只按「贴图类型」区分：同类型内重复判定（MD5/像素/相似度，按节点设置）
+            # 命中即合并；跨类型（如 LightMap 线性 vs MaterialMap sRGB）永不合并。
+            spec = ("dds", texture_type)
+            convert_kwargs = {
+                "props": bpy.context.scene.texture_tools_props,
+                "force": is_overwrite,
+                "match_name": stem,
+                "texture_type": texture_type,
+                "name_hints": (str(getattr(material, "name", "") or ""), stem),
+                "workspace_source_path": workspace_source_path or "",
+            }
+        else:
+            if (
+                forced_filename
+                and os.path.splitext(forced_filename)[1].lower() == file_extension.lower()
+            ):
+                preferred_filename = forced_filename
+            else:
+                preferred_filename = f"{stem}{file_extension}"
+            spec = ("copy",)
+            convert_kwargs = None
+
+        return TextureExportPlan.register(
+            source_path,
+            target_folder,
+            preferred_filename,
+            owner=TextureExportPlan.OWNER_MATERIAL,
+            owner_label=str(getattr(self, "name", "") or ""),
+            spec=spec,
+            convert_kwargs=convert_kwargs,
+            overwrite_policy="overwrite" if is_overwrite else "skip",
+            dedup_group=dedup_group,
+        )
+
     def copy_texture_file(self, texture_image, target_folder, material, forced_filename=None,
-                          workspace_source_path=None):
+                          workspace_source_path=None, dedup_group=None):
         if not texture_image or not texture_image.filepath:
             return None
         try:
@@ -1390,11 +1550,37 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
             stem = SSMTNode_PostProcess_MaterialBase._material_resource_stem(material)
             _, file_extension = os.path.splitext(os.path.basename(source_path))
 
+            # 贴图计划（落盘前联合去重）：只登记 + 决策，复制 / 转 DDS 由
+            # TextureExportPlan.finalize() 统一执行；内容重复时直接复用代表文件名。
+            if TextureExportPlan is not None and TextureExportPlan.enabled():
+                source_is_dds_for_plan = is_dds_file(source_path)
+                return self._register_texture_plan_entry(
+                    source_path=source_path,
+                    target_folder=target_folder,
+                    stem=stem,
+                    file_extension=file_extension,
+                    material=material,
+                    forced_filename=forced_filename,
+                    workspace_source_path=workspace_source_path,
+                    dedup_group=dedup_group,
+                    needs_convert=(
+                        (file_extension.lower() != ".dds" or not source_is_dds_for_plan)
+                        and getattr(self, "export_textures_as_dds", False)
+                    ),
+                )
+
             # 导出 DDS 优先：编辑期贴图常是无损 PNG（避免反复存 DDS 时被过度压缩），但游戏
             # 只认 DDS，所以导出时按现有 DDS 规则转一份放进 Mod，INI 的 filename 靠本函数
             # 的返回值生成，自然跟着指向 .dds。开关在「材质转资源pro」节点上；旧版弃用壳没有
             # 该属性，getattr 兜底为 False，行为与改动前一致。
-            if file_extension.lower() != ".dds" and getattr(self, "export_textures_as_dds", False):
+            #
+            # 判断按**文件内容**而不是扩展名：工作空间里的贴图常是「改后缀的 PNG」
+            # （F:\library\...\贴图\10.dds 实际是 PNG 字节）。只按扩展名判断会跳过转换、
+            # 把 PNG 字节原样复制成 .dds，3DMigoto 按 DDS 读取失败 → 游戏里贴图没效果。
+            source_is_dds = is_dds_file(source_path)
+            if (file_extension.lower() != ".dds" or not source_is_dds) and getattr(
+                self, "export_textures_as_dds", False
+            ):
                 converted_name = f"{stem}.dds"
                 converted_path = os.path.join(target_folder, converted_name)
                 # 格式来源优先级：工作空间里这张材质的原贴图 DDS 头 → 材质类型规则 → 源文件名。
@@ -1425,7 +1611,11 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
                 new_filename = f"{stem}{file_extension}"
 
             target_path = os.path.join(target_folder, new_filename)
-            if os.path.exists(target_path) and not self.material_to_resource_override:
+            if (
+                os.path.exists(target_path)
+                and not self.material_to_resource_override
+                and is_dds_file(target_path)
+            ):
                 return new_filename
             shutil.copy2(source_path, target_path)
             return new_filename
@@ -1496,6 +1686,74 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
         return mapping
 
 
+    def _order_materials_by_switch_group(self, materials, group_key):
+        """按切换组扫描时的档位顺序排列材质（与面板/热键看到的档位一致）。
+
+        导出时 ``find_matching_materials`` 按材质槽顺序返回，而扫描生成的切换组
+        ``bindings`` 是排序后的材质名列表；两者顺序不同会让「第 N 档」对不上用户配置
+        的第 N 档（切档显示另一档的贴图）。拿不到顺序时保持原样。
+        """
+        order_map = getattr(self, "_material_group_order", None) or {}
+        order = order_map.get(group_key)
+        if not order:
+            return list(materials)
+        by_name = {
+            str(getattr(material, "name", "") or ""): material for material in materials
+        }
+        ordered = [by_name[name] for name in order if name in by_name]
+        seen = set(order)
+        ordered.extend(
+            material
+            for material in materials
+            if str(getattr(material, "name", "") or "") not in seen
+        )
+        return ordered
+
+    @staticmethod
+    def _best_matching_switch_group(mat_names_tuple, material_group_to_swapkey):
+        """材质集合与扫描时 bindings 不完全一致时，找交集最大的已有切换组。"""
+        wanted = set(mat_names_tuple)
+        best_key = None
+        best_hit = 0
+        for key in material_group_to_swapkey:
+            hit = len(wanted & set(key))
+            if hit > best_hit:
+                best_key = key
+                best_hit = hit
+        return best_key
+
+    @staticmethod
+    def _parse_switch_key_parts(value):
+        """``$swapkey150`` -> ``("$swapkey", 150)``（非贪婪，前缀不能吃掉数字）。"""
+        match = re.match(r"^(\$\w+?)(\d+)$", str(value or "").strip())
+        if not match:
+            return str(value or "").strip() or "$swapkey", 0
+        return match.group(1), int(match.group(2))
+
+    def _next_free_switch_key(self, swap_key_prefix, next_swap_key_num):
+        """新建切换变量时避开本节点与同蓝图其它切换节点已占用的编号。"""
+        used = set()
+        try:
+            tree = getattr(self, "id_data", None)
+            if tree is not None:
+                for node in getattr(tree, "nodes", []) or []:
+                    containers = []
+                    for item in getattr(node, "target_items", []) or []:
+                        containers.extend(list(getattr(item, "switch_groups", []) or []))
+                    containers.extend(list(getattr(node, "global_switch_groups", []) or []))
+                    for group in containers:
+                        _p, number = self._parse_switch_key_parts(
+                            getattr(group, "switch_variable", "")
+                        )
+                        if number > 0:
+                            used.add(number)
+        except Exception:
+            pass
+        number = int(next_swap_key_num or 0)
+        while number in used:
+            number += 1
+        return swap_key_prefix, number
+
     def generate_material_lines(self, matching_materials, param_name, texture_type, obj,
                                 texture_folder, all_sections,
                                 object_to_diffuse_swapkey, material_group_to_swapkey,
@@ -1527,21 +1785,39 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
                 all_sections,
                 resource_name_override=resource_name,
                 workspace_source_path=workspace_source_by_material.get(str(getattr(material, "name", "") or "")),
+                dedup_group=f"{getattr(obj, 'name', '') or ''}|{texture_type}|single",
             )
             if new_line:
                 generated_lines.append(new_line)
 
         elif len(matching_materials) > 1:
             current_swap_variable = None
+            mat_names_tuple = tuple(sorted([mat.name for mat in matching_materials]))
+            ordered_materials = self._order_materials_by_switch_group(
+                matching_materials, mat_names_tuple
+            )
             if texture_type != 'DiffuseMap' and obj.name in object_to_diffuse_swapkey:
                 current_swap_variable = object_to_diffuse_swapkey[obj.name]
             else:
-                mat_names_tuple = tuple(sorted([mat.name for mat in matching_materials]))
                 if mat_names_tuple not in material_group_to_swapkey:
-                    new_swap_key = f"{swap_key_prefix}{next_swap_key_num}"
-                    material_group_to_swapkey[mat_names_tuple] = new_swap_key
-                    next_swap_key_num += 1
-                current_swap_variable = material_group_to_swapkey[mat_names_tuple]
+                    # 用户改过材质槽时，材质集合与扫描时的 bindings 不再完全一致：
+                    # 按「材质名交集最大」复用已有切换组，避免新建一个变量把同一组
+                    # 拆成两个（实机：身体出现 $swapkey15152，切换时该槽位不跟组走）。
+                    matched_key = self._best_matching_switch_group(
+                        mat_names_tuple, material_group_to_swapkey
+                    )
+                    if matched_key is None:
+                        swap_key_prefix, next_swap_key_num = self._next_free_switch_key(
+                            swap_key_prefix, next_swap_key_num
+                        )
+                        new_swap_key = f"{swap_key_prefix}{next_swap_key_num}"
+                        material_group_to_swapkey[mat_names_tuple] = new_swap_key
+                        next_swap_key_num += 1
+                    else:
+                        new_swap_key = material_group_to_swapkey[matched_key]
+                else:
+                    new_swap_key = material_group_to_swapkey[mat_names_tuple]
+                current_swap_variable = new_swap_key
 
                 if texture_type == 'DiffuseMap':
                     object_to_diffuse_swapkey[obj.name] = current_swap_variable
@@ -1549,7 +1825,7 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
             used_swap_keys.add(current_swap_variable)
 
             generated_lines.append(f"; {texture_type} 材质切换 (组: {current_swap_variable})")
-            for index, material in enumerate(matching_materials):
+            for index, material in enumerate(ordered_materials):
                 resource_name = resource_name_provider(material, index) if resource_name_provider else None
                 new_line = self.create_resource_entry(
                     material,
@@ -1558,6 +1834,9 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
                     all_sections,
                     resource_name_override=resource_name,
                     workspace_source_path=workspace_source_by_material.get(str(getattr(material, "name", "") or "")),
+                    # 同一切换组的不同档位是刻意变体（脸妆/服装微调）：联合去重不得把它们
+                    # 合并成同一张图，否则切档看起来"没反应"。
+                    dedup_group=f"{getattr(obj, 'name', '') or ''}|{texture_type}|{current_swap_variable}",
                 )
                 if new_line:
                     generated_lines.append(f"if {current_swap_variable} == {index}")
@@ -1572,11 +1851,15 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
         return generated_lines, next_swap_key_num
 
     def create_resource_entry(self, material, param_name, texture_folder, all_sections,
-                              resource_name_override=None, workspace_source_path=None):
+                              resource_name_override=None, workspace_source_path=None,
+                              dedup_group=None):
         global _material_resource_cache
 
         # 细分进度：每张材质贴图开始复制/转 DDS 前先刷新状态栏文本。
-        self._report_texture_progress()
+        # 联合去重模式下这里只登记、不复制/不转换，进度改由落盘阶段统一上报
+        # （「贴图落盘 i/total」），否则状态栏会显示并不存在的"转换中"。
+        if TextureExportPlan is None or not TextureExportPlan.enabled():
+            self._report_texture_progress()
 
         texture_image = self.get_texture_from_material(material)
         if not texture_image: return None
@@ -1598,10 +1881,13 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
                 material,
                 forced_filename=cached_entry.get("filename"),
                 workspace_source_path=workspace_source_path,
+                dedup_group=dedup_group,
             )
         else:
             copied_filename = self.copy_texture_file(
-                texture_image, texture_folder, material, workspace_source_path=workspace_source_path
+                texture_image, texture_folder, material,
+                workspace_source_path=workspace_source_path,
+                dedup_group=dedup_group,
             )
             resource_name = resource_name_override or f"Resource_{self._material_resource_stem(material)}"
             if copied_filename:
@@ -1933,86 +2219,19 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
         return None
 
     def _build_ttl_draw_lines(self, block_lines):
+        """Replace native draws in place while preserving bindings and branches."""
         ttl_lines = []
         found = False
-        pending_flags = []
-        i = 0
-        n = len(block_lines)
-        while i < n:
-            stripped = str(block_lines[i]).strip()
-            if _DRAG_OBJVIS_LINE_RE.match(stripped):
-                # 拖拽显隐 flag 行先收集，在紧随的绘制转换输出前冲刷。
-                # TTL 块边界从 mesh 注释行开始（可能落在 if 块内部），此时
-                # flag 与 drawindexed 都走「非 if 路径」——必须保留 flag，
-                # 否则隐藏物体仍可被命中。
-                if not pending_flags or str(pending_flags[-1]).strip() != stripped:
-                    pending_flags.append(block_lines[i])
-                i += 1
+        for line in block_lines:
+            draw = self._ttl_parse_drawindexed(str(line).strip())
+            if draw is None:
+                ttl_lines.append(line)
                 continue
-            if re.match(r'^if\s+', stripped, re.IGNORECASE):
-                if pending_flags:
-                    ttl_lines.extend(pending_flags)
-                    pending_flags = []
-                depth = 0
-                j = i
-                else_index = -1
-                while j < n:
-                    current = str(block_lines[j]).strip()
-                    if re.match(r'^if\s+', current, re.IGNORECASE):
-                        depth += 1
-                    elif current.casefold() == 'endif':
-                        depth -= 1
-                        if depth == 0:
-                            break
-                    elif current.casefold() == 'else' and depth == 1 and else_index == -1:
-                        else_index = j
-                    j += 1
-                if j >= n or depth != 0:
-                    break
-                head = block_lines[i]
-                tail = block_lines[j]
-                branch1_end = else_index if else_index != -1 else j
-                branch1 = block_lines[i + 1:branch1_end]
-                branch2 = block_lines[else_index + 1:j] if else_index != -1 else []
-                draw1 = self._ttl_first_drawindexed(branch1)
-                draw2 = self._ttl_first_drawindexed(branch2) if else_index != -1 else None
-                if draw1 is None and draw2 is None:
-                    i = j + 1
-                    continue
-                found = True
-                ttl_lines.append(head)
-                if draw1 is not None:
-                    # 保留拖拽显隐 flag 行（重建不得丢弃，否则隐藏物体仍可被命中）
-                    for bl in branch1:
-                        if _DRAG_OBJVIS_LINE_RE.match(str(bl).strip()):
-                            ttl_lines.append(bl)
-                    ttl_lines.append("    ${}TTL{}_1 = {}".format(chr(92), chr(92), draw1[0]))
-                    ttl_lines.append("    ${}TTL{}_2 = {}".format(chr(92), chr(92), draw1[1]))
-                    ttl_lines.append("    ${}TTL{}_3 = {}".format(chr(92), chr(92), draw1[2]))
-                    ttl_lines.append("    run = CommandList{}TTL{}Draw".format(chr(92), chr(92)))
-                if else_index != -1:
-                    ttl_lines.append(block_lines[else_index])
-                    if draw2 is not None:
-                        for bl in branch2:
-                            if _DRAG_OBJVIS_LINE_RE.match(str(bl).strip()):
-                                ttl_lines.append(bl)
-                        ttl_lines.append("    ${}TTL{}_1 = {}".format(chr(92), chr(92), draw2[0]))
-                        ttl_lines.append("    ${}TTL{}_2 = {}".format(chr(92), chr(92), draw2[1]))
-                        ttl_lines.append("    ${}TTL{}_3 = {}".format(chr(92), chr(92), draw2[2]))
-                        ttl_lines.append("    run = CommandList{}TTL{}Draw".format(chr(92), chr(92)))
-                ttl_lines.append(tail)
-                i = j + 1
-            else:
-                draw = self._ttl_parse_drawindexed(stripped)
-                if draw is not None:
-                    found = True
-                    ttl_lines.extend(pending_flags)
-                    pending_flags = []
-                    ttl_lines.append("${}TTL{}_1 = {}".format(chr(92), chr(92), draw[0]))
-                    ttl_lines.append("${}TTL{}_2 = {}".format(chr(92), chr(92), draw[1]))
-                    ttl_lines.append("${}TTL{}_3 = {}".format(chr(92), chr(92), draw[2]))
-                    ttl_lines.append("run = CommandList{}TTL{}Draw".format(chr(92), chr(92)))
-                i += 1
+            found = True
+            indent = str(line)[:len(str(line)) - len(str(line).lstrip())]
+            for index, value in enumerate(draw, start=1):
+                ttl_lines.append(indent + "${}TTL{}_{} = {}".format(chr(92), chr(92), index, value))
+            ttl_lines.append(indent + "run = CommandList{}TTL{}Draw".format(chr(92), chr(92)))
         return ttl_lines, found
 
     def _ttl_section_name(self, mesh_name, all_sections, generated_names):
@@ -2133,84 +2352,34 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
                     for line in ttl_draw_lines
                 ]
 
-            new_lines = []
-            object_to_diffuse_swapkey = {}
-            for header_line in header_lines:
-                stripped = str(header_line).strip()
-                if not stripped:
-                    continue
-                if stripped.casefold().startswith(_TTL_MASK_INVERT_PREFIX):
-                    continue
-                resource_match = re.match(
-                    r'^(ps-t\d+|Resource\\[^\s=]+)\s*=\s*(?:ref\s+)?(.*)$',
-                    stripped,
-                    re.IGNORECASE,
-                )
-                if resource_match:
-                    param_name = resource_match.group(1).strip()
-                    texture_type = self.extract_texture_type_from_resource(resource_match.group(2).strip())
-                    if texture_type:
-                        matching_materials = self.find_matching_materials(obj, texture_type) if obj is not None else []
-                        if matching_materials:
-                            generated_lines, next_swap_key_num = self.generate_material_lines(
-                                matching_materials, param_name, texture_type, obj, texture_folder, all_sections,
-                                object_to_diffuse_swapkey, material_group_to_swapkey,
-                                swap_key_prefix, next_swap_key_num, used_swap_keys)
-                            new_lines.extend(generated_lines)
-                            continue
-                new_lines.append(header_line)
-
-            anchor_line = str(lines[mesh_index])
-            if anchor_line.lstrip().startswith(';'):
-                new_lines.append(anchor_line)
-            else:
-                new_lines.append(f"; {mesh_name}")
-
-            if ttl_materials:
-                ttl_lines_ref, next_swap_key_num = self.generate_material_lines(
-                    ttl_materials, r"Resource\TTL\TransparencyTex", "TTLMap", obj, texture_folder, all_sections,
-                    {}, material_group_to_swapkey, swap_key_prefix, next_swap_key_num, used_swap_keys)
-                new_lines.extend(ttl_lines_ref)
-                new_lines.append("${}TTL{}mask_channel = 3".format(chr(92), chr(92)))
-
-            if ttl_materials:
-                new_lines.append("${}TTL{}mask_invert = 1".format(chr(92), chr(92)))
-
+            # TTL 必须替换本物体的普通绘制；先画不透明底层再叠加 TTL 无法透出背景。
+            # 保留块内的纹理绑定、条件和拖拽标记，并在每次 TTL 调用前重设材质参数。
+            # 同一个 hash 只保留一个段，避免 TTL 段头里的自定义贴图提前写进槽位、
+            # 污染主段里其它「不覆盖」（= null）的 mesh。
+            merged_lines = []
+            ttl_lines_ref, next_swap_key_num = self.generate_material_lines(
+                ttl_materials, r"Resource\TTL\TransparencyTex", "TTLMap", obj, texture_folder, all_sections,
+                {}, material_group_to_swapkey, swap_key_prefix, next_swap_key_num, used_swap_keys)
+            merged_lines.extend(ttl_lines_ref)
+            merged_lines.append("${}TTL{}mask_channel = 3".format(chr(92), chr(92)))
+            merged_lines.append("${}TTL{}mask_invert = 1".format(chr(92), chr(92)))
             alpha_value = transparency_value if transparency_value else "1.0"
             alpha_var = self._ttl_ensure_alpha_variable(alpha_value, all_sections)
-            new_lines.append("${}TTL{}alpha = {}".format(chr(92), chr(92), alpha_var))
-            # 提亮默认写在条件块之外（此时 if 块尚未拼接），否则进 if 内会失效/爆炸。
-            new_lines.append("${}TTL{}V = {}".format(chr(92), chr(92), _TTL_DEFAULT_BRIGHTNESS))
-
-            if cond_if_indexes:
-                cond_block = []
-                for if_idx in cond_if_indexes:
-                    cond_block.append(lines[if_idx])
-                indent = "    " * len(cond_if_indexes)
-                for ttl_line in ttl_draw_lines:
-                    if str(ttl_line).strip():
-                        cond_block.append(indent + str(ttl_line))
-                    else:
-                        cond_block.append(ttl_line)
-                for if_idx in reversed(cond_if_indexes):
-                    _end_idx, end_line = if_endif_map.get(if_idx, (None, None))
-                    if end_line is not None:
-                        cond_block.append(end_line)
-                new_lines.extend(cond_block)
-            else:
-                new_lines.extend(ttl_draw_lines)
-
-            new_section_name = self._ttl_section_name(mesh_name, all_sections, generated_section_names)
-            ttl_sections_to_add[new_section_name] = new_lines
-            del lines[block_start:block_end]
+            merged_lines.append("${}TTL{}alpha = {}".format(chr(92), chr(92), alpha_var))
+            merged_lines.append("${}TTL{}V = {}".format(chr(92), chr(92), _TTL_DEFAULT_BRIGHTNESS))
+            replacement_lines = []
+            arg1_prefix = "${}TTL{}_1".format(chr(92), chr(92))
+            for draw_line in ttl_draw_lines:
+                if re.match(r'^' + re.escape(arg1_prefix) + r'\s*=', str(draw_line).strip()):
+                    indent = str(draw_line)[:len(str(draw_line)) - len(str(draw_line).lstrip())]
+                    replacement_lines.extend(indent + str(setup).lstrip() for setup in merged_lines)
+                replacement_lines.append(draw_line)
+            lines[block_start:block_end] = replacement_lines
 
         self._cleanup_empty_if_blocks(lines)
 
         for command_list_name, command_list_lines in ttl_draw_command_lists.items():
             all_sections[f"[{command_list_name}]"] = command_list_lines
-
-        for new_section_name, new_section_lines in ttl_sections_to_add.items():
-            all_sections[f"[{new_section_name}]"] = new_section_lines
 
         if not any(self.extract_mesh_name(line) for line in lines) and not any('drawindexed' in line for line in lines):
             all_sections.pop(section_name, None)
@@ -2289,7 +2458,7 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
             next_swap_key_num = None
         if swap_key_prefix is None or next_swap_key_num is None:
             base_swap_var = getattr(self, "material_switch_var", "") or "$swapkey0"
-            match = re.match(r'(\$\w+)(\d+)', str(base_swap_var))
+            match = re.match(r'(\$\w+?)(\d+)', str(base_swap_var))
             swap_key_prefix = match.group(1) if match else str(base_swap_var)
             next_swap_key_num = int(match.group(2)) if match else 0
 
@@ -2747,6 +2916,33 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
             converted.append(line)
         return converted
 
+    def _prewarm_material_sources(self, sections):
+        if TextureExportPlan is None or not TextureExportPlan.enabled():
+            return
+        paths = set()
+        objects = {}
+        for name in self._material_target_section_names(sections):
+            for line in sections[name]:
+                mesh_name = self.extract_mesh_name(line)
+                if not mesh_name:
+                    continue
+                obj = self.find_object_by_mesh_name(mesh_name)
+                if obj is not None:
+                    objects[obj.name] = obj
+                cache = _material_lookup_cache.get() or {}
+                for candidate in cache.get((id(self), mesh_name), ()):
+                    objects[candidate.name] = candidate
+        for obj in objects.values():
+            if hasattr(self, '_is_custom_target') and not getattr(self, 'use_global_assign', False):
+                if not self._is_custom_target(obj):
+                    continue
+            for slot in obj.material_slots:
+                image = self.get_texture_from_material(slot.material)
+                if image is not None and image.filepath:
+                    paths.add(bpy.path.abspath(image.filepath, library=image.library))
+        TextureExportPlan.prewarm_sources(sorted(paths))
+
+    @_material_lookup_scope
     def execute_postprocess(self, mod_export_path, exporter=None):
         from ..utils.log_utils import LOG as _LOG
 
@@ -2780,12 +2976,13 @@ class SSMTNode_PostProcess_MaterialBase(SSMTNode_PostProcess_Base):
             preamble_lines, sections = self._parse_ini_content(content)
 
             sections['_config_path'] = mod_export_path
+            self._prewarm_material_sources(sections)
 
             transparency_sections_to_add = OrderedDict()
             used_swap_keys = set()
             material_group_to_swapkey = {}
             base_swap_var = self.material_switch_var
-            match = re.match(r'(\$\w+)(\d+)', base_swap_var)
+            match = re.match(r'(\$\w+?)(\d+)', base_swap_var)
             swap_key_prefix = match.group(1) if match else base_swap_var
             next_swap_key_num = int(match.group(2)) if match else 0
 

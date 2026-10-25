@@ -93,9 +93,11 @@ _install_module(
 )
 # 材质转资源的导出路径会调用 toolkit 的 DDS 转换；桩成「转换成功」，
 # 这里只关心 ini/资源段生成，贴图转换本身在 test_dds_conversion 里单独覆盖。
+# 本测试用假字节造贴图，is_dds_file 按扩展名判定（生产侧按文件头判定）。
 _install_module(
     f"{PKG}.toolkit.tt_dds_conversion",
     convert_texture_to_dds_cached=lambda *_args, **_kwargs: (True, ""),
+    is_dds_file=lambda path: str(path or "").lower().endswith(".dds"),
 )
 
 
