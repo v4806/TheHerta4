@@ -1677,9 +1677,7 @@ class SSMTQuickExportSelected(_BackgroundExportMixin, bpy.types.Operator):
         except Exception as e:
             print(f"❌ 快速局部导出失败: {e}")
             LOG.exception(e)
-            # 失败栈落到 <插件根>/.dbg/last_export_error.txt：Blender 的信息面板只留一行，
-            # 用户贴回来的往往只有异常文案，没有调用链。`.dbg/` 是本地临时目录（.gitignore），
-            # 写盘失败不能盖掉原始错误，所以整段兜在 try 里。
+            # 【临时诊断】把完整调用栈落到工作区，便于离线定位（无 UI 可看时的唯一取证途径）。
             try:
                 import traceback as _tb
 
