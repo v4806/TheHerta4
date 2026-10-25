@@ -189,6 +189,36 @@ class PreProcessHelper:
                     node.object_id = cls._resolve_object_id(target_name, getattr(node, 'object_id', ''))
                     recovered_count += 1
 
+                elif node.bl_idname == 'SSMTNode_Object_Info_Pro':
+                    # 物体信息 Pro：逐条目恢复（一个节点 = 多个物体信息节点）
+                    node_changed = False
+                    for item in getattr(node, 'object_list', []):
+                        current_name = getattr(item, 'object_name', '')
+                        fallback_name = getattr(item, 'original_object_name', '')
+                        current_obj = bpy.data.objects.get(current_name) if current_name else None
+
+                        should_recover = current_obj is None or (
+                            fallback_name and cls._looks_like_runtime_object_name(current_name)
+                        )
+                        if not should_recover:
+                            continue
+
+                        target_name = cls._resolve_runtime_reference_target(current_name, fallback_name)
+                        if not target_name or target_name == current_name:
+                            continue
+
+                        item.object_name = target_name
+                        item.object_id = cls._resolve_object_id(target_name, getattr(item, 'object_id', ''))
+                        recovered_count += 1
+                        node_changed = True
+
+                    if node_changed:
+                        from .node_obj import _refresh_object_info_pro_node, refresh_object_info_pro_item
+
+                        for item in getattr(node, 'object_list', []):
+                            refresh_object_info_pro_item(item)
+                        _refresh_object_info_pro_node(node)
+
                 elif node.bl_idname == 'SSMTNode_MultiFile_Export':
                     node_changed = False
                     for item in getattr(node, 'object_list', []):
@@ -265,7 +295,7 @@ class PreProcessHelper:
 
         unique_objects = cls.collect_target_object_names_strict(object_names)
         
-        cache_enabled = GlobalProterties.enable_preprocess_cache()
+        cache_enabled = GlobalProterties.enable_export_cache()
         
         if cache_enabled:
             cls._execute_preprocess_with_cache(unique_objects)
@@ -281,7 +311,7 @@ class PreProcessHelper:
         cls.reset_runtime_state()
 
         unique_objects = cls.collect_target_object_names_strict(object_names)
-        if GlobalProterties.enable_preprocess_cache():
+        if GlobalProterties.enable_export_cache():
             cls._execute_preprocess_preserve_shape_keys_with_cache(unique_objects)
         else:
             cls._execute_preprocess_preserve_shape_keys_without_cache(unique_objects)
@@ -294,7 +324,7 @@ class PreProcessHelper:
         BlueprintExportHelper.clear_direct_shapekey_position_records()
 
         unique_objects = cls.collect_target_object_names_strict(object_names)
-        if GlobalProterties.enable_preprocess_cache():
+        if GlobalProterties.enable_export_cache():
             cls._execute_preprocess_capture_shape_keys_with_cache(unique_objects)
         else:
             cls._execute_preprocess_capture_shape_keys_without_cache(unique_objects)
@@ -1534,6 +1564,7 @@ class PreProcessHelper:
         
         updated_count = 0
         multi_file_updated_count = 0
+        object_info_pro_updated_count = 0
         multi_ref_objects = {}
         
         for current_tree in trees_to_update:
@@ -1567,7 +1598,53 @@ class PreProcessHelper:
                         if matched_name not in multi_ref_objects:
                             multi_ref_objects[matched_name] = []
                         multi_ref_objects[matched_name].append(f"Object_Info:{node.name}")
-                
+
+                elif node.bl_idname == 'SSMTNode_Object_Info_Pro' and not node.mute:
+                    # 物体信息 Pro：逐条目替换为副本名（一个节点 = 多个物体信息节点）
+                    object_list = getattr(node, 'object_list', [])
+                    pro_changed = False
+                    for item_index, item in enumerate(object_list):
+                        item_name = str(getattr(item, 'object_name', '') or '')
+                        if not item_name:
+                            continue
+                        if item_name.endswith('_copy'):
+                            continue
+                        virtual_name = ObjectPrefixHelper.build_virtual_object_name_for_node(item)
+                        matched_name, copy_name = BlueprintExportHelper.find_preprocess_copy_name(
+                            cls.original_to_copy_map,
+                            item_name,
+                            object_id=getattr(item, 'object_id', ''),
+                            original_object_name=getattr(item, 'original_object_name', ''),
+                            virtual_object_name=virtual_name,
+                        )
+                        if not copy_name:
+                            continue
+                        cls.modified_nodes.append({
+                            "tree_name": current_tree.name,
+                            "node_name": node.name,
+                            "node_type": "object_info_pro",
+                            "item_index": item_index,
+                            "original_name": item_name,
+                            "original_object_id": getattr(item, 'object_id', ''),
+                            "original_original_name": getattr(item, 'original_object_name', ''),
+                        })
+                        item.object_name = copy_name
+                        item.object_id = cls._resolve_object_id(copy_name, getattr(item, 'object_id', ''))
+                        item.original_object_name = matched_name or getattr(item, 'original_object_name', '')
+                        object_info_pro_updated_count += 1
+                        pro_changed = True
+
+                        if matched_name not in multi_ref_objects:
+                            multi_ref_objects[matched_name] = []
+                        multi_ref_objects[matched_name].append(f"Object_Info_Pro:{node.name}")
+
+                    if pro_changed:
+                        from .node_obj import _refresh_object_info_pro_node, refresh_object_info_pro_item
+
+                        for item in getattr(node, 'object_list', []):
+                            refresh_object_info_pro_item(item)
+                        _refresh_object_info_pro_node(node)
+
                 elif node.bl_idname == 'SSMTNode_MultiFile_Export' and not node.mute:
                     object_list = getattr(node, 'object_list', [])
                     for item_index, item in enumerate(object_list):
@@ -1655,9 +1732,13 @@ class PreProcessHelper:
                         updated_count += 1
         
         multi_ref_count = sum(1 for k, v in multi_ref_objects.items() if len(v) > 1)
-        
-        if multi_file_updated_count > 0:
-            LOG.info(f"📋 更新节点引用: Object_Info {updated_count} 个, MultiFile_Export {multi_file_updated_count} 个")
+
+        if object_info_pro_updated_count > 0 or multi_file_updated_count > 0:
+            LOG.info(
+                f"📋 更新节点引用: Object_Info {updated_count} 个, "
+                f"Object_Info_Pro {object_info_pro_updated_count} 个, "
+                f"MultiFile_Export {multi_file_updated_count} 个"
+            )
         elif multi_ref_count > 0:
             LOG.info(f"📋 更新节点引用: {updated_count} 个节点 ({multi_ref_count} 个物体被多节点引用)")
         else:
@@ -1670,6 +1751,7 @@ class PreProcessHelper:
         
         restored_count = 0
         multi_file_nodes_to_refresh = set()
+        pro_nodes_to_refresh = set()
 
         for entry in cls.modified_nodes:
             tree_name = entry.get("tree_name", "")
@@ -1700,6 +1782,24 @@ class PreProcessHelper:
                     node.original_object_name = original_original_name
                     restored_count += 1
             
+            elif node_type == 'object_info_pro':
+                object_list = getattr(node, 'object_list', [])
+                if item_index is None or item_index < 0 or item_index >= len(object_list):
+                    continue
+
+                item = object_list[item_index]
+                changed = (
+                    getattr(item, 'object_name', '') != original_name
+                    or getattr(item, 'object_id', '') != cls._resolve_object_id(original_name, original_object_id)
+                    or getattr(item, 'original_object_name', '') != original_original_name
+                )
+                if changed:
+                    item.object_name = original_name
+                    item.object_id = cls._resolve_object_id(original_name, original_object_id)
+                    item.original_object_name = original_original_name
+                    restored_count += 1
+                    pro_nodes_to_refresh.add((tree_name, node_name))
+
             elif node_type == 'multi_file_export':
                 object_list = getattr(node, 'object_list', [])
                 if item_index is None or item_index < 0 or item_index >= len(object_list):
@@ -1747,7 +1847,19 @@ class PreProcessHelper:
             node = tree.nodes.get(node_name)
             if node:
                 node.update_node_width([item.object_name for item in getattr(node, 'object_list', [])])
-        
+
+        for tree_name, node_name in pro_nodes_to_refresh:
+            tree = bpy.data.node_groups.get(tree_name)
+            if not tree:
+                continue
+            node = tree.nodes.get(node_name)
+            if node:
+                from .node_obj import _refresh_object_info_pro_node, refresh_object_info_pro_item
+
+                for item in getattr(node, 'object_list', []):
+                    refresh_object_info_pro_item(item)
+                _refresh_object_info_pro_node(node)
+
         if restored_count > 0:
             LOG.info(f"   ✅ 已恢复 {restored_count} 个节点引用")
 

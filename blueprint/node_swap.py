@@ -589,10 +589,15 @@ class SSMT_OT_CycleSwapPreview(bpy.types.Operator):
         return True
 
     def _append_object_info_preview_object(self, node, objects_to_show, rename_nodes_on_path):
-        effective_name = self._get_preview_effective_object_name(node)
-        if not self._passes_rename_filters(effective_name, rename_nodes_on_path):
-            return
-        self._append_object_by_name(objects_to_show, getattr(node, "object_name", ""))
+        # 物体信息 Pro 通过条目视图展开成多个普通物体信息节点条目；
+        # 普通节点只有一个条目（即节点自身），行为不变。
+        from .node_obj import iter_object_info_entries
+
+        for entry in iter_object_info_entries(node):
+            effective_name = self._get_preview_effective_object_name(entry)
+            if not self._passes_rename_filters(effective_name, rename_nodes_on_path):
+                continue
+            self._append_object_by_name(objects_to_show, getattr(entry, "object_name", ""))
 
     def _append_multifile_preview_objects(self, node, objects_to_show, rename_nodes_on_path):
         for item in getattr(node, "object_list", []):
@@ -642,7 +647,7 @@ class SSMT_OT_CycleSwapPreview(bpy.types.Operator):
         visited_nodes.add(node_key)
 
         node_type = getattr(current_node, "bl_idname", "")
-        if node_type == "SSMTNode_Object_Info":
+        if node_type in ("SSMTNode_Object_Info", "SSMTNode_Object_Info_Pro"):
             self._append_object_info_preview_object(current_node, objects_to_show, rename_nodes_on_path)
         elif node_type == "SSMTNode_MultiFile_Export":
             self._append_multifile_preview_objects(current_node, objects_to_show, rename_nodes_on_path)

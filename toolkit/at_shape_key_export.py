@@ -44,7 +44,16 @@ class SKE_AutomationPipeline:
                     obj = bpy.data.objects.get(obj_name)
                     if obj and obj.type == 'MESH' and obj.data and obj not in self.target_objects:
                         self.target_objects.append(obj)
-            
+
+            elif node.bl_idname == 'SSMTNode_Object_Info_Pro':
+                for item in getattr(node, 'object_list', []) or []:
+                    obj_name = getattr(item, 'object_name', '')
+                    if not obj_name:
+                        continue
+                    obj = bpy.data.objects.get(obj_name)
+                    if obj and obj.type == 'MESH' and obj.data and obj not in self.target_objects:
+                        self.target_objects.append(obj)
+
             elif node.bl_idname == 'SSMTNode_Blueprint_Nest':
                 nested_tree_name = getattr(node, 'blueprint_name', '')
                 if nested_tree_name and nested_tree_name != 'NONE':
