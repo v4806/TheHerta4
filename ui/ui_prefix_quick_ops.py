@@ -64,18 +64,27 @@ class PrefixQuickOpsHelper:
             if getattr(tree, "bl_idname", "") != 'SSMTBlueprintTreeType':
                 continue
             for node in tree.nodes:
-                if getattr(node, "bl_idname", "") == 'SSMTNode_Object_Info':
+                if getattr(node, "bl_idname", "") in ('SSMTNode_Object_Info', 'SSMTNode_Object_Info_Pro'):
                     yield node
+
+    @staticmethod
+    def _iter_object_info_entry_targets(node):
+        """返回节点上可写的前缀目标：普通节点自身，或 Pro 节点的物体列表项。"""
+        object_list = getattr(node, "object_list", None)
+        if object_list is not None and len(object_list) > 0:
+            return list(object_list)
+        return [node]
 
     @classmethod
     def _find_object_info_nodes(cls, obj):
         object_id = str(obj.as_pointer())
         matched_nodes = []
         for node in cls._iter_object_info_nodes():
-            node_object_name = getattr(node, "object_name", "")
-            node_object_id = getattr(node, "object_id", "")
-            if node_object_id == object_id or node_object_name == obj.name:
-                matched_nodes.append(node)
+            for entry in cls._iter_object_info_entry_targets(node):
+                node_object_name = getattr(entry, "object_name", "")
+                node_object_id = getattr(entry, "object_id", "")
+                if node_object_id == object_id or node_object_name == obj.name:
+                    matched_nodes.append(entry)
         return matched_nodes
 
     @staticmethod
@@ -118,18 +127,19 @@ class PrefixQuickOpsHelper:
         added_count = 0
 
         for node in cls._iter_object_info_nodes():
-            info = ObjectPrefixHelper.get_node_prefix_info(node)
-            if not info:
-                continue
+            for entry in cls._iter_object_info_entry_targets(node):
+                info = ObjectPrefixHelper.get_node_prefix_info(entry)
+                if not info:
+                    continue
 
-            prefix, separator = info
-            display_name = cls._build_display_name(
-                prefix,
-                object_name=ObjectPrefixHelper.build_virtual_object_name_for_node(node),
-                alias_name=getattr(node, "alias_name", ""),
-            )
-            if cls._upsert_prefix_item(items, prefix, separator, display_name):
-                added_count += 1
+                prefix, separator = info
+                display_name = cls._build_display_name(
+                    prefix,
+                    object_name=ObjectPrefixHelper.build_virtual_object_name_for_node(entry),
+                    alias_name=getattr(entry, "alias_name", ""),
+                )
+                if cls._upsert_prefix_item(items, prefix, separator, display_name):
+                    added_count += 1
 
         return added_count
 
@@ -142,23 +152,24 @@ class PrefixQuickOpsHelper:
         added_count = 0
 
         for node in cls._iter_object_info_nodes():
-            node_object_name = getattr(node, "object_name", "")
-            node_object_id = getattr(node, "object_id", "")
-            if node_object_name not in selected_names and node_object_id not in selected_ids:
-                continue
+            for entry in cls._iter_object_info_entry_targets(node):
+                node_object_name = getattr(entry, "object_name", "")
+                node_object_id = getattr(entry, "object_id", "")
+                if node_object_name not in selected_names and node_object_id not in selected_ids:
+                    continue
 
-            info = ObjectPrefixHelper.get_node_prefix_info(node)
-            if not info:
-                continue
+                info = ObjectPrefixHelper.get_node_prefix_info(entry)
+                if not info:
+                    continue
 
-            prefix, separator = info
-            display_name = cls._build_display_name(
-                prefix,
-                object_name=ObjectPrefixHelper.build_virtual_object_name_for_node(node),
-                alias_name=getattr(node, "alias_name", ""),
-            )
-            if cls._upsert_prefix_item(items, prefix, separator, display_name):
-                added_count += 1
+                prefix, separator = info
+                display_name = cls._build_display_name(
+                    prefix,
+                    object_name=ObjectPrefixHelper.build_virtual_object_name_for_node(entry),
+                    alias_name=getattr(entry, "alias_name", ""),
+                )
+                if cls._upsert_prefix_item(items, prefix, separator, display_name):
+                    added_count += 1
 
         return added_count
 

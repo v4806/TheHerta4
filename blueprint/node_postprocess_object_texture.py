@@ -635,7 +635,7 @@ _OUTPUT_IDS = {
     "SSMTNode_Result_Output_NTMIModImp",
     "SSMTNode_VeloExportBridge",
 }
-_SOURCE_IDS = {"SSMTNode_Object_Info", "SSMTNode_MultiFile_Export"}
+_SOURCE_IDS = {"SSMTNode_Object_Info", "SSMTNode_Object_Info_Pro", "SSMTNode_MultiFile_Export"}
 
 
 def _tree_unique_key(node):
@@ -686,6 +686,11 @@ def _collect_source_object_names_from_output(output_node, visited=None, visited_
                 obj_name = getattr(node, "object_name", "")
                 if obj_name:
                     names.append(obj_name)
+            elif bl_idname == "SSMTNode_Object_Info_Pro":
+                for item in getattr(node, "object_list", []):
+                    obj_name = getattr(item, "object_name", "")
+                    if obj_name:
+                        names.append(obj_name)
             elif bl_idname == "SSMTNode_MultiFile_Export":
                 for item in getattr(node, "object_list", []):
                     obj_name = getattr(item, "object_name", "")

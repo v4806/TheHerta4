@@ -85,6 +85,16 @@ def linked_objects(node):
                 raise ValueError('物体不存在: ' + n.object_name)
             if obj.type == 'MESH' and obj not in result:
                 result.append(obj)
+        elif n.bl_idname == 'SSMTNode_Object_Info_Pro':
+            for item in getattr(n, 'object_list', []) or []:
+                object_name = str(getattr(item, 'object_name', '') or '')
+                if not object_name:
+                    continue
+                obj = bpy.data.objects.get(object_name)
+                if obj is None:
+                    raise ValueError('物体不存在: ' + object_name)
+                if obj.type == 'MESH' and obj not in result:
+                    result.append(obj)
         elif n.bl_idname in (NODE_ID, 'SSMTNode_Object_Group', 'SSMTNode_ObjectSwap', 'NodeReroute'):
             for socket in n.inputs:
                 for link in socket.links:
@@ -142,6 +152,12 @@ def _object_condition_paths(node, bindings):
         if n.bl_idname == 'SSMTNode_Object_Info':
             if n.object_name:
                 paths.setdefault(n.object_name, []).append(list(conditions))
+            return
+        if n.bl_idname == 'SSMTNode_Object_Info_Pro':
+            for item in getattr(n, 'object_list', []) or []:
+                object_name = str(getattr(item, 'object_name', '') or '')
+                if object_name:
+                    paths.setdefault(object_name, []).append(list(conditions))
             return
         if n.bl_idname in ('SSMTNode_Object_Group', 'NodeReroute', NODE_ID):
             for sock in n.inputs:
@@ -281,7 +297,7 @@ def _seed_postprocess_detection_from_ini(tree, ini_path):
     try:
         text = Path(ini_path).read_text(encoding='utf-8')
         for node in tree.nodes:
-            if node.bl_idname != 'SSMTNode_PostProcess_SwapPanel' or node.mute:
+            if node.bl_idname not in {'SSMTNode_PostProcess_SwapPanel', 'SSMTNode_PostProcess_CombinedPanel'} or node.mute:
                 continue
             target = str(getattr(node, 'target_object', '') or '')
             comp = re.search(r'component[_ -]*(\d+)', target, re.IGNORECASE)

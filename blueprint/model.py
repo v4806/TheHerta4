@@ -44,7 +44,7 @@ _SINGLE_INSTANCE_POSTPROCESS_LABELS = {
     "SSMTNode_PostProcess_ShapeKey": "形态键配置",
     "SSMTNode_PostProcess_ShapeKeyExt": "形态键扩展配置",
     "SSMTNode_PostProcess_SliderPanel": "滑块面板",
-    "SSMTNode_PostProcess_SwapPanel": "物体切换面板",
+    "SSMTNode_PostProcess_CombinedPanel": "切换＆滑块面板",
     "SSMTNode_PostProcess_TextAppend": "文本追加",
     "SSMTNode_PostProcess_UVOffset": "UV偏移",
 }
@@ -147,7 +147,10 @@ def validate_postprocess_node_constraints(nodes) -> None:
     active_nodes = [node for node in (nodes or []) if not getattr(node, "mute", False)]
     nodes_by_type = {}
     for node in active_nodes:
-        nodes_by_type.setdefault(getattr(node, "bl_idname", ""), []).append(node)
+        node_type = getattr(node, "bl_idname", "")
+        if node_type == "SSMTNode_PostProcess_SwapPanel":
+            node_type = "SSMTNode_PostProcess_CombinedPanel"
+        nodes_by_type.setdefault(node_type, []).append(node)
 
     for node_type, label in _SINGLE_INSTANCE_POSTPROCESS_LABELS.items():
         duplicate_nodes = nodes_by_type.get(node_type, [])
@@ -211,11 +214,14 @@ def validate_postprocess_node_constraints(nodes) -> None:
         slider_node = slider_nodes[0]
         slider_index = active_nodes.index(slider_node)
         for node in active_nodes:
-            if getattr(node, "bl_idname", "") != "SSMTNode_PostProcess_SwapPanel":
+            if getattr(node, "bl_idname", "") not in {
+                "SSMTNode_PostProcess_SwapPanel",
+                "SSMTNode_PostProcess_CombinedPanel",
+            }:
                 continue
             if active_nodes.index(node) < slider_index:
                 raise ValueError(
-                    "物体切换面板节点必须排在启用了滑块面板的形态键扩展节点之后："
+                    "切换＆滑块面板节点必须排在启用了滑块面板的形态键扩展节点之后："
                     f"当前「物体切换面板（{getattr(node, 'name', '未命名')}）」在"
                     f"「形态键扩展配置（{getattr(slider_node, 'name', '未命名')}）」之前，"
                     "否则点击滑块面板以外的按钮会连带关闭形态键滑块面板"
@@ -1885,6 +1891,24 @@ class BluePrintModel:
             obj_model.work_key_list = copy.deepcopy(chain_key_list)
 
             self.ordered_draw_obj_data_model_list.append(obj_model)
+
+        elif unknown_node.bl_idname == 'SSMTNode_Object_Info_Pro':
+            # 物体信息 Pro：逐条目展开（一个节点 = 多个物体信息节点）
+            from .node_obj import build_object_info_entry_views
+
+            for entry_view in build_object_info_entry_views(unknown_node):
+                virtual_object_name = ObjectPrefixHelper.build_virtual_object_name_for_node(entry_view, strict=True)
+                obj = bpy.data.objects.get(virtual_object_name)
+                if obj is None or obj.type != 'MESH' or obj.data is None or len(obj.data.vertices) == 0:
+                    LOG.info("BluePrintModel: 跳过空网格或无效对象: " + str(virtual_object_name))
+                    continue
+
+                obj_model = DrawCallModel(obj_name=virtual_object_name)
+                original_name = str(getattr(entry_view, 'original_object_name', '') or '')
+                if original_name:
+                    obj_model.display_name = original_name
+                obj_model.work_key_list = copy.deepcopy(chain_key_list)
+                self.ordered_draw_obj_data_model_list.append(obj_model)
 
         elif unknown_node.bl_idname == _NODE_TYPE_SHAPEKEY:
             from .chain_traverser import ChainTraverser

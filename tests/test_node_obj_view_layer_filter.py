@@ -25,12 +25,17 @@ _fake_bpy = types.SimpleNamespace(
     props=types.SimpleNamespace(
         StringProperty=lambda **_kwargs: None,
         BoolProperty=lambda **_kwargs: None,
+        IntProperty=lambda **_kwargs: None,
+        CollectionProperty=lambda **_kwargs: None,
     ),
     types=types.SimpleNamespace(
         Operator=object,
         NodeTree=object,
         Node=object,
         NodeSocket=object,
+        # 物体信息 Pro 的条目 PropertyGroup / UIList（见 blueprint/node_obj.py）
+        PropertyGroup=type("PropertyGroup", (), {}),
+        UIList=type("UIList", (), {}),
         VIEW3D_HT_header=types.SimpleNamespace(append=lambda _fn: None, remove=lambda _fn: None),
     ),
     data=types.SimpleNamespace(node_groups={}, objects={}),
@@ -47,12 +52,16 @@ _install_module(
     Node=object,
     NodeSocket=object,
     Operator=object,
+    PropertyGroup=type("PropertyGroup", (), {}),
+    UIList=type("UIList", (), {}),
     VIEW3D_HT_header=_fake_bpy.types.VIEW3D_HT_header,
 )
 _install_module(
     "bpy.props",
     StringProperty=lambda **_kwargs: None,
     BoolProperty=lambda **_kwargs: None,
+    IntProperty=lambda **_kwargs: None,
+    CollectionProperty=lambda **_kwargs: None,
 )
 _install_module(f"{PKG}.common.logic_name", LogicName=types.SimpleNamespace())
 _install_module(f"{PKG}.common.global_config", GlobalConfig=types.SimpleNamespace())

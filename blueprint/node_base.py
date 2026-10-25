@@ -155,7 +155,11 @@ class SSMTNodeBase(Node):
         else:
             bl_idname = getattr(node_or_bl_idname, "bl_idname", "")
 
-        if bl_idname in {'SSMTNode_Object_Info', 'SSMTNode_MultiFile_Export'}:
+        if bl_idname in {
+            'SSMTNode_Object_Info',
+            'SSMTNode_Object_Info_Pro',
+            'SSMTNode_MultiFile_Export',
+        }:
             return _NODE_COLOR_INPUT_SOURCE
         if bl_idname == 'SSMTNode_Object_Group':
             return _NODE_COLOR_GROUP

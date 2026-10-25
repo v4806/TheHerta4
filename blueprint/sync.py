@@ -15,7 +15,11 @@ from bpy.app.handlers import persistent
 
 from ..common.global_config import GlobalConfig
 
-_SYNC_NODE_TYPES = {'SSMTNode_Object_Info', 'SSMTNode_MultiFile_Export'}
+_SYNC_NODE_TYPES = {
+    'SSMTNode_Object_Info',
+    'SSMTNode_Object_Info_Pro',
+    'SSMTNode_MultiFile_Export',
+}
 
 _sync_enabled = True
 _is_syncing = False
@@ -133,6 +137,12 @@ def _node_has_object_id(node, object_id):
     try:
         if node.bl_idname == 'SSMTNode_Object_Info':
             return getattr(node, 'object_id', '') == object_id
+        elif node.bl_idname == 'SSMTNode_Object_Info_Pro':
+            if getattr(node, 'object_id', '') == object_id:
+                return True
+            for item in getattr(node, 'object_list', []):
+                if getattr(item, 'object_id', '') == object_id:
+                    return True
         elif node.bl_idname == 'SSMTNode_MultiFile_Export':
             for item in getattr(node, 'object_list', []):
                 if getattr(item, 'object_id', '') == object_id:
@@ -145,6 +155,11 @@ def _node_has_object_id(node, object_id):
 def _iter_node_object_references(node):
     try:
         if node.bl_idname == 'SSMTNode_Object_Info':
+            return (node,)
+        if node.bl_idname == 'SSMTNode_Object_Info_Pro':
+            object_list = tuple(getattr(node, 'object_list', []) or ())
+            if object_list:
+                return object_list
             return (node,)
         if node.bl_idname == 'SSMTNode_MultiFile_Export':
             return tuple(getattr(node, 'object_list', []))
@@ -279,7 +294,7 @@ def _resolve_node_objects(node):
     except (AttributeError, ReferenceError):
         pass
 
-    if not objects and getattr(node, 'bl_idname', '') == 'SSMTNode_Object_Info':
+    if not objects and getattr(node, 'bl_idname', '') in ('SSMTNode_Object_Info', 'SSMTNode_Object_Info_Pro'):
         object_id = getattr(node, 'object_id', '')
         object_name = getattr(node, 'object_name', '')
         if object_id or object_name:
@@ -312,7 +327,8 @@ def _update_object_name_in_node(node, old_name, new_name, object_id=None):
             node_object_id = getattr(node, 'object_id', '')
             node_original_name = getattr(node, 'original_object_name', '')
 
-            matched = (object_id and node_object_id == object_id) or node_object_name == old_name
+            # old_name 为空表示「缓存里还没这个物体，只按 ID 校正」，不能靠名字匹配
+            matched = (object_id and node_object_id == object_id) or (old_name and node_object_name == old_name)
             if matched:
                 if node_object_name != new_name:
                     node.object_name = new_name
@@ -320,13 +336,54 @@ def _update_object_name_in_node(node, old_name, new_name, object_id=None):
                     node.object_id = object_id
                 if old_name and old_name != new_name and not node_original_name:
                     node.original_object_name = old_name
+        elif node.bl_idname == 'SSMTNode_Object_Info_Pro':
+            any_changed = False
+            for item in getattr(node, 'object_list', []):
+                item_name = getattr(item, 'object_name', '')
+                item_id = getattr(item, 'object_id', '')
+                item_original = getattr(item, 'original_object_name', '')
+                matched = (object_id and item_id == object_id) or (old_name and item_name == old_name)
+                if not matched:
+                    continue
+
+                if item_name != new_name:
+                    item.object_name = new_name
+                    any_changed = True
+                if object_id and item_id != object_id:
+                    item.object_id = object_id
+                    any_changed = True
+                if old_name and old_name != new_name and not item_original:
+                    item.original_object_name = old_name
+                    any_changed = True
+
+            # 节点自身（输入框显示 / 活动项镜像 / 空列表时的单物体引用）同样要跟着改名
+            node_self_name = str(getattr(node, 'object_name', '') or '')
+            node_self_id = str(getattr(node, 'object_id', '') or '')
+            self_matched = bool(
+                (object_id and node_self_id == object_id)
+                or (old_name and node_self_name == old_name)
+            )
+            if self_matched and node_self_name != new_name:
+                node.object_name = new_name
+                node_self_name = new_name
+                any_changed = True
+            if self_matched and object_id and node_self_id != object_id:
+                node.object_id = object_id
+                any_changed = True
+
+            if any_changed:
+                from .node_obj import _refresh_object_info_pro_node, refresh_object_info_pro_item
+
+                for item in getattr(node, 'object_list', []):
+                    refresh_object_info_pro_item(item)
+                _refresh_object_info_pro_node(node)
         elif node.bl_idname == 'SSMTNode_MultiFile_Export':
             any_changed = False
             for item in getattr(node, 'object_list', []):
                 item_name = getattr(item, 'object_name', '')
                 item_id = getattr(item, 'object_id', '')
                 item_original = getattr(item, 'original_object_name', '')
-                matched = (object_id and item_id == object_id) or item_name == old_name
+                matched = (object_id and item_id == object_id) or (old_name and item_name == old_name)
                 if not matched:
                     continue
 
@@ -1120,6 +1177,10 @@ def depsgraph_update_handler(scene, depsgraph):
                 old_name = _object_id_to_name[obj_id]
                 if old_name != obj_name:
                     on_object_renamed_by_id(obj_id, old_name, obj_name)
+            else:
+                # 缓存里还没有这个物体（刚加载工程 / 新物体）：直接按 object_id
+                # 校正名字不一致的引用，改名立即生效，不用等周期维护（最多 8 秒）。
+                on_object_renamed_by_id(obj_id, "", obj_name)
 
             _object_id_to_name[obj_id] = obj_name
 
@@ -1338,6 +1399,34 @@ class SSMT_OT_UpdateAllNodeReferences(bpy.types.Operator):
                                 obj = bpy.data.objects.get(object_name)
                                 if obj:
                                     node.object_id = str(obj.as_pointer())
+
+                        elif node.bl_idname == 'SSMTNode_Object_Info_Pro':
+                            for item in getattr(node, 'object_list', []):
+                                obj_name = getattr(item, 'object_name', '')
+                                object_id = getattr(item, 'object_id', '')
+                                if object_id:
+                                    obj = find_object_by_id(object_id)
+                                    if obj and obj.name != obj_name:
+                                        item.object_name = obj.name
+                                        updated_count += 1
+                                elif obj_name:
+                                    obj = bpy.data.objects.get(obj_name)
+                                    if obj:
+                                        item.object_id = str(obj.as_pointer())
+                                        updated_count += 1
+
+                            if not getattr(node, 'object_list', []):
+                                object_id = getattr(node, 'object_id', '')
+                                object_name = getattr(node, 'object_name', '')
+                                if object_id:
+                                    obj = find_object_by_id(object_id)
+                                    if obj and obj.name != object_name:
+                                        node.object_name = obj.name
+                                        updated_count += 1
+                                elif object_name:
+                                    obj = bpy.data.objects.get(object_name)
+                                    if obj:
+                                        node.object_id = str(obj.as_pointer())
 
                         elif node.bl_idname == 'SSMTNode_MultiFile_Export':
                             for item in getattr(node, 'object_list', []):
