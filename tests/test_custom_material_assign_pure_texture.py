@@ -43,6 +43,7 @@ _fake_bpy.types = types.SimpleNamespace(
     Node=object,
     NodeSocket=object,
     UIList=object,
+    Object=object,
 )
 _fake_bpy.props = types.SimpleNamespace(
     StringProperty=lambda **_kwargs: "",
