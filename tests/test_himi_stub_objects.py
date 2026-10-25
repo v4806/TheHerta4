@@ -2451,6 +2451,7 @@ class StubDrawCallContractTests(_StubCase):
             )
         # `object_prefix_helper` import bpy ⇒ 依赖 `_StubCase.setUp` 装好的假 bpy
         for qualname, relpath in (
+            (f"{PKG}.common.geometry_hash", "common/geometry_hash.py"),
             (f"{PKG}.common.m_key", "common/m_key.py"),
             (f"{PKG}.common.object_prefix_helper", "common/object_prefix_helper.py"),
             (f"{PKG}.common.draw_call_model", "common/draw_call_model.py"),

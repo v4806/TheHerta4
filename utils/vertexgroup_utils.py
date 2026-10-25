@@ -875,6 +875,39 @@ class VertexGroupUtils:
         return blendweights_dict, blendindices_dict
 
     @classmethod
+    def get_blend_layout_with_diagnostics(cls, mesh, channel_count, normalize_weights=True,
+                                        loop_vertex_indices=None):
+        """Read RNA once for native selection, normalization and loss diagnostics."""
+        try:
+            from ..common.export_geometry_native import extract_blend_layout
+            result = extract_blend_layout(mesh, channel_count, normalize_weights, loop_vertex_indices)
+            if result is not None:
+                return result
+        except ImportError:
+            pass
+        diagnostics = dict(max_influences=0, over_vertices=0, max_dropped=0.0, samples=[])
+        for vertex in mesh.vertices:
+            weights = []
+            for assignment in getattr(vertex, 'groups', ()) or ():
+                try:
+                    weight = float(getattr(assignment, 'weight', 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if weight > 0 and math.isfinite(weight):
+                    weights.append(weight)
+            diagnostics['max_influences'] = max(diagnostics['max_influences'], len(weights))
+            if len(weights) > channel_count:
+                diagnostics['over_vertices'] += 1
+                if len(diagnostics['samples']) < 3:
+                    diagnostics['samples'].append(int(getattr(vertex, 'index', 0)))
+                total = float(sum(weights))
+                if total > 0:
+                    kept = float(sum(sorted(weights, reverse=True)[:channel_count]))
+                    diagnostics['max_dropped'] = max(diagnostics['max_dropped'], max(0.0, (total-kept)/total))
+        weights, indices = cls.get_blendweights_blendindices_for_layout(mesh, channel_count, normalize_weights)
+        return weights, indices, diagnostics
+
+    @classmethod
     def get_blendweights_blendindices_for_layout(
         cls,
         mesh,

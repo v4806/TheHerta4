@@ -1,4 +1,5 @@
 import collections
+import math
 import copy
 from .d3d11_gametype import D3D11GameType
 from .draw_call_model import DrawCallModel
@@ -635,37 +636,12 @@ class ObjBufferHelper:
                     blend_size = 4
             # 统计（在调用提取函数**之前**，与提取函数同一口径：weight > 0 且有限）：
             # 全网格最大有效影响数 M、超限顶点数、最大丢弃权重占比、样本顶点索引。
-            max_effective_influences = 0
-            over_slot_vertices = 0
-            max_dropped_fraction = 0.0
-            sample_offenders: list[int] = []
-            for vertex in mesh_vertices:
-                weights: list[float] = []
-                for assignment in getattr(vertex, "groups", ()) or ():
-                    try:
-                        weight = float(getattr(assignment, "weight", 0.0) or 0.0)
-                    except (TypeError, ValueError):
-                        continue
-                    if weight > 0.0 and numpy.isfinite(weight):
-                        weights.append(weight)
-                effective_influences = len(weights)
-                if effective_influences > max_effective_influences:
-                    max_effective_influences = effective_influences
-                if effective_influences <= blend_size:
-                    continue
-                over_slot_vertices += 1
-                if len(sample_offenders) < 3:
-                    sample_offenders.append(int(getattr(vertex, "index", 0)))
-                total_weight = float(sum(weights))
-                if total_weight > 0.0:
-                    kept_weight = float(
-                        sum(sorted(weights, reverse=True)[:blend_size])
-                    )
-                    dropped_fraction = max(
-                        0.0, (total_weight - kept_weight) / total_weight
-                    )
-                    if dropped_fraction > max_dropped_fraction:
-                        max_dropped_fraction = dropped_fraction
+            blendweights_dict, blendindices_dict, diagnostics = VertexGroupUtils.get_blend_layout_with_diagnostics(
+                mesh, blend_size, normalize_weights=True, loop_vertex_indices=loop_vertex_indices)
+            max_effective_influences = diagnostics['max_influences']
+            over_slot_vertices = diagnostics['over_vertices']
+            max_dropped_fraction = diagnostics['max_dropped']
+            sample_offenders = diagnostics['samples']
             if over_slot_vertices:
                 target_format = (
                     str(getattr(blend_index_element, "Format", "") or "unknown")
@@ -696,11 +672,6 @@ class ObjBufferHelper:
                         f"{blend_size} → 归一化 All 修好权重后再导出"
                         "（合并骨骼下组名 = 全局骨骼 id，不要靠删组解决）。"
                     )
-            blendweights_dict, blendindices_dict = VertexGroupUtils.get_blendweights_blendindices_for_layout(
-                mesh=mesh,
-                channel_count=blend_size,
-                normalize_weights=True,
-            )
         elif GlobalConfig.logic_name == LogicName.WWMI or GlobalConfig.logic_name == LogicName.NTEMI:
             # print("鸣潮专属测试版权重处理：")
             blendweights_dict, blendindices_dict = VertexGroupUtils.get_blendweights_blendindices_v4_fast(mesh=mesh,normalize_weights = normalize_weights,blend_size=blend_size)
@@ -1033,25 +1004,26 @@ class ObjBufferHelper:
         if vid_bytes is not None:
             combined_padded[:, filtered_row_size:filtered_row_size+4] = vid_bytes
 
-        # View as uint64 blocks (shape: n_loops x n_blocks)
-        n_blocks = padded_width // 8
-        combined_u64 = combined_padded.view(numpy.uint64).reshape(n_loops, n_blocks)
-
-        # Create a structured view so numpy.unique treats each row as a single record
-        dtype_descr = [(f'f{i}', numpy.uint64) for i in range(n_blocks)]
-        structured = combined_u64.view(numpy.dtype(dtype_descr)).reshape(n_loops)
-
-        unique_struct, unique_first_indices, inverse = numpy.unique(
-            structured, return_index=True, return_inverse=True
-        )
-
-        # Remap unique ids to insertion order (first occurrence order)
-        order = numpy.argsort(unique_first_indices)
-        new_id = numpy.empty_like(order)
-        new_id[order] = numpy.arange(len(order), dtype=new_id.dtype)
-        inverse = new_id[inverse]
-
-        unique_first_indices_insertion = unique_first_indices[order]
+        native_unique = None
+        try:
+            from .export_geometry_native import stable_unique_rows
+            native_unique = stable_unique_rows(combined_padded)
+        except ImportError:
+            pass
+        if native_unique is not None:
+            unique_first_indices_insertion, inverse = native_unique
+        else:
+            n_blocks = padded_width // 8
+            combined_u64 = combined_padded.view(numpy.uint64).reshape(n_loops, n_blocks)
+            dtype_descr = [(f'f{i}', numpy.uint64) for i in range(n_blocks)]
+            structured = combined_u64.view(numpy.dtype(dtype_descr)).reshape(n_loops)
+            _, unique_first_indices, inverse = numpy.unique(
+                structured, return_index=True, return_inverse=True)
+            order = numpy.argsort(unique_first_indices)
+            new_id = numpy.empty_like(order)
+            new_id[order] = numpy.arange(len(order), dtype=new_id.dtype)
+            inverse = new_id[inverse]
+            unique_first_indices_insertion = unique_first_indices[order]
 
         # Pick original unique rows from row_bytes using insertion-ordered indices
         # 注意：这里使用原始的 row_bytes 而不是 filtered_row_bytes，以保留完整数据

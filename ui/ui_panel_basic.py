@@ -25,12 +25,21 @@ from ..blueprint.preprocess_parallel import ParallelPreprocessCoordinator
 
 class SSMT_OT_ClearPreprocessCache(bpy.types.Operator):
     bl_idname = "ssmt.clear_preprocess_cache"
-    bl_label = "清空前处理缓存"
-    bl_description = "清空所有前处理缓存文件"
+    bl_label = "清空导出缓存"
+    bl_description = "清空当前工程前处理缓存和本机共享的贴图分析、DDS 产物缓存"
+
+    @classmethod
+    def poll(cls, context):
+        from ..blueprint.export_background import get_active_session
+        return get_active_session() is None
 
     def execute(self, context):
-        cleared_count = PreProcessCache.clear_cache()
-        self.report({'INFO'}, f"已清空 {cleared_count} 个缓存文件")
+        from ..common.export_cache import clear_export_caches
+        result = clear_export_caches()
+        if result['errors']:
+            self.report({'WARNING'}, f"已清空 {result['total']} 个缓存文件，{len(result['errors'])} 个文件暂时无法清理")
+        else:
+            self.report({'INFO'}, f"已清空 {result['total']} 个导出缓存文件")
         return {'FINISHED'}
 
 
@@ -607,19 +616,22 @@ class PanelBasicInformation(bpy.types.Panel):
             icon_only=True,
             emboss=False,
         )
-        cache_header.label(text="前处理缓存", icon='FILE_CACHE')
+        cache_header.label(text="导出缓存", icon='FILE_CACHE')
 
         if global_properties.expand_preprocess_cache:
             cache_box.prop(global_properties, "enable_preprocess_cache")
 
-            cache_stats = PreProcessCache.get_cache_stats()
-            file_count = cache_stats["file_count"]
-            total_size = cache_stats["total_size"]
-            size_str = PreProcessCache.format_size(total_size)
-            cache_box.label(text=f"缓存文件: {file_count} 个 大小: {size_str}")
+            from ..common.export_cache import get_export_cache_stats
+            cache_stats = get_export_cache_stats()
+            for key, label in (('preprocess', '前处理（当前工程）'),
+                               ('analysis', '贴图分析（共享）'), ('dds', 'DDS 产物（共享）')):
+                item = cache_stats[key]
+                cache_box.label(text=f"{label}: {item['file_count']} 个 / {PreProcessCache.format_size(item['total_size'])}")
+            total = cache_stats['total']
+            cache_box.label(text=f"合计: {PreProcessCache.format_size(total['total_size'])}")
 
             row = cache_box.row()
-            row.operator(SSMT_OT_ClearPreprocessCache.bl_idname, icon='TRASH')
+            row.operator(SSMT_OT_ClearPreprocessCache.bl_idname, text="清空导出缓存", icon='TRASH')
 
         parallel_box = layout.box()
         parallel_header = parallel_box.row(align=True)

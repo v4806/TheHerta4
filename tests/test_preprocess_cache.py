@@ -2,6 +2,8 @@ import importlib.util
 import sys
 import types
 import unittest
+import tempfile
+from unittest import mock
 from pathlib import Path
 
 import numpy as np
@@ -141,6 +143,17 @@ class _Object:
 class PreProcessCacheHashTests(unittest.TestCase):
     def setUp(self):
         _fake_bpy.data.objects.clear()
+
+    def test_nested_cache_stats_and_clear(self):
+        with tempfile.TemporaryDirectory(prefix='herta_preprocess_clear_') as temp:
+            root=Path(temp)
+            (root/'nested').mkdir()
+            (root/'object.blend').write_bytes(b'cached')
+            (root/'nested'/'object.json').write_bytes(b'metadata')
+            with mock.patch.object(PreProcessCache,'get_cache_dir',return_value=str(root)):
+                self.assertEqual(PreProcessCache.get_cache_stats(),{'file_count':2,'total_size':14})
+                self.assertEqual(PreProcessCache.clear_cache(),2)
+                self.assertEqual(PreProcessCache.get_cache_stats(),{'file_count':0,'total_size':0})
 
     def test_ntmi_custom_color_attribute_is_ignored_in_hash(self):
         mesh = _Mesh(

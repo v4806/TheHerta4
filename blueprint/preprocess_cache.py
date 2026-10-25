@@ -36,6 +36,13 @@ class PreProcessCache:
     _index_cache_by_path: dict[str, dict] = {}
     _index_cache_mtime_by_path: dict[str, float] = {}
 
+    @staticmethod
+    def _write_mesh_cache(filepath, datablocks):
+        # Local scratch cache favors avoiding repeated mesh compression. Both
+        # variants remain ordinary Blender libraries and share the same hashes.
+        compress = os.environ.get('HERTA_PREPROCESS_CACHE_COMPRESSION', '0') == '1'
+        bpy.data.libraries.write(filepath, datablocks, compress=compress, fake_user=True)
+
     @classmethod
     def invalidate_index_cache(cls, cache_dir: str = ""):
         if cache_dir:
@@ -596,7 +603,7 @@ class PreProcessCache:
 
         try:
             datablocks = {copy_obj, copy_obj.data}
-            bpy.data.libraries.write(cache_filepath, datablocks, compress=True, fake_user=True)
+            cls._write_mesh_cache(cache_filepath, datablocks)
         except Exception as e:
             LOG.warning(f"⚠️ 缓存文件保存失败 {obj_name}: {e}")
             for i, mat in enumerate(saved_materials):
@@ -697,7 +704,7 @@ class PreProcessCache:
             
             try:
                 datablocks = {copy_obj, copy_obj.data}
-                bpy.data.libraries.write(cache_filepath, datablocks, compress=True, fake_user=True)
+                cls._write_mesh_cache(cache_filepath, datablocks)
             except Exception as e:
                 LOG.warning(f"⚠️ 缓存文件保存失败 {obj_name}: {e}")
                 for i, mat in enumerate(saved_materials):
@@ -1049,21 +1056,40 @@ class PreProcessCache:
             return False
 
     @classmethod
+    def _iter_cache_files(cls, cache_dir):
+        root = os.path.realpath(cache_dir)
+        def inside(path):
+            try:
+                return os.path.normcase(os.path.commonpath((root, os.path.realpath(path)))) == os.path.normcase(root)
+            except ValueError:
+                return False
+        is_junction = getattr(os.path, 'isjunction', lambda path: False)
+        for directory, folders, files in os.walk(cache_dir, followlinks=False):
+            folders[:] = [name for name in folders
+                          if not os.path.islink(os.path.join(directory, name))
+                          and not is_junction(os.path.join(directory, name))
+                          and inside(os.path.join(directory, name))]
+            for name in files:
+                path = os.path.join(directory, name)
+                if inside(path):
+                    yield path
+
+    @classmethod
     def clear_cache(cls) -> int:
         cache_dir = cls.get_cache_dir()
         if not cache_dir or not os.path.exists(cache_dir):
             return 0
 
         cleared_count = 0
-        for filename in os.listdir(cache_dir):
-            filepath = os.path.join(cache_dir, filename)
+        for filepath in cls._iter_cache_files(cache_dir):
             try:
                 if os.path.isfile(filepath):
                     os.remove(filepath)
                     cleared_count += 1
             except Exception as e:
-                LOG.warning(f"⚠️ 删除缓存文件失败 {filename}: {e}")
+                LOG.warning(f"⚠️ 删除缓存文件失败 {os.path.basename(filepath)}: {e}")
 
+        cls.invalidate_index_cache()
         LOG.info(f"🧹 缓存已清空: 删除 {cleared_count} 个文件")
         return cleared_count
 
@@ -1076,11 +1102,12 @@ class PreProcessCache:
         file_count = 0
         total_size = 0
 
-        for filename in os.listdir(cache_dir):
-            filepath = os.path.join(cache_dir, filename)
-            if os.path.isfile(filepath):
+        for filepath in cls._iter_cache_files(cache_dir):
+            try:
                 file_count += 1
                 total_size += os.path.getsize(filepath)
+            except OSError:
+                continue
 
         return {"file_count": file_count, "total_size": total_size}
 

@@ -62,7 +62,7 @@ class ParallelPreprocessCoordinator:
             LOG.info(f"🔧 已清理 {cleaned_count} 个损坏的形态键")
 
         # 直出 ShapeKey 采样现在也跟随前处理缓存生命周期，不再单独禁用缓存。
-        cache_enabled = GlobalProterties.enable_preprocess_cache()
+        cache_enabled = GlobalProterties.enable_export_cache()
         classify_start = perf_counter()
         hash_map, cached_objects, uncached_objects = cls._classify_objects(
             unique_objects,
@@ -92,7 +92,9 @@ class ParallelPreprocessCoordinator:
         session_dir = cls._prepare_session_directory()
 
         try:
+            phase_started = perf_counter()
             snapshot_path = cls._create_snapshot(session_dir)
+            LOG.info(f"[CodexTiming] PreprocessParallel-Snapshot {perf_counter() - phase_started:.3f}s")
             jobs = cls._build_jobs(
                 session_dir,
                 snapshot_path,
@@ -101,8 +103,12 @@ class ParallelPreprocessCoordinator:
                 preserve_shape_keys=preserve_shape_keys,
                 capture_shape_keys=capture_shape_keys,
             )
+            phase_started = perf_counter()
             cls._run_jobs(jobs, config)
+            LOG.info(f"[CodexTiming] PreprocessParallel-Workers {perf_counter() - phase_started:.3f}s")
+            phase_started = perf_counter()
             cls._integrate_results(jobs, hash_map, cache_enabled, capture_shape_keys=capture_shape_keys)
+            LOG.info(f"[CodexTiming] PreprocessParallel-Integrate {perf_counter() - phase_started:.3f}s")
         except Exception:
             if not config["keep_temp"]:
                 shutil.rmtree(session_dir, ignore_errors=True)
@@ -598,10 +604,21 @@ def _run_worker(manifest_path: str):
             if obj_name not in copy_names:
                 bpy.data.objects.remove(obj, do_unlink=True)
 
-        ShapeKeyUtils.save_as_mainfile_with_shape_key_recovery(
-            filepath=manifest["result_blend_path"],
-            check_existing=False,
-        )
+        written_library = False
+        if os.environ.get('HERTA_PREPROCESS_RESULT_LIBRARY', '1') != '0':
+            try:
+                objects = [bpy.data.objects.get(name) for name in copy_names]
+                datablocks = {obj for obj in objects if obj is not None}
+                datablocks.update(obj.data for obj in objects if obj is not None and obj.data is not None)
+                bpy.data.libraries.write(manifest['result_blend_path'], datablocks, compress=False)
+                written_library = True
+            except Exception as exc:
+                LOG.warning(f"结果库写入失败，使用完整工程回退: {exc}")
+        if not written_library:
+            ShapeKeyUtils.save_as_mainfile_with_shape_key_recovery(
+                filepath=manifest["result_blend_path"],
+                check_existing=False,
+            )
 
         result["status"] = "success"
         result["original_to_copy_map"] = copy_map

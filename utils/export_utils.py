@@ -1,4 +1,6 @@
 import math
+import json
+from time import perf_counter
 
 import bpy
 import numpy
@@ -93,9 +95,13 @@ class ExportUtils:
         obj_name: str = "",
         final_elementname_data_dict: Optional[dict] = None,
     ) -> ObjElementContext:
+        profile_started = perf_counter()
         resolved_obj = obj or ObjUtils.get_obj_by_name(name=obj_name)
+        resolved_at = perf_counter()
         with ExportUtils._temporarily_reset_shapekey_values_for_export(resolved_obj):
+            entered_at = perf_counter()
             mesh = ObjUtils.get_mesh_evaluate_from_obj(obj=resolved_obj)
+            evaluated_at = perf_counter()
             if len(mesh.polygons) > 0:
                 uv_map_name = "TEXCOORD.xy" if "TEXCOORD.xy" in mesh.uv_layers else None
                 try:
@@ -104,6 +110,7 @@ class ExportUtils:
                     ObjUtils.mesh_triangulate(mesh)
                     mesh.calc_tangents(uvmap=uv_map_name)
 
+            tangents_at = perf_counter()
             original_elementname_data_dict = ObjBufferHelper.parse_elementname_data_dict(
                 mesh=mesh,
                 d3d11_game_type=d3d11_game_type,
@@ -114,8 +121,10 @@ class ExportUtils:
                     vg.name for vg in (getattr(resolved_obj, "vertex_groups", None) or ())
                 ] or None,
             )
+            parsed_at = perf_counter()
 
-        return ObjElementContext(
+        restored_at = perf_counter()
+        context = ObjElementContext(
             obj=resolved_obj,
             mesh=mesh,
             d3d11_game_type=d3d11_game_type,
@@ -124,6 +133,20 @@ class ExportUtils:
             original_elementname_data_dict=original_elementname_data_dict,
             final_elementname_data_dict=final_elementname_data_dict or {},
         )
+        print('[ElementParseProfile] ' + json.dumps({
+            'object': resolved_obj.name,
+            'vertices': len(getattr(mesh, 'vertices', ())),
+            'loops': len(getattr(mesh, 'loops', ())),
+            'resolve_s': resolved_at - profile_started,
+            'shapekey_enter_s': entered_at - resolved_at,
+            'evaluate_s': evaluated_at - entered_at,
+            'tangents_s': tangents_at - evaluated_at,
+            'attributes_s': parsed_at - tangents_at,
+            'shapekey_restore_s': restored_at - parsed_at,
+            'context_s': perf_counter() - restored_at,
+            'total_s': perf_counter() - profile_started,
+        }), flush=True)
+        return context
 
     @staticmethod
     def pack_element_vertex_ndarray(

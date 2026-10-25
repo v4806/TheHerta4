@@ -5,6 +5,8 @@ import shutil
 import struct
 import subprocess
 import tempfile
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import bpy
 
@@ -443,6 +445,65 @@ def _read_dds_header(path: str):
     return header
 
 
+def is_dds_file(path: str) -> bool:
+    """文件头是否为 ``DDS ``：只看内容，不看扩展名。
+
+    工作空间里的贴图常是「改后缀的 PNG」（``10.dds`` 里装的是 PNG 字节，实测
+    ``F:\\library\\...\\贴图\\*.dds`` 全是这种）。只按扩展名判断会跳过转换、把 PNG
+    字节原样复制成 ``.dds``，3DMigoto 按 DDS 读失败 → 游戏里贴图不生效。
+    """
+    try:
+        with open(path, "rb") as handle:
+            return handle.read(4) == b"DDS "
+    except OSError:
+        return False
+
+
+_IMAGE_MAGIC_EXTENSIONS = (
+    (b"\x89PNG\r\n\x1a\n", ".png"),
+    (b"\xff\xd8\xff", ".jpg"),
+    (b"GIF87a", ".gif"),
+    (b"GIF89a", ".gif"),
+    (b"BM", ".bmp"),
+)
+
+
+def _sniff_image_extension(path: str) -> str:
+    """按文件魔数猜真实图片扩展名；认不出返回空串（交给 texconv 自己报错）。"""
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(16)
+    except OSError:
+        return ""
+    for magic, extension in _IMAGE_MAGIC_EXTENSIONS:
+        if head.startswith(magic):
+            return extension
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return ".webp"
+    return ""
+
+
+def _source_with_real_extension(source_path: str, staging_dir: str) -> str:
+    """给 texconv 的输入：扩展名与内容不符时，在 staging 里复制一份真扩展名的副本。
+
+    texconv 按扩展名选解码器，把「.dds 里装 PNG 字节」的文件直接喂给它必定失败
+    （实测 ``reading ... FAILED (80004005)``）。副本保持文件名词干不变，所以 texconv
+    的输出名（``<词干>.dds``）与调用方预期的产物名一致。
+    """
+    real_extension = _sniff_image_extension(source_path)
+    if not real_extension:
+        return source_path
+    if os.path.splitext(source_path)[1].lower() == real_extension:
+        return source_path
+    stem = os.path.splitext(os.path.basename(source_path))[0]
+    staged_path = os.path.join(staging_dir, f"{stem}{real_extension}")
+    try:
+        shutil.copy2(source_path, staged_path)
+    except OSError:
+        return source_path
+    return staged_path
+
+
 def dds_header_dxgi_format(path: str):
     """DX10 头返回偏移 128 的 DXGI 格式号；legacy FOURCC 头返回 None。"""
     header = _read_dds_header(path)
@@ -473,6 +534,18 @@ def read_dds_header_format(path: str) -> str:
         return ""
     fourcc = bytes(header[84:88])
     if fourcc != b"DX10":
+        # texconv 默认把常见 RGBA8/BGRA8 写成 legacy 位掩码头，而非 DX10 头。
+        # 这仍是确定的格式，不能当成未知后再重复编码一次。
+        flags = struct.unpack_from("<I", header, 80)[0]
+        if not flags & 4 and flags & 0x40:
+            layout = struct.unpack_from("<5I", header, 88)
+            formats = {
+                (32, 0xFF, 0xFF00, 0xFF0000, 0xFF000000): "r8g8b8a8_unorm",
+                (32, 0xFF0000, 0xFF00, 0xFF, 0xFF000000): "b8g8r8a8_unorm",
+                (32, 0xFF0000, 0xFF00, 0xFF, 0): "b8g8r8x8_unorm",
+            }
+            if layout in formats:
+                return formats[layout]
         return _DDS_LEGACY_FOURCC_FORMATS.get(fourcc, "")
     if len(header) < _DDS_FULL_HEADER_SIZE:
         return ""
@@ -513,14 +586,74 @@ def existing_dds_matches_format(path: str, dds_format: str):
 # 引用时，导出流程会为同一个目标反复走到这里 —— 没有这层缓存就是 N 次 texconv，
 # 而单张 4096² 的 BC7 转换约 4 秒，重复转换正是导出耗时的主要来源。
 # 生命周期：由 BlueprintExportHelper.clear_postprocess_caches() 在每次导出开始时
-# 调 :func:`clear_dds_conversion_cache` 清空，所以「覆盖现有资源」每次导出仍会
-# 重新生成一遍，只是不会在一次导出里重复生成。
+# 调 :func:`clear_dds_conversion_cache` 清空。节点批准写出的任务可再复用内容与
+# 编码参数完全匹配的持久产物；该持久缓存不参与目标是否允许覆盖的判定。
 _dds_conversion_cache: dict = {}
+_dds_artifact_store = None
+_dds_encoder_recipe_cache = {}
 
 
 def clear_dds_conversion_cache():
     """清空导出期的 DDS 转换缓存（每次导出开始时调用一次）。"""
     _dds_conversion_cache.clear()
+    _dds_encoder_recipe_cache.clear()
+
+
+def _artifact_store():
+    global _dds_artifact_store
+    if _dds_artifact_store is None:
+        try:
+            from .dds_artifact_cache import DDSArtifactCache
+            _dds_artifact_store = DDSArtifactCache()
+        except ImportError:
+            return None
+    return _dds_artifact_store
+
+
+def _artifact_prepare(executable, source, fmt):
+    """A cache key describes encoded bytes, never permission to overwrite."""
+    if not executable:
+        return None, None
+    cache = _artifact_store()
+    if cache is None or not cache.enabled:
+        return None, None
+    try:
+        from .dds_artifact_cache import file_sha256
+        executable_signature = _source_signature(executable)
+        if executable_signature is None:
+            return None, None
+        encoder_hash = _dds_encoder_recipe_cache.get(executable_signature)
+        if encoder_hash is None:
+            encoder_hash = file_sha256(executable)
+            _dds_encoder_recipe_cache[executable_signature] = encoder_hash
+        before = _source_signature(source)
+        source_hash = file_sha256(source)
+        if before is None or before != _source_signature(source):
+            return None, None
+        recipe = {'backend': 'texconv-default-v1', 'encoder_sha256': encoder_hash,
+                  'format': str(fmt).lower(), 'color_flags': _texconv_colorspace_flags(fmt),
+                  'mips': 'default-full', 'quality': 'default', 'input_preparation': 1}
+        return cache, cache.key(source_hash, recipe)
+    except (OSError, ValueError):
+        return None, None
+
+
+def _artifact_publish(cache, key, executable, source, target, fmt):
+    if cache is None or key is None:
+        return False
+    # Never attach output to a stale source key if it changed while encoding.
+    _, current_key = _artifact_prepare(executable, source, fmt)
+    if key != current_key or existing_dds_matches_format(target, fmt) is not True:
+        return False
+    return cache.put_file(key, target)
+
+
+def _native_dds_converter():
+    try:
+        from .dds_native_encoder import try_convert_file
+        return try_convert_file
+    except ImportError:
+        return None
 
 
 def _source_signature(source_path: str):
@@ -583,8 +716,6 @@ def convert_texture_to_dds(
     **不改动源文件**，返回 ``(True, "")`` 或 ``(False, 失败原因)``。
     """
     texconv_executable = find_texconv()
-    if not texconv_executable:
-        return False, "未找到 texconv.exe。请将其放入插件目录的 Toolset 子文件夹，或手动指定路径。"
 
     if props is None:
         props = bpy.context.scene.texture_tools_props
@@ -602,6 +733,24 @@ def convert_texture_to_dds(
     )
     colorspace_flags = _texconv_colorspace_flags(dds_format)
 
+    cache_started = time.perf_counter()
+    artifact_cache, artifact_key = _artifact_prepare(texconv_executable, source_path, dds_format)
+    if artifact_cache is not None and artifact_key is not None:
+        if artifact_cache.restore(artifact_key, target_path,
+                                  lambda path: existing_dds_matches_format(path, dds_format) is True):
+            print('[DDSArtifactCacheProfile] ' + json.dumps(
+                {'scope': 'single', 'hits': 1, 'elapsed_s': time.perf_counter() - cache_started}), flush=True)
+            return True, ''
+
+    native = _native_dds_converter()
+    if native is not None:
+        result = native(source_path, target_path, dds_format, cache=artifact_cache)
+        if result is not None:
+            print('[DDSNativeProfile] ' + json.dumps(result), flush=True)
+            return True, ''
+    if not texconv_executable:
+        return False, "未找到 texconv.exe。请将其放入插件目录的 Toolset 子文件夹，或手动指定路径。"
+
     command = [texconv_executable, "-f", dds_format]
     command.extend(colorspace_flags)
 
@@ -613,9 +762,18 @@ def convert_texture_to_dds(
     if target_dir:
         os.makedirs(target_dir, exist_ok=True)
 
+    profile_started = time.perf_counter()
+    profile = {"source": os.path.basename(source_path), "target": os.path.basename(target_path),
+               "format": dds_format, "prepare_s": 0.0, "encode_s": 0.0,
+               "write_s": 0.0, "cleanup_s": 0.0, "outcome": "error"}
     staging = tempfile.mkdtemp(prefix=".herta_dds_staging_", dir=target_dir or None)
     try:
-        command.extend(["-o", staging, "-y", source_path])
+        # 源扩展名与内容不符（工作空间常见的「.dds 里装 PNG 字节」）时，texconv 按扩展名
+        # 选解码器会直接 FAILED；这里先复制一份真扩展名的副本再交给它。
+        texconv_source = _source_with_real_extension(source_path, staging)
+        command.extend(["-o", staging, "-y", texconv_source])
+        profile["prepare_s"] = time.perf_counter() - profile_started
+        encode_started = time.perf_counter()
         try:
             process = subprocess.run(
                 command,
@@ -626,6 +784,12 @@ def convert_texture_to_dds(
             )
         except Exception as exc:
             return False, f"调用 texconv 失败: {exc}"
+        finally:
+            profile["encode_s"] = time.perf_counter() - encode_started
+
+        profile["returncode"] = process.returncode
+        profile["gpu_info"] = [line.strip() for line in (process.stdout or "").splitlines()
+                               if any(word in line.lower() for word in ("directcompute", "adapter", "gpu"))]
 
         if process.returncode != 0:
             detail = (process.stderr or process.stdout or "").strip()
@@ -636,9 +800,12 @@ def convert_texture_to_dds(
                     f"{os.path.basename(verbatim)}（保持工作空间原格式）"
                 )
                 try:
+                    write_started = time.perf_counter()
                     shutil.copy2(verbatim, target_path)
+                    profile["write_s"] = time.perf_counter() - write_started
                 except Exception as exc:
                     return False, f"原样复制原贴图失败: {exc}"
+                profile["outcome"] = "copied-verbatim"
                 return True, f"copied-verbatim:{dds_format}"
             return False, detail or f"texconv 退出码 {process.returncode}"
 
@@ -649,11 +816,20 @@ def convert_texture_to_dds(
             return False, f"texconv 未生成 {produced}"
 
         try:
+            write_started = time.perf_counter()
             shutil.move(produced, target_path)
+            profile["write_s"] = time.perf_counter() - write_started
+            profile["outcome"] = "encoded"
+            profile["artifact_cached"] = _artifact_publish(
+                artifact_cache, artifact_key, texconv_executable, source_path, target_path, dds_format)
         except Exception as exc:
             return False, f"写出目标文件失败: {exc}"
     finally:
+        cleanup_started = time.perf_counter()
         shutil.rmtree(staging, ignore_errors=True)
+        profile["cleanup_s"] = time.perf_counter() - cleanup_started
+        profile["total_s"] = time.perf_counter() - profile_started
+        print("[DDSConvertProfile] " + json.dumps(profile, ensure_ascii=False), flush=True)
 
     return True, ""
 
@@ -675,8 +851,8 @@ def convert_texture_to_dds_cached(
     磁盘上那份旧格式的产物不会被当成最新结果复用。
 
     ``force=True`` 对应节点上的「覆盖现有资源」：表示愿意重新生成，但仅限本次导出的
-    第一次 —— 同一张贴图被 N 个物体引用时不会再各转一遍。缓存每次导出开始时清空，
-    所以下次导出仍会重新生成。复用磁盘已有产物时同样返回 ``(True, "")``：调用方只
+    第一次 —— 同一张贴图被 N 个物体引用时不会再各转一遍。此进程内缓存每次导出清空；
+    已由调用方批准的写出任务可复用内容/格式/编码器匹配的持久产物。复用时返回 ``(True, "")``：调用方只
     关心「目标就绪」。
 
     ``match_name`` 沿用旧签名：材质资源名先查规则，命中就定格式（导出侧真正的命名依据）。
@@ -721,6 +897,172 @@ def convert_texture_to_dds_cached(
     if ok:
         _dds_conversion_cache[cache_key] = cache_value
     return ok, reason
+
+
+def convert_new_textures_to_dds_batch(requests, progress_callback=None):
+    """新目标先用缓存/原生并行编码，其余共用 texconv/GPU 上下文。
+
+    仅处理尚不存在的目标，已有目标的智能覆盖仍由贴图计划器决定。
+    在主线程解析 Blender 属性；编码仍沿用相同格式、色彩标志和默认质量。
+    """
+    executable = find_texconv()
+    groups = {}
+    for entry_id, source, target, kwargs in requests:
+        if os.path.exists(target) or not os.path.isfile(source):
+            continue
+        try:
+            props = kwargs.get("props")
+            if props is None:
+                props = bpy.context.scene.texture_tools_props
+            fmt = resolve_texture_dds_format(
+                source, props, texture_type=kwargs.get("texture_type", ""),
+                name_hints=tuple(kwargs.get("name_hints") or ()),
+                format_override=kwargs.get("format_override", ""),
+                workspace_source_path=kwargs.get("workspace_source_path", ""),
+                match_name=kwargs.get("match_name"),
+            )
+            directory = os.path.dirname(os.path.abspath(target))
+            groups.setdefault((fmt, directory), []).append(
+                (entry_id, source, target, _source_signature(source)))
+        except Exception as exc:
+            print(f"[DDS批处理] 准备失败，沿用逐项转换: {os.path.basename(source)}: {exc}")
+
+    completed = set()
+    artifact_entries = {}
+    cache_started = time.perf_counter()
+    cache_hits = 0
+    store = _artifact_store()
+    if executable and store is not None and store.enabled and groups:
+        def restore_job(item):
+            job, fmt = item
+            entry_id, source, target, signature = job
+            cache, key = _artifact_prepare(executable, source, fmt)
+            hit = bool(cache is not None and key and not os.path.exists(target) and
+                       cache.restore(key, target,
+                                     lambda path: existing_dds_matches_format(path, fmt) is True))
+            return job, cache, key, hit
+
+        for (fmt, directory), jobs in list(groups.items()):
+            pending = []
+            with ThreadPoolExecutor(max_workers=min(16, len(jobs))) as pool:
+                futures = [pool.submit(restore_job, (job, fmt)) for job in jobs]
+                for future in as_completed(futures):
+                    job, cache, key, hit = future.result()
+                    entry_id, source, target, signature = job
+                    artifact_entries[entry_id] = (cache, key)
+                    if hit:
+                        completed.add(entry_id)
+                        cache_hits += 1
+                        _dds_conversion_cache[os.path.normcase(os.path.abspath(target))] = (signature, fmt)
+                        if progress_callback is not None:
+                            progress_callback(len(completed))
+                    else:
+                        pending.append(job)
+            groups[(fmt, directory)] = pending
+        print('[DDSArtifactCacheProfile] ' + json.dumps(
+            {'scope': 'batch', 'hits': cache_hits,
+             'misses': sum(len(jobs) for jobs in groups.values()),
+             'elapsed_s': time.perf_counter() - cache_started}), flush=True)
+
+    native = _native_dds_converter()
+    if native is not None:
+        native_started = time.perf_counter()
+        native_hits = native_successes = native_attempts = 0
+        stage_sums = {'decode_s': 0.0, 'mip_s': 0.0, 'encode_s': 0.0}
+        def convert_native_job(item):
+            job, fmt = item
+            result = native(job[1], job[2], fmt, cache=store, overwrite=False)
+            return job, result
+        for (fmt, directory), jobs in list(groups.items()):
+            if not jobs or fmt not in ('bc7_unorm', 'bc7_unorm_srgb'):
+                continue
+            native_attempts += len(jobs)
+            pending = []
+            with ThreadPoolExecutor(max_workers=min(16, len(jobs))) as pool:
+                futures = [pool.submit(convert_native_job, (job, fmt)) for job in jobs]
+                for future in as_completed(futures):
+                    job, result = future.result()
+                    if result is None:
+                        pending.append(job)
+                        continue
+                    entry_id, source, target, signature = job
+                    completed.add(entry_id)
+                    native_successes += 1
+                    native_hits += bool(result.get('cache_hit'))
+                    for key in stage_sums:
+                        stage_sums[key] += result.get(key, 0.0)
+                    _dds_conversion_cache[os.path.normcase(os.path.abspath(target))] = (signature, fmt)
+                    # Report on the coordinating thread after each output has
+                    # finished. A slow first input must not hide later results.
+                    if progress_callback is not None:
+                        progress_callback(len(completed))
+            groups[(fmt, directory)] = pending
+        if native_attempts:
+            print('[DDSNativeBatchProfile] ' + json.dumps({
+                'attempts': native_attempts, 'successes': native_successes, 'cache_hits': native_hits,
+                'workers': 16, 'elapsed_s': time.perf_counter() - native_started,
+                'cumulative_stage_s': stage_sums}), flush=True)
+    if not executable:
+        return completed
+    for (fmt, directory), jobs in groups.items():
+        if not jobs:
+            continue
+        # 同一批输出目录中的源词干必须唯一；限制 Windows 命令行长度。
+        batches, current, stems, command_length = [], [], set(), 0
+        for job in jobs:
+            stem = os.path.splitext(os.path.basename(job[1]))[0].casefold()
+            length = len(job[1]) + 4
+            if current and (stem in stems or len(current) >= 64 or command_length + length > 24000):
+                batches.append(current)
+                current, stems, command_length = [], set(), 0
+            current.append(job)
+            stems.add(stem)
+            command_length += length
+        if current:
+            batches.append(current)
+        os.makedirs(directory, exist_ok=True)
+        for batch in batches:
+            started = time.perf_counter()
+            profile = {"files": len(batch), "format": fmt, "successes": 0,
+                       "prepare_s": 0.0, "encode_s": 0.0, "write_s": 0.0}
+            staging = tempfile.mkdtemp(prefix=".herta_dds_batch_", dir=directory)
+            try:
+                sources = [_source_with_real_extension(job[1], staging) for job in batch]
+                command = [executable, "-f", fmt] + _texconv_colorspace_flags(fmt)
+                command.extend(["-o", staging, "-y"] + sources)
+                profile["prepare_s"] = time.perf_counter() - started
+                encoded = time.perf_counter()
+                process = subprocess.run(command, capture_output=True, text=True,
+                                         encoding="utf-8", errors="ignore")
+                profile["encode_s"] = time.perf_counter() - encoded
+                profile["returncode"] = process.returncode
+                profile["gpu_info"] = [line.strip() for line in (process.stdout or "").splitlines()
+                                       if "directcompute" in line.lower()]
+                writing = time.perf_counter()
+                for job, source in zip(batch, sources):
+                    entry_id, original, target, signature = job
+                    produced = os.path.join(staging, os.path.splitext(os.path.basename(source))[0] + ".dds")
+                    # texconv 可部分成功：只接收头格式正确的产物，其余按原逻辑重试。
+                    if not os.path.isfile(produced) or not existing_dds_matches_format(produced, fmt):
+                        continue
+                    if os.path.exists(target):
+                        continue
+                    shutil.move(produced, target)
+                    _dds_conversion_cache[os.path.normcase(os.path.abspath(target))] = (signature, fmt)
+                    cache, key = artifact_entries.get(entry_id, (None, None))
+                    _artifact_publish(cache, key, executable, original, target, fmt)
+                    completed.add(entry_id)
+                    profile["successes"] += 1
+                    if progress_callback is not None:
+                        progress_callback(len(completed))
+                profile["write_s"] = time.perf_counter() - writing
+            except Exception as exc:
+                profile["error"] = str(exc)
+            finally:
+                shutil.rmtree(staging, ignore_errors=True)
+                profile["total_s"] = time.perf_counter() - started
+                print("[DDSBatchProfile] " + json.dumps(profile, ensure_ascii=False), flush=True)
+    return completed
 
 
 class TT_OT_convert_to_dds(bpy.types.Operator):

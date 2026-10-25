@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 import numpy
 
 from .draw_call_model import DrawCallModel
+from .geometry_hash import extract_object_hash_data, prepare_object_hashes
 
 from ..utils.export_utils import ExportUtils
 from ..utils.obj_utils import ObjUtils
@@ -18,12 +19,9 @@ from ..blueprint.export_helper import BlueprintExportHelper
 
 import bpy
 import math
-import array
-import hashlib
+import json
 import os
 import re
-import struct
-from concurrent.futures import ThreadPoolExecutor
 from time import perf_counter
 
 
@@ -1331,99 +1329,18 @@ class SubMeshModel:
             self.drawcall_model_list = deduped
 
     def _precompute_object_hashes(self) -> tuple:
-        """预计算所有源对象的数据哈希，使用多线程并行计算
-        
-        流程：
-        1. 主线程中从 Blender 对象提取原始数据（Blender API 非线程安全）
-        2. 多线程并行计算哈希值（纯 Python 计算，线程安全）
-        
-        Returns:
-            (hashes, source_obj_list): 哈希列表和源对象引用列表
-        """
-        raw_data_list = []
-        source_obj_list = []
-        for draw_call_model in self.drawcall_model_list:
-            blender_obj_name = draw_call_model.get_blender_obj_name()
-            source_obj = ObjUtils.get_obj_by_name(blender_obj_name)
-            source_obj_list.append(source_obj)
-
-            if source_obj is None:
-                raw_data_list.append(None)
-                continue
-
-            raw_data_list.append(self._extract_object_raw_data(source_obj))
-
-        # 第二步：使用多线程并行计算哈希
-        def compute_hash(raw_data):
-            if raw_data is None:
-                return None
-            h = hashlib.md5()
-            for item in raw_data:
-                if isinstance(item, bytes):
-                    h.update(item)
-                elif isinstance(item, str):
-                    h.update(item.encode('utf-8'))
-                elif isinstance(item, int):
-                    h.update(struct.pack('i', item))
-                elif isinstance(item, float):
-                    h.update(struct.pack('f', item))
-            return h.hexdigest()
-
-        if len(raw_data_list) > 8:
-            try:
-                with ThreadPoolExecutor() as executor:
-                    hashes = list(executor.map(compute_hash, raw_data_list))
-            except Exception:
-                hashes = [compute_hash(raw_data) for raw_data in raw_data_list]
-        else:
-            hashes = [compute_hash(raw_data) for raw_data in raw_data_list]
-
+        """主线程批量提取，原生权重打包/哈希并行；同一源对象只提取一次。"""
+        hashes, source_obj_list, profile = prepare_object_hashes(
+            self.drawcall_model_list, ObjUtils.get_obj_by_name,
+            extractor=self._extract_object_raw_data,
+        )
+        print('[GeometryHashProfile] ' + json.dumps(profile, ensure_ascii=False), flush=True)
         return hashes, source_obj_list
 
     @staticmethod
     def _extract_object_raw_data(obj) -> list:
-        """从 Blender 对象提取用于哈希计算的原始数据
-        
-        包含：顶点位置、顶点组名称和权重、UV 数据
-        使用 foreach_get 批量读取，性能远优于逐顶点迭代
-        """
-        mesh = obj.data
-        raw_data = []
-
-        # 1. 顶点位置数据
-        vert_count = len(mesh.vertices)
-        raw_data.append(vert_count)
-        if vert_count > 0:
-            coords = array.array('f', [0.0] * (vert_count * 3))
-            mesh.vertices.foreach_get('co', coords)
-            raw_data.append(coords.tobytes())
-
-        # 2. 顶点组名称（顶点组存储在 Object 层面，不同对象可以不同）
-        vg_count = len(obj.vertex_groups)
-        raw_data.append(vg_count)
-        for vg in obj.vertex_groups:
-            raw_data.append(vg.name)
-
-        # 3. 顶点组权重数据
-        if vert_count > 0 and vg_count > 0:
-            for vi, vert in enumerate(mesh.vertices):
-                for group in vert.groups:
-                    raw_data.append(vi)
-                    raw_data.append(group.group)
-                    raw_data.append(group.weight)
-
-        # 4. UV 数据
-        uv_layer_count = len(mesh.uv_layers)
-        raw_data.append(uv_layer_count)
-        for uv_layer in mesh.uv_layers:
-            uv_count = len(uv_layer.data)
-            raw_data.append(uv_count)
-            if uv_count > 0:
-                uvs = array.array('f', [0.0] * (uv_count * 2))
-                uv_layer.data.foreach_get('uv', uvs)
-                raw_data.append(uvs.tobytes())
-
-        return raw_data
+        """保持原哈希字节顺序，权重使用连续列数组代替大量混合 Python 对象。"""
+        return extract_object_hash_data(obj)
 
     def _normalize_temp_obj_for_export(self, temp_obj: bpy.types.Object):
         if self.d3d11_game_type is None:

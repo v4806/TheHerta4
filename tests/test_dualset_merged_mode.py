@@ -93,6 +93,7 @@ _real_ini = _load_real(f"{PKG}.common.m_ini_builder", "common/m_ini_builder.py")
 M_IniBuilder = _real_ini.M_IniBuilder
 M_IniSection = _real_ini.M_IniSection
 M_SectionType = _real_ini.M_SectionType
+_load_real(f"{PKG}.common.geometry_hash", "common/geometry_hash.py")
 _sm = _load_real(f"{PKG}.common.submesh_model", "common/submesh_model.py")
 SubMeshModel = _sm.SubMeshModel
 _efmi = _load_real(f"{PKG}.ui.universal.efmi", "ui/universal/efmi.py")
