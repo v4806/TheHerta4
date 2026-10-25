@@ -3924,6 +3924,123 @@ class HIMIMergedAttachCsTests(unittest.TestCase):
         self.assertIn("base_slot = 0xFFFFFFFFu;", code)
         self.assertIn("if (base_slot == 0xFFFFFFFFu)", code)
 
+    def test_merged_attach_borrow_block_uses_export_time_rows_and_live_palettes(self):
+        """借用块：行数只信导出期常量、X_源 每帧从**两支活 palette** 现算（t91 修）。
+
+        实机证伪的两条旧写法都必须被判据钉死：
+        1. ``himi_borrow_map.GetDimensions()`` —— typed 视图 1 分量 + HLSL 元素 4 分量落进跨显卡
+           未定义区，实测 216 行只回 60 行 ⇒ 表里后 156 行永远不执行；
+        2. 读 ``himi_object_matrix`` 合成 X_源 —— 那张表的来源在真机上不是物体矩阵（恒零）⇒
+           X 恒退回载荷 = 宿主族单位阵 ⇒ 借用槽写成裸 P_源。
+        """
+        sample = _himi_exporter.MERGED_ATTACH_BASE_TABLE_SAMPLE_RANGES
+        text = _himi_exporter.merged_attach_hlsl_text()
+        code = _himi_exporter._strip_hlsl_comments(text)
+        families = _runtime.borrow_palette_families(sample)
+        rank_count = max(1, len(families))
+        # 行数 = 本次 ranges 里**借用行最多的那一族**（参考样例没有借用 ⇒ 下限 1，空表哨兵）
+        sample_rows = max(
+            [len(rows) for rows in _runtime.borrow_map_rows_by_family(sample).values()] or [0]
+        )
+        self.assertIn(
+            f"#define HIMI_BORROW_ROWS {max(1, sample_rows)}u",
+            code,
+            "借用表行数必须由导出期按本次 ranges 算出（不信运行期 GetDimensions）",
+        )
+        self.assertIn(f"#define HIMI_BORROW_RANK_COUNT {rank_count}u", code)
+        self.assertIn("uint borrow_elements = HIMI_BORROW_ROWS;", code)
+        self.assertNotIn(
+            "himi_borrow_map.GetDimensions", code, "行数必须来自导出期常量，不许退回运行期读维度"
+        )
+        # 骨对 = 只有索引的两张表，缺省全是哨兵（没有解出的骨对 ⇒ 该槽退回单位阵）
+        for name in ("HIMI_BORROW_PAIR_OWN", "HIMI_BORROW_PAIR_SRC"):
+            self.assertIn(f"static const uint {name}[{rank_count * rank_count}] = {{", code)
+            self.assertIn(f"{name}[borrow_pair_index]", code)
+        self.assertIn(
+            "himi_affine_mul(borrow_m_own,",
+            code,
+            "X_源 必须 = P_本族[p]·P_来源[q]⁻¹（own 在前）",
+        )
+        self.assertEqual(
+            code.count("himi_affine_mul(borrow_m_own, himi_affine_inverse(borrow_m_src))"),
+            1,
+            "X_源 每帧现算恰好一次",
+        )
+        self.assertNotIn("himi_object_matrix[borrow_base_row", code, "不许再读恒零的物体矩阵表")
+        # 结构门：借用目标必然落在本族块尾，读到 0 / 被截断的行必须跳过
+        self.assertIn("borrow_entry.x < base_slot + span_slots", code)
+        self.assertLess(
+            code.index("borrow_entry.x == 0xFFFFFFFFu"),
+            code.index("borrow_entry.x < base_slot + span_slots"),
+            "哨兵判断必须先于结构门（哨兵行的 x 是 0xFFFFFFFF，落在块尾判断之外）",
+        )
+        self.assertLess(
+            code.index("borrow_entry.x < base_slot + span_slots"),
+            code.index("uint borrow_rank = borrow_entry.y;"),
+            "结构门必须先于读 rank",
+        )
+        # 有借用行时行数由 ranges 现算（这里 1 行），显式给出 borrow_rows 时以它为准
+        borrowed = {
+            "famA": {
+                "base": 0,
+                "slots": 10,
+                "block_slots": 11,
+                "own_block": True,
+                "borrow": ({"target_slot": 10, "source_family": "famB", "source_local": 3},),
+            },
+            "famB": {"base": 11, "slots": 8, "block_slots": 8, "own_block": True},
+        }
+        self.assertEqual(_runtime.borrow_palette_families(borrowed), ["famA", "famB"])
+        self.assertEqual(
+            _runtime.borrow_map_rows_by_family(borrowed), {"famA": [(10, 1, 3)], "famB": []}
+        )
+        borrowed_code = _himi_exporter._strip_hlsl_comments(
+            _himi_exporter.merged_attach_hlsl_text(ranges=borrowed)
+        )
+        self.assertIn("#define HIMI_BORROW_ROWS 1u", borrowed_code, "行数 = ranges 现算")
+        self.assertIn("#define HIMI_BORROW_RANK_COUNT 2u", borrowed_code)
+        self.assertIn(
+            "#define HIMI_BORROW_ROWS 216u",
+            _himi_exporter._strip_hlsl_comments(
+                _himi_exporter.merged_attach_hlsl_text(ranges=borrowed, borrow_rows=216)
+            ),
+            "导出侧显式给出的行数必须优先（实机借用表 216 行）",
+        )
+        # 骨对表真被填进去时能逐字出现在文本里（索引表，不是矩阵常量）
+        filled = _himi_exporter.merged_attach_hlsl_text(
+            borrow_pairs={(0, 1): (7, 11), (2, 0): (5, 3)}
+        )
+        filled_code = _himi_exporter._strip_hlsl_comments(filled)
+        own_table = filled_code.split("HIMI_BORROW_PAIR_OWN[", 1)[1].split("};", 1)[0]
+        self.assertIn("7u", own_table, "本族槽必须按 (本族序号, rank) 落进索引表")
+        self.assertIn("5u", own_table)
+        self.assertEqual(_himi_exporter.merged_attach_borrow_problems(filled), [])
+
+    def test_merged_attach_borrow_predicate_rejects_the_old_x_path(self):
+        """两态：把行数退回 GetDimensions / 把 X_源 退回物体矩阵表，都必须报 problem。"""
+        good = _himi_exporter.merged_attach_hlsl_text()
+        self.assertEqual(_himi_exporter.merged_attach_borrow_problems(good), [])
+        rows_back = good.replace(
+            "uint borrow_elements = HIMI_BORROW_ROWS;",
+            "uint borrow_elements = 0u;\n    himi_borrow_map.GetDimensions(borrow_elements);",
+        )
+        self.assertNotEqual(rows_back, good, "夹具前提：替换必须真的生效")
+        self.assertNotEqual(
+            _himi_exporter.merged_attach_borrow_problems(rows_back),
+            [],
+            "退回运行期 GetDimensions 必须判红（实机只回 1/4 不到的行数）",
+        )
+        x_back = good.replace(
+            "himi_affine_mul(borrow_m_own, himi_affine_inverse(borrow_m_src))",
+            "himi_affine_mul(himi_affine_inverse(borrow_m_base), borrow_m_src)",
+        )
+        self.assertNotEqual(x_back, good, "夹具前提：替换必须真的生效")
+        self.assertNotEqual(
+            _himi_exporter.merged_attach_borrow_problems(x_back),
+            [],
+            "退回 inv(P_宿主)·P_源 必须判红（实测差 1.8 / 1.3，方向错）",
+        )
+
     def test_merged_attach_cs_predicate_is_not_vacuous(self):
         """两态：把基址表删掉 / 把 IniParams 读回来 / 退回逐族宏，每一条都必须报错。"""
         good = _himi_exporter.merged_attach_hlsl_text()
@@ -5055,82 +5172,40 @@ class HIMILocalZeroSlotMappingTests(unittest.TestCase):
         )
 
 
-class HIMIVertexGroupIndexNameTests(unittest.TestCase):
-    """【T45-F4】``index == int(name)`` 的导出期断言（两态）。"""
+class HIMIVertexGroupNameContractTests(unittest.TestCase):
+    """【t111】导出只认组名；导出前不再扫场景网格的「索引 == 名字」。
 
-    def test_pure_predicate_two_state(self):
-        self.assertEqual(
-            _skeleton.vertex_group_index_name_problems([(0, "0"), (1, "1"), (342, "342")]),
-            [],
-            "真实场景形态（3120/3120 实测）必须通过",
-        )
-        bad_name = _skeleton.vertex_group_index_name_problems([(0, "0"), (1, "77")])
-        self.assertEqual(len(bad_name), 1, bad_name)
-        self.assertIn("索引 ≠ 名字", bad_name[0])
-        nonnumeric = _skeleton.vertex_group_index_name_problems([(0, "Bone")])
-        self.assertEqual(len(nonnumeric), 1, nonnumeric)
-        self.assertIn("非数字", nonnumeric[0])
-        # 读不到 ``.index`` ⇒ unavailable（不阻断；真实 bpy 恒有 index）
-        self.assertEqual(
-            _skeleton.vertex_group_index_name_problems(
-                [types.SimpleNamespace(name="Bone")]
-            ),
-            [],
-        )
+    被删门控的事故（m02503）：它按**工作空间 submesh 名**去场景里取物体（LOD0.2c706fbd-5259-55380 等 12 个名字），而导出真正的几何来自 DrawCall 指向的 …_copy 物体、写 BLENDINDICES 的是 TEMP_SUBMESH_MERGED_* 临时合并对象 ⇒ 检查集与写入集无关，蓝图里根本没连的遗留原版网格把导出整死。
+    """
 
-    def test_exporter_gate_is_fatal_only_when_groups_disagree(self):
+    def test_early_gate_and_its_helpers_are_gone(self):
+        self.assertFalse(
+            hasattr(ExportHIMI, "_himi_verify_vertex_group_index_names"),
+            "早期门控已删除：它查的不是导出读取的物体（作用域错位）",
+        )
+        for name in (
+            "vertex_group_index_name_problems",
+            "blender_vertex_group_index_name_problems",
+        ):
+            self.assertFalse(hasattr(_skeleton, name), name + " 已随门控删除")
+
+    def test_slot_comes_from_group_name_not_index_TWO_STATE(self):
+        """索引与名字分叉时取**名字**（真对象形态）；非数字名 fail-closed。
+
+        这就是删掉「索引 == 名字」门控的依据：分叉本身不再是错误，只有非数字名才是。
+        """
         Fatal = sys.modules[f"{PKG}.utils.format_utils"].Fatal
-        blueprint_model = types.SimpleNamespace(
-            keyname_mkey_dict={}, ordered_draw_obj_data_model_list=[]
-        )
-        exporter = ExportHIMI(blueprint_model)
-        exporter.drawib_model_list = []
-        # A 态：没有 bpy / 没有可判组的对象 ⇒ 不抛（离线环境不误杀）
-        exporter._himi_verify_vertex_group_index_names()
-        # B 态：注入一个「名字与索引分叉」的组 ⇒ 必须 Fatal（零写入：进程内 monkeypatch）
-        nope = _skeleton._require_bpy
-        objects = {
-            "LOD0.aaaa-1-0": types.SimpleNamespace(
-                vertex_groups=[
-                    types.SimpleNamespace(index=0, name="3"),
-                    types.SimpleNamespace(index=1, name="1"),
-                ]
-            )
-        }
-        fake_bpy = types.SimpleNamespace(data=types.SimpleNamespace(objects=objects))
-        _skeleton._require_bpy = lambda: fake_bpy
-        exporter._himi_export_entries = lambda: [
-            {"unique_str": "LOD0.aaaa-1-0", "bare": "aaaa-1-0"}
-        ]
-        exporter.drawib_model_list = [
-            types.SimpleNamespace(
-                submesh_model_list=[
-                    types.SimpleNamespace(
-                        workspace_unique_str="LOD0.aaaa-1-0", blender_obj_name="LOD0.aaaa-1-0"
-                    )
-                ]
-            )
-        ]
-        try:
-            with self.assertRaises(Fatal) as caught:
-                exporter._himi_verify_vertex_group_index_names()
-            self.assertIn("索引 == 名字", str(caught.exception))
-            self.assertIn("组 #0", str(caught.exception))
-            # 还原成正例 ⇒ 必须不抛
-            objects["LOD0.aaaa-1-0"].vertex_groups = [
-                types.SimpleNamespace(index=0, name="0"),
-                types.SimpleNamespace(index=1, name="1"),
-            ]
-            exporter._himi_verify_vertex_group_index_names()
-            # 再变异一次 ⇒ 又必须抛（两态都能反复观测，不是一次性）
-            objects["LOD0.aaaa-1-0"].vertex_groups = [
-                types.SimpleNamespace(index=0, name="0"),
-                types.SimpleNamespace(index=1, name="9"),
-            ]
-            with self.assertRaises(Fatal):
-                exporter._himi_verify_vertex_group_index_names()
-        finally:
-            _skeleton._require_bpy = nope
+        resolve = _vertexgroup.VertexGroupUtils.resolve_group_slot
+        # A 态：索引 1 / 名字 273 分叉 ⇒ 取名字（不是索引），不抛
+        self.assertEqual(resolve(["184", "273"], 1, True), 273)
+        self.assertEqual(resolve(["0", "216"], 1, True), 216)
+        # B 态：非数字名 ⇒ strict 下 Fatal（写盘点的存活护栏）
+        with self.assertRaises(Fatal) as caught:
+            resolve(["Bone"], 0, True)
+        self.assertIn("不是纯数字", str(caught.exception))
+        # C 态：没有名单 ⇒ strict 下 Fatal（不许退回取序号）
+        with self.assertRaises(Fatal):
+            resolve(None, 0, True)
 
 
 class HIMIDeformReplayUnconditionalTests(unittest.TestCase):
@@ -5239,7 +5314,6 @@ class HIMIMergedDeformKeyTests(unittest.TestCase):
             message="",
         )
         exporter._himi_verify_base_table_against_plan = lambda plan: None
-        exporter._himi_verify_vertex_group_index_names = lambda: None
         exporter._himi_verify_deform_draw_structure = lambda plan: None
         # 不抛 = 不阻断（K4 只诊断）；诊断文本由 merged_deform_key_problems 直接断言
         decision = exporter._himi_enforce_contract()
@@ -6584,6 +6658,12 @@ class HIMIBorrowLayoutBaselineTests(unittest.TestCase):
             self.assertEqual(decl.name, f"ResourceHI3BorrowMap_{family}")
             self.assertEqual(int(decl.array), len(rows), f"{family}: ini array = 该族行数")
             self.assertEqual(int(decl.stride), _runtime.BORROW_MAP_STRIDE)
+            self.assertEqual(
+                decl.ini_format,
+                "R32G32B32A32_UINT",
+                f"{family}: 4 分量 typed 视图（与 HLSL 的 Buffer<uint4> 元素同宽）；"
+                "R32_UINT 是 1 分量视图 + 4 分量元素，实机 GetDimensions 只回 60/216 行",
+            )
         empty = _runtime.borrow_map_payload(())
         self.assertEqual(
             struct.unpack("<4I", empty),
