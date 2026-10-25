@@ -29,6 +29,11 @@ for package_name in (PKG, f"{PKG}.blueprint", f"{PKG}.common", f"{PKG}.toolkit")
     package.__path__ = []
 
 
+def _is_dds_file_stub(path):
+    """本测试用假字节造贴图，按扩展名判定 DDS（生产侧按文件头判定）。"""
+    return str(path or "").lower().endswith(".dds")
+
+
 _fake_bpy = types.SimpleNamespace(
     types=types.SimpleNamespace(PropertyGroup=object, Operator=object, Node=object),
     props=types.SimpleNamespace(
@@ -73,6 +78,7 @@ _install_module(
 _install_module(
     f"{PKG}.toolkit.tt_dds_conversion",
     convert_texture_to_dds_cached=lambda *_args, **_kwargs: (True, ""),
+    is_dds_file=lambda path: _is_dds_file_stub(path),
 )
 
 # 细分进度上报桩：真实实现在 blueprint/export_progress.py（无 stage 文件时静默），
