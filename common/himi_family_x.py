@@ -568,6 +568,59 @@ def solve_family_x_from_palettes(
     }
 
 
+def solve_palette_pair(borrower_palette, source_palette, *, tol: float = PALETTE_SOLVE_TOL) -> dict:
+    """同一根物理骨在两族 palette 里的局部槽对（借位槽实时求 X 用）。
+
+    借用槽要的是 `X_源 = P_本族[p] · P_源[q]⁻¹`（**own 在前**）：p/q 正是同一根骨在
+    借用方/来源方 palette 里的两个槽号，所以复用 `solve_family_x_from_palettes`
+    （base = 借用方、family = 来源方），再从 `matched` 里取**残差最小**的那一项。
+    `matched` 的元组语义是 `(族槽, 宿主槽, 残差)`：这里的族 = 来源方、宿主 = 借用方
+    ⇒ `(src_slot, own_slot, residual)`。
+
+    解不出（两族没有共享骨 / 一侧为空）⇒ `ok=False`、`own = src = -1`：
+    运行期那时退回单位阵（本帧先原样写 P_源），绝不猜一个槽对。
+    """
+    solved = solve_family_x_from_palettes(borrower_palette, source_palette, tol=tol)
+    if not solved.get("ok"):
+        return {
+            "ok": False,
+            "own": -1,
+            "src": -1,
+            "residual": float("inf"),
+            "votes": 0,
+            "note": str(solved.get("note") or "两族 palette 解不出共享骨"),
+        }
+    matched = [tuple(item) for item in (solved.get("matched") or ())]
+    if not matched:
+        return {
+            "ok": False,
+            "own": -1,
+            "src": -1,
+            "residual": float("inf"),
+            "votes": 0,
+            "note": "解出的候选没有命中任何骨对",
+        }
+    src_slot, own_slot, residual = min(matched, key=lambda item: float(item[2]))
+    votes = int(solved.get("votes", 0) or 0)
+    if votes < 3:
+        return {
+            "ok": False,
+            "own": -1,
+            "src": -1,
+            "residual": float(residual),
+            "votes": votes,
+            "note": f"匹配命中票数过低（{votes} < 3），两族无足够共享骨，放弃骨对匹配",
+        }
+    return {
+        "ok": True,
+        "own": int(own_slot),
+        "src": int(src_slot),
+        "residual": float(residual),
+        "votes": votes,
+        "note": "",
+    }
+
+
 # --------------------------------------------------------------------------- #
 # 参与合并的族（与导出侧同一事实源）
 # --------------------------------------------------------------------------- #
