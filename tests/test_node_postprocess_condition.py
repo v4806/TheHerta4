@@ -12,7 +12,10 @@
 - 检测 hash 已被本 mod 接管时，置位块落在该 hash 自己的 TextureOverride 段体
   顶层（段根匹配键之后、门控 if 之外）；
 - 导出执行：先改写一次，再次执行不再改写文件（落盘幂等）；
-- 同目录分文件（multifile）里有同名段时只提示、不改动分文件。
+- 同目录分文件（multifile）里有同名段时只提示、不改动分文件；
+- 纯贴图模式段（材质转资源pro 生成、物体不在导出链上）：按物体名 hash 兜底
+  找到 draw_ib、段登记表能反查到该类段；门控只包 `= ref` 切换块，顶层的
+  ``Resource`` 槽位别名 ``= null`` 兜底行必须留在门控 if 之外。
 """
 import importlib.util
 import os
@@ -259,6 +262,28 @@ INI_WITH_PRESENT = (
     "post $some_other = 1\n"
 )
 
+#: 「材质转资源pro」纯贴图模式生成的段：顶部 null 兜底 + 可门控的切换 if 块。
+PURE_TEXTURE_SECTION = "TextureOverride_MaterialPureTexture_7fbbcf0d"
+PURE_TEXTURE_INI = (
+    "[Constants]\n"
+    "global persist $mod_enabled = 1\n"
+    "\n"
+    f"[{PURE_TEXTURE_SECTION}]\n"
+    "; --- 纯贴图替换（无网格修改）：由「材质转资源pro」节点生成 ---\n"
+    "; 物体: LOD0.7fbbcf0d-7116-0.脸\n"
+    "hash = 7fbbcf0d\n"
+    "Resource\\ZZMI\\Diffuse = null\n"
+    "Resource\\ZZMI\\NormalMap = null\n"
+    "; DiffuseMap 材质切换 (组: $swapkey154)\n"
+    "if $swapkey154 == 0\n"
+    "    Resource\\ZZMI\\Diffuse = ref Resource_DiffuseMap_A\n"
+    "endif\n"
+    "run = CommandList\\ZZMI\\SetTextures\n"
+    "\n"
+    "[Present]\n"
+    "post $some_other = 1\n"
+)
+
 
 def _make_model(object_name=OBJECT_NAME, draw_ib=DRAW_IB):
     draw_call = types.SimpleNamespace(
@@ -427,6 +452,55 @@ class ConditionApplyTests(unittest.TestCase):
         # 目标段自身照旧被门控
         self.assertIn(f"if $cond_{NS}_cond_active == 1", lines)
 
+    def test_pure_texture_section_keeps_slot_nulls_top_level(self):
+        """纯贴图模式段：顶层 null 兜底不进门控，只有 `= ref` 切换块被门控。"""
+        updated, stats = module._apply_condition(
+            PURE_TEXTURE_INI, NS, {PURE_TEXTURE_SECTION}, DETECT_HASH
+        )
+
+        self.assertEqual(1, stats["wrapped"])
+        lines = _stripped_lines(updated)
+        begin = lines.index(f"; @@COND:{NS}:begin@@")
+        end = lines.index(f"; @@COND:{NS}:end@@")
+        diffuse_null = lines.index(r"Resource\ZZMI\Diffuse = null")
+        normal_null = lines.index(r"Resource\ZZMI\NormalMap = null")
+        ref_line = lines.index(r"Resource\ZZMI\Diffuse = ref Resource_DiffuseMap_A")
+        run_line = lines.index(r"run = CommandList\ZZMI\SetTextures")
+        self.assertLess(diffuse_null, begin)
+        self.assertLess(normal_null, begin)
+        self.assertLess(begin, ref_line)
+        self.assertLess(ref_line, end)
+        self.assertGreater(run_line, end)
+
+        # 二次执行幂等（门控块与 null 行都不重复、不移动）
+        again, _stats = module._apply_condition(
+            updated, NS, {PURE_TEXTURE_SECTION}, DETECT_HASH
+        )
+        self.assertEqual(updated, again)
+
+    def test_efmi_slot_null_is_also_kept_top_level(self):
+        """EFMI（RabbitFx）槽位的 ``= null`` 同样必须留在门控 if 之外。"""
+        text = (
+            "[TextureOverride_MaterialPureTexture_7fbbcf0d]\n"
+            "hash = 7fbbcf0d\n"
+            r"Resource\RabbitFx\Diffuse = null" "\n"
+            "if $swapkey154 == 0\n"
+            "    " r"Resource\RabbitFx\Diffuse = ref Resource_A" "\n"
+            "endif\n"
+        )
+
+        updated, stats = module._apply_condition(
+            text, NS, {"TextureOverride_MaterialPureTexture_7fbbcf0d"}, DETECT_HASH
+        )
+
+        self.assertEqual(1, stats["wrapped"])
+        lines = _stripped_lines(updated)
+        begin = lines.index(f"; @@COND:{NS}:begin@@")
+        self.assertLess(lines.index(r"Resource\RabbitFx\Diffuse = null"), begin)
+        self.assertGreater(
+            lines.index(r"Resource\RabbitFx\Diffuse = ref Resource_A"), begin
+        )
+
 # ---------------------------------------------------------------------------
 # 导出执行层
 # ---------------------------------------------------------------------------
@@ -507,6 +581,45 @@ class ConditionExecuteTests(unittest.TestCase):
             self.assertEqual(sibling_before, Path(sibling_path).read_bytes())
             self.assertTrue(
                 any("分文件" in text and "Sub.ini" in text for text in _log.texts("info")),
+                _log.records,
+            )
+
+    def test_non_chain_pure_texture_section_is_gated(self):
+        """列表里不在导出链的物体：名字 hash 兜底 + 纯贴图段登记，仍能门控。
+
+        复现现场：两个脸部没有导入/不在节点链上，只被「材质转资源pro」的纯贴图
+        模式覆盖；它们的段不是导出器写的，只能靠纯贴图模式登记进段登记表。
+        """
+        registry = _FakeRegistry(
+            [
+                {
+                    "name": PURE_TEXTURE_SECTION,
+                    "draw_ib": DRAW_IB,
+                    "type": "TextureOverrideMaterialPureTexture",
+                }
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_ini(tmp, PURE_TEXTURE_INI)
+            _ExportState.target_ini = path
+            # 模型里没有脸所属的 DrawCall（脸不在节点链上），只有身体
+            _ExportState.model = _make_model(
+                object_name="LOD0.28e05a59-59094-0.身体", draw_ib="28e05a59"
+            )
+            node = _make_node(object_names=["LOD0.7fbbcf0d-1260-9402.脸"])
+
+            with _RegistryPatch(registry):
+                self.assertTrue(node.execute_postprocess(tmp))
+
+            updated = Path(path).read_text(encoding="utf-8")
+            ns = node._namespace()
+            self.assertIn(f"; @@COND:{ns}:begin@@", updated)
+            self.assertIn(r"Resource\ZZMI\Diffuse = ref Resource_DiffuseMap_A", updated)
+            lines = _stripped_lines(updated)
+            begin = lines.index(f"; @@COND:{ns}:begin@@")
+            self.assertLess(lines.index(r"Resource\ZZMI\Diffuse = null"), begin)
+            self.assertTrue(
+                any("门控 1 个段" in text for text in _log.texts("info")),
                 _log.records,
             )
 

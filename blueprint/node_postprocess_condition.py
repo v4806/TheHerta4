@@ -21,6 +21,13 @@
    「这个 draw_ib 产出了哪些 ini 段」，再排除 ``Resource*``（资源声明段）
    与 ``TextureOverrideCheckHash*``（本节点自己的检测段）。
 
+   列表里的物体**不在节点链上**时也能门控：「材质转资源pro」的**纯贴图模式**
+   （目标物体不在导出链、只生成贴图替换段）会把它凭空生成的
+   ``[TextureOverride_MaterialPureTexture_<hash>]`` 段登记进同一张登记表
+   （段类型 ``TextureOverrideMaterialPureTexture``），本节点据此把它纳入目标段。
+   这类段自带顶层的 ``Resource`` 槽位别名 ``= null`` 兜底行（纯贴图模式负责写），
+   门控关闭时才回落原生贴图，而不是残留同帧别的部件的 mod 贴图。
+
 「哈希出现」的检测方式（两种，优先第一种）
 ------------------------------------------
 
@@ -461,14 +468,15 @@ def _find_sections(lines):
 #: - 只在 if 体内赋值的 ``$变量`` 会被加载期优化器按初值静态折叠
 #:   （``$zz_ms_seen_*`` / ``$zz_ms_occ_*`` 的 sticky 累加尤其致命）；
 #: - ``ResourceZZPalette_*`` 是骨架状态捕获，必须每帧在顶层执行；
-#: - ``Resource\ZZMI\* = null`` 是「不覆盖」的安全置空：条件不满足时不执行
-#:   ``= ref``、但要保留这份置空，``SetTextures`` 才会按 unless_null 不覆盖槽位
-#:   -> 原生贴图；把它门控掉会让槽位残留上一次的 mod 贴图。
+#: - 任意 ``Resource\<ns>\<槽位> = null`` 是「不覆盖」的安全置空（ZZMI /
+#:   EFMI 的 SetTextures 都按 unless_null 处理）：条件不满足时不执行
+#:   ``= ref``、但要保留这份置空，槽位才会回落原生贴图；把它门控掉会让槽位
+#:   残留同帧上一次的 mod 贴图（「材质转资源pro」纯贴图模式段就靠这行兜底）。
 _TOP_ONLY_PATTERNS = (
     (re.compile(r"^run\s*=", re.IGNORECASE), "run"),
     (re.compile(r"^\$[A-Za-z_\\]"), "$变量"),
     (re.compile(r"^resourcezzpalette", re.IGNORECASE), "Palette 捕获"),
-    (re.compile(r"^resource\\zzmi\\[^=]*=\s*null\s*(?:;.*)?$", re.IGNORECASE), "贴图槽置空"),
+    (re.compile(r"^resource\\[^=]*=\s*null\s*(?:;.*)?$", re.IGNORECASE), "贴图槽置空"),
 )
 
 #: 段体内**可以门控**（放进 ``if`` 体内）的行判定；逐个尝试，命中即可门控。
