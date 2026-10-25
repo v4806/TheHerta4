@@ -18,12 +18,14 @@ import os
 import glob
 import re
 import shutil
+import tempfile
 import uuid
 from collections import OrderedDict
 
 import bpy
 
 from .node_postprocess_base import SSMTNode_PostProcess_Base
+from ..common.ui_image_color import mark_png_as_srgb
 
 try:
     from .node_swap_ini import SwapKeyINIGenerator
@@ -74,6 +76,32 @@ class SSMT_SwapPanelButtonEntry(bpy.types.PropertyGroup):
     image_path: bpy.props.StringProperty(name="按钮图片", subtype='FILE_PATH', default="")
 
 
+class SSMT_OT_SwapPanel_AddActiveObject(bpy.types.Operator):
+    bl_idname = "ssmt.swap_panel_add_active_object"
+    bl_label = "添加选中物体"
+    bl_description = "将当前活动物体设为角色检测目标，并自动解析哈希值和 IndexCount"
+    bl_options = {'REGISTER', 'INTERNAL'}
+    node_name: bpy.props.StringProperty()
+
+    def execute(self, context):
+        space_data = getattr(context, "space_data", None)
+        tree = (getattr(space_data, "edit_tree", None) or getattr(space_data, "node_tree", None)) if space_data else None
+        node = tree.nodes.get(self.node_name) if tree else None
+        if node is None or node.bl_idname not in {'SSMTNode_PostProcess_SwapPanel', 'SSMTNode_PostProcess_CombinedPanel'}:
+            self.report({'WARNING'}, "无法找到物体切换面板节点")
+            return {'CANCELLED'}
+        obj = getattr(context, "active_object", None)
+        if obj is None:
+            obj = getattr(getattr(context, "view_layer", None), "objects", None)
+            obj = getattr(obj, "active", None)
+        if obj is None:
+            self.report({'WARNING'}, "当前没有选中活动物体")
+            return {'CANCELLED'}
+        node.target_object = obj.name
+        self.report({'INFO'}, f"已添加选中物体：{obj.name}")
+        return {'FINISHED'}
+
+
 class SSMT_OT_SwapPanel_ParseObject(bpy.types.Operator):
     bl_idname = "ssmt.swap_panel_parse_object"
     bl_label = "解析物体"
@@ -86,7 +114,7 @@ class SSMT_OT_SwapPanel_ParseObject(bpy.types.Operator):
             tree = getattr(space_data, "edit_tree", None) or getattr(space_data, "node_tree", None)
             if tree:
                 node = tree.nodes.get(self.node_name)
-                if node and node.bl_idname == 'SSMTNode_PostProcess_SwapPanel':
+                if node and node.bl_idname in {'SSMTNode_PostProcess_SwapPanel', 'SSMTNode_PostProcess_CombinedPanel'}:
                     node._update_from_object()
                     self.report({'INFO'}, f"已解析物体 '{node.target_object}' -> 哈希: {node.detect_hash}, IndexCount: {node.detect_index_count}")
                     return {'FINISHED'}
@@ -107,7 +135,7 @@ class SSMT_OT_SwapPanel_Scan(bpy.types.Operator):
             tree = getattr(space_data, "edit_tree", None) or getattr(space_data, "node_tree", None)
             if tree:
                 node = tree.nodes.get(self.node_name)
-                if node and node.bl_idname == 'SSMTNode_PostProcess_SwapPanel':
+                if node and node.bl_idname in {'SSMTNode_PostProcess_SwapPanel', 'SSMTNode_PostProcess_CombinedPanel'}:
                     count = node._refresh_entries()
                     self.report({'INFO'}, f"已刷新物体切换列表，共 {count} 项")
                     return {'FINISHED'}
@@ -128,7 +156,7 @@ class SSMT_OT_SwapPanel_Refresh(bpy.types.Operator):
             tree = getattr(space_data, "edit_tree", None) or getattr(space_data, "node_tree", None)
             if tree:
                 node = tree.nodes.get(self.node_name)
-                if node and node.bl_idname == 'SSMTNode_PostProcess_SwapPanel':
+                if node and node.bl_idname in {'SSMTNode_PostProcess_SwapPanel', 'SSMTNode_PostProcess_CombinedPanel'}:
                     ini_path = (node.ini_file_path or "").strip() or node.last_mod_ini_path
                     if not ini_path or not os.path.isfile(ini_path):
                         self.report({'WARNING'}, "未找到目标 ini：请先导出一次 mod，或在节点「INI文件」中指定")
@@ -143,7 +171,614 @@ class SSMT_OT_SwapPanel_Refresh(bpy.types.Operator):
         return {'CANCELLED'}
 
 
-class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
+class SSMT_OT_CombinedPanel_Refresh(bpy.types.Operator):
+    bl_idname = "ssmt.combined_panel_refresh"
+    bl_label = "应用设置到Mod"
+    bl_description = "使用共用 INI 路径依次更新形态键滑块和物体切换设置"
+    bl_options = {'REGISTER', 'INTERNAL'}
+    node_name: bpy.props.StringProperty()
+
+    def execute(self, context):
+        space_data = getattr(context, "space_data", None)
+        tree = None
+        if space_data and space_data.type == 'NODE_EDITOR':
+            tree = getattr(space_data, "edit_tree", None) or getattr(space_data, "node_tree", None)
+        if tree is None:
+            self.report({'WARNING'}, "请在蓝图节点编辑器中执行此操作")
+            return {'CANCELLED'}
+
+        combined = tree.nodes.get(self.node_name)
+        if combined is None or combined.bl_idname != 'SSMTNode_PostProcess_CombinedPanel':
+            self.report({'WARNING'}, "无法找到「切换＆滑块面板」节点")
+            return {'CANCELLED'}
+
+        slider_node = combined._find_shape_ext_node()
+        ini_path = (combined.ini_file_path or "").strip()
+        if not ini_path:
+            ini_path = (combined.last_mod_ini_path or "").strip()
+        if not ini_path and slider_node is not None:
+            ini_path = (slider_node.ini_file_path or "").strip() or (slider_node.last_mod_ini_path or "").strip()
+        if not ini_path or not os.path.isfile(ini_path):
+            self.report({'WARNING'}, "未找到目标 ini：请先导出一次 mod，或在共用设置中指定 INI 文件")
+            return {'CANCELLED'}
+
+        export_dir = os.path.dirname(ini_path)
+        if combined.create_cumulative_backup:
+            try:
+                combined._create_cumulative_backup(ini_path, export_dir)
+            except Exception as error:
+                print(f"[切换＆滑块面板] 创建共享备份失败: {error}")
+                self.report({'ERROR'}, "创建累积备份失败，未应用设置")
+                return {'CANCELLED'}
+
+        slider_ok = None
+        if slider_node is not None:
+            try:
+                slider_node._sync_combined_slider_config()
+                slider_ok = bool(slider_node.execute_postprocess(
+                    export_dir, _in_place=True, _ini_path=ini_path, _skip_backup=True
+                ))
+            except Exception as error:
+                print(f"[切换＆滑块面板] 更新形态键滑块设置失败: {error}")
+                slider_ok = False
+            if slider_ok:
+                slider_node.last_mod_ini_path = ini_path
+
+        try:
+            switch_ok = bool(combined.execute_postprocess(
+                export_dir,
+                _in_place=True,
+                _ini_path=ini_path,
+                _skip_backup=True,
+            ))
+        except Exception as error:
+            print(f"[切换＆滑块面板] 更新物体切换设置失败: {error}")
+            switch_ok = False
+
+        if switch_ok:
+            combined.last_mod_ini_path = ini_path
+            if slider_node is not None and slider_ok:
+                self.report({'INFO'}, f"已更新滑块与切换设置: {os.path.basename(ini_path)}")
+            elif slider_node is None:
+                self.report({'INFO'}, f"已更新物体切换设置: {os.path.basename(ini_path)}")
+            else:
+                self.report({'WARNING'}, "切换设置已更新；滑块设置更新失败，请查看控制台日志")
+            return {'FINISHED'}
+
+        self.report({'ERROR'}, "物体切换设置更新失败，请查看控制台日志")
+        return {'CANCELLED'}
+
+
+def _combined_panel_preview_image(node):
+    """Draw a lightweight PNG mockup from the current combined-panel settings."""
+    if not PIL_AVAILABLE:
+        raise RuntimeError("预览需要 Pillow")
+
+    def rgba(rgb, alpha=255):
+        values = tuple(int(max(0, min(1, float(v))) * 255) for v in rgb[:3])
+        return values + (alpha,)
+
+    def image_path(value):
+        value = (value or "").strip()
+        return bpy.path.abspath(value) if value else ""
+
+    scale = 1000
+    gap = 18
+    button_h = max(34, int(float(node.button_height) * scale))
+    slider_h = max(30, int(float(node.slider_height) * scale))
+    row_gap = max(8, int(float(node.button_row_spacing) * scale))
+    button_gap = max(8, int(float(node.button_column_spacing) * scale))
+    count = len(node.swap_panel_entries)
+    per_row = max(1, min(int(node.buttons_per_row or 1), max(1, count)))
+    button_rows = (count + per_row - 1) // per_row
+    button_area_h = max(button_h, button_rows * button_h + max(0, button_rows - 1) * row_gap) + int(float(node.button_top_padding) * scale)
+    ext = node._find_shape_ext_node()
+    slider_names = []
+    if ext is not None:
+        slider_names = [e.shape_key_name for e in getattr(ext, "play_group_entries", []) if getattr(e, "group_index", 0) > 0]
+    if not slider_names:
+        slider_names = ["形态键滑块预览"]
+    slider_content_h = len(slider_names) * slider_h + max(0, len(slider_names) - 1) * 18 + 60
+    if not node.slider_use_slider_panel:
+        slider_content_h = 0
+    elif not bool(node.auto_crop_background):
+        slider_content_h = max(slider_content_h, int(float(node.slider_panel_min_height) * scale))
+    integrated = node.panel_mode in {'INTEGRATED_TOP', 'INTEGRATED_BOTTOM'} and node.slider_use_slider_panel
+    attached = node.panel_mode == 'ATTACHED_LEFT' and node.slider_use_slider_panel
+    if integrated:
+        panel_w = max(560, per_row * 250 + (per_row - 1) * button_gap + 80)
+        panel_h = slider_content_h + button_area_h + gap * 3
+        left_panel_w = panel_w
+    elif attached:
+        panel_w = max(800, 300 + 560)
+        attached_buttons_h = max(button_h, count * button_h + max(0, count - 1) * row_gap) + int(float(node.button_top_padding) * scale)
+        panel_h = max(slider_content_h, attached_buttons_h) + gap * 2
+        left_panel_w = 300
+    else:
+        panel_w = 900 if node.slider_use_slider_panel else max(420, per_row * 250 + (per_row - 1) * button_gap + 80)
+        panel_h = max(slider_content_h, button_area_h) + gap * 2
+        left_panel_w = max(420, per_row * 250 + (per_row - 1) * button_gap + 80)
+    margin = 36
+    canvas_w = panel_w + margin * 2 + (gap if not (integrated or attached or not node.slider_use_slider_panel) else 0)
+    canvas_h = panel_h + margin * 2
+    canvas = PILImage.new('RGBA', (canvas_w, canvas_h), (36, 36, 36, 255))
+    draw = PILDraw.Draw(canvas, 'RGBA')
+    bg_color = (13, 20, 31, int(255 * float(node.background_opacity)))
+    border = rgba(node.background_border_color)
+    radius = max(0, min(100, int(node.background_corner_radius)))
+
+    def panel_rect(x, y, w, h, bg_path=""):
+        rect = (x, y, x + w, y + h)
+        path = image_path(bg_path)
+        if path and os.path.isfile(path):
+            try:
+                with PILImage.open(path) as src:
+                    source = src.convert('RGBA')
+                resampling = getattr(PILImage, "Resampling", PILImage).LANCZOS
+                source_ratio = source.width / max(1, source.height)
+                target_ratio = w / max(1, h)
+                if source_ratio > target_ratio:
+                    crop_w = max(1, int(source.height * target_ratio))
+                    left = (source.width - crop_w) // 2
+                    source = source.crop((left, 0, left + crop_w, source.height))
+                elif source_ratio < target_ratio:
+                    crop_h = max(1, int(source.width / target_ratio))
+                    top = (source.height - crop_h) // 2
+                    source = source.crop((0, top, source.width, top + crop_h))
+                fitted = source.resize((w, h), resampling)
+                canvas.alpha_composite(fitted, (x, y))
+            except Exception:
+                draw.rounded_rectangle(rect, radius=radius, fill=bg_color)
+        else:
+            draw.rounded_rectangle(rect, radius=radius, fill=bg_color)
+        if node.background_border_width:
+            draw.rounded_rectangle(rect, radius=radius, outline=border, width=max(1, int(node.background_border_width)))
+
+    def rounded_button(x, y, w, h, text, custom_path=""):
+        custom = image_path(custom_path)
+        if custom and os.path.isfile(custom):
+            try:
+                with PILImage.open(custom) as src:
+                    icon = src.convert('RGBA')
+                icon.thumbnail((w, h), getattr(PILImage, "Resampling", PILImage).LANCZOS)
+                canvas.alpha_composite(icon, (x + (w - icon.width) // 2, y + (h - icon.height) // 2))
+                return
+            except Exception:
+                pass
+        draw.rounded_rectangle((x, y, x + w, y + h), radius=5, fill=rgba(node.button_bg_color, int(255 * node.button_opacity)), outline=rgba(node.button_border_color), width=max(1, int(node.button_border_width)))
+        try:
+            font = PILImageFont.truetype("C:/Windows/Fonts/msyh.ttc", 20)
+        except Exception:
+            font = PILImageFont.load_default()
+        label = text or "切换按钮"
+        bb = draw.textbbox((0, 0), label, font=font)
+        draw.text((x + (w - (bb[2] - bb[0])) / 2, y + (h - (bb[3] - bb[1])) / 2 - bb[1]), label, font=font, fill=(255, 255, 255, 255))
+
+    button_width_px = int(float(node.button_width) * scale * (16.0 / 9.0)) if node.button_width > 0 else button_h * 3
+
+    x0, y0 = margin, margin
+    slider_bg = node.slider_background_image if integrated or attached else ""
+    if integrated:
+        panel_rect(x0, y0, panel_w, panel_h, slider_bg)
+        switch_y = y0 + gap
+        if node.panel_mode == 'INTEGRATED_BOTTOM':
+            switch_y = y0 + panel_h - button_area_h - gap
+        for idx, entry in enumerate(node.swap_panel_entries):
+            col, row = idx % per_row, idx // per_row
+            bw = button_width_px
+            bx = x0 + gap + col * (bw + button_gap)
+            by = switch_y + row * (button_h + row_gap)
+            entry_path = node.swap_panel_button_entries[idx].image_path if idx < len(node.swap_panel_button_entries) else ""
+            rounded_button(bx, by, bw, button_h, entry.comment or entry.variable_name, entry_path or node.button_image)
+        slider_start = y0 + (button_area_h + gap * 2 if node.panel_mode == 'INTEGRATED_TOP' else gap)
+        _draw_slider_preview(canvas, draw, rounded_button, node, slider_names, x0 + gap, slider_start, panel_w - gap * 2, slider_h)
+    elif attached:
+        panel_rect(x0 + left_panel_w + gap, y0, panel_w - left_panel_w - gap, panel_h, slider_bg)
+        for idx, entry in enumerate(node.swap_panel_entries):
+            by = y0 + gap + idx * (button_h + row_gap)
+            entry_path = node.swap_panel_button_entries[idx].image_path if idx < len(node.swap_panel_button_entries) else ""
+            rounded_button(x0, by, left_panel_w, button_h, entry.comment or entry.variable_name, entry_path or node.button_image)
+        _draw_slider_preview(canvas, draw, rounded_button, node, slider_names, x0 + left_panel_w + gap, y0 + gap, panel_w - left_panel_w - gap * 2, slider_h)
+    else:
+        switch_panel_h = button_area_h + gap * 2
+        panel_rect(x0, y0, left_panel_w, switch_panel_h, node.background_image)
+        for idx, entry in enumerate(node.swap_panel_entries):
+            col, row = idx % per_row, idx // per_row
+            bw = button_width_px
+            bx = x0 + gap + col * (bw + button_gap)
+            by = y0 + gap + row * (button_h + row_gap)
+            entry_path = node.swap_panel_button_entries[idx].image_path if idx < len(node.swap_panel_button_entries) else ""
+            rounded_button(bx, by, bw, button_h, entry.comment or entry.variable_name, entry_path or node.button_image)
+        if node.slider_use_slider_panel:
+            sx = x0 + left_panel_w + gap
+            panel_rect(sx, y0, panel_w - left_panel_w - gap, panel_h, node.slider_background_image)
+            _draw_slider_preview(canvas, draw, rounded_button, node, slider_names, sx + gap, y0 + gap, panel_w - left_panel_w - gap * 2, slider_h)
+
+    output = os.path.join(tempfile.gettempdir(), "ssmt_combined_panel_preview.png")
+    canvas.convert('RGB').save(output)
+    return output
+
+
+def _draw_slider_preview(canvas, draw, draw_button, node, names, x, y, width, slider_h):
+    try:
+        font = PILImageFont.truetype("C:/Windows/Fonts/msyh.ttc", 18)
+    except Exception:
+        font = PILImageFont.load_default()
+    handle_path = bpy.path.abspath(node.slider_handle_image) if node.slider_handle_image else ""
+    for index, name in enumerate(names):
+        top = y + index * (slider_h + 18)
+        draw.rounded_rectangle((x, top, x + width, top + slider_h), radius=6, fill=(50, 50, 50, 230))
+        draw.rounded_rectangle((x + 8, top + 7, x + width - 8, top + slider_h - 7), radius=5, fill=(92, 92, 92, 230))
+        label = str(name)
+        draw.text((x + 18, top + 6), label[:32], font=font, fill=(245, 245, 245, 255))
+        rounded = getattr(node, "slider_play_button_image", "")
+        if rounded:
+            draw_button(x + width - 38, top + 3, 32, slider_h - 6, "▶", rounded)
+        elif handle_path and os.path.isfile(handle_path):
+            try:
+                with PILImage.open(handle_path) as src:
+                    handle = src.convert('RGBA')
+                handle.thumbnail((slider_h - 10, slider_h - 10), getattr(PILImage, "Resampling", PILImage).LANCZOS)
+                canvas.alpha_composite(handle, (x + width // 2, top + (slider_h - handle.height) // 2))
+            except Exception:
+                draw.ellipse((x + width // 2, top + 5, x + width // 2 + slider_h - 10, top + slider_h - 5), fill=(190, 210, 235, 255))
+        else:
+            draw.ellipse((x + width // 2, top + 5, x + width // 2 + slider_h - 10, top + slider_h - 5), fill=(190, 210, 235, 255))
+
+
+def _combined_panel_preview_from_export(node):
+    """Composite the actual generated Mod textures using the exported INI geometry."""
+    if not PIL_AVAILABLE or node.panel_mode not in {'INTEGRATED_TOP', 'INTEGRATED_BOTTOM'}:
+        return None
+    ini_path = (getattr(node, "last_mod_ini_path", "") or getattr(node, "ini_file_path", "")).strip()
+    if not ini_path or not os.path.isfile(ini_path):
+        return None
+    root = os.path.dirname(os.path.abspath(ini_path))
+    res_dir = os.path.join(root, "res")
+    ini_text = open(ini_path, "r", encoding="utf-8", errors="replace").read()
+
+    def constant(name, default=None):
+        match = re.search(rf'^\s*global(?:\s+persist)?\s+\${re.escape(name)}\s*=\s*([-+]?\d+(?:\.\d*)?)', ini_text, re.MULTILINE)
+        return float(match.group(1)) if match else default
+
+    texture_paths = [os.path.join(res_dir, name) for name in ("0.png", "1.png", "2.png", "3.png")]
+    if not all(os.path.isfile(path) for path in texture_paths):
+        return None
+    bg = PILImage.open(texture_paths[0]).convert("RGBA")
+    width, height = bg.size
+    base_w, base_h = constant("base_width0"), constant("base_height0")
+    if not base_w or not base_h:
+        return None
+    zoom = constant("zoom0", 1.0) or 1.0
+    render_w, render_h = base_w * zoom, base_h * zoom
+    sx, sy = width / max(render_w, 1e-9), height / max(render_h, 1e-9)
+    composite = PILImage.new("RGBA", (width, height), (0, 0, 0, 0))
+    composite.alpha_composite(bg)
+
+    def paste_texture(path, x, y, w, h):
+        if not path or not os.path.isfile(path) or w <= 0 or h <= 0:
+            return
+        try:
+            with PILImage.open(path) as source:
+                image = source.convert("RGBA")
+            resampling = getattr(PILImage, "Resampling", PILImage).LANCZOS
+            size = (max(1, int(round(w * sx))), max(1, int(round(h * sy))))
+            image = image.resize(size, resampling)
+            # INI y offsets are expressed from the panel's upper edge, matching the draw shader.
+            px, py = int(round(x * sx)), int(round(y * sy))
+            layer = PILImage.new("RGBA", (width, height), (0, 0, 0, 0))
+            layer.alpha_composite(image, (px, py))
+            composite.alpha_composite(layer)
+        except Exception as error:
+            print(f"[切换＆滑块面板预览] 贴图合成失败 {os.path.basename(path)}: {error}")
+
+    # 滑块所在位置及进度条按 ShapeKeyExt 写入 INI 的同一组公式计算。
+    slider_ids = []
+    for match in re.finditer(r'^\s*global(?:\s+persist)?\s+\$base_width(\d+)\s*=', ini_text, re.MULTILINE):
+        idx = int(match.group(1))
+        if idx > 0 and constant(f"base_height{idx}") is not None:
+            slider_ids.append(idx)
+    slider_ids.sort()
+    for index in slider_ids:
+        slider_h = constant(f"base_height{index}", 0.042) * zoom
+        slider_w = constant(f"base_width{index}", 0.02) * zoom
+        button_w = constant(f"btn_width{index}", 0.0393) * zoom
+        button_h = constant(f"btn_height{index}", 0.045) * zoom
+        rel_y = constant(f"fixed_rel_y{index}", 0.5) * render_h - slider_h / 2
+        min_rel_x = button_w + 0.02
+        max_rel_x = render_w * 0.95 - slider_w
+        # Runtime slider state is transient; show a neutral 50% position in the settings preview.
+        rel_x = min_rel_x + (max_rel_x - min_rel_x) * 0.5
+        center_x = rel_x + slider_w * 0.5
+        bar_h = slider_h * 0.5
+        bar_y = rel_y + slider_h * 0.25
+        paste_texture(texture_paths[2], min_rel_x, bar_y, center_x - min_rel_x, bar_h)
+        paste_texture(texture_paths[3], center_x, bar_y, render_w * 0.95 - center_x, bar_h)
+        paste_texture(texture_paths[1], rel_x, rel_y, slider_w, slider_h)
+        play_path = os.path.join(res_dir, f"4_{index}.png")
+        if os.path.isfile(play_path):
+            paste_texture(play_path, min_rel_x - button_w - 0.01, rel_y + (slider_h - button_h) * 0.5, button_w, button_h)
+
+    # 使用实际导出时生成的文字/图片按钮 PNG，并按 INI 中的按钮宽高和节点布局落位。
+    namespace_match = re.search(r'^\s*global\s+\$([A-Za-z0-9_]+)_btn_w1\s*=', ini_text, re.MULTILINE)
+    if namespace_match:
+        namespace = namespace_match.group(1)
+        button_files = []
+        for match in re.finditer(r'^\s*\[ResourceSwapButton(\d+)_'+re.escape(namespace)+r'\]\s*\r?\n\s*filename\s*=\s*\./res/([^\r\n]+)', ini_text, re.MULTILINE):
+            button_files.append((int(match.group(1)), match.group(2).strip()))
+        button_files.sort()
+        count = len(button_files)
+        per_row = max(1, min(int(node.buttons_per_row or 1), max(1, count)))
+        rows = int(math.ceil(count / float(per_row))) if count else 0
+        gap_x = float(node.button_column_spacing)
+        gap_y = float(node.button_row_spacing)
+        button_h = float(node.button_height)
+        sizes = [(constant(f"{namespace}_btn_w{i}", 0.0), constant(f"{namespace}_btn_h{i}", button_h)) for i in range(1, count + 1)]
+        col_widths = [0.0] * per_row
+        for idx, (bw, _bh) in enumerate(sizes):
+            col_widths[idx % per_row] = max(col_widths[idx % per_row], bw)
+        offsets, cursor = [], 0.02
+        for col_w in col_widths:
+            offsets.append(cursor)
+            cursor += col_w + gap_x
+        for index, (resource_index, filename) in enumerate(button_files):
+            col, row = index % per_row, index // per_row
+            bw, bh = sizes[index]
+            x = offsets[col] + (col_widths[col] - bw) * 0.5
+            if node.panel_mode == 'INTEGRATED_TOP':
+                y = row * (bh + gap_y)
+            else:
+                y = render_h - rows * (bh + gap_y) + row * (bh + gap_y)
+            paste_texture(os.path.join(res_dir, filename), x, y, bw, bh)
+
+    # Surrounding game view is intentionally neutral; the panel textures, scale and geometry are exact.
+    margin = 24
+    canvas = PILImage.new("RGBA", (width + margin * 2, height + margin * 2), (30, 30, 30, 255))
+    canvas.alpha_composite(composite, (margin, margin))
+    output = os.path.join(tempfile.gettempdir(), "ssmt_combined_panel_preview.png")
+    canvas.convert("RGB").save(output)
+    return output
+
+
+def _combined_panel_preview_from_settings(node):
+    """Reuse the exporter's image builders and geometry formulas without touching the Mod."""
+    if not PIL_AVAILABLE or node.panel_mode not in {'INTEGRATED_TOP', 'INTEGRATED_BOTTOM'}:
+        return None
+    slider_node = node._find_shape_ext_node()
+    if slider_node is None or not node.slider_use_slider_panel:
+        return None
+    addon_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    toolset_dir = os.path.join(addon_dir, "Toolset")
+    ini_path = (getattr(node, "last_mod_ini_path", "") or "").strip()
+    with tempfile.TemporaryDirectory(prefix="ssmt_panel_preview_") as temp_dir:
+        res_dir = os.path.join(temp_dir, "res")
+        os.makedirs(res_dir, exist_ok=True)
+
+        def copy_image(source_path, dest_name, default_name=None):
+            source = bpy.path.abspath(source_path) if source_path else ""
+            if not source or not os.path.isfile(source):
+                source = os.path.join(toolset_dir, default_name or dest_name)
+            if os.path.isfile(source):
+                shutil.copy2(source, os.path.join(res_dir, dest_name))
+                return os.path.join(res_dir, dest_name)
+            return ""
+
+        background_path = copy_image(node.slider_background_image, "0.png")
+        handle_path = copy_image(node.slider_handle_image, "1.png")
+        left_bar_path = copy_image(node.slider_left_bar_image, "2.png")
+        right_bar_path = copy_image(node.slider_right_bar_image, "3.png")
+        if not all((background_path, handle_path, left_bar_path, right_bar_path)):
+            return None
+
+        # The settings preview represents the node's visible button list. Do not
+        # use _build_button_list here: export merges controls sharing a hotkey,
+        # but that must not collapse separately configured preview buttons.
+        buttons = []
+        button_widths = []
+        button_height = float(node.button_height)
+        button_data = []
+        for entry in node.swap_panel_entries:
+            var_names = [
+                value.strip()
+                for value in str(entry.variables or entry.variable_name or "").split("|")
+                if value.strip()
+            ]
+            if not var_names:
+                continue
+            button_data.append({
+                "var_name": entry.variable_name or var_names[0],
+                "var_names": var_names,
+                "option_count": entry.option_count,
+                "option_counts": [entry.option_count] * len(var_names),
+                "comment": entry.comment,
+                "hotkey": entry.hotkey,
+                "image_path": node._button_image_for_source(entry.hotkey, var_names[0]),
+            })
+        for index, button in enumerate(button_data, start=1):
+            dest = node._ensure_button_image(
+                res_dir, "preview", index, toolset_dir, button, style_src=node
+            )
+            if not dest or not os.path.isfile(dest):
+                return None
+            with PILImage.open(dest) as image:
+                aspect = image.width / max(1, image.height)
+            width_value = float(node.button_width or 0.0)
+            if width_value <= 0:
+                width_value = button_height * aspect * 0.5625
+            buttons.append((dest, width_value, button_height))
+            button_widths.append(width_value)
+
+        freq_params, _skipped = slider_node._collect_slider_freq_params()
+        num_sliders = len(freq_params)
+        if num_sliders <= 0:
+            return None
+        ordered_freq_params = sorted(freq_params)
+        default_weights = {}
+        if ini_path and os.path.isfile(ini_path):
+            try:
+                with open(ini_path, "r", encoding="utf-8", errors="replace") as handle:
+                    export_ini = handle.read()
+                for match in re.finditer(
+                    r'^\s*global(?:\s+persist)?\s+\$(Freq_[^\s=]+)\s*=\s*([-+]?(?:\d+(?:\.\d*)?|\.\d+))',
+                    export_ini, re.MULTILINE,
+                ):
+                    default_weights["$" + match.group(1)] = float(match.group(2))
+            except OSError:
+                pass
+
+        # The shape-key generator uses the play image aspect for its left-side slot.
+        play_paths = []
+        play_widths = []
+        for index in range(1, num_sliders + 1):
+            current = os.path.join(os.path.dirname(ini_path), "res", f"4_{index}.png") if ini_path else ""
+            if current and os.path.isfile(current):
+                dest = os.path.join(res_dir, f"4_{index}.png")
+                shutil.copy2(current, dest)
+            else:
+                dest = copy_image(node.slider_play_button_image, f"4_{index}.png", "4.png")
+            if not dest or not os.path.isfile(dest):
+                return None
+            with PILImage.open(dest) as image:
+                aspect = image.width / max(1, image.height)
+            play_paths.append(dest)
+            play_widths.append(float(node.slider_play_button_height) * aspect * 0.5625)
+
+        slider_h = float(node.slider_height)
+        with PILImage.open(handle_path) as handle_image:
+            slider_w = handle_image.width / max(1, handle_image.height) * slider_h * 0.5625
+        row_gap = float(node.button_row_spacing)
+        column_gap = float(node.button_column_spacing)
+        per_row = max(1, min(int(node.buttons_per_row or 1), max(1, len(buttons))))
+        rows = int(math.ceil(len(buttons) / float(per_row))) if buttons else 0
+        switch_columns = [0.0] * per_row
+        for index, width_value in enumerate(button_widths):
+            switch_columns[index % per_row] = max(switch_columns[index % per_row], width_value)
+        switch_width = (0.02 + sum(switch_columns)
+                        + max(0, per_row - 1) * column_gap + 0.02) if buttons else 0.0
+        switch_height = (float(node.button_top_padding) + rows * button_height
+                         + max(0, rows - 1) * row_gap + 0.02) if buttons else 0.0
+        slider_content_height = num_sliders * slider_h + max(0, num_sliders - 1) * 0.02 + 0.06
+        parent_height = slider_content_height + switch_height
+        if not node.auto_crop_background:
+            parent_height = max(parent_height, float(node.slider_panel_min_height))
+        min_slider_width = max(
+            (play_width + 0.02 + slider_w * 2.5) / 0.95 for play_width in play_widths
+        ) if play_widths else slider_w * 2.5
+        content_width = max(min_slider_width, switch_width)
+
+        try:
+            with PILImage.open(background_path) as source:
+                bg_aspect = source.width / max(1, source.height)
+            if node.auto_crop_background:
+                target_aspect = content_width / max(parent_height * 0.5625, 1e-8)
+                node._crop_background_to_aspect(background_path, target_aspect)
+                with PILImage.open(background_path) as source:
+                    bg_aspect = source.width / max(1, source.height)
+            panel_width = parent_height * bg_aspect * 0.5625
+            node._generate_background_image(
+                background_path, panel_width, parent_height,
+                use_existing=bool(node.slider_background_image and os.path.isfile(bpy.path.abspath(node.slider_background_image))),
+            )
+            with PILImage.open(background_path) as source:
+                panel = source.convert("RGBA")
+        except Exception as error:
+            print(f"[切换＆滑块面板预览] 背景处理失败: {error}")
+            return None
+
+        panel_w_px, panel_h_px = panel.size
+        scale_x = panel_w_px / max(panel_width, 1e-8)
+        scale_y = panel_h_px / max(parent_height, 1e-8)
+        composite = PILImage.new("RGBA", panel.size, (0, 0, 0, 0))
+        composite.alpha_composite(panel)
+
+        def place(path, x, y, width_value, height_value):
+            if not path or not os.path.isfile(path):
+                return
+            with PILImage.open(path) as source:
+                image = source.convert("RGBA")
+            resampling = getattr(PILImage, "Resampling", PILImage).LANCZOS
+            image = image.resize((max(1, int(round(width_value * scale_x))),
+                                  max(1, int(round(height_value * scale_y)))), resampling)
+            layer = PILImage.new("RGBA", panel.size, (0, 0, 0, 0))
+            layer.alpha_composite(image, (int(round(x * scale_x)), int(round(y * scale_y))))
+            composite.alpha_composite(layer)
+
+        current_y = 0.03 + (switch_height if node.panel_mode == 'INTEGRATED_TOP' else 0.0)
+        for index in range(num_sliders):
+            play_w, play_h = play_widths[index], float(node.slider_play_button_height)
+            center_y = current_y + slider_h * 0.5
+            min_x = play_w + 0.02
+            max_x = panel_width * 0.95 - slider_w
+            weight = default_weights.get(ordered_freq_params[index], 0.5)
+            weight_min = float(node.slider_weight_min)
+            weight_max = float(node.slider_weight_max)
+            default_position = ((weight - weight_min) / (weight_max - weight_min)
+                                if abs(weight_max - weight_min) > 1e-8 else 0.5)
+            default_position = max(0.0, min(1.0, default_position))
+            knob_x = min_x + max(0.0, max_x - min_x) * default_position
+            bar_h = slider_h * 0.5
+            bar_y = current_y + slider_h * 0.25
+            knob_center = knob_x + slider_w * 0.5
+            place(left_bar_path, min_x, bar_y, knob_center - min_x, bar_h)
+            place(right_bar_path, knob_center, bar_y, panel_width * 0.95 - knob_center, bar_h)
+            place(handle_path, knob_x, current_y, slider_w, slider_h)
+            place(play_paths[index], min_x - play_w - 0.01, center_y - play_h * 0.5, play_w, play_h)
+            current_y += slider_h + 0.02
+
+        col_widths = switch_columns
+        col_offsets = []
+        cursor = 0.02
+        for col_width in col_widths:
+            col_offsets.append(cursor)
+            cursor += col_width + column_gap
+        for index, (path, width_value, height_value) in enumerate(buttons):
+            col, row = index % per_row, index // per_row
+            y = (row * (height_value + row_gap) if node.panel_mode == 'INTEGRATED_TOP'
+                 else parent_height - rows * (height_value + row_gap) + row * (height_value + row_gap))
+            if node.panel_mode == 'INTEGRATED_TOP':
+                y += float(node.button_top_padding)
+            x = col_offsets[col] + (col_widths[col] - width_value) * 0.5
+            place(path, x, y, width_value, height_value)
+
+        margin = 24
+        canvas = PILImage.new("RGBA", (panel_w_px + margin * 2, panel_h_px + margin * 2), (30, 30, 30, 255))
+        canvas.alpha_composite(composite, (margin, margin))
+        output = os.path.join(tempfile.gettempdir(), "ssmt_combined_panel_preview.png")
+        canvas.convert("RGB").save(output)
+        return output
+
+
+class SSMT_OT_CombinedPanel_Preview(bpy.types.Operator):
+    bl_idname = "ssmt.combined_panel_preview"
+    bl_label = "预览最终面板"
+    bl_description = "按当前切换与滑块设置生成面板效果预览图"
+    bl_options = {'REGISTER'}
+    node_name: bpy.props.StringProperty()
+
+    def execute(self, context):
+        tree = getattr(getattr(context, "space_data", None), "edit_tree", None) or getattr(getattr(context, "space_data", None), "node_tree", None)
+        node = tree.nodes.get(self.node_name) if tree else None
+        if node is None or node.bl_idname != 'SSMTNode_PostProcess_CombinedPanel':
+            self.report({'ERROR'}, "找不到切换＆滑块面板节点")
+            return {'CANCELLED'}
+        try:
+            if not PIL_AVAILABLE:
+                raise RuntimeError("预览需要 Pillow，当前环境未安装")
+            # Always prefer the current node's settings. An older exported INI
+            # can contain a different button set and must not masquerade as the
+            # preview of the current configuration.
+            preview_path = (_combined_panel_preview_from_settings(node)
+                            or _combined_panel_preview_image(node)
+                            or _combined_panel_preview_from_export(node))
+            bpy.ops.wm.path_open(filepath=preview_path)
+            self.report({'INFO'}, "已生成当前设置的面板预览图")
+            return {'FINISHED'}
+        except Exception as error:
+            self.report({'ERROR'}, f"生成预览失败：{error}")
+            return {'CANCELLED'}
+
+
+class _SSMTNode_PostProcess_SwapPanelMixin:
     bl_idname = 'SSMTNode_PostProcess_SwapPanel'
     bl_label = '物体切换面板'
     bl_description = (
@@ -178,6 +813,18 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
     SLIDER_PANEL_SHARED_VARS = (
         "$img0_x", "$img0_y", "$zoom0", "$help", "$ui_active",
         "$mouse_clicked", "$is_dragging", "$click_outside",
+    )
+
+    panel_mode: bpy.props.EnumProperty(
+        name="面板模式",
+        description="选择独立浮动、附加在滑块左侧，或将按钮放入滑块面板顶部/底部",
+        items=[
+            ('INDEPENDENT', "独立面板", "单独显示物体切换面板"),
+            ('ATTACHED_LEFT', "附加在左侧", "按钮显示在形态键滑块面板左侧"),
+            ('INTEGRATED_TOP', "集成在上方", "按钮显示在形态键滑块面板内部上方"),
+            ('INTEGRATED_BOTTOM', "集成在下方", "按钮显示在形态键滑块面板内部下方"),
+        ],
+        default='ATTACHED_LEFT',
     )
 
     create_cumulative_backup: bpy.props.BoolProperty(name="创建累积备份", default=True)
@@ -219,6 +866,11 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
     detect_index_count: bpy.props.StringProperty(name="IndexCount", default="")
 
     background_image: bpy.props.StringProperty(name="背景图片", subtype='FILE_PATH', default="")
+    auto_crop_background: bpy.props.BoolProperty(
+        name="自动裁剪背景",
+        description="按切换按钮和滑块的实际占用范围裁切背景图，保持图像比例；需要 Pillow",
+        default=False,
+    )
     button_image: bpy.props.StringProperty(name="按钮图片（全局回退）", subtype='FILE_PATH', default="")
     button_border_image: bpy.props.StringProperty(name="按钮边框图片", subtype='FILE_PATH', default="")
 
@@ -543,11 +1195,17 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
         slider_node = self._find_slider_panel_node()
         # 附加模式：按钮附加到滑块面板左侧，复用其位置/缩放/显隐；
         # 下列由滑块面板统一负责的设置项在该模式下无效，自动隐藏。
-        attached_mode = slider_node is not None
+        attached_mode = slider_node is not None and self.panel_mode != 'INDEPENDENT'
+        layout.prop(self, "panel_mode", text="面板模式")
         info_box = layout.box()
-        if slider_node is not None:
+        if slider_node is not None and self.panel_mode != 'INDEPENDENT':
             info_box.label(text=f"已检测到形态键滑块面板（{slider_node.name}）", icon='CHECKMARK')
-            info_box.label(text="切换按钮将附加到滑块面板左侧，复用其位置/缩放/显隐", icon='INFO')
+            mode_hint = {
+                'ATTACHED_LEFT': "按钮显示在滑块面板左侧，并复用其位置/缩放/显隐",
+                'INTEGRATED_TOP': "按钮显示在滑块面板内部上方，并复用其位置/缩放/显隐",
+                'INTEGRATED_BOTTOM': "按钮显示在滑块面板内部下方，并复用其位置/缩放/显隐",
+            }.get(self.panel_mode, "")
+            info_box.label(text=mode_hint, icon='INFO')
         else:
             info_box.label(text="未检测到形态键滑块面板，使用独立浮动面板机制", icon='INFO')
         layout.separator()
@@ -562,11 +1220,19 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
         box.label(text="快捷键设置", icon='KEYINGSET')
         col = box.column(align=True)
         if not attached_mode:
-            col.prop(self, "help_key", text="显示/隐藏面板")
-            col.prop(self, "reset_key", text="重置位置")
-            col.prop(self, "zoom_in_key", text="放大")
-            col.prop(self, "zoom_out_key", text="缩小")
-            col.prop(self, "drag_key", text="拖拽键")
+            for prop_name, label in (
+                ("help_key", "显示/隐藏面板"),
+                ("reset_key", "重置位置"),
+                ("zoom_in_key", "放大"),
+                ("zoom_out_key", "缩小"),
+                ("drag_key", "拖拽键"),
+            ):
+                row = col.row(align=True)
+                picker = row.operator("ssmt.key_picker", text="选键", icon='KEYINGSET')
+                picker.node_name = self.name
+                picker.node_tree_name = self.id_data.name
+                picker.target_prop = prop_name
+                row.prop(self, prop_name, text=label)
         col.prop(self, "gui_only", text="GUI全局模式")
 
         box = col_left.box()
@@ -591,6 +1257,7 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
             box.label(text="角色检测设置", icon='VIEWZOOM')
             row = box.row(align=True)
             row.prop_search(self, "target_object", bpy.data, "objects", text="物体", icon='OBJECT_DATA')
+            row.operator("ssmt.swap_panel_add_active_object", text="添加选中物体", icon='EYEDROPPER').node_name = self.name
             row.operator("ssmt.swap_panel_parse_object", text="", icon='FILE_REFRESH').node_name = self.name
             box.prop(self, "detect_hash", text="哈希值")
             box.prop(self, "detect_index_count", text="IndexCount")
@@ -770,6 +1437,77 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
         collect(tree)
         return collected
 
+    def _collect_pure_texture_switch_groups(self):
+        """Collect enabled switch groups from pure-texture (no-mesh) nodes.
+
+        纯贴图替换节点（``SSMTNode_PostProcess_PureTexture``）的切换组结构与
+        材质转资源pro 相同（``switch_variable`` / ``state_count`` / ``key`` /
+        ``comment`` / ``enabled``），只是挂在各目标部件的 ``switch_groups`` 上。
+        面板要把它们也做成按钮，否则纯贴图物体的贴图切换只能靠热键、无法点面板。
+        """
+        tree = getattr(self, "id_data", None)
+        if tree is None:
+            return []
+        collected = []
+        visited = set()
+
+        def collect(current_tree):
+            tree_key = getattr(current_tree, "name", str(id(current_tree)))
+            if tree_key in visited:
+                return
+            visited.add(tree_key)
+            for node in current_tree.nodes:
+                if node.bl_idname == 'SSMTNode_PostProcess_PureTexture' and not node.mute:
+                    for item in node.target_items:
+                        target_object = item.target_object
+                        for group in item.switch_groups:
+                            if not bool(getattr(group, "enabled", True)):
+                                continue
+                            variable = str(getattr(group, "switch_variable", "") or "").strip()
+                            if not variable:
+                                continue
+                            collected.append((node, target_object, group))
+                elif node.bl_idname == 'SSMTNode_Blueprint_Nest' and not node.mute:
+                    blueprint_name = str(getattr(node, "blueprint_name", "") or "")
+                    nested = bpy.data.node_groups.get(blueprint_name) if blueprint_name and blueprint_name != "NONE" else None
+                    if nested and getattr(nested, "bl_idname", "") == "SSMTBlueprintTreeType":
+                        collect(nested)
+
+        collect(tree)
+        return collected
+
+    @staticmethod
+    def _pure_texture_effective_variable(node, target_object, variable, cache):
+        """纯贴图节点导出期改号后的变量（与 ``_resolve_switch_variables`` 同一口径）。
+
+        面板生成按钮时若仍用用户数据里的原变量（$swapkey150），会和「材质转资源pro」的
+        衣服/身体按钮共用同一个变量，并把脸妆的 10 档循环套到只有 2/5 档的变量上。
+        """
+        if not hasattr(node, "_resolve_switch_variables"):
+            return variable
+        key = str(getattr(node, "name", "") or "")
+        mapping = cache.get(key)
+        if mapping is None:
+            mapping = {}
+            try:
+                specs = node.iter_switch_specs()
+                original_variables = [str(spec.get("variable") or "") for spec in specs]
+                resolved_specs = node._resolve_switch_variables(specs)
+                for original_variable, spec in zip(original_variables, resolved_specs):
+                    object_name = str(spec.get("object_name") or "")
+                    mapping[(object_name, original_variable)] = str(
+                        spec.get("variable") or ""
+                    )
+            except Exception:
+                mapping = {}
+            cache[key] = mapping
+        object_name = (
+            str(getattr(target_object, "name", "") or "")
+            if target_object is not None
+            else ""
+        )
+        return mapping.get((object_name, variable)) or variable
+
     @staticmethod
     def _entry_variable_names(entry):
         """返回条目记录的变量列表（``variables`` 为空时回退到 ``variable_name``）。"""
@@ -886,6 +1624,44 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
             var = str(getattr(group, "switch_variable", "") or "").strip()
             if not var:
                 continue
+            comment = str(getattr(group, "comment", "") or "").strip()
+            option_count = max(2, int(getattr(group, "state_count", 2) or 2))
+            hotkey = str(getattr(group, "key", "") or "").strip()
+            existing = self._find_entry_index(var, comment, allow_variable_match=True)
+            if existing >= 0:
+                entry = self.swap_panel_entries[existing]
+                self._append_entry_variable(entry, var)
+                if comment and comment not in entry.comment.split(" / "):
+                    entry.comment = " / ".join(part for part in (entry.comment, comment) if part)
+                entry.option_count = max(entry.option_count, option_count)
+                if not entry.hotkey:
+                    entry.hotkey = hotkey
+                idx_map[var] = existing
+                continue
+            entry = self.swap_panel_entries.add()
+            entry.variable_name = var
+            entry.variables = var
+            entry.comment = comment
+            entry.option_count = option_count
+            entry.hotkey = hotkey
+            part_name = getattr(target_object, "name", "") if target_object is not None else ""
+            entry.node_name = f"{node.name}:{part_name or 'part'}:{var}"
+            idx_map[var] = len(self.swap_panel_entries) - 1
+
+        # 2c. 纯贴图替换节点（无网格修改）的贴图切换组
+        pure_variable_cache = {}
+        for node, target_object, group in self._collect_pure_texture_switch_groups():
+            var = str(getattr(group, "switch_variable", "") or "").strip()
+            if not var:
+                continue
+            # 纯贴图节点导出期会避让同蓝图「材质转资源pro」已用的变量号（150→152）。
+            # 面板必须跟着用改号后的变量：否则会把「衣服/身体」和「脸妆」并进同一个
+            # 按钮、并按脸妆的 10 档去循环只有 2/5 档的变量 → 越界后绑定不生效（贴图错乱）。
+            var = self._pure_texture_effective_variable(
+                node, target_object, var, pure_variable_cache
+            )
+            # 备注名：直接取切换组上用户填的值（与「贴图切换 V5.1」/材质转资源pro 同口径），
+            # 空就是空 —— 不自造默认值，否则不同切换组会因同备注被错误合并成一个按钮。
             comment = str(getattr(group, "comment", "") or "").strip()
             option_count = max(2, int(getattr(group, "state_count", 2) or 2))
             hotkey = str(getattr(group, "key", "") or "").strip()
@@ -1122,11 +1898,23 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
     def _build_button_list(self, target_ini_file):
         """构建按钮数据列表。
 
-        INI configuration takes priority, then blueprint nodes fill in remarks
-        and any switch functions that have not been written yet.
+        Current node list controls order; INI-only switches are retained after
+        node entries, and INI settings fill metadata for matching variables.
         """
         buttons = []
         by_variable = {}
+
+        # 纯贴图节点的切换变量若与「材质转资源pro」冲突，先写回节点数据再收集按钮：
+        # 否则两套切换会被并进同一个按钮（实机：衣服/身体/脸妆挤一个按钮、档位越界）。
+        for node, _target_object, _group in self._collect_pure_texture_switch_groups():
+            sync_variables = getattr(
+                node, "sync_switch_variables_with_material_node", None
+            )
+            if callable(sync_variables):
+                try:
+                    sync_variables()
+                except Exception:
+                    pass
 
         def button_var_names(button):
             names = [
@@ -1195,7 +1983,35 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
             new_button["var_names"] = names
             new_button["option_counts"] = counts[:len(names)]
             buttons.append(new_button)
-            by_variable[var_name] = new_button
+            for name in names:
+                by_variable[name] = new_button
+
+        # The visible node list is the user's current ordering. Seed it first so
+        # an older target INI cannot silently put its previous KeySwap order back
+        # in front of the current settings. The INI loop below still enriches
+        # matching entries and appends INI-only controls.
+        for entry in getattr(self, "swap_panel_entries", []) or []:
+            var_names = [
+                name.strip() for name in str(getattr(entry, "variables", "") or "").split("|")
+                if name.strip()
+            ]
+            if not var_names:
+                name = str(getattr(entry, "variable_name", "") or "").strip()
+                if name:
+                    var_names = [name]
+            if not var_names:
+                continue
+            option_count = max(1, int(getattr(entry, "option_count", 2) or 2))
+            hotkey = str(getattr(entry, "hotkey", "") or "")
+            add_button({
+                "var_name": var_names[0],
+                "var_names": var_names,
+                "option_count": option_count,
+                "option_counts": [option_count] * len(var_names),
+                "comment": str(getattr(entry, "comment", "") or ""),
+                "hotkey": hotkey,
+                "image_path": self._button_image_for_source(hotkey, var_names[0]),
+            })
 
         # 1. Explicit INI takes priority; otherwise inspect the generated INI.
         explicit = (self.ini_file_path or "").strip()
@@ -1254,7 +2070,29 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
                 "hotkey": hotkey,
                 "image_path": self._button_image_for_source(hotkey, var),
             })
-        return self._merge_buttons_by_hotkey(buttons)
+        # 5. Fill from every pure-texture (no-mesh) node's switch groups.
+        pure_variable_cache = {}
+        for node, target_object, group in self._collect_pure_texture_switch_groups():
+            var = str(getattr(group, "switch_variable", "") or "").strip()
+            if not var:
+                continue
+            var = self._pure_texture_effective_variable(
+                node, target_object, var, pure_variable_cache
+            )
+            hotkey = str(getattr(group, "key", "") or "").strip()
+            add_button({
+                "var_name": var,
+                # 备注名原样取用（与「贴图切换 V5.1」同口径），空就是空。
+                "comment": str(getattr(group, "comment", "") or "").strip(),
+                "option_count": max(2, int(getattr(group, "state_count", 2) or 2)),
+                "hotkey": hotkey,
+                "image_path": self._button_image_for_source(hotkey, var),
+            })
+        # Preserve separately configured controls in the panel even when their
+        # keyboard shortcuts match. A shared KeySwap hotkey may still activate
+        # several variables in the game, but it must not collapse their UI
+        # buttons into one long, unusably narrow label.
+        return buttons
 
     @staticmethod
     def _normalize_hotkey(value):
@@ -1519,6 +2357,37 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
             return self._apply_button_border_image(dest_path)
         return None
 
+    @staticmethod
+    def _crop_background_to_aspect(image_path, target_aspect):
+        """在输出副本上居中裁切到控件占用比例，不拉伸图像。"""
+        if not PIL_AVAILABLE or not image_path or not os.path.isfile(image_path):
+            return False
+        try:
+            target_aspect = float(target_aspect)
+            if target_aspect <= 0.0:
+                return False
+            with PILImage.open(image_path) as source:
+                image = source.convert('RGBA')
+            width, height = image.size
+            if width <= 0 or height <= 0:
+                return False
+            current_aspect = width / height
+            if abs(current_aspect - target_aspect) <= 0.002:
+                return True
+            if current_aspect > target_aspect:
+                crop_width = max(1, min(width, int(round(height * target_aspect))))
+                left = (width - crop_width) // 2
+                image = image.crop((left, 0, left + crop_width, height))
+            else:
+                crop_height = max(1, min(height, int(round(width / target_aspect))))
+                top = (height - crop_height) // 2
+                image = image.crop((0, top, width, top + crop_height))
+            image.save(image_path)
+            return True
+        except Exception as error:
+            print(f"[物体切换面板] 自动裁剪背景失败：{error}")
+            return False
+
     def _generate_background_image(self, dest_path, panel_w, panel_h, use_existing=False):
         """生成/处理面板背景图（圆角 + 边框）。panel_w/panel_h 为面板在屏幕单位的宽高。
 
@@ -1656,17 +2525,21 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
             dest_res_dir = os.path.join(mod_export_path, "res")
             os.makedirs(dest_res_dir, exist_ok=True)
 
-            # 确保 draw_2d.hlsl 存在（滑块面板也会复制，两处都做去重即可）
+            # 始终刷新共享 shader，避免已存在的旧版文件绕过色彩修正。
             shader_src = os.path.join(source_asset_dir, "draw_2d.hlsl")
             shader_dst = os.path.join(dest_res_dir, "draw_2d.hlsl")
-            if os.path.exists(shader_src) and not os.path.exists(shader_dst):
+            if os.path.exists(shader_src):
                 shutil.copy2(shader_src, shader_dst)
+
+            for image_name in ("0.png", "1.png", "2.png", "3.png"):
+                mark_png_as_srgb(os.path.join(dest_res_dir, image_name))
 
             btn_w_list = []
             for i, b in enumerate(buttons, start=1):
                 img_path = self._ensure_button_image(
                     dest_res_dir, ns, i, source_asset_dir, b, style_src=slider_style_src
                 )
+                mark_png_as_srgb(img_path)
                 btn_w_i = float(self.button_width or 0.0)
                 if btn_w_i <= 0.0:
                     btn_w_i = btn_h * 3.0 * SCREEN_RATIO_CORRECTION  # 缺省按 3:1 比例
@@ -1754,15 +2627,43 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
 
         gap = 0.02  # 按钮组与滑块面板之间的水平间隙
 
-        # 位置计算：按钮从左往右排列在滑块面板左侧
+        # 按钮可放在左侧，或沿滑块面板内部顶/底边横向排列。
+        integrated = self.panel_mode in {'INTEGRATED_TOP', 'INTEGRATED_BOTTOM'}
+        per_row = max(1, min(int(self.buttons_per_row or 1), num_buttons))
+        row_count = int(math.ceil(num_buttons / float(per_row)))
+        integrated_col_widths = [0.0] * per_row
+        for index, width in enumerate(btn_w_list):
+            integrated_col_widths[index % per_row] = max(integrated_col_widths[index % per_row], width)
+        integrated_col_offsets = []
+        # Keep equal left/right side padding; button_top_padding controls the
+        # vertical inset, not the horizontal start of the grid.
+        side_padding = 0.02
+        running_offset = side_padding
+        for width in integrated_col_widths:
+            integrated_col_offsets.append(running_offset)
+            running_offset += width + float(self.button_column_spacing or 0.0)
         for i, _b in enumerate(buttons, start=1):
             # 每个按钮相对面板顶部的 y 偏移（屏幕比例；与滑块面板同缩放）
             y_offset_screen_units = self.button_top_padding + (i - 1) * (btn_h + self.button_row_spacing)
             present_additions.append(f"    ${ns}_btn_render_w{i} = ${ns}_btn_w{i} * $zoom0")
             present_additions.append(f"    ${ns}_btn_render_h{i} = ${ns}_btn_h{i} * $zoom0")
-            # 按钮右边缘紧贴滑块面板左边缘（面板 x = $img0_x）
-            present_additions.append(f"    ${ns}_btn_x{i} = $img0_x - {gap:.4f} - ${ns}_btn_render_w{i}")
-            present_additions.append(f"    ${ns}_btn_y{i} = $img0_y + {y_offset_screen_units:.4f} * $zoom0")
+            if integrated:
+                col_index = (i - 1) % per_row
+                row_index = (i - 1) // per_row
+                centered_offset = integrated_col_offsets[col_index] + (
+                    integrated_col_widths[col_index] - btn_w_list[i - 1]
+                ) * 0.5
+                x_expr = f"$img0_x + {centered_offset:.4f} * $zoom0"
+                if self.panel_mode == 'INTEGRATED_TOP':
+                    y_expr = f"$img0_y + {self.button_top_padding:.4f} * $zoom0 + {row_index} * (${ns}_btn_render_h{i} + {self.button_row_spacing:.4f} * $zoom0)"
+                else:
+                    y_expr = f"$img0_y + $norm_height0 - {row_count} * (${ns}_btn_render_h{i} + {self.button_row_spacing:.4f} * $zoom0) + {row_index} * (${ns}_btn_render_h{i} + {self.button_row_spacing:.4f} * $zoom0)"
+                present_additions.append(f"    ${ns}_btn_x{i} = {x_expr}")
+                present_additions.append(f"    ${ns}_btn_y{i} = {y_expr}")
+            else:
+                # 按钮右边缘紧贴滑块面板左边缘（面板 x = $img0_x）
+                present_additions.append(f"    ${ns}_btn_x{i} = $img0_x - {gap:.4f} - ${ns}_btn_render_w{i}")
+                present_additions.append(f"    ${ns}_btn_y{i} = $img0_y + {y_offset_screen_units:.4f} * $zoom0")
 
         # 按钮按下/弹起检测：复用滑块面板的鼠标状态
         # 注意：滑块面板自身的 Present 块先执行时会因为鼠标落在面板外而设置 $click_outside = 1，
@@ -1849,11 +2750,10 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
             traceback.print_exc()
             return False
 
-    def execute_postprocess(self, mod_export_path, _in_place=False, _ini_path=None):
+    def execute_postprocess(self, mod_export_path, _in_place=False, _ini_path=None, _skip_backup=False):
         """生成 / 原地刷新物体切换面板配置。
 
-        - 若蓝图中存在形态键滑块面板（启用 use_slider_panel），进入附加模式：把切换按钮
-          附加到滑块面板左侧，复用其坐标系与交互状态，不生成独立浮动面板。
+        - 按面板模式选择独立面板、附加在滑块左侧，或集成在滑块区域顶部/底部。
         - 否则走原有独立面板机制。
         - 导出时（_in_place=False）：在 mod 目录 ini 中追加面板配置（含专有标识注释）。
         - 刷新时（_in_place=True）：按专有标识移除本面板旧配置后原地重新生成，无需重新导出整个 mod。
@@ -1876,12 +2776,12 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
 
         # 2. 检测形态键滑块面板：存在**且确实产出**时走附加模式（不生成独立浮动面板）
         slider_node = self._find_slider_panel_node()
-        if slider_node is not None:
+        if slider_node is not None and self.panel_mode != 'INDEPENDENT':
             # 附加模式复用的是滑块面板的「无命名空间」全局变量（$img0_x / $zoom0 / $help …），
             # 它们只在滑块面板真的写出时才有定义：节点勾了开关但没有可建滑块的形态键参数、
             # 或节点没被连进后处理链时，附加块会引用不存在的变量（3Dmigoto 侧读到 0）。
             if self._slider_panel_emitted(target_ini_file):
-                print(f"[物体切换面板] 检测到形态键滑块面板节点 '{slider_node.name}'，切换按钮将附加到其左侧")
+                print(f"[物体切换面板] 检测到形态键滑块面板节点 '{slider_node.name}'，布局={self.panel_mode}")
                 # 附加模式总是替换旧配置，允许从独立模式平滑切换过来（不残留旧的独立面板段落）
                 return self._generate_attached_panel(
                     mod_export_path, target_ini_file, buttons, _in_place=True
@@ -1903,7 +2803,7 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
                 pass
 
         try:
-            if self.create_cumulative_backup:
+            if self.create_cumulative_backup and not _skip_backup:
                 self._create_cumulative_backup(target_ini_file, mod_export_path)
         except Exception as e:
             print(f"创建备份时出错: {e}")
@@ -1925,7 +2825,7 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
 
             shader_src = os.path.join(source_asset_dir, "draw_2d.hlsl")
             shader_dst = os.path.join(dest_res_dir, "draw_2d.hlsl")
-            if os.path.exists(shader_src) and not os.path.exists(shader_dst):
+            if os.path.exists(shader_src):
                 shutil.copy2(shader_src, shader_dst)
 
             btn_h = self.button_height
@@ -1937,7 +2837,7 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
                 shutil.copy2(bg_custom, bg_dest_path)
             else:
                 default_bg_src = os.path.join(source_asset_dir, "0.png")
-                if os.path.exists(default_bg_src) and not os.path.exists(bg_dest_path):
+                if os.path.exists(default_bg_src):
                     shutil.copy2(default_bg_src, bg_dest_path)
 
             # 读取实际使用的背景图宽高（用户选择的背景图片优先；未选择时为内置默认图）
@@ -2005,8 +2905,24 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
         side_padding = 0.02
         total_button_height = num_rows * btn_h
         total_spacing_height = max(0, (num_rows - 1) * self.button_row_spacing)
-        parent_height = total_button_height + total_spacing_height + top_padding + bottom_padding
-        parent_height = max(parent_height, self.panel_min_height)
+        content_height = total_button_height + total_spacing_height + top_padding + bottom_padding
+        parent_height = content_height
+        if not (self.auto_crop_background and PIL_AVAILABLE):
+            parent_height = max(parent_height, self.panel_min_height)
+
+        if self.auto_crop_background and PIL_AVAILABLE:
+            crop_panel_width = grid_width + (side_padding * 2)
+            target_aspect = crop_panel_width / max(parent_height * SCREEN_RATIO_CORRECTION, 1e-6)
+            if self._crop_background_to_aspect(bg_dest_path, target_aspect):
+                bg_img_w = bg_img_h = None
+                try:
+                    with PILImage.open(bg_dest_path) as image:
+                        bg_img_w, bg_img_h = image.size
+                except Exception:
+                    pass
+                bg_aspect = (bg_img_w / bg_img_h) if (bg_img_w and bg_img_h) else None
+            else:
+                parent_height = max(parent_height, self.panel_min_height)
 
         if bg_aspect:
             derived_bg_width = parent_height * bg_aspect * SCREEN_RATIO_CORRECTION
@@ -2019,6 +2935,9 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
         self._generate_background_image(os.path.join(dest_res_dir, f"swpbg_{ns}.png"),
                                         adjusted_panel_bg_width, parent_height,
                                         use_existing=bool(bg_custom))
+        mark_png_as_srgb(os.path.join(dest_res_dir, f"swpbg_{ns}.png"))
+        for i in range(1, num_buttons + 1):
+            mark_png_as_srgb(os.path.join(dest_res_dir, f"swpbtn_{ns}_{i}.png"))
 
         help_key = self.help_key.strip() or "home"
         reset_key = self.reset_key.strip() or "ctrl home"
@@ -2309,21 +3228,826 @@ class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
             return False
 
 
+def _clone_panel_property_annotations(source_annotations):
+    cloned = {}
+    for name, prop in source_annotations.items():
+        factory = getattr(prop, "function", None)
+        keywords = getattr(prop, "keywords", None)
+        cloned[name] = factory(**dict(keywords)) if callable(factory) and keywords is not None else prop
+    return cloned
+
+
+def _apply_swap_panel_implementation(cls):
+    """Copy shared Python behavior onto a concrete Blender node class.
+
+    Concrete Blender node types must derive directly from the post-process
+    base; a Python mixin must not participate in their inheritance chain.
+    """
+    reserved = {
+        "__annotations__", "__classcell__", "__dict__", "__doc__", "__module__",
+        "__weakref__", "bl_idname", "bl_label", "bl_description", "init", "copy",
+    }
+    for name, value in vars(_SSMTNode_PostProcess_SwapPanelMixin).items():
+        if name not in reserved and name not in cls.__dict__:
+            setattr(cls, name, value)
+    return cls
+
+
+class SSMTNode_PostProcess_SwapPanel(SSMTNode_PostProcess_Base):
+    bl_idname = 'SSMTNode_PostProcess_SwapPanel'
+    bl_label = '物体切换面板'
+    bl_description = _SSMTNode_PostProcess_SwapPanelMixin.bl_description
+    __annotations__ = _clone_panel_property_annotations(_SSMTNode_PostProcess_SwapPanelMixin.__annotations__)
+    def init(self, context):
+        SSMTNode_PostProcess_Base.init(self, context)
+        self.width = 600
+
+    def copy(self, node):
+        self.namespace = ""
+
+
+_apply_swap_panel_implementation(SSMTNode_PostProcess_SwapPanel)
+
+
+class SSMTNode_PostProcess_CombinedPanel(SSMTNode_PostProcess_Base):
+    """统一呈现切换按钮与形态键滑块设置的面板节点。
+
+    滑块实际生成仍委托给旧形态键扩展节点，保证旧版导出路径与持久化数据兼容。
+    """
+    bl_idname = 'SSMTNode_PostProcess_CombinedPanel'
+    bl_label = '切换＆滑块面板'
+    bl_description = (
+        '统一设置物体切换按钮和形态键滑块面板；形态键扩展节点仍负责形态键数据处理。'
+    )
+    __annotations__ = _clone_panel_property_annotations(_SSMTNode_PostProcess_SwapPanelMixin.__annotations__)
+    def init(self, context):
+        SSMTNode_PostProcess_Base.init(self, context)
+        self.width = 700
+        self.shared_settings_version = 1
+        self["_combined_common_ui_version"] = 2
+        self["_combined_common_hotkeys_version"] = 2
+
+    def copy(self, node):
+        self.namespace = ""
+
+    slider_use_slider_panel: bpy.props.BoolProperty(name="启用滑块面板", default=True)
+    slider_create_cumulative_backup: bpy.props.BoolProperty(name="创建累积备份", default=True)
+    slider_weight_min: bpy.props.FloatProperty(name="滑块下限", default=0.0, min=-4.0, max=4.0, precision=3)
+    slider_weight_max: bpy.props.FloatProperty(name="滑块上限", default=1.0, min=-4.0, max=4.0, precision=3)
+    slider_help_key: bpy.props.StringProperty(name="显示/隐藏面板", default="home")
+    slider_reset_key: bpy.props.StringProperty(name="重置位置", default="ctrl home")
+    slider_zoom_in_key: bpy.props.StringProperty(name="放大", default="up")
+    slider_zoom_out_key: bpy.props.StringProperty(name="缩小", default="down")
+    slider_drag_key: bpy.props.StringProperty(name="拖拽键", default="VK_LBUTTON")
+    slider_height: bpy.props.FloatProperty(name="滑块高度", default=0.042, min=0.001, max=1.0, precision=4)
+    slider_play_button_height: bpy.props.FloatProperty(name="播放按钮高度", default=0.045, min=0.001, max=1.0, precision=4)
+    slider_panel_min_height: bpy.props.FloatProperty(name="滑块面板最小高度", default=0.75, min=0.01, max=1.0, precision=4)
+    slider_panel_scale: bpy.props.FloatProperty(name="滑块面板默认缩放", default=1.0, min=0.1, max=5.0, precision=2)
+    slider_target_object: bpy.props.StringProperty(name="滑块目标物体", default="")
+    slider_detect_hash: bpy.props.StringProperty(name="滑块哈希值", default="")
+    slider_detect_index_count: bpy.props.StringProperty(name="滑块IndexCount", default="")
+    slider_check_hash: bpy.props.StringProperty(name="备用滑块哈希值", default="")
+    slider_match_index_count: bpy.props.IntProperty(name="备用滑块IndexCount", default=0, min=0)
+    slider_background_image: bpy.props.StringProperty(name="滑块面板背景图片", subtype='FILE_PATH', default="")
+    slider_auto_crop_background: bpy.props.BoolProperty(name="自动裁剪背景", default=False)
+    slider_handle_image: bpy.props.StringProperty(name="滑块图片", subtype='FILE_PATH', default="")
+    slider_left_bar_image: bpy.props.StringProperty(name="左进度条图片", subtype='FILE_PATH', default="")
+    slider_right_bar_image: bpy.props.StringProperty(name="右进度条图片", subtype='FILE_PATH', default="")
+    slider_play_button_image: bpy.props.StringProperty(name="播放按钮图片", subtype='FILE_PATH', default="")
+    slider_play_button_bg_color: bpy.props.FloatVectorProperty(name="播放按钮背景色", subtype='COLOR', default=(0.16, 0.22, 0.32), min=0.0, max=1.0, size=3)
+    slider_play_button_border_color: bpy.props.FloatVectorProperty(name="播放按钮边框色", subtype='COLOR', default=(0.59, 0.75, 0.94), min=0.0, max=1.0, size=3)
+    slider_play_button_border_width: bpy.props.IntProperty(name="播放按钮边框宽度", default=2, min=0, max=20)
+    slider_play_button_opacity: bpy.props.FloatProperty(name="播放按钮透明度", default=0.9, min=0.0, max=1.0, precision=2)
+    slider_panel_corner_radius: bpy.props.IntProperty(name="滑块面板圆角", default=5, min=0, max=100)
+    slider_panel_border_color: bpy.props.FloatVectorProperty(name="滑块面板边框色", subtype='COLOR', default=(0.59, 0.75, 0.94), min=0.0, max=1.0, size=3)
+    slider_panel_border_width: bpy.props.IntProperty(name="滑块面板边框宽度", default=3, min=0, max=20)
+    slider_panel_opacity: bpy.props.FloatProperty(name="滑块面板透明度", default=0.85, min=0.0, max=1.0, precision=2)
+    shared_settings_version: bpy.props.IntProperty(default=0, options={'HIDDEN'})
+    ui_show_switch_controls: bpy.props.BoolProperty(name="切换设置", default=True, options={'HIDDEN'})
+    ui_show_switch_data: bpy.props.BoolProperty(name="检测与按钮列表", default=True, options={'HIDDEN'})
+    ui_show_switch_appearance: bpy.props.BoolProperty(name="切换外观", default=False, options={'HIDDEN'})
+    ui_show_common_panel_settings: bpy.props.BoolProperty(
+        name="共用面板设置", default=True, options={'HIDDEN'}
+    )
+    ui_show_slider_controls: bpy.props.BoolProperty(name="滑块控制", default=False, options={'HIDDEN'})
+    ui_show_slider_appearance: bpy.props.BoolProperty(name="滑块外观", default=False, options={'HIDDEN'})
+
+    SLIDER_CONFIG_MAP = {
+        "slider_use_slider_panel": "use_slider_panel",
+        "slider_create_cumulative_backup": "create_cumulative_backup",
+        "slider_weight_min": "weight_min", "slider_weight_max": "weight_max",
+        "slider_help_key": "help_key", "slider_reset_key": "reset_key",
+        "slider_zoom_in_key": "zoom_in_key", "slider_zoom_out_key": "zoom_out_key",
+        "slider_drag_key": "drag_key", "slider_height": "slider_height",
+        "slider_play_button_height": "button_height", "slider_panel_min_height": "panel_min_height",
+        "slider_auto_crop_background": "auto_crop_background",
+        "slider_panel_scale": "panel_default_scale", "slider_target_object": "target_object",
+        "slider_detect_hash": "detect_hash", "slider_detect_index_count": "detect_index_count",
+        "slider_check_hash": "check_hash", "slider_match_index_count": "match_index_count",
+        "slider_background_image": "background_image", "slider_handle_image": "slider_handle_image",
+        "slider_left_bar_image": "left_bar_image", "slider_right_bar_image": "right_bar_image",
+        "slider_play_button_image": "button_image", "slider_play_button_bg_color": "button_bg_color",
+        "slider_play_button_border_color": "button_border_color",
+        "slider_play_button_border_width": "button_border_width", "slider_play_button_opacity": "button_opacity",
+        "slider_panel_corner_radius": "background_corner_radius",
+        "slider_panel_border_color": "background_border_color",
+        "slider_panel_border_width": "background_border_width", "slider_panel_opacity": "background_opacity",
+    }
+
+    def _find_shape_ext_node(self):
+        root = getattr(self, "id_data", None)
+        visited = set()
+
+        def walk(tree):
+            if tree is None:
+                return None
+            pointer = tree.as_pointer() if hasattr(tree, "as_pointer") else id(tree)
+            if pointer in visited:
+                return None
+            visited.add(pointer)
+            for node in getattr(tree, "nodes", []) or []:
+                if (getattr(node, "bl_idname", "") == "SSMTNode_PostProcess_ShapeKeyExt"
+                        and not getattr(node, "mute", False)):
+                    return node
+                nested = getattr(node, "node_tree", None)
+                found = walk(nested) if nested is not None else None
+                if found is not None:
+                    return found
+            return None
+
+        return walk(root)
+
+    def _draw_switch_controls(self, context, layout, attached_mode, show_shared_scale=True,
+                              show_switch_layout=True):
+        box = layout.box()
+        box.prop(self, "ui_show_switch_controls", text="切换设置", icon='SHADERFX', toggle=True)
+        if not self.ui_show_switch_controls:
+            return
+        layout = box.column()
+
+        mode = layout.box()
+        mode.label(text="面板布局", icon='FULLSCREEN_ENTER')
+        mode_row = mode.row(align=True)
+        mode_row.prop(self, "panel_mode", text="")
+        emitted_slider_node = self._find_slider_panel_node()
+        slider_node = self._find_shape_ext_node()
+        if emitted_slider_node is not None and self.panel_mode != 'INDEPENDENT':
+            mode_hint = {
+                'ATTACHED_LEFT': "切换按钮附加在滑块左侧，共用滑块位置、缩放和快捷键。",
+                'INTEGRATED_TOP': "切换按钮排在滑块面板内部上方。",
+                'INTEGRATED_BOTTOM': "切换按钮排在滑块面板内部下方。",
+            }.get(self.panel_mode, "")
+            mode.label(text=mode_hint, icon='LINKED')
+        elif slider_node is not None:
+            mode.label(text="独立模式：位置和快捷键分别控制", icon='INFO')
+        else:
+            mode.label(text="无滑块面板：切换按钮独立显示", icon='INFO')
+
+        box = layout.box()
+        box.prop(self, "gui_only", text="GUI全局模式")
+
+        if show_switch_layout:
+            box = layout.box()
+            box.label(text="切换按钮布局", icon='PROPERTIES')
+            col = box.column(align=True)
+            if not attached_mode and show_shared_scale:
+                col.prop(self, "panel_default_scale", text="面板默认缩放")
+            col.prop(self, "button_height", text="切换按钮高度")
+            col.prop(self, "button_width", text="切换按钮默认宽度")
+            col.prop(self, "buttons_per_row", text="每行按钮数")
+            row = col.row(align=True)
+            row.prop(self, "button_column_spacing", text="列间距")
+            row.prop(self, "button_row_spacing", text="行间距")
+            col.prop(self, "button_top_padding", text="顶部留白")
+            if not attached_mode:
+                col.prop(self, "panel_min_height", text="面板最小高度")
+
+    def _draw_switch_data(self, layout, attached_mode, show_target_detection=True):
+        box = layout.box()
+        box.prop(self, "ui_show_switch_data", text=("切换按钮列表" if not show_target_detection else "目标检测与按钮列表"), icon='VIEWZOOM', toggle=True)
+        if not self.ui_show_switch_data:
+            return
+        body = box.column()
+        if not attached_mode and show_target_detection:
+            section = body.box()
+            section.label(text="切换目标检测", icon='VIEWZOOM')
+            row = section.row(align=True)
+            row.prop_search(self, "target_object", bpy.data, "objects", text="物体", icon='OBJECT_DATA')
+            row.operator("ssmt.swap_panel_add_active_object", text="添加选中物体", icon='EYEDROPPER').node_name = self.name
+            row.operator("ssmt.swap_panel_parse_object", text="", icon='FILE_REFRESH').node_name = self.name
+            section.prop(self, "detect_hash", text="哈希值")
+            section.prop(self, "detect_index_count", text="IndexCount")
+
+        section = body.box()
+        section.label(text="切换按钮列表", icon='SHADERFX')
+        row = section.row(align=True)
+        row.operator("ssmt.swap_panel_scan", text="刷新列表", icon='FILE_REFRESH').node_name = self.name
+        section.label(text="修改设置后可使用顶部按钮原地更新", icon='INFO')
+        if self.swap_panel_entries:
+            for entry in self.swap_panel_entries:
+                note = entry.comment or "(无备注)"
+                vars_text = entry.variables.replace("|", " / ") or entry.variable_name
+                section.label(text=f"{vars_text}  |  {note}  |  {entry.option_count}项", icon='NONE')
+        else:
+            section.label(text="未检测到切换，点击「刷新列表」", icon='INFO')
+
+    def _draw_switch_appearance(self, layout, attached_mode, show_shared_styles=True):
+        box = layout.box()
+        box.prop(self, "ui_show_switch_appearance", text="切换按钮外观", icon='TEXTURE', toggle=True)
+        if not self.ui_show_switch_appearance:
+            return
+        layout = box.column()
+
+        box = layout.box()
+        box.label(text="切换按钮图片", icon='TEXTURE')
+        if not attached_mode:
+            box.prop(self, "background_image", text="背景图片")
+            box.prop(self, "button_image", text="全局回退图片")
+        box.prop(self, "button_border_image", text="按钮边框")
+        box.label(text="单按钮图片优先，其次全局图片和备注图标", icon='INFO')
+        if self.swap_panel_button_entries:
+            box.separator()
+            box.label(text="各控制按钮图片", icon='IMAGE_DATA')
+            for entry in self.swap_panel_button_entries:
+                row = box.row(align=True)
+                row.label(text=entry.label or "(无备注)", icon='NONE')
+                row.prop(entry, "image_path", text="")
+
+        box = layout.box()
+        box.label(text="备注图标与按钮样式", icon='FILE_FONT')
+        if attached_mode:
+            box.label(text="集成模式下，按钮颜色和文字样式跟随滑块面板", icon='LINKED')
+        else:
+            if PIL_AVAILABLE:
+                box.prop(self, "use_remark_as_icon", text="用备注生成图标")
+                if self.use_remark_as_icon:
+                    col = box.column(align=True)
+                    col.prop(self, "remark_font_family", text="字体")
+                    col.prop(self, "remark_font_size", text="字号")
+                    row = col.row(align=True)
+                    row.prop(self, "remark_text_color", text="文字色")
+                    row.prop(self, "remark_stroke_color", text="描边色")
+                    col.prop(self, "remark_stroke_width", text="描边粗细")
+            else:
+                box.label(text="未安装 Pillow，无法用备注生成图标", icon='ERROR')
+            if show_shared_styles:
+                box.label(text="按钮背景/边框", icon='COLOR')
+                row = box.row(align=True)
+                row.prop(self, "button_bg_color", text="背景色")
+                row.prop(self, "button_border_color", text="边框色")
+                box.prop(self, "button_border_width", text="边框宽度")
+                box.prop(self, "button_opacity", text="透明度")
+            box.prop(self, "button_align", text="按钮对齐")
+
+        if not attached_mode and show_shared_styles:
+            box = layout.box()
+            box.label(text="独立切换面板背景", icon='MATERIAL')
+            box.prop(self, "background_corner_radius", text="圆角")
+            box.prop(self, "background_border_color", text="边框色")
+            box.prop(self, "background_border_width", text="边框宽度")
+            box.prop(self, "background_opacity", text="透明度")
+
+    def _draw_common_panel_settings(self, layout, slider_node=None, emitted_slider_node=None):
+        box = layout.box()
+        box.prop(
+            self,
+            "ui_show_common_panel_settings",
+            text="共用面板设置",
+            icon='LINKED',
+            toggle=True,
+        )
+        if not self.ui_show_common_panel_settings:
+            return
+        body = box.column()
+        split = body.split(factor=0.5)
+        left = split.column()
+        right = split.column()
+
+        actions = left.box()
+        actions.label(text="共用操作", icon='FILE_TICK')
+        action_row = actions.row(align=True)
+        action_row.alignment = 'LEFT'
+        action_row.prop(self, "create_cumulative_backup", text="累积备份")
+        action_row.operator(
+            "ssmt.combined_panel_refresh",
+            text="应用设置到Mod",
+            icon='FILE_TICK',
+        ).node_name = self.name
+        action_row.operator(
+            "ssmt.combined_panel_preview",
+            text="预览",
+            icon='HIDE_OFF',
+        ).node_name = self.name
+        actions.prop(self, "ini_file_path", text="共用 INI")
+
+        hotkeys = left.box()
+        hotkeys.label(text="快捷键设置（切换与滑块共用）", icon='KEYINGSET')
+        hotkey_col = hotkeys.column(align=True)
+        for prop_name, label in (
+            ("help_key", "显示/隐藏面板"),
+            ("reset_key", "重置位置"),
+            ("zoom_in_key", "放大"),
+            ("zoom_out_key", "缩小"),
+            ("drag_key", "拖拽键"),
+        ):
+            row = hotkey_col.row(align=True)
+            picker = row.operator("ssmt.key_picker", text="选键", icon='KEYINGSET')
+            picker.node_name = self.name
+            picker.node_tree_name = self.id_data.name
+            picker.target_prop = prop_name
+            row.prop(self, prop_name, text=label)
+
+        section = left.box()
+        section.label(text="角色检测设置", icon='VIEWZOOM')
+        row = section.row(align=True)
+        row.prop_search(self, "target_object", bpy.data, "objects", text="物体", icon='OBJECT_DATA')
+        row.operator("ssmt.swap_panel_add_active_object", text="添加选中物体", icon='EYEDROPPER').node_name = self.name
+        row.operator("ssmt.swap_panel_parse_object", text="", icon='FILE_REFRESH').node_name = self.name
+        section.prop(self, "detect_hash", text="哈希值")
+        section.prop(self, "detect_index_count", text="IndexCount")
+
+        if emitted_slider_node is not None and self.panel_mode != 'INDEPENDENT':
+            section = left.box()
+            section.label(text="集成面板背景图片", icon='TEXTURE')
+            section.prop(self, "slider_background_image", text="背景")
+
+        section = left.box()
+        section.label(text="背景处理", icon='IMAGE_DATA')
+        section.prop(self, "auto_crop_background", text="自动裁剪背景")
+        if self.auto_crop_background:
+            section.label(text="按按钮/滑块占用范围裁切，不保留最小高度留白", icon='INFO')
+        if not PIL_AVAILABLE:
+            section.label(text="需要 Pillow；当前未安装", icon='ERROR')
+
+        section = right.box()
+        section.label(text="文字按钮样式", icon='FILE_FONT')
+        row = section.row(align=True)
+        row.prop(self, "button_bg_color", text="背景色")
+        row.prop(self, "button_border_color", text="边框色")
+        section.prop(self, "button_border_width", text="边框宽度")
+        section.prop(self, "button_opacity", text="透明度")
+
+        section = right.box()
+        section.label(text="面板背景样式（切换与滑块共用）", icon='MATERIAL')
+        section.prop(self, "background_corner_radius", text="背景圆角")
+        section.prop(self, "background_border_color", text="边框色")
+        section.prop(self, "background_border_width", text="边框宽度")
+        section.prop(self, "background_opacity", text="透明度")
+
+        section = right.box()
+        section.label(text="UI尺寸设置", icon='PROPERTIES')
+        section.prop(self, "panel_default_scale", text="面板默认缩放")
+        section.prop(self, "slider_height", text="滑块高度")
+        section.prop(self, "slider_play_button_height", text="滑块按钮高度")
+        section.prop(self, "slider_panel_min_height", text="滑块面板最小高度")
+        section.label(text="宽度按高度与图片比例自动计算", icon='INFO')
+
+    def draw_buttons(self, context, layout):
+        slider_node = self._find_shape_ext_node()
+        emitted_slider_node = self._find_slider_panel_node()
+        attached_mode = emitted_slider_node is not None and self.panel_mode != 'INDEPENDENT'
+
+        self._draw_common_panel_settings(layout, slider_node, emitted_slider_node)
+
+        split = layout.split(factor=0.5)
+        left = split.column()
+        right = split.column()
+        left_box = left.box()
+        left_box.label(text="物体切换设置", icon='OBJECT_DATA')
+        left = left_box.column()
+        right_box = right.box()
+        right_box.label(text="形态键滑块设置", icon='SHAPEKEY_DATA')
+        right = right_box.column()
+        self._draw_switch_controls(
+            context, left, attached_mode, show_shared_scale=False, show_switch_layout=True
+        )
+        self._draw_switch_data(left, attached_mode, show_target_detection=False)
+        self._draw_switch_appearance(left, attached_mode, show_shared_styles=False)
+        if slider_node is None:
+            box = right.box()
+            box.label(text="滑块设置需要同一蓝图中的形态键扩展配置节点", icon='INFO')
+            return
+        slider_node._draw_slider_ui(
+            layout,
+            config_node=self,
+            property_map=self.SLIDER_CONFIG_MAP,
+            columns=(right, right),
+            show_enable=True,
+            show_backup=False,
+            show_background_image=not attached_mode,
+        )
+
+
+_apply_swap_panel_implementation(SSMTNode_PostProcess_CombinedPanel)
+
+
+def _copy_rna_value(source, target, prop):
+    identifier = prop.identifier
+    if (identifier in {"rna_type", "name", "id_data", "inputs", "outputs", "internal_links"}
+            or identifier.startswith("bl_")):
+        return
+    if getattr(prop, "is_readonly", False) and prop.type != 'COLLECTION':
+        return
+    try:
+        value = getattr(source, identifier)
+        if prop.type == 'COLLECTION':
+            destination = getattr(target, identifier)
+            if hasattr(destination, "clear"):
+                destination.clear()
+            for source_item in value:
+                target_item = destination.add()
+                for item_prop in source_item.bl_rna.properties:
+                    if item_prop.identifier in {"rna_type", "name"} or item_prop.is_readonly:
+                        continue
+                    try:
+                        item_value = getattr(source_item, item_prop.identifier)
+                        if item_prop.type == 'COLLECTION':
+                            nested = getattr(target_item, item_prop.identifier)
+                            for nested_source in item_value:
+                                nested_target = nested.add()
+                                for nested_prop in nested_source.bl_rna.properties:
+                                    if nested_prop.identifier in {"rna_type", "name"} or nested_prop.is_readonly:
+                                        continue
+                                    try:
+                                        setattr(nested_target, nested_prop.identifier, getattr(nested_source, nested_prop.identifier))
+                                    except Exception:
+                                        pass
+                        else:
+                            setattr(target_item, item_prop.identifier, item_value)
+                    except Exception:
+                        pass
+        elif prop.type != 'POINTER':
+            setattr(target, identifier, value)
+    except Exception:
+        # Properties unavailable in this Blender version retain their new-node defaults.
+        pass
+
+
+def _socket_match(sockets, old_socket):
+    identifier = getattr(old_socket, "identifier", "")
+    for socket in sockets:
+        if identifier and getattr(socket, "identifier", "") == identifier:
+            return socket
+    for socket in sockets:
+        if socket.name == old_socket.name:
+            return socket
+    return None
+
+
+def migrate_legacy_swap_panels():
+    """Convert legacy swap-panel nodes in loaded projects, preserving values and links."""
+    try:
+        trees = list(getattr(bpy.data, "node_groups", []) or [])
+        for collection_name in ("materials", "worlds", "scenes"):
+            for owner in getattr(bpy.data, collection_name, []) or []:
+                tree = getattr(owner, "node_tree", None)
+                if tree is not None and tree not in trees:
+                    trees.append(tree)
+    except Exception:
+        return
+
+    for tree in trees:
+        for old_node in list(getattr(tree, "nodes", []) or []):
+            if getattr(old_node, "bl_idname", "") != 'SSMTNode_PostProcess_SwapPanel':
+                continue
+            new_node = None
+            reused_combined = False
+            reused_links_before = set()
+            old_name = old_node.name
+            try:
+                old_links = [
+                    (link.from_node, link.from_socket, link.to_node, link.to_socket)
+                    for link in list(tree.links)
+                    if link.from_node == old_node or link.to_node == old_node
+                ]
+                existing_combined = [
+                    node for node in getattr(tree, "nodes", []) or []
+                    if node != old_node
+                    and getattr(node, "bl_idname", "") == 'SSMTNode_PostProcess_CombinedPanel'
+                ]
+                upstream_combined = []
+                pending = [(node, 1) for node in old_links if node[2] == old_node]
+                visited = set()
+                while pending:
+                    link_data, distance = pending.pop(0)
+                    upstream = link_data[0]
+                    if upstream in visited:
+                        continue
+                    visited.add(upstream)
+                    if getattr(upstream, "bl_idname", "") == 'SSMTNode_PostProcess_CombinedPanel':
+                        upstream_combined.append((distance, upstream))
+                    pending.extend(
+                        ((link.from_node, link.from_socket, link.to_node, link.to_socket), distance + 1)
+                        for link in list(tree.links) if link.to_node == upstream
+                    )
+                downstream_combined = []
+                pending = [(link[2], 1) for link in old_links if link[0] == old_node]
+                visited = set()
+                while pending:
+                    downstream, distance = pending.pop(0)
+                    if downstream in visited:
+                        continue
+                    visited.add(downstream)
+                    if getattr(downstream, "bl_idname", "") == 'SSMTNode_PostProcess_CombinedPanel':
+                        downstream_combined.append((distance, downstream))
+                    pending.extend(
+                        (link.to_node, distance + 1)
+                        for link in list(tree.links) if link.from_node == downstream
+                    )
+
+                related = upstream_combined or downstream_combined
+                if related:
+                    related.sort(key=lambda item: item[0])
+                    new_node = related[0][1]
+                    reused_combined = True
+                    reused_links_before = {
+                        (link.from_node, link.from_socket, link.to_node, link.to_socket)
+                        for link in list(tree.links)
+                        if link.from_node == new_node or link.to_node == new_node
+                    }
+                elif existing_combined:
+                    old_location = old_node.location
+                    existing_combined.sort(key=lambda node: (
+                        (node.location.x - old_location.x) ** 2 + (node.location.y - old_location.y) ** 2
+                    ))
+                    new_node = existing_combined[0]
+                    reused_combined = True
+                    reused_links_before = {
+                        (link.from_node, link.from_socket, link.to_node, link.to_socket)
+                        for link in list(tree.links)
+                        if link.from_node == new_node or link.to_node == new_node
+                    }
+                else:
+                    new_node = tree.nodes.new('SSMTNode_PostProcess_CombinedPanel')
+                for prop in old_node.bl_rna.properties:
+                    _copy_rna_value(old_node, new_node, prop)
+                if not reused_links_before:
+                    new_node.location = old_node.location.copy()
+                    new_node.parent = old_node.parent
+                    new_node.label = old_node.label or ""
+                    new_node.use_custom_color = old_node.use_custom_color
+                    if new_node.use_custom_color:
+                        new_node.color = old_node.color
+                    new_node.select = old_node.select
+                new_node.width = max(float(new_node.width), 700.0)
+                # Reuse a disconnected CombinedPanel already placed in the same graph
+                # instead of leaving a duplicate beside the migrated legacy node.
+                # The reusable CombinedPanel is still disconnected here, so its
+                # normal upstream lookup cannot see the legacy ShapeKeyExt yet.
+                # Walk the old panel's incoming chain before rewiring it.
+                slider_node = None
+                pending_upstream = [from_node for from_node, _from_socket, to_node, _to_socket in old_links
+                                    if to_node == old_node]
+                visited_upstream = set()
+                while pending_upstream and slider_node is None:
+                    upstream = pending_upstream.pop()
+                    if upstream in visited_upstream:
+                        continue
+                    visited_upstream.add(upstream)
+                    if getattr(upstream, "bl_idname", "") == 'SSMTNode_PostProcess_ShapeKeyExt':
+                        slider_node = upstream
+                        break
+                    pending_upstream.extend(
+                        link.from_node for link in list(tree.links) if link.to_node == upstream
+                    )
+                if slider_node is None:
+                    slider_node = new_node._find_shape_ext_node()
+                if slider_node is not None:
+                    for combined_prop, legacy_prop in new_node.SLIDER_CONFIG_MAP.items():
+                        if combined_prop == "slider_create_cumulative_backup":
+                            continue
+                        try:
+                            setattr(new_node, combined_prop, getattr(slider_node, legacy_prop))
+                        except Exception:
+                            pass
+                    try:
+                        new_node.create_cumulative_backup = bool(old_node.create_cumulative_backup) and bool(
+                            slider_node.create_cumulative_backup
+                        )
+                        if not new_node.ini_file_path and slider_node.ini_file_path:
+                            new_node.ini_file_path = slider_node.ini_file_path
+                    except Exception:
+                        pass
+                new_node.width = max(float(old_node.width), 700.0)
+                new_node.shared_settings_version = 1
+                new_node["_combined_common_ui_version"] = 0
+                new_node["_combined_common_hotkeys_version"] = 0
+
+                for from_node, from_socket, to_node, to_socket in old_links:
+                    if to_node == old_node:
+                        if from_node == new_node:
+                            # The existing combined node is already upstream; its
+                            # existing input connection remains the merged input.
+                            continue
+                        destination_socket = _socket_match(new_node.inputs, to_socket)
+                        if destination_socket is None:
+                            raise RuntimeError(f"新节点缺少输入 socket: {to_socket.name}")
+                        tree.links.new(from_socket, destination_socket)
+                    else:
+                        if to_node == new_node:
+                            # The existing combined node is downstream; bypass the
+                            # legacy switch node and feed its original input forward.
+                            continue
+                        source_socket = _socket_match(new_node.outputs, from_socket)
+                        if source_socket is None:
+                            raise RuntimeError(f"新节点缺少输出 socket: {from_socket.name}")
+                        tree.links.new(source_socket, to_socket)
+
+                tree.nodes.remove(old_node)
+                new_node.name = old_name
+                print(f"[切换＆滑块面板] 已迁移旧物体切换面板节点：{old_name}（{tree.name}）")
+            except Exception as error:
+                if new_node is not None and not reused_combined:
+                    try:
+                        tree.nodes.remove(new_node)
+                    except Exception:
+                        pass
+                elif reused_combined and new_node is not None:
+                    for link in list(tree.links):
+                        key = (link.from_node, link.from_socket, link.to_node, link.to_socket)
+                        if (link.from_node == new_node or link.to_node == new_node) and key not in reused_links_before:
+                            try:
+                                tree.links.remove(link)
+                            except Exception:
+                                pass
+                # 创建替代节点中途失败时，把可能被 Blender 自动替换的输入连线接回旧节点。
+                for from_node, from_socket, to_node, to_socket in locals().get("old_links", []):
+                    try:
+                        if to_node == old_node:
+                            destination_socket = _socket_match(old_node.inputs, to_socket)
+                            if destination_socket is not None and not any(
+                                link.from_socket == from_socket and link.to_socket == destination_socket
+                                for link in tree.links
+                            ):
+                                tree.links.new(from_socket, destination_socket)
+                        elif from_node == old_node:
+                            source_socket = _socket_match(old_node.outputs, from_socket)
+                            if source_socket is not None and not any(
+                                link.from_socket == source_socket and link.to_socket == to_socket
+                                for link in tree.links
+                            ):
+                                tree.links.new(source_socket, to_socket)
+                    except Exception:
+                        pass
+                print(f"[切换＆滑块面板] 迁移旧节点失败，保留原节点 {old_name}：{error}")
+
+    # Earlier preview builds could leave two CombinedPanels chained together
+    # when a legacy SwapPanel followed an already connected CombinedPanel.
+    # Collapse those pairs into the upstream node and keep the slider settings.
+    switch_properties = set(getattr(_SSMTNode_PostProcess_SwapPanelMixin, "__annotations__", {}))
+    for tree in trees:
+        while True:
+            pair = next((link for link in list(getattr(tree, "links", []) or [])
+                         if getattr(link.from_node, "bl_idname", "") == 'SSMTNode_PostProcess_CombinedPanel'
+                         and getattr(link.to_node, "bl_idname", "") == 'SSMTNode_PostProcess_CombinedPanel'), None)
+            if pair is None:
+                break
+            upstream, downstream = pair.from_node, pair.to_node
+            try:
+                backup_enabled = bool(upstream.create_cumulative_backup) and bool(
+                    downstream.create_cumulative_backup
+                )
+                for identifier in switch_properties:
+                    try:
+                        setattr(upstream, identifier, getattr(downstream, identifier))
+                    except Exception:
+                        pass
+                upstream.create_cumulative_backup = backup_enabled
+                if downstream.ini_file_path:
+                    upstream.ini_file_path = downstream.ini_file_path
+                if downstream.last_mod_ini_path:
+                    upstream.last_mod_ini_path = downstream.last_mod_ini_path
+                upstream.width = max(float(upstream.width), float(downstream.width), 700.0)
+
+                downstream_outputs = [
+                    (link.from_socket, link.to_node, link.to_socket)
+                    for link in list(tree.links) if link.from_node == downstream
+                ]
+                for old_output, to_node, to_socket in downstream_outputs:
+                    if to_node == upstream:
+                        continue
+                    new_output = _socket_match(upstream.outputs, old_output)
+                    if new_output is None:
+                        raise RuntimeError(f"合并节点缺少输出 socket：{old_output.name}")
+                    tree.links.new(new_output, to_socket)
+                tree.nodes.remove(downstream)
+                print(f"[切换＆滑块面板] 已合并重复组合节点：{upstream.name}（{tree.name}）")
+            except Exception as error:
+                print(f"[切换＆滑块面板] 合并重复组合节点失败：{upstream.name}（{tree.name}）：{error}")
+                break
+
+    # Bring nodes written by the first CombinedPanel version onto the shared
+    # backup/path settings once. New nodes and freshly migrated legacy nodes
+    # mark themselves current during creation above.
+    for tree in trees:
+        for node in getattr(tree, "nodes", []) or []:
+            if getattr(node, "bl_idname", "") != 'SSMTNode_PostProcess_CombinedPanel':
+                continue
+            if int(getattr(node, "shared_settings_version", 0) or 0) >= 1:
+                continue
+            try:
+                node.create_cumulative_backup = bool(node.create_cumulative_backup) and bool(
+                    node.slider_create_cumulative_backup
+                )
+                slider_node = node._find_shape_ext_node()
+                if slider_node is not None and not node.ini_file_path and slider_node.ini_file_path:
+                    node.ini_file_path = slider_node.ini_file_path
+                node.width = max(float(node.width), 700.0)
+                node.shared_settings_version = 1
+                print(f"[切换＆滑块面板] 已合并共享设置：{node.name}（{tree.name}）")
+            except Exception as error:
+                print(f"[切换＆滑块面板] 合并共享设置失败：{node.name}（{tree.name}）：{error}")
+
+    # Consolidate settings that used to be edited independently on the slider
+    # panel into the CombinedPanel's canonical shared controls, once per file.
+    slider_to_shared = {
+        "slider_target_object": ("target_object", True),
+        "slider_detect_hash": ("detect_hash", True),
+        "slider_detect_index_count": ("detect_index_count", True),
+        "slider_panel_scale": ("panel_default_scale", False),
+        "slider_play_button_bg_color": ("button_bg_color", False),
+        "slider_play_button_border_color": ("button_border_color", False),
+        "slider_play_button_border_width": ("button_border_width", False),
+        "slider_play_button_opacity": ("button_opacity", False),
+        "slider_panel_corner_radius": ("background_corner_radius", False),
+        "slider_panel_border_color": ("background_border_color", False),
+        "slider_panel_border_width": ("background_border_width", False),
+        "slider_panel_opacity": ("background_opacity", False),
+    }
+    for tree in trees:
+        for node in getattr(tree, "nodes", []) or []:
+            if getattr(node, "bl_idname", "") != 'SSMTNode_PostProcess_CombinedPanel':
+                continue
+            if int(node.get("_combined_common_ui_version", 0) or 0) >= 2:
+                continue
+            try:
+                for slider_prop, (shared_prop, empty_only) in slider_to_shared.items():
+                    slider_value = getattr(node, slider_prop, None)
+                    if slider_value is None:
+                        continue
+                    if empty_only and not slider_value:
+                        continue
+                    setattr(node, shared_prop, slider_value)
+                node["_combined_common_ui_version"] = 2
+                print(f"[切换＆滑块面板] 已迁移共用面板设置：{node.name}（{tree.name}）")
+            except Exception as error:
+                print(f"[切换＆滑块面板] 迁移共用面板设置失败：{node.name}（{tree.name}）：{error}")
+
+    slider_hotkeys = {
+        "slider_help_key": "help_key",
+        "slider_reset_key": "reset_key",
+        "slider_zoom_in_key": "zoom_in_key",
+        "slider_zoom_out_key": "zoom_out_key",
+        "slider_drag_key": "drag_key",
+    }
+    for tree in trees:
+        for node in getattr(tree, "nodes", []) or []:
+            if getattr(node, "bl_idname", "") != 'SSMTNode_PostProcess_CombinedPanel':
+                continue
+            if int(node.get("_combined_common_hotkeys_version", 0) or 0) >= 2:
+                continue
+            try:
+                for slider_prop, shared_prop in slider_hotkeys.items():
+                    value = getattr(node, slider_prop, "")
+                    if value:
+                        setattr(node, shared_prop, value)
+                node["_combined_common_hotkeys_version"] = 2
+                print(f"[切换＆滑块面板] 已迁移共用快捷键：{node.name}（{tree.name}）")
+            except Exception as error:
+                print(f"[切换＆滑块面板] 迁移共用快捷键失败：{node.name}（{tree.name}）：{error}")
+
+
+@bpy.app.handlers.persistent
+def _combined_panel_load_post(_dummy):
+    migrate_legacy_swap_panels()
+
+
 classes = (
     SSMT_SwapPanelEntry,
     SSMT_SwapPanelButtonEntry,
     SSMT_OT_SwapPanel_ParseObject,
+    SSMT_OT_SwapPanel_AddActiveObject,
     SSMT_OT_SwapPanel_Scan,
     SSMT_OT_SwapPanel_Refresh,
+    SSMT_OT_CombinedPanel_Refresh,
+    SSMT_OT_CombinedPanel_Preview,
     SSMTNode_PostProcess_SwapPanel,
+    SSMTNode_PostProcess_CombinedPanel,
 )
 
 
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
+    handlers = bpy.app.handlers.load_post
+    if _combined_panel_load_post not in handlers:
+        handlers.append(_combined_panel_load_post)
+    migrate_legacy_swap_panels()
 
 
 def unregister():
+    handlers = bpy.app.handlers.load_post
+    if _combined_panel_load_post in handlers:
+        handlers.remove(_combined_panel_load_post)
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)

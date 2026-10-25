@@ -14,6 +14,7 @@ class SSMTNode_Blueprint_Nest(SSMTNodeBase):
 
     _NODE_TYPE_LABELS = {
         'SSMTNode_Object_Info': '物体信息',
+        'SSMTNode_Object_Info_Pro': '物体信息Pro',
         'SSMTNode_Object_Group': '物体组',
         'SSMTNode_Result_Output': '输出',
         'SSMTNode_ShapeKey': '形态键',
@@ -38,7 +39,8 @@ class SSMTNode_Blueprint_Nest(SSMTNodeBase):
         'SSMTNode_PostProcess_Glow': 'RabbitFX贴图后处理',
         'SSMTNode_PostProcess_RabbitFXPro': 'RabbitFX贴图后处理pro',
         'SSMTNode_PostProcess_DiffuseSwitch': '贴图切换 V5.1',
-        'SSMTNode_PostProcess_SwapPanel': '物体切换面板',
+        'SSMTNode_PostProcess_SwapPanel': '物体切换面板（兼容）',
+        'SSMTNode_PostProcess_CombinedPanel': '切换＆滑块面板',
         'SSMTNode_PostProcess_TextAppend': '文本追加',
     }
 

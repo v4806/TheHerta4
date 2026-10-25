@@ -6,6 +6,7 @@ import shutil
 from collections import OrderedDict
 
 from .node_postprocess_base import SSMTNode_PostProcess_Base
+from ..common.ui_image_color import mark_png_as_srgb
 from ..common.shapekey_weight_range import (
     SLIDER_WINDOW_MIN,
     SLIDER_WINDOW_MAX,
@@ -115,9 +116,8 @@ class SSMTNode_PostProcess_SliderPanel(SSMTNode_PostProcess_Base):
             shader_source_path = os.path.join(source_asset_dir, "draw_2d.hlsl")
             shader_dest_path = os.path.join(dest_res_dir, "draw_2d.hlsl")
             if os.path.exists(shader_source_path):
-                if not os.path.exists(shader_dest_path):
-                    shutil.copy2(shader_source_path, shader_dest_path)
-                    print(f"已复制 draw_2d.hlsl 到 {dest_res_dir}")
+                shutil.copy2(shader_source_path, shader_dest_path)
+                print(f"已更新 draw_2d.hlsl 到 {dest_res_dir}")
             else:
                 print(f"警告: 未找到 'draw_2d.hlsl' 模板, 滑块UI可能无法显示。路径: {shader_source_path}")
 
@@ -132,6 +132,7 @@ class SSMTNode_PostProcess_SliderPanel(SSMTNode_PostProcess_Base):
                         print(f"已复制 {image_name} 到 {dest_res_dir}")
                 else:
                     print(f"警告: UI图片 '{image_name}' 在插件目录中未找到。路径: {source_image_path}")
+                mark_png_as_srgb(dest_image_path)
         except Exception as e:
             print(f"准备和复制资源文件时出错: {e}")
             return
