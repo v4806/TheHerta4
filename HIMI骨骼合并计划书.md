@@ -2140,7 +2140,7 @@ cd E:\代码\TheHerta4 ; .\.venv\Scripts\python.exe -m pytest -q
 
 ---
 
-### 13.23 t100 —— 最新导出里 `LOD0.09c6e58a-4386-57792` 消失：IB 段被注入蒙皮 pass
+## 13.23 t100 —— 最新导出里 `LOD0.09c6e58a-4386-57792` 消失：IB 段被注入蒙皮 pass
 
 **现象（用户 m01572）**
 
@@ -2171,7 +2171,7 @@ cd E:\代码\TheHerta4 ; .\.venv\Scripts\python.exe -m pytest -q
 
 **修法**
 
-- `ui/universal/himi.py:5111` `add_unity_vs_texture_override_ib_sections` 删掉 `skin_entry` /
+- `ui/universal/himi.py:5206` `add_unity_vs_texture_override_ib_sections` 删掉 `skin_entry` /
   `skin_lines` 的构建与 `out.extend(skin_lines)`，只保留 `out.extend(capture_lines)`
   （即「cb3 捕获 → run attach」）。全仓 `skin_entry|skin_lines` 引用数为 0。
 - `himi_skin_sections()` 的段与资源发射**保持不变**（与 t97 产物一致：段存在但无人引用 ⇒
@@ -2288,7 +2288,7 @@ Blend 权重和恒 1.0 ⇒ 不是数据坏，是同一份几何被画了多次�
 - 站位 bare 与真网格同名 ⇒ 若用户之后把被吸收族也选进来，规则④/t106 都不会重复补（`stub_members` 去重 + `scene_present` 判据），但**两族都在场时**仍可能重复画几何（宿主顶点池里已有副本）—— 那是 §13.24 的「叠影」问题，不在本条范围内。
 
 
-### 13.27 t108/t109 · 后台代为导出：t106 已生效，假降级门才是新问题
+## 13.27 t108/t109 · 后台代为导出：t106 已生效，假降级门才是新问题
 
 ### 13.27.1 现象（用户 m02168）
 
@@ -2335,3 +2335,54 @@ t106 落地后用户在 Blender 里点「快速局部导出」仍然撞到 orpha
 - 子集导出（只导 077+09c）仍会报「本次只写 217/219 个槽，未覆盖 [217,219)」与「变形家族未完整纳入：6e0ccfd4 / 72fabb02 / bbbbf903」——这三族在本 `.blend` 里没有对象，属预期；要让它们的几何也吃到合并收益必须一起导出。
 - 产物 ini 里「基址表 span 之和 217 ≠ 221」是旧口径（只数 palette span、没数借用行），只影响自述文字。
 - 后台导出脚本：`.dbg/t108_export_selected.py`（`T108_SELECT=host|all` 控制选择）、`.dbg/t108_probe_scene.py`（场景物体与顶点组读数）。
+
+## §13.28 t116/t117 借用槽两处真因：行数只走了 60/216 + X_源 恒退回宿主单位阵
+
+### 13.28.1 现象与现场基准
+
+用户口径：「直接导入 + 简单合并后导出 ⇒ 整具扭/错位」（m02987 / m03245 / m03289），并要求「先修模组再修生成器」（m03436）、物体变换矫正 X 必须运行期实时算（m03260）。
+
+基准产物 = 17:50 那次蓝图导出（`K:\SSMT-Package-master\3Dmigoto\HI3\Mods\SSMTGeneratedMod\嗨♪爱愿妖精♥`）：ini 869 行；`ResourceHI3MergedSkeleton_role_0512e26f` array = 1677（559 槽 × 3）；五族 PaletteFam array 184/18/71/19/51；宿主族 = **b35cfc6c（19 根骨）**（HostEvidence 原文「Meshes/b35cfc6c-Position.buf 的缓冲最长（1039940 B）」）；其 BorrowMap **216 行**（rank 直方图 `{0: 165, 4: 51}`，target 292..507），借用权重 18776.4 ≈ **全模型 79%**；借方 2c706fbd 与 def0c0ae 与宿主的物体空间差 179.124° / 159.416°。
+
+对照已验收的 虚构游戏：宿主 09c6e58a（165 骨）、借用行 5、唯一借方差 11.651° ⇒ **同样的缺陷在那套产物上几乎看不出来**，这就是「另一个角色正常」的原因。
+
+### 13.28.2 决定性读数（F8 抓帧 `FrameAnalysis-2026-10-25-181539`）
+
+`deduped\` 下 5 份 26832 B（= 559 槽 × 48 B）的合并骨架副本**读数完全一致**：
+
+* 各族本块写满：2c 184/184、694 18/18、70a 71/71、b35 19/19、def 51/51；
+* **借用尾 [292,508) 只有 292..351（60 个槽）非零，352..507（156 个槽）12 个 float 全零**，分布是硬边界 `{0: 156, 12: 60}` ⇒ 用到这 156 个槽的顶点被零矩阵拽向原点；
+* 已写的 60 个槽与来源族 palette 的行**逐字节相同** ⇒ 写进去的是裸 `P_源`，**一次都没乘物体空间校正**。
+
+借用表文件本身健康（3456 B = 216 行，target 连续 292..507、无哨兵行、无 target=0 行），ini 也声明 `array = 216`、`dispatch = 4,1,1`（256 线程 ≥ 19 + 216 = 235）⇒ 唯一的解释是运行期 `himi_borrow_map.GetDimensions()` 只回 **60**。
+
+### 13.28.3 两个真因
+
+1. **typed 视图分量数 ≠ HLSL 元素分量数。** 借用表声明是 `type = Buffer / format = R32_UINT / stride = 16`，而 HLSL 是 `Buffer<uint4>`（4 × u32 = 16 B 元素）⇒ 1 分量视图配 4 分量元素，落进 D3D11 未定义区（与本文件 A1 条同一个失效模式），表现为 `GetDimensions` 回不到真行数。
+2. **X_源 的数据源根本不存在。** 原逻辑读 `himi_object_matrix`（cs-u1），来源是 `vs-cb3`；实测该游戏 7 笔 draw 的 `vs-cb0..cb6` 每个槽内容都**完全相同**，cb3 是投影矩阵（rows0..2.xyz 全 0、rows0..3.w = 0）⇒ 表恒零 ⇒ X 恒退回「本族载荷」= 宿主族单位阵。生成器自己在 `HIMIMergedSkeleton.json` 的 `FamilyX.Problems` 里也记过这件事（「抓帧里没有一笔 draw 的 vs-cb3 是合法对象矩阵（试过 15 笔）」）。
+
+### 13.28.4 修法：骨对索引表 + 每帧现算矩阵
+
+离线全量验证（3×4 仿射逆，数据源 `LOD0/<bare>/ModImpRuntime/<bare>-BoneMatrix.buf`）：`X_源 = P_本族[p] · P_来源[q]⁻¹`（**own 在前**）精确成立 —— b35[0] ↔ 2c[1] 残差 4.6e-7、b35[5] ↔ def[0] 4.9e-7；反方向 `inv(P_own)·P_src` 差 1.8 / 1.3（原来的写法方向就是错的）。
+
+⇒ 导出期只烘「同一根物理骨在两族 palette 里的局部槽」这对**索引**，矩阵每帧从两支活 palette 现算（cs-t0 本族、cs-t2/t3/t5/t6/t7 来源族，本来就都绑在同一次 dispatch 上）：
+
+* `ui/universal/himi.py::merged_attach_hlsl_text` 新增 `borrow_rows` / `borrow_pairs` 两个可选参数；模板发出 `#define HIMI_BORROW_ROWS`、`#define HIMI_BORROW_RANK_COUNT`、`#define HIMI_BORROW_PAIR_COUNT`、`static const uint HIMI_BORROW_PAIR_OWN/SRC[…]`（下标 = 本族序号 × RANK_COUNT + rank，`0xFFFFFFFF` = 这对不用）；
+* 借用块不再读 `GetDimensions`（行数取导出期常量），新增结构门 `borrow_entry.x < base_slot + span_slots ⇒ return`（防止表被截断后把「行号 0 的那根骨」写进 slot 0 覆盖别人的块）；
+* X 改为 `borrow_x = P_本族[p] · P_来源[q]⁻¹`，两支任一为全零（本帧还没捕到 palette）就退回单位阵（下一帧自愈），**不再从载荷取 X 的逆**；
+* `common/himi_family_x.py::solve_palette_pair` 给出骨对；`ui/universal/himi.py::_himi_borrow_pairs` 在导出时按 `ranges` 只对「有借用行的族 × 每个 rank」求解，解不出就跳过并告警（不阻断导出）；
+* `common/himi_merged_runtime.py`：`BORROW_MAP_INI_FORMAT` 改 `R32G32B32A32_UINT`（4 分量 typed，与 `Buffer<uint4>` 同宽；`stride` 仍 16）。
+
+### 13.28.5 验收读数
+
+* `pytest tests/test_himi_merged_runtime.py tests/test_himi_family_x.py tests/test_himi_stub_objects.py -q` ⇒ **330 passed / 1 skipped / 26 subtests / 2 failed**，两条失败仍是既存环境失败（`HIMICacheOnlyOracleTests::test_real_dump_missing_target_none_is_not_authoritative`、`HIMIRealDumpEndToEndTests::test_real_role_end_to_end`，缺 FrameAnalysis 目录与 `Config/HIMIMergedSkeleton.json`）。
+* 参考渲染路（`merged_attach_hlsl_text()` 缺省参数）：`#define HIMI_BORROW_ROWS` 在、`HIMI_BORROW_PAIR_OWN[` 在、`himi_borrow_map.GetDimensions` 不在；`merged_attach_borrow_problems` / `merged_attach_hlsl_problems` 均为空。
+* 真实工作空间 `K:\SSMT-Package-master\WorkSpace\HIMI\嗨♪爱愿妖精♥` 上 `_himi_borrow_pairs` 的实际结果：`{(3, 0): (0, 1), (3, 4): (0, 0)}`（残差 4.4e-16 / 2.2e-16），没有解不出的对。
+* 真机未验：F10 reload 在该机器上连续 4 次导致 BH3「停止交互」被关闭（Windows `Application Hang` 17:46 / 17:51 / 17:55 / 18:09 各一条），**验证必须走重启游戏**。
+
+### 13.28.6 遗留
+
+* 部署目录里那份 `res/himi_attach.hlsl` 上的 t116 手工补丁（行数 216 + 结构门 + 实时 X）只作临时验证用，下一版导出会由生成器整体覆盖；
+* 死蒙皮段 `[CustomShaderHI3MergedSkin_<fam>]` 仍指向不存在的 `res/himi_merged_skin.hlsl`，每次 reload 刷 `Shader not found` 噪声，待删；
+* 产物 ini 诊断块「基址表 span 之和 343 ≠ 559」「out_of_range_refs = 70%」仍是审计没减 base 的老 bug（假警报），待修；
+* 本角色的 559 槽里 216 个来自借用（79% 权重），宿主挑选口径（「Position 缓冲最长」）会让「19 根骨的族」当宿主 —— 是否要改成「palette 骨数最多者」需要单独决策。
