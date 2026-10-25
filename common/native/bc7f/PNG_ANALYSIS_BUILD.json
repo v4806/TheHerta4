@@ -1,0 +1,10 @@
+{
+  "abi": 1,
+  "target": "Windows x64 SSE2",
+  "compiler": "MSVC 14.50.35717 /O2 /MD /std:c++17",
+  "files": {
+    "png_analysis.cpp": "d72ed2b025c342d01eb6434c3189465ced76de910cbd7dcf253180320ac8b937",
+    "stb_image.h": "594c2fe35d49488b4382dbfaec8f98366defca819d916ac95becf3e75f4200b3",
+    "herta_png_analysis_windows_x64.dll": "62a99bf1aeff66158c76d20b006bdde3abf80f7384ed748b77b31f608a2ca936"
+  }
+}

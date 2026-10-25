@@ -1,0 +1,27 @@
+{
+  "abi": 1,
+  "platform": "Windows x64 SSE2",
+  "compiler": "MSVC 14.50.35717 /O2 /MD /EHsc /std:c++20 /fp:precise /utf-8",
+  "files": {
+    "common/export_geometry_native.py": {
+      "sha256": "5112c1d7c34c6943f0043c91e77ccf7f2747ce9e7542554ecbd643cdaed4697e",
+      "bytes": 4902
+    },
+    "common/native/export_geometry.cpp": {
+      "sha256": "e459a33376d531b2d12ee3d074b9b12aad03d5a8c52337538682eb1d1e7111cb",
+      "bytes": 6291
+    },
+    "common/native/herta_export_geometry_windows_x64.dll": {
+      "sha256": "2ecbef44021f87d4a4fafb30ea79b32799716eaf5015284f56d068b0a2291869",
+      "bytes": 40448
+    },
+    "common/native/export_geometry/CMakeLists.txt": {
+      "sha256": "5bec151b4a3d4fec13728e85fa8e0ceb6bda7cb6959cf78f6ea823fe97e2ec94",
+      "bytes": 569
+    },
+    "tests/test_export_geometry_native.py": {
+      "sha256": "4dd39b716e1a84da1882a55f29c1d0dced6a8cdaf3073a29c6849fe39a354ce6",
+      "bytes": 4737
+    }
+  }
+}

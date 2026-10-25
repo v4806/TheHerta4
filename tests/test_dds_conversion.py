@@ -768,5 +768,100 @@ class DDSConversionCacheTests(unittest.TestCase):
         self.assertIn("不存在", reason)
 
 
+class DDSBatchConversionTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp(prefix="dds_batch_test_"))
+        self.addCleanup(shutil.rmtree, self.root, True)
+        dds_conversion.clear_dds_conversion_cache()
+
+    def request(self, index, name, fmt="bc7_unorm", directory="source"):
+        folder = self.root / directory
+        folder.mkdir(exist_ok=True)
+        source = folder / name
+        source.write_bytes(bytes([index]))
+        return (index, str(source), str(self.root / f"target_{index}.dds"),
+                {"props": types.SimpleNamespace(), "format_override": fmt})
+
+    def fake_run(self, command, **kwargs):
+        directory = Path(command[command.index("-o") + 1])
+        fmt = command[command.index("-f") + 1]
+        code = 99 if fmt.endswith("srgb") else 98
+        for source in command[command.index("-y") + 1:]:
+            source = Path(source)
+            (directory / (source.stem + ".dds")).write_bytes(
+                _dds_header(b"DX10", code) + source.read_bytes())
+        return types.SimpleNamespace(returncode=0, stdout="GPU test", stderr="")
+
+    def test_batch_groups_formats_preserves_flags_and_populates_cache(self):
+        jobs = [self.request(1, "a.png"), self.request(2, "b.png"),
+                self.request(3, "c.png", "bc7_unorm_srgb")]
+        with mock.patch.object(dds_conversion, "find_texconv", return_value="texconv.exe"), \
+                mock.patch.object(dds_conversion.subprocess, "run", side_effect=self.fake_run) as run:
+            done = dds_conversion.convert_new_textures_to_dds_batch(jobs)
+        self.assertEqual(done, {1, 2, 3})
+        self.assertEqual(run.call_count, 2)
+        self.assertIn("--ignore-srgb", run.call_args_list[0].args[0])
+        self.assertIn("--srgb-in", run.call_args_list[1].args[0])
+        for index, source, target, _ in jobs:
+            self.assertEqual(Path(target).read_bytes()[-1], index)
+            self.assertIn(os.path.normcase(os.path.abspath(target)), dds_conversion._dds_conversion_cache)
+
+    def test_equal_stems_in_different_folders_cannot_overwrite_each_other(self):
+        jobs = [self.request(1, "same.png", directory="one"),
+                self.request(2, "same.png", directory="two")]
+        with mock.patch.object(dds_conversion, "find_texconv", return_value="texconv.exe"), \
+                mock.patch.object(dds_conversion.subprocess, "run", side_effect=self.fake_run) as run:
+            self.assertEqual(dds_conversion.convert_new_textures_to_dds_batch(jobs), {1, 2})
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(Path(jobs[0][2]).read_bytes()[-1], 1)
+        self.assertEqual(Path(jobs[1][2]).read_bytes()[-1], 2)
+
+    def test_existing_targets_are_preserved(self):
+        job = self.request(1, "a.png")
+        Path(job[2]).write_bytes(b"existing user texture")
+        with mock.patch.object(dds_conversion, "find_texconv", return_value="texconv.exe"), \
+                mock.patch.object(dds_conversion.subprocess, "run") as run:
+            self.assertEqual(dds_conversion.convert_new_textures_to_dds_batch([job]), set())
+        run.assert_not_called()
+        self.assertEqual(Path(job[2]).read_bytes(), b"existing user texture")
+
+    def test_partial_failure_only_accepts_valid_completed_outputs(self):
+        jobs = [self.request(1, "a.png"), self.request(2, "b.png")]
+        def partial(command, **kwargs):
+            directory = Path(command[command.index("-o") + 1])
+            (directory / "a.dds").write_bytes(_dds_header(b"DX10", 98))
+            return types.SimpleNamespace(returncode=1, stdout="", stderr="second input failed")
+        with mock.patch.object(dds_conversion, "find_texconv", return_value="texconv.exe"), \
+                mock.patch.object(dds_conversion.subprocess, "run", side_effect=partial):
+            self.assertEqual(dds_conversion.convert_new_textures_to_dds_batch(jobs), {1})
+        self.assertFalse(Path(jobs[1][2]).exists())
+
+    def test_wrong_output_format_is_not_accepted(self):
+        job = self.request(1, "a.png", "bc7_unorm_srgb")
+        def wrong(command, **kwargs):
+            directory = Path(command[command.index("-o") + 1])
+            (directory / "a.dds").write_bytes(_dds_header(b"DX10", 98))
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        with mock.patch.object(dds_conversion, "find_texconv", return_value="texconv.exe"), \
+                mock.patch.object(dds_conversion.subprocess, "run", side_effect=wrong):
+            self.assertEqual(dds_conversion.convert_new_textures_to_dds_batch([job]), set())
+        self.assertFalse(Path(job[2]).exists())
+
+
+    def test_legacy_rgba_batch_output_is_recognized_without_retry(self):
+        job = self.request(1, "normal.png", "r8g8b8a8_unorm")
+        def legacy(command, **kwargs):
+            directory = Path(command[command.index("-o") + 1])
+            data = bytearray(_dds_header(bytes(4), None))
+            struct.pack_into("<I", data, 80, 0x41)
+            struct.pack_into("<5I", data, 88, 32, 0xFF, 0xFF00, 0xFF0000, 0xFF000000)
+            (directory / "normal.dds").write_bytes(data)
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        with mock.patch.object(dds_conversion, "find_texconv", return_value="texconv.exe"), \
+                mock.patch.object(dds_conversion.subprocess, "run", side_effect=legacy):
+            self.assertEqual(dds_conversion.convert_new_textures_to_dds_batch([job]), {1})
+        self.assertEqual(dds_conversion.read_dds_header_format(job[2]), "r8g8b8a8_unorm")
+
+
 if __name__ == "__main__":
     unittest.main()

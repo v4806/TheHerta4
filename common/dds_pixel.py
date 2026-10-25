@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""DDS 贴图像素级解码与比较（纯 numpy 实现，无 Blender 依赖）。
+"""DDS 贴图像素级解码与比较（可选原生 C 加速，numpy 回退，无 Blender 依赖）。
 
 供「贴图资源去重」节点的像素级去重模式使用：把 DDS 文件解码为 RGBA8 像素数组，
 两文件像素完全相同时（即使文件格式不同、MD5 不同）判为重复。
@@ -16,8 +16,10 @@
 与 Khronos ARB_texture_compression_bptc 规范一致）。
 """
 
+import hashlib
 import os
 import struct
+import threading
 
 import numpy as np
 
@@ -129,6 +131,73 @@ _DXGI_KIND = {
 _BLOCK_BYTES = {"bc1": 8, "bc2": 16, "bc3": 16, "bc4": 8, "bc5": 16, "bc7": 16}
 
 last_error = ""
+
+_native_lock = threading.Lock()
+_native_checked = False
+_native_library = None
+
+
+def _get_native_library():
+    """ctypes CDLL releases the GIL; the decoder has no shared mutable state."""
+    global _native_checked, _native_library
+    if _native_checked:
+        return _native_library
+    with _native_lock:
+        if not _native_checked:
+            try:
+                import ctypes
+                import platform
+                if os.name == "nt" and platform.machine().lower() in ("amd64", "x86_64"):
+                    path = os.path.join(os.path.dirname(__file__), "native", "herta_dds_windows_x64.dll")
+                    library = ctypes.CDLL(path)
+                    library.herta_dds_abi_version.restype = ctypes.c_uint
+                    if library.herta_dds_abi_version() != 1:
+                        raise ValueError("Unsupported DDS native ABI")
+                    library.herta_dds_decode_bc7.argtypes = [
+                        ctypes.c_char_p, ctypes.c_size_t, ctypes.c_uint, ctypes.c_uint,
+                        ctypes.c_void_p, ctypes.c_size_t,
+                    ]
+                    library.herta_dds_decode_bc7.restype = ctypes.c_int
+                    library.herta_dds_pool_bc7.argtypes = [
+                        ctypes.c_char_p, ctypes.c_size_t, ctypes.c_uint, ctypes.c_uint,
+                        ctypes.c_uint, ctypes.c_uint, ctypes.c_void_p, ctypes.c_size_t,
+                    ]
+                    library.herta_dds_pool_bc7.restype = ctypes.c_int
+                    _native_library = library
+                    print("[DDSDecode] backend=C-BC7 (native decode / fused mean pooling)")
+            except (ImportError, OSError, AttributeError, ValueError):
+                _native_library = None
+            _native_checked = True
+    return _native_library
+
+
+def native_backend_name():
+    return "C-BC7" if _get_native_library() is not None else "numpy"
+
+
+def decode_dds_thumbnail(data, grid=64):
+    """Exact base-mip RGB mean pooling without materializing a full RGBA image.
+
+    Returns None for unsupported formats/platforms, allowing the full decode path.
+    Every pixel contributes: this does not sample mipmaps or discard image detail.
+    """
+    header = parse_dds_header(data)
+    if not header or header["kind"] != "bc7" or int(grid) <= 0:
+        return None
+    library = _get_native_library()
+    if library is None:
+        return None
+    width, height = header["width"], header["height"]
+    ow, oh = min(int(grid), width), min(int(grid), height)
+    need = ((width + 3) // 4) * ((height + 3) // 4) * 16
+    payload = data[header["payload_offset"]:header["payload_offset"] + need]
+    if len(payload) != need:
+        return None
+    thumb = np.empty((oh, ow, 3), dtype=np.float64)
+    if library.herta_dds_pool_bc7(payload, need, width, height, ow, oh,
+                                  thumb.ctypes.data, thumb.size):
+        return thumb
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -585,6 +654,7 @@ def parse_dds_header(data):
         return None
 
     kind = None
+    format_key = None
     if pf_flags & _DDPF_FOURCC:
         if fourcc == b"DX10":
             if len(data) < 148:
@@ -599,6 +669,7 @@ def parse_dds_header(data):
             if kind is None:
                 last_error = f"不支持的 DXGI 格式 {dxgi}"
                 return None
+            format_key = f"dxgi:{dxgi}"
         else:
             kind = _FOURCC_KIND.get(fourcc)
             if kind is None:
@@ -607,6 +678,7 @@ def parse_dds_header(data):
             if kind == "bc6h":
                 last_error = "BC6H（HDR）暂不支持像素解码"
                 return None
+            format_key = f"fourcc:{fourcc!r}:{pf_flags & _DDPF_ALPHAPIXELS}"
     elif pf_flags & (_DDPF_RGB | _DDPF_LUMINANCE | _DDPF_ALPHA | _DDPF_ALPHAPIXELS):
         if bitcount not in (8, 16, 24, 32):
             last_error = f"不支持的非压缩位深 {bitcount}"
@@ -626,6 +698,7 @@ def parse_dds_header(data):
         "bmask": bmask,
         "amask": amask,
         "kind": kind,
+        "format_key": format_key,
         "payload_offset": 148 if fourcc == b"DX10" else 128,
     }
 
@@ -636,6 +709,49 @@ def dds_dimensions(data):
     if header is None:
         return None
     return header["width"], header["height"]
+
+
+def dds_file_metadata(file_path, include_signature=False):
+    """只读 DDS 头；可选计算与解码结果严格等价的 base mip 压缩块指纹。
+
+    ``include_signature`` 仅对受支持的 BC 块格式返回签名。相同尺寸、DXGI/FourCC
+    格式与 base-mip 块字节意味着逐块解码结果相同，因此这个签名只负责确认精确重复，
+    不用于近似相似度判断。
+    """
+    try:
+        with open(file_path, "rb") as file_obj:
+            prefix = file_obj.read(160)
+            header = parse_dds_header(prefix)
+            if header is None:
+                return None
+            result = {
+                "dims": (header["width"], header["height"]),
+                "kind": header["kind"],
+                "format_key": header.get("format_key"),
+                "signature": None,
+            }
+            if not include_signature:
+                return result
+            block_bytes = _BLOCK_BYTES.get(header["kind"])
+            if block_bytes is None or not header.get("format_key"):
+                return result
+            grid_w = (header["width"] + 3) // 4
+            grid_h = (header["height"] + 3) // 4
+            level_size = grid_w * grid_h * block_bytes
+            file_obj.seek(header["payload_offset"])
+            payload = file_obj.read(level_size)
+            if len(payload) != level_size:
+                return result
+            digest = hashlib.sha256(payload).hexdigest()
+            result["signature"] = (
+                header["width"],
+                header["height"],
+                header["format_key"],
+                digest,
+            )
+            return result
+    except (OSError, ValueError, struct.error):
+        return None
 
 
 def decode_dds_rgba8(data):
@@ -682,6 +798,13 @@ def decode_dds_rgba8(data):
         if len(payload) < need:
             last_error = "压缩数据长度不足"
             return None
+        if kind == "bc7":
+            library = _get_native_library()
+            if library is not None:
+                result = np.empty((height, width, 4), dtype=np.uint8)
+                if library.herta_dds_decode_bc7(payload, len(payload), width, height,
+                                                result.ctypes.data, result.nbytes):
+                    return result
         blocks = np.frombuffer(payload, dtype=np.uint8, count=need).reshape(-1, block_bytes)
         if kind == "bc1":
             pixels = _decode_bc1(blocks)

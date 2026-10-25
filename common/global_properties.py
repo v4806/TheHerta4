@@ -6,6 +6,15 @@ import os
 _blueprint_enum_items_cache = []
 _workspace_safe_identifier_map: dict[str, str] = {}
 
+
+def _update_export_cache_toggle(self, context):
+    try:
+        from .export_cache import set_export_cache_enabled
+    except ImportError:
+        # The UI/property migration can precede the optional cache backend.
+        return
+    set_export_cache_enabled(self.enable_preprocess_cache)
+
 # 「顶点去重精度控制」面板的 8 个类型复选框，与下面 deduplicate_* 开关一一对应。
 # 全勾＝面板默认；导出时默认走历史的全字段去重键（见 utils/export_utils.py）。
 DEDUPLICATE_ELEMENT_TYPES: tuple[str, ...] = (
@@ -408,9 +417,10 @@ class GlobalProterties(bpy.types.PropertyGroup):
     ) # type: ignore
 
     enable_preprocess_cache: bpy.props.BoolProperty(
-        name="启用前处理缓存",
-        description="启用后，前处理结果会被缓存到本地文件。当物体数据未变化时，下次导出将直接使用缓存，减少重复计算",
+        name="启用导出缓存",
+        description="缓存前处理结果、贴图分析特征和 DDS 编码产物，减少后续导出的重复计算；关闭后不读取或写入这些磁盘缓存",
         default=True,
+        update=_update_export_cache_toggle,
     ) # type: ignore
 
     enable_parallel_preprocess: bpy.props.BoolProperty(
@@ -475,8 +485,8 @@ class GlobalProterties(bpy.types.PropertyGroup):
     ) # type: ignore
 
     expand_preprocess_cache: bpy.props.BoolProperty(
-        name="展开前处理缓存",
-        description="展开前处理缓存面板",
+        name="展开导出缓存",
+        description="展开导出缓存设置和占用统计",
         default=False,
     ) # type: ignore
 
@@ -764,7 +774,12 @@ class GlobalProterties(bpy.types.PropertyGroup):
         return bool(instance.import_materials_by_submesh_mark)
 
     @classmethod
-    def enable_preprocess_cache(cls):
+    def is_preprocess_cache_enabled(cls):
+        return cls.enable_export_cache()
+
+    @classmethod
+    def enable_export_cache(cls):
+        """Legacy RNA identifier preserves existing .blend preferences."""
         return cls._instance().enable_preprocess_cache
 
     @classmethod

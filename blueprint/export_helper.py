@@ -1,4 +1,5 @@
 import hashlib
+import time
 
 import bpy
 
@@ -867,6 +868,17 @@ class BlueprintExportHelper:
                     )
                     return
 
+                if node_type == 'SSMTNode_Object_Info_Pro':
+                    # 物体信息 Pro：展开成多个伪装成普通物体信息节点的条目视图。
+                    # 链式遍历与下游处理节点因此拿到的就是 N 个普通物体信息节点，
+                    # 无需为 Pro 类型做任何分支（一个 Pro 节点 = 过去的多个节点）。
+                    if not getattr(current_node, "mute", False):
+                        from .node_obj import build_object_info_entry_views
+
+                        for entry_view in build_object_info_entry_views(current_node):
+                            append_start_node(entry_view)
+                    return
+
                 if node_type in {'SSMTNode_Object_Info', 'SSMTNode_MultiFile_Export'}:
                     if not getattr(current_node, "mute", False):
                         append_start_node(current_node)
@@ -1503,15 +1515,31 @@ class BlueprintExportHelper:
                 print(f"Warning: Postprocess node type '{node.bl_idname}' is not registered, skipping")
                 continue
 
+            started = time.perf_counter()
+            status = "ok"
             try:
                 node.execute_postprocess(mod_export_path)
             except Exception as e:
+                status = "error"
                 print(f"Error executing postprocess node '{node.name}': {e}")
                 import traceback
                 traceback.print_exc()
+            finally:
+                print(
+                    f"[PostProcessProfile] node={node.name!r} "
+                    f"type={node.bl_idname} elapsed={time.perf_counter() - started:.3f}s "
+                    f"status={status}"
+                )
 
     @staticmethod
     def clear_postprocess_caches():
+        # Snapshot the active scene's export-cache policy before worker threads
+        # start. The saved legacy RNA field also travels in background snapshots.
+        try:
+            from ..common.export_cache import is_export_cache_enabled
+            is_export_cache_enabled()
+        except ImportError:
+            pass
         # DDS 转换缓存（toolkit.tt_dds_conversion 模块级）：一次导出内同一个目标只真正
         # 转一次 texconv，所以必须每次导出开始时清空 —— 否则「覆盖现有资源」在第二次
         # 导出时会因缓存命中而不再重新生成，等于开关失灵。

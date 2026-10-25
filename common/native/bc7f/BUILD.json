@@ -1,0 +1,24 @@
+{
+  "abi": 1,
+  "cpu": "Windows x64 SSE2 baseline",
+  "basis_commit": "ee771a7f913a3233a252eb6d281b4446f6a3c9f5",
+  "stb_blob": "9eedabedc45b3e6fd88fae6f14a160b4d53272ec",
+  "files": [
+    {
+      "path": "common/native/bc7f/herta_texture_windows_x64.dll",
+      "sha256": "66cc67fc905acf690dc2667a46fc71de2067938c8bb31beb129850bf702824fa"
+    },
+    {
+      "path": "common/native/bc7f/pipeline.cpp",
+      "sha256": "ed28f97e7f4d5870afff7b5ecee14c8b4da616456fd07e2c35401b2af7012633"
+    },
+    {
+      "path": "common/native/bc7f/bc7f_bridge.cpp",
+      "sha256": "0c4154edd33048e046cb6823072a4ec1596073b0faf7069bff25b76258fd24f4"
+    },
+    {
+      "path": "common/native/bc7f/stb_image.h",
+      "sha256": "594c2fe35d49488b4382dbfaec8f98366defca819d916ac95becf3e75f4200b3"
+    }
+  ]
+}
