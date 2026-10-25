@@ -807,6 +807,23 @@ class ManualHashEntryTests(unittest.TestCase):
         self.assertEqual("nope", invalid[0][1])
         self.assertIn("无效", module._manual_skip_item_label(item))
 
+    def test_add_duplicate_migrates_legacy_first(self):
+        """旧列表里已有同一条目时：先迁移到统一列表，再提示已存在，列表能看到该行。"""
+        node = _FakeUnifiedSkipNode()
+        legacy = node.manual_hash_items.add()
+        legacy.hash = "28e05a59"
+        legacy.index_count = ""
+        legacy.first_index = ""
+
+        ok, message = module._add_manual_skip_item(node, "28e05A59")
+
+        self.assertTrue(ok)
+        self.assertIn("已存在", message)
+        self.assertEqual(1, len(node.skip_objects))
+        self.assertEqual(0, len(node.manual_hash_items))
+        self.assertTrue(node.skip_objects[0].is_manual)
+        self.assertEqual("28e05a59", node.skip_objects[0].manual_hash)
+
     def test_manual_triple_builds_full_skip_section(self):
         entries, _invalid = module._collect_manual_hash_entries(
             [types.SimpleNamespace(hash="ab12cd34", index_count="1260", first_index="9402")]
