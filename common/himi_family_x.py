@@ -71,6 +71,8 @@ DUALITY_MIN_HITS = 3
 #: 产物 mod 里 Position 缓冲所在目录（与 MERGED_SKELETON_DEFAULT_FOLDER 同值）
 POSITION_BUFFER_FOLDER = "Meshes"
 POSITION_BUFFER_SUFFIX = "-Position.buf"
+# 抓帧目录名前缀（3Dmigoto 抓帧 = FrameAnalysis-YYYY-MM-DD-HHMMSS；名序即时间序）
+FRAME_ANALYSIS_PREFIX = "FrameAnalysis-"
 
 
 def identity_3x4() -> list:
@@ -166,8 +168,94 @@ def resolve_mod_root(workspace_root: str, mod_root: str = "") -> str:
 # --------------------------------------------------------------------------- #
 
 
-def resolve_frame_analysis_dir(workspace_root: str) -> dict:
-    """读 Config/FrameAnalysisPath.json ⇒ {"ok","path","name","note"}（不抛异常）。"""
+def resolve_frame_analysis_dir(
+    workspace_root: str,
+    *,
+    mod_root: str = "",
+    prefer_freshest: bool = False,
+    draws=(),
+) -> dict:
+    """读 Config/FrameAnalysisPath.json ⇒ 抓帧目录（不抛异常）。
+
+    ``prefer_freshest=True`` 时**不盲信配置**：扫一遍 ``<game>/FrameAnalysis-*``，
+    若存在比配置里那个更新的抓帧，且它确实能给 ``draws`` 里的 draw 提供 vs-cb3，
+    就改用最新的那个 —— 配置里那条路径是**上一次场景**的快照，改过拆并关系后它会过期
+    （这正是 ``*-AttachRange.buf`` 里 X_f 对不上的根因）。
+
+    返回另带 ``declared``/``declared_ok``/``freshest``/``source``/``stale``/``note``，
+    调用方据此把「用了哪一帧、为什么」写进审计记录，而不是静默换源。
+    """
+    declared = _declared_frame_analysis_dir(workspace_root)
+    game_root = capture_game_root(workspace_root, mod_root)
+    captures = list_frame_analysis_dirs(game_root)
+    freshest = captures[-1] if captures else ""
+    declared_name = str(declared.get("name") or "")
+    freshest_name = os.path.basename(os.path.normpath(freshest)) if freshest else ""
+    stale = bool(declared_name and freshest_name and freshest_name > declared_name)
+    result = dict(declared)
+    result.update(
+        declared=str(declared.get("path") or ""),
+        declared_ok=bool(declared.get("ok")),
+        freshest=freshest,
+        stale=stale,
+        source="declared",
+    )
+    if prefer_freshest and stale:
+        usable = capture_cb3_coverage(freshest, draws) > 0
+        if not usable and draws:
+            result["note"] = (
+                f"最新抓帧 {freshest_name} 没有这些 draw 的 vs-cb3 ⇒ 仍用配置里的 {declared_name}"
+            )
+            return result
+        result.update(
+            ok=True,
+            path=freshest,
+            name=freshest_name,
+            source="freshest",
+            note=(
+                f"配置里的抓帧 {declared_name} 已过期（更新的 {freshest_name} 可用）"
+                f"⇒ 改用最新的那一帧算 X_f"
+            ),
+        )
+    return result
+
+
+def capture_game_root(workspace_root: str, mod_root: str = "") -> str:
+    """抓帧根目录 = 部署目录 ``Mods`` 的父目录（``.../3Dmigoto/<game>``）；推不出 ⇒ 空串。"""
+    current = os.path.abspath(str(resolve_mod_root(workspace_root, mod_root) or ""))
+    for _ in range(6):
+        parent = os.path.dirname(current)
+        if not parent or parent == current:
+            break
+        current = parent
+        if os.path.basename(current).lower() == "mods":
+            return os.path.dirname(current)
+    return ""
+
+
+def list_frame_analysis_dirs(game_root: str) -> list:
+    """``game_root`` 下的 ``FrameAnalysis-*`` 目录（目录名自带时间戳，名序即时间序）。"""
+    root = str(game_root or "")
+    if not root or not os.path.isdir(root):
+        return []
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return []
+    return [
+        os.path.join(root, name)
+        for name in names
+        if name.startswith(FRAME_ANALYSIS_PREFIX) and os.path.isdir(os.path.join(root, name))
+    ]
+
+
+def capture_cb3_coverage(fa_dir: str, draws=()) -> int:
+    """这笔抓帧里有多少个 ``draws`` 能拿到 vs-cb3（用来判断某帧是否还能算 X_f）。"""
+    return sum(1 for draw in (draws or ()) if find_draw_cb3_file(fa_dir, draw))
+
+
+def _declared_frame_analysis_dir(workspace_root: str) -> dict:
+    """Config/FrameAnalysisPath.json 原样读出来（不做新鲜度判断）。"""
     path = os.path.join(str(workspace_root or ""), "Config", "FrameAnalysisPath.json")
     try:
         with open(path, "r", encoding="utf-8") as handle:
@@ -383,6 +471,104 @@ def duality_check(base_palette, family_palette, x, *, tol: float = DUALITY_TOL) 
 
 
 # --------------------------------------------------------------------------- #
+# palette 反解（X_f 的权威来源：导出时现算，不读抓帧）
+# --------------------------------------------------------------------------- #
+
+#: palette 反解的接受阈值（矩阵元最大差；与骨对偶同一把尺子）
+PALETTE_SOLVE_TOL = DUALITY_TOL
+#: palette 解与「抓帧 vs-cb3」解的交叉核对容差（两条独立来源应在此量级内一致）
+X_SOURCE_CROSS_TOL = 1e-3
+#: 反解时用前 N 个 palette 槽当候选种子（正常第 0 个就够，留几个防脏槽）
+PALETTE_SEED_LIMIT = 4
+#: 反解时一块候选占用的浮点上限（控制内存；大 palette 会自动缩小块）
+PALETTE_BLOCK_FLOATS = 6_000_000
+
+
+def _homogeneous(palette):
+    """12 float/槽 ⇒ (n,4,4) 齐次矩阵（只有反解用 numpy）。"""
+    import numpy
+
+    rows = numpy.asarray(list(palette or ()), dtype=numpy.float64)
+    if rows.size == 0:
+        return numpy.zeros((0, 4, 4), dtype=numpy.float64)
+    rows = rows.reshape(-1, 3, 4)
+    homogeneous = numpy.zeros((rows.shape[0], 4, 4), dtype=numpy.float64)
+    homogeneous[:, :3, :] = rows
+    homogeneous[:, 3, 3] = 1.0
+    return homogeneous
+
+
+def solve_family_x_from_palettes(
+    base_palette, family_palette, *, tol: float = PALETTE_SOLVE_TOL,
+    seed_limit: int = PALETTE_SEED_LIMIT,
+) -> dict:
+    """从两族 palette 反解 ``X_f = M_base⁻¹ · M_f``（**不读抓帧、不读 vs-cb3**）。
+
+    同一根骨在两族 palette 里是同一位姿的两份表达：``P_base[k] = X_f · P_f[j]``
+    ⇒ ``X_f = P_base[k] · P_f[j]⁻¹``。骨对**对应关系未知**，所以先拿若干族槽当种子 ×
+    全部宿主槽生成候选，再看「这个候选能让多少根族骨落到宿主骨上（矩阵元最大差 ≤ tol）」
+    投票；票数最高、命中残差最小的候选即解。
+
+    两族 palette 都是精确刚体（同一个绑定矩阵 B 派生），正确解命中时残差只在 float32
+    噪声量级（1e-7），错解 O(1) ⇒ 判别很干脆。返回 ``{"ok","x","votes","total",
+    "max_residual","matched","tol","note"}``；``matched`` = ``[(族槽, 宿主槽, 残差)]``。
+    """
+    import numpy
+
+    family = _homogeneous(family_palette)
+    base = _homogeneous(base_palette)
+    total = int(family.shape[0])
+    base_total = int(base.shape[0])
+    empty = {"ok": False, "x": [], "votes": 0, "total": total, "base_total": base_total,
+             "max_residual": float("inf"), "matched": [], "tol": float(tol)}
+    if total <= 0 or base_total <= 0:
+        return dict(empty, note="两族 palette 有一侧为空 ⇒ 无法反解")
+    inverse_family = numpy.linalg.inv(family)
+    base3 = base[:, :3, :]
+    limit = float(tol)
+    block = max(1, min(16, int(PALETTE_BLOCK_FLOATS // max(1, total * base_total * 12))))
+    best = None
+    for seed in range(min(int(seed_limit), total)):
+        candidates = base @ inverse_family[seed]
+        for start in range(0, base_total, block):
+            chunk = candidates[start : start + block]
+            moved = numpy.einsum("cij,njk->cnik", chunk, family)[:, :, :3, :]
+            distance = numpy.abs(
+                moved[:, :, None, :, :] - base3[None, None, :, :, :]
+            ).max(axis=(3, 4))
+            nearest = distance.min(axis=2)
+            hit = nearest <= limit
+            hits = hit.sum(axis=1)
+            worst = numpy.where(hit, nearest, 0.0).max(axis=1)
+            for row in range(chunk.shape[0]):
+                score = (int(hits[row]), -float(worst[row]))
+                if best is not None and score <= (best["hits"], -best["worst"]):
+                    continue
+                matched = []
+                for slot in numpy.nonzero(hit[row])[0]:
+                    host = int(distance[row, slot].argmin())
+                    matched.append((int(slot), host, float(distance[row, slot, host])))
+                best = {"hits": int(hits[row]), "worst": float(worst[row]), "matched": matched}
+    if not best or best["hits"] <= 0:
+        return dict(empty, note="没有任何候选能让族骨落到宿主骨上（两族可能没有共享骨）")
+    slot, host, _residual = min(best["matched"], key=lambda item: item[2])
+    x = mat3x4_compose(list(base_palette[host]), mat3x4_inverse(list(family_palette[slot])))
+    if is_identity(x):
+        x = identity_3x4()
+    return {
+        "ok": True,
+        "x": [float(value) for value in x],
+        "votes": int(best["hits"]),
+        "total": total,
+        "base_total": base_total,
+        "max_residual": float(best["worst"]),
+        "matched": list(best["matched"]),
+        "tol": float(tol),
+        "note": "",
+    }
+
+
+# --------------------------------------------------------------------------- #
 # 参与合并的族（与导出侧同一事实源）
 # --------------------------------------------------------------------------- #
 
@@ -436,6 +622,8 @@ def compute_family_x(
     fa_dir: str = "",
     palettes=None,
     host_evidence: str = "",
+    mod_root: str = "",
+    prefer_freshest: bool = False,
 ) -> dict:
     """算每族的 X_f（palette 口径 12 float）+ 骨对偶校验 + 审计记录。
 
@@ -463,15 +651,6 @@ def compute_family_x(
     if not host_family or host_family not in bares:
         problems.append(f"宿主族 {host_family} 不在参与合并的族里（{sorted(bares)}）⇒ 无法算 X_f")
         return _family_x_result(host_family, host_evidence, "", "", {}, {}, problems, exemptions)
-    fa_path = str(fa_dir or "")
-    frame_name = os.path.basename(os.path.normpath(fa_path)) if fa_path else ""
-    if not fa_path:
-        frame = resolve_frame_analysis_dir(workspace_root)
-        if not frame.get("ok"):
-            problems.append(f'抓帧不可用：{frame.get("note")}')
-            return _family_x_result(host_family, host_evidence, "", "", {}, {}, problems, exemptions)
-        fa_path = str(frame.get("path") or "")
-        frame_name = str(frame.get("name") or "")
     draws = component_draw_map(workspace_root)
     candidates = {}
     for component in sorted(draws):
@@ -480,6 +659,22 @@ def compute_family_x(
             continue
         for draw in draws.get(component) or ():
             candidates.setdefault(family, []).append((str(component), str(draw)))
+    known_draws = sorted({draw for pairs in candidates.values() for _component, draw in pairs})
+    fa_path = str(fa_dir or "")
+    frame_name = os.path.basename(os.path.normpath(fa_path)) if fa_path else ""
+    frame = {"ok": True, "path": fa_path, "name": frame_name, "source": "explicit"}
+    if not fa_path:
+        frame = resolve_frame_analysis_dir(
+            workspace_root,
+            mod_root=mod_root,
+            prefer_freshest=prefer_freshest,
+            draws=known_draws,
+        )
+        if not frame.get("ok"):
+            problems.append(f'抓帧不可用：{frame.get("note")}')
+            return _family_x_result(host_family, host_evidence, "", "", {}, {}, problems, exemptions)
+        fa_path = str(frame.get("path") or "")
+        frame_name = str(frame.get("name") or "")
     found = {}
     for family in sorted(bares):
         attempts = []
@@ -576,6 +771,266 @@ def compute_family_x(
         exemptions,
     )
     result["host_palette_slots"] = len(base_palette)
+    result["source"] = "frame-vs-cb3"
+    # 用了哪一帧、配置里那帧是否过期 —— 供审计与「X_f 变过吗」的复核（不静默换源）。
+    result["frame_source"] = str(frame.get("source") or "")
+    result["frame_declared"] = str(frame.get("declared") or "")
+    result["frame_stale"] = bool(frame.get("stale"))
+    result["frame_note"] = str(frame.get("note") or "")
+    if frame.get("source") == "freshest":
+        exemptions.append(str(frame.get("note") or ""))
+    return result
+
+
+def compute_family_x_from_palettes(
+    workspace_root: str,
+    *,
+    host_family: str,
+    family_bares,
+    palettes=None,
+    host_evidence: str = "",
+) -> dict:
+    """**X_f 的权威来源**：导出时从当前工作空间的族 palette 现算（不读抓帧目录）。
+
+    返回体与 :func:`compute_family_x` 同形，发布侧/审计侧可无缝替换；额外字段：
+    ``source = "palette"``，每族 ``Source``/``Votes``/``MaxResidual``。
+    解不出来的族**不猜**——记进 ``problems`` 且不给 ``x``，由调用方决定走显式兜底
+    （:func:`compute_family_x`，来源会标成 ``frame-vs-cb3``）还是按部分校准 Fatal。
+    """
+    workspace_root = str(workspace_root or "")
+    host_family = str(host_family or "").strip()
+    bares = {}
+    for family, bare in dict(family_bares or {}).items():
+        family = str(family or "").strip()
+        bare = str(bare or "").strip()
+        if family and bare:
+            bares[family] = bare
+    problems = []
+    exemptions = []
+    if not bares:
+        problems.append("没有参与合并的族（family_bares 为空）⇒ 无法算 X_f")
+        return _family_x_result(host_family, host_evidence, "", "", {}, {}, problems, exemptions)
+    if not host_family or host_family not in bares:
+        problems.append(f"宿主族 {host_family} 不在参与合并的族里（{sorted(bares)}）⇒ 无法算 X_f")
+        return _family_x_result(host_family, host_evidence, "", "", {}, {}, problems, exemptions)
+
+    palettes = dict(palettes or {})
+
+    def _palette(family):
+        """(槽列表, 来源路径/原因)：优先用调用方注入的，其次读工作空间缓存。"""
+        injected = list(palettes.get(family) or ())
+        if injected:
+            return injected, "injected"
+        loaded = read_family_palette(workspace_root, bares.get(family, ""))
+        if not loaded.get("ok"):
+            return [], str(loaded.get("note") or "")
+        slots = list(loaded.get("slots") or ())
+        palettes[family] = slots
+        return slots, str(loaded.get("path") or "")
+
+    base_palette, base_source = _palette(host_family)
+    if not base_palette:
+        problems.append(f"宿主族 {host_family} 的 palette 不可读 ⇒ 无法反解 X_f：{base_source}")
+        return _family_x_result(host_family, host_evidence, "", "", {}, {}, problems, exemptions)
+
+    families = {}
+    for family in sorted(bares):
+        if family == host_family:
+            family_palette, path = base_palette, base_source
+            x = identity_3x4()
+            votes = len(base_palette)
+            max_residual = 0.0
+        else:
+            family_palette, path = _palette(family)
+            if not family_palette:
+                problems.append(f"{family}: palette 不可读 ⇒ 无法反解 X_f：{path}")
+                continue
+            solved = solve_family_x_from_palettes(base_palette, family_palette)
+            if not solved.get("ok"):
+                problems.append(f"{family}: {solved.get('note')}")
+                continue
+            x = list(solved["x"])
+            votes = int(solved["votes"])
+            max_residual = float(solved["max_residual"])
+        snapped = is_identity(x)
+        if snapped:
+            x = identity_3x4()
+        duality = duality_check(base_palette, family_palette, x)
+        record = {
+            "Bare": bares.get(family, ""),
+            "Component": "",
+            "Draw": "",
+            "Source": "palette",
+            "SourceFile": path,
+            "PaletteSlots": len(family_palette),
+            "ObjectMatrix": [],
+            "InverseResidual": 0.0,
+            "X": [float(value) for value in x],
+            "IsIdentity": bool(snapped),
+            "AngleDeg": round(_rotation_deg(x), 3),
+            "Translation": [round(float(x[3]), 9), round(float(x[7]), 9), round(float(x[11]), 9)],
+            "Votes": votes,
+            "MaxResidual": max_residual,
+            "Duality": duality,
+            "DualityStatus": f"反解命中 {duality['hits']}/{duality['checked']}",
+        }
+        if family != host_family and votes < DUALITY_MIN_HITS:
+            # 不代表解错：解是**从**这些命中骨算出来的（残差 float32 量级）。只提示置信度低。
+            record["LowConfidence"] = True
+            exemptions.append(
+                f"{family}: 只用 {votes} 根共享骨反解 X_f（< {DUALITY_MIN_HITS}）"
+                "——解仍精确，但独立验证较弱"
+            )
+        families[family] = record
+    result = _family_x_result(
+        host_family,
+        host_evidence,
+        "",
+        base_source if os.path.isfile(str(base_source)) else "",
+        families,
+        {family: list(entry["X"]) for family, entry in families.items()},
+        problems,
+        exemptions,
+    )
+    result["source"] = "palette"
+    result["host_palette_slots"] = len(base_palette)
+    return result
+
+
+def _family_x_problems_for(problems, family) -> list:
+    """摘掉「只针对某族」的问题行（该族已由另一路解出来时用）。"""
+    head = str(family or "") + ":"
+    host_head = "宿主族 " + str(family or "") + " "
+    return [
+        str(item)
+        for item in (problems or ())
+        if not (str(item).startswith(head) or host_head in str(item))
+    ]
+
+
+def resolve_family_x(
+    workspace_root: str,
+    *,
+    host_family: str,
+    family_bares,
+    palettes=None,
+    host_evidence: str = "",
+    mod_root: str = "",
+    prefer_freshest: bool = True,
+    cross_check_capture: bool = True,
+) -> dict:
+    """**导出用唯一入口**：逐族挑 X_f 来源，来源逐族留痕（不静默混用）。
+
+    逐族顺序：
+      1. ``palette`` —— 从本次工作空间的族 palette 反解 ``X_f = P_base[k] · P_f[j]⁻¹``。
+         不读抓帧目录 ⇒ 不会用上一次场景的 object matrix；同一批数据自洽。
+      2. ``frame-vs-cb3`` —— palette 解不出的族（单槽族、与宿主族无共享骨）才退回抓帧
+         对象矩阵；抓帧目录按「配置里那帧 vs 最新一帧」判新鲜度（``prefer_freshest``），
+         换源会写进 ``frame_note`` 与 exemptions。
+    两路都给出 X 的族做交叉核对，差 > ``X_SOURCE_CROSS_TOL`` ⇒ 记 problem：说明抓帧与这批
+    palette 不是同一帧，抓帧那一路的数字不可信。
+
+    返回体同 :func:`compute_family_x`，额外 ``sources``（族 → 来源）与 ``frame_*`` 字段。
+    """
+    workspace_root = str(workspace_root or "")
+    host_family = str(host_family or "").strip()
+    bares = {
+        str(family or "").strip(): str(bare or "").strip()
+        for family, bare in dict(family_bares or {}).items()
+        if str(family or "").strip() and str(bare or "").strip()
+    }
+    palettes = dict(palettes or {})
+    palette_result = compute_family_x_from_palettes(
+        workspace_root,
+        host_family=host_family,
+        family_bares=bares,
+        palettes=palettes,
+        host_evidence=host_evidence,
+    )
+    palette_x = dict(palette_result.get("x") or {})
+    palette_families = dict(palette_result.get("families") or {})
+    problems = list(palette_result.get("problems") or ())
+    exemptions = list(palette_result.get("exemptions") or ())
+    wanted = sorted(bares)
+    missing = [family for family in wanted if family not in palette_x]
+    frame_result = {}
+    if (missing or cross_check_capture) and host_family in bares:
+        # 把宿主一并传进去（compute_family_x 的入参要求），它的 X 恒为单位阵、不会被采用。
+        subset = {family: bares[family] for family in (missing or wanted)}
+        subset[host_family] = bares[host_family]
+        frame_result = compute_family_x(
+            workspace_root,
+            host_family=host_family,
+            family_bares=subset,
+            palettes=palettes,
+            host_evidence=host_evidence,
+            mod_root=mod_root,
+            prefer_freshest=prefer_freshest,
+        )
+        frame_x = dict(frame_result.get("x") or {})
+        frame_families = dict(frame_result.get("families") or {})
+        frame_problems = [
+            str(item) for item in (frame_result.get("problems") or ())
+            if not str(item).startswith(str(host_family) + ":")
+        ]
+        for family in missing:
+            if family in frame_x:
+                # 该族由抓帧解出 ⇒ 摘掉 palette 那边针对它的抱怨（否则会误判成「部分校准」）
+                problems = _family_x_problems_for(problems, family)
+                palette_families[family] = dict(frame_families.get(family) or {})
+                palette_families[family]["Source"] = "frame-vs-cb3"
+                palette_x[family] = list(frame_x[family])
+            else:
+                problems.extend(frame_problems)
+                frame_problems = []
+                break
+        problems.extend(frame_problems)
+        exemptions.extend(list(frame_result.get("exemptions") or ()))
+    # 交叉核对：两路都给了 X 的族，看抓帧那一帧与这批 palette 是否同一帧。
+    cross = {}
+    for family in sorted(set(palette_result.get("x") or {}) & set(frame_result.get("x") or {})):
+        if family == host_family:
+            continue
+        delta = max_abs_diff(
+            list((palette_result.get("x") or {})[family]),
+            list((frame_result.get("x") or {})[family]),
+        )
+        cross[family] = round(float(delta), 9)
+        if delta > X_SOURCE_CROSS_TOL:
+            votes = int((palette_families.get(family) or {}).get("Votes") or 0)
+            note = (
+                f"{family}: palette 反解（{votes} 根共享骨）与抓帧 vs-cb3 不一致（Δ={delta:.3g}）"
+                "⇒ 抓帧很可能不是这批 palette 的来源帧"
+            )
+            if votes >= DUALITY_MIN_HITS:
+                problems.append(note + "；本轮以 palette 为准")
+            else:
+                # 单根骨反解是「精确但未独立验证」的解：抓帧那一路也是单点证据，不能一票否决。
+                exemptions.append(note + "；两路都只有单骨量级的证据，保留 palette 解")
+    host_family = palette_result.get("host_family") or host_family
+    sources = {}
+    for family, entry in palette_families.items():
+        sources[family] = str(entry.get("Source") or "palette")
+    used_frame = any(value == "frame-vs-cb3" for value in sources.values())
+    source_label = "palette+frame-vs-cb3" if used_frame else "palette"
+    result = _family_x_result(
+        host_family,
+        host_evidence,
+        str(frame_result.get("source_frame") or ""),
+        str(frame_result.get("frame_analysis_path") or ""),
+        palette_families,
+        {family: list(value) for family, value in palette_x.items()},
+        problems,
+        exemptions,
+    )
+    result["source"] = source_label
+    result["sources"] = sources
+    result["cross_source_delta"] = cross
+    result["host_palette_slots"] = int(palette_result.get("host_palette_slots") or 0)
+    result["frame_source"] = str(frame_result.get("frame_source") or "")
+    result["frame_declared"] = str(frame_result.get("frame_declared") or "")
+    result["frame_stale"] = bool(frame_result.get("frame_stale"))
+    result["frame_note"] = str(frame_result.get("frame_note") or "")
     return result
 
 
@@ -585,12 +1040,21 @@ def family_x_summary(record) -> str:
         return "无族级物体矩阵记录"
     families = record.get("families") or {}
     host = str(record.get("host_family") or "")
+    source = str(record.get("source") or "frame-vs-cb3")
     frame = str(record.get("source_frame") or "?")
     hits = []
     for entry in families.values():
         hits.append(str((entry.get("Duality") or {}).get("hits", 0)))
+    sources = dict(record.get("sources") or {})
+    fallback = sorted(family for family, value in sources.items() if value == "frame-vs-cb3")
+    if source == "palette":
+        origin = "palette 现算"
+    elif source == "palette+frame-vs-cb3":
+        origin = "palette 现算 + 抓帧兜底 " + str(len(fallback)) + " 族"
+    else:
+        origin = "抓帧 " + frame
     return (
-        "X_f " + str(len(families)) + " 族（宿主 " + host + "；抓帧 " + frame
+        "X_f " + str(len(families)) + " 族（宿主 " + host + "；来源 " + origin
         + "；对偶命中 " + "/".join(hits) + "）"
     )
 
@@ -601,8 +1065,9 @@ def family_x_summary(record) -> str:
 
 
 def family_x_audit_record(record, *, host_evidence: str = "", mod_root: str = "") -> dict:
-    """把 compute_family_x 的结果整理成**可长期审计**的 JSON 记录。"""
+    """把 compute_family_x / resolve_family_x 的结果整理成**可长期审计**的 JSON 记录。"""
     families = {}
+    cross = dict((record or {}).get("cross_source_delta") or {})
     for family, entry in sorted((record.get("families") or {}).items()):
         duality = dict(entry.get("Duality") or {})
         families[str(family)] = {
@@ -617,11 +1082,25 @@ def family_x_audit_record(record, *, host_evidence: str = "", mod_root: str = ""
             "DualityTotal": int(duality.get("total") or 0),
             "DualityMaxResidual": float(duality.get("max_residual") or 0.0),
             "DualityStatus": entry.get("DualityStatus", ""),
+            "Source": entry.get("Source", ""),
+            "Votes": int(entry.get("Votes") or 0),
+            "MaxResidual": float(entry.get("MaxResidual") or 0.0),
+            "CrossSourceDelta": float(cross.get(str(family)) or 0.0),
         }
     return {
-        "Algorithm": "X_f = M_base⁻¹ · M_f（vs-cb3 colT 口径；写槽 S = X_f · P_f，方案 B）",
+        "Algorithm": str(
+            record.get("algorithm")
+            or "X_f = M_base⁻¹ · M_f（palette 反解 = P_base[k]·P_f[j]⁻¹；写槽 S = X_f · P_f，方案 B）"
+        ),
+        "Source": str(record.get("source") or "frame-vs-cb3"),
+        "Sources": dict(record.get("sources") or {}),
         "SourceFrame": str(record.get("source_frame") or ""),
         "FrameAnalysisPath": str(record.get("frame_analysis_path") or ""),
+        "FrameSource": str(record.get("frame_source") or ""),
+        "FrameDeclared": str(record.get("frame_declared") or ""),
+        "FrameStale": bool(record.get("frame_stale")),
+        "FrameNote": str(record.get("frame_note") or ""),
+        "CrossSourceTolerance": X_SOURCE_CROSS_TOL,
         "HostFamily": str(record.get("host_family") or ""),
         "HostEvidence": str(host_evidence or record.get("host_evidence") or ""),
         "ModRoot": str(mod_root or ""),

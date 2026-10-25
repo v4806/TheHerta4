@@ -21,6 +21,7 @@ utils/vertexgroup_utils.py），因此在本机（无 bpy）也能真跑：
 import ast
 import importlib.util
 import json
+import math
 import shutil
 import inspect
 import os
@@ -286,7 +287,8 @@ class AttachRangePayloadTests(unittest.TestCase):
         )
         self.assertTrue(result["ok"])
         self.assertTrue(result["written"])
-        self.assertEqual(len(result["files"]), 2)
+        # 每族 2 份：身份载荷（128 B）+ BorrowMap（【t91】借用表与身份资源同批落盘）
+        self.assertEqual(len(result["files"]), 4)
         self.assertIn("128 B", result["message"])
         self.assertIn("X_f", result["message"])
         self.assertIn("单位阵", result["message"])
@@ -385,6 +387,34 @@ class AttachRangePayloadTests(unittest.TestCase):
         problems = _himi_exporter.verify_attach_range_references(ini, root)
         self.assertTrue(problems)
         self.assertTrue([p for p in problems if "128" in p])
+        with open(target, "wb") as handle:
+            handle.write(_runtime.attach_range_payload(0, 184, placement=IDENTITY, family_x=IDENTITY))
+        self.assertEqual(_himi_exporter.verify_attach_range_references(ini, root), [])
+
+    def test_reference_gate_ignores_vb_bound_cs_slots(self):
+        """t109：`[CustomShaderHI3MergedSkin_*]` 里的 `cs-t1 = ref Resource<fam>Blend` 绑的是 VB 缓冲。
+
+        门只认 `ResourceHI3AttachRange_*`（身份载荷）。把 VB 绑定也算进来 ⇒ 每次导出都假报
+        「没有 [Resource<fam>Blend] 声明」⇒ 契约降级成普通导出，合并骨架整条路径被打掉。
+        """
+        root = tempfile.mkdtemp(prefix="himi_mod_root_vb_bound_")
+        os.makedirs(os.path.join(root, "Meshes"), exist_ok=True)
+        target = os.path.join(root, "Meshes", _runtime.attach_range_basename("2c706fbd"))
+        ini = "\n".join(
+            [
+                "[CustomShaderHI3MergedSkin_2c706fbd]",
+                "cs-t1 = ref Resource2c706fbdBlend",
+                "cs-u0 = ref ResourceHI3SkinOut_2c706fbd",
+                "",
+                "[ResourceHI3AttachRange_2c706fbd]",
+                "type = Buffer",
+                "format = " + _runtime.ATTACH_RANGE_INI_FORMAT,
+                "filename = ./Meshes/2c706fbd-AttachRange.buf",
+                "",
+                "[CommandList_Attach]",
+                "cs-t1 = ref ResourceHI3AttachRange_2c706fbd",
+            ]
+        )
         with open(target, "wb") as handle:
             handle.write(_runtime.attach_range_payload(0, 184, placement=IDENTITY, family_x=IDENTITY))
         self.assertEqual(_himi_exporter.verify_attach_range_references(ini, root), [])
@@ -811,7 +841,13 @@ class FamilyXPureTests(unittest.TestCase):
         self.assertEqual(stub._himi_family_x_problems, [])
         self.assertIn("不做 X_f 校准", stub.notices[-1][1])
 
-    def test_state_partial_goes_to_problems(self):
+    def test_state_partial_keeps_the_families_it_got(self):
+        """部分缺失 ⇒ 拿到手的族照常返给载荷，缺的族落零（CS 跳过左乘，下一帧自愈）。
+
+        旧契约「半校准比不校准更坏 ⇒ 整批丢弃」已推翻：校准的权威在运行期
+        （CS 每帧按骨算 X = M_宿主⁻¹·M_来源），导出期 X_f 只是表还没热起来那一两帧
+        的兜底，缺一族不该让整笔产物退回不校准。
+        """
         stub = self._stub(
             {"ok": True, "family": "2c706fbd", "size": 10, "note": "内存"}, self._ITEMS
         )
@@ -823,7 +859,7 @@ class FamilyXPureTests(unittest.TestCase):
                 "problems": ["70a4da3e: 抓帧里没有一笔 draw 的 vs-cb3 是合法对象矩阵"],
             },
         )
-        self.assertEqual(result, {})
+        self.assertEqual(sorted(result.keys()), ["2c706fbd"])
         self.assertEqual(len(stub._himi_family_x_problems), 1)
         self.assertIn("70a4da3e", stub._himi_family_x_problems[0])
         self.assertEqual(stub._himi_family_x_skipped, [])
@@ -854,7 +890,7 @@ class FamilyXPureTests(unittest.TestCase):
             {"2c706fbd": "LOD0.2c706fbd-47199-0"},
             {"x": {"2c706fbd": IDENTITY}, "problems": []},
         )
-        self.assertEqual(result, {})
+        self.assertEqual(sorted(result.keys()), ["2c706fbd"])
         self.assertTrue([p for p in stub._himi_family_x_problems if "70a4da3e" in p])
 
 
@@ -924,6 +960,19 @@ class AttachRangeExportGateTests(unittest.TestCase):
             self.plan = plan
             self.messages = []
             self._himi_attach_range_result = {}
+            # 【门控】发布路径只在**真的有跨族借用槽**时才算/写 X_f（不合并的导出不再抓帧
+            # 算物体矩阵）。本类测的是 X_f 的发布-复核往返，所以给一条借用账，
+            # 让该分支保持被覆盖。
+            self._himi_borrow_ledger = {
+                "families": {
+                    AttachRangeExportGateTests.FAMILY: {
+                        "base": 0,
+                        "slots": 184,
+                        "block_slots": 185,
+                        "borrow": [(184, 3, "deadbeef")],
+                    }
+                }
+            }
 
         def _himi_family_placements(self):
             return {AttachRangeExportGateTests.FAMILY: _rotate_z(12.0)}
@@ -1251,6 +1300,10 @@ class CrossFamilyBorrowingTests(unittest.TestCase):
             raise unittest.SkipTest("抓帧不可用：" + str(frame.get("note")))
         frame_dir = str(frame.get("path") or "")
         mod_root = _family_x.resolve_mod_root(REAL_WORKSPACE)
+        # 工作空间 json 里记的是导出时的模组名；改了名（如 嗨♪爱愿妖精 → 虚构游戏）之后
+        # 这个路径就不存在了 —— 那是环境变了，不是判据错，跳过而不是报错。
+        if not mod_root or not os.path.isdir(mod_root):
+            raise unittest.SkipTest("模组目录不存在：" + str(mod_root))
         sizes = {}
         for name in sorted(os.listdir(mod_root)):
             if not name.startswith("Meshes"):
@@ -1451,6 +1504,114 @@ class FamilyXRecordVertexCalibrationTests(unittest.TestCase):
             "",
             "旧产物（没有 VertexCalibration 键）必须读成空串，不能被误判成方案 B",
         )
+
+
+class PaletteSolvedXTests(unittest.TestCase):
+    """X_f 的**权威来源**：导出时从当前工作空间的族 palette 现算（不读抓帧目录）。
+
+    这就是这次校准的核心性质，也是「它随场景变」的证明：
+      * 同一场景算两次 ⇒ 同一个 X（确定性，不含时间/目录等外部状态）；
+      * 把某一族挪一下 ⇒ 它的 X 跟着挪（旧实现读的是**上一次场景**的 vs-cb3 快照，不会变）。
+    """
+
+    @staticmethod
+    def _object_matrix(*, degrees=0.0, translate=(0.0, 0.0, 0.0)):
+        """绕 Z 转 degrees、再平移 ⇒ 12 float 3×4 行主序（列向量口径）。"""
+        radians = math.radians(degrees)
+        cos, sin = math.cos(radians), math.sin(radians)
+        return [
+            cos, -sin, 0.0, translate[0],
+            sin, cos, 0.0, translate[1],
+            0.0, 0.0, 1.0, translate[2],
+        ]
+
+    def _palettes(self, base_matrix, family_matrix, count=5):
+        """两族 palette：``P = M⁻¹ · B``（B = 绑定矩阵，两族引用同一份骨）。"""
+        bones = [
+            self._object_matrix(
+                degrees=11.0 * index,
+                translate=(0.17 * index, 0.09 * index * index, 0.31 * index + 0.05),
+            )
+            for index in range(count)
+        ]
+        base_inverse = _family_x.mat3x4_inverse(base_matrix)
+        family_inverse = _family_x.mat3x4_inverse(family_matrix)
+        return (
+            [_family_x.mat3x4_compose(base_inverse, bone) for bone in bones],
+            [_family_x.mat3x4_compose(family_inverse, bone) for bone in bones],
+            base_inverse,
+        )
+
+    def test_solved_x_is_the_matrix_world_relation(self):
+        base = self._object_matrix(degrees=17.0, translate=(0.4, -1.2, 0.9))
+        family = self._object_matrix(degrees=-43.0, translate=(2.0, 0.5, -0.25))
+        base_palette, family_palette, base_inverse = self._palettes(base, family)
+        solved = _family_x.solve_family_x_from_palettes(base_palette, family_palette)
+        self.assertTrue(solved["ok"], solved)
+        expected = _family_x.mat3x4_compose(base_inverse, family)
+        self.assertLessEqual(
+            _family_x.max_abs_diff(solved["x"], expected), 1e-9,
+            "反解出来的必须就是 X_f = M_base⁻¹ · M_f",
+        )
+        self.assertEqual(solved["votes"], 5, "五根骨都必须能落到宿主骨上")
+        self.assertLessEqual(solved["max_residual"], _family_x.PALETTE_SOLVE_TOL)
+
+    def test_x_is_deterministic_and_follows_the_scene(self):
+        base = self._object_matrix(translate=(0.4, -1.2, 0.9))
+        near = self._object_matrix(degrees=-43.0, translate=(2.0, 0.5, -0.25))
+        far = self._object_matrix(degrees=-43.0, translate=(2.6, 0.5, -0.25))
+        base_palette, family_palette, _inverse = self._palettes(base, near)
+        one = _family_x.solve_family_x_from_palettes(base_palette, family_palette)
+        two = _family_x.solve_family_x_from_palettes(base_palette, family_palette)
+        self.assertEqual(one["x"], two["x"], "同一场景两次现算必须逐位相同")
+        shifted_base, shifted_family, shifted_inverse = self._palettes(base, far)
+        moved = _family_x.solve_family_x_from_palettes(shifted_base, shifted_family)
+        self.assertGreater(
+            _family_x.max_abs_diff(one["x"], moved["x"]), 0.5,
+            "该族挪动 0.6 ⇒ X 必须跟着变（抓帧快照不会变，这正是旧实现坏掉的地方）",
+        )
+        self.assertLessEqual(
+            _family_x.max_abs_diff(
+                moved["x"], _family_x.mat3x4_compose(shifted_inverse, far)
+            ),
+            1e-9,
+        )
+
+    def test_host_family_is_identity_and_source_is_palette(self):
+        base = self._object_matrix(translate=(0.4, -1.2, 0.9))
+        family = self._object_matrix(degrees=-43.0, translate=(2.0, 0.5, -0.25))
+        base_palette, family_palette, base_inverse = self._palettes(base, family)
+        with tempfile.TemporaryDirectory(prefix="himi_family_x_palette_") as folder:
+            result = _family_x.compute_family_x_from_palettes(
+                folder,
+                host_family="aaaa1111",
+                family_bares={"aaaa1111": "aaaa1111-100-0", "bbbb2222": "bbbb2222-50-0"},
+                palettes={"aaaa1111": base_palette, "bbbb2222": family_palette},
+            )
+        self.assertEqual(result["source"], "palette")
+        self.assertEqual(result["problems"], [])
+        self.assertEqual(result["families"]["aaaa1111"]["X"], IDENTITY, "宿主族恒为单位阵")
+        self.assertEqual(result["families"]["bbbb2222"]["Source"], "palette")
+        expected = _family_x.mat3x4_compose(base_inverse, family)
+        self.assertLessEqual(
+            _family_x.max_abs_diff(result["x"]["bbbb2222"], expected), 1e-9
+        )
+        # 审计记录必须能把「来源」带到产物元数据里（旧产物 = frame-vs-cb3，这次 = palette）
+        audit = _family_x.family_x_audit_record(result)
+        self.assertEqual(audit["Source"], "palette")
+        self.assertEqual(audit["Families"]["bbbb2222"]["Source"], "palette")
+        self.assertEqual(audit["Families"]["bbbb2222"]["Votes"], 5)
+
+    def test_unreadable_palette_is_reported_not_guessed(self):
+        with tempfile.TemporaryDirectory(prefix="himi_family_x_palette_") as folder:
+            result = _family_x.compute_family_x_from_palettes(
+                folder,
+                host_family="aaaa1111",
+                family_bares={"aaaa1111": "aaaa1111-100-0", "bbbb2222": "bbbb2222-50-0"},
+                palettes={"aaaa1111": [list(IDENTITY)]},
+            )
+        self.assertNotIn("bbbb2222", result["x"], "解不出来就必须不给 X，绝不能猜一个")
+        self.assertTrue(result["problems"], "缺 palette 必须报成问题（调用方据此兜底或 Fatal）")
 
 
 if __name__ == "__main__":
