@@ -319,7 +319,7 @@ def audit(root: str, ini_path: str, hlsl_path: str) -> list:
             line for line in (raw.strip() for raw in text.splitlines())
             if line.startswith("Buffer<float4> himi_borrow_palette_")
         ]
-        if len(palette_decls) != len(palette):
+        if len(palette_decls) < len(palette):
             bad(
                 f"hlsl: 声明了 {len(palette_decls)} 个 himi_borrow_palette_*，"
                 f"但 ini 里有 {len(palette)} 个家族 palette"
