@@ -1243,41 +1243,29 @@ float DistGridSignedN(float3 p, out float3 outN)
     return bestSigned;
 }
 
-// 逐顶点碰撞求解。约束语义（用户 m03851 的「表面滑移」要求）：
+// 最终不变量：位移不得沿起点法线 n0 向内（切向分量原样保留）。
+// 依据：对凸碰撞体，过表面点 p0 的切平面是支撑平面，实体整个落在它内侧 ⇒ 位移停在
+// {dot(q - p0, n0) >= 0} 里就不可能进实体。凹处（两腿之间）只是近似，靠各求解器自己
+// 的路径检查兜底。写成半空间投影：只剪负分量、不动切向 ⇒「沿表面滑移」手感不变。
+float3 GuardInwardHalfSpace(float3 p0, float3 p, float3 n0)
+{
+    float3 disp = p - p0;
+    float inward = dot(disp, n0);
+    return inward < 0.0 ? p0 + disp - n0 * inward : p;
+}
+
+// 逐顶点碰撞求解的路径段（最终不变量在下面的 CollisionSolveGrid 里加）。
+// 约束语义（用户 m03851 的「表面滑移」要求）：
 //   切向位移自由保留，径向被裁到「离表面 ≥ base」。
 // 用「沿位移路径二分」是错的 —— 二分只回答「整个位移是否合法」，而曲面滑移
 // 时位移必然带一点向内的径向分量（弦切：沿切向走直线、表面是弧，弦在弧内侧），
 // 于是二分把 tLo 压到 0，顶点被完全钉死（实测拖拽位移 = 0.0000）。
 // 正确做法是投影：算出超出量，沿接触面法线推回。
-float3 CollisionSolveGrid(uint i, float3 p0, float3 offset, float3 vn)
+// n0（起点外法线）与 gap（该顶点应停留的带符号距离）由调用方传入 —— 外层的不变量
+// 也要用 n0，所以两者在 CollisionSolveGrid 里只算一次。
+float3 CollisionSolveGridCore(float3 p0, float3 offset, float3 n0, float gap)
 {
     float tolerance = max(COLLISION_PARAMS.y, 0.0);
-    // 【根因修复 2026-10-11】ColliderVertexL0 是每顶点 8 个 float32：
-    //   [i*2+0] = float4(q0.xyz, t0)    t0 = 绑定姿态带符号距离（实测 2.98e-5..1.37e-4）
-    //   [i*2+1] = float4(n0.xyz, valid) valid = 0/1
-    // 旧代码从 [i*2+1] 取 .w 当基准，读到的是 valid（可拖拽顶点恒 1.0）而不是 t0，
-    // 于是 base = -1.0。必须从 [i*2+0] 取 t0。
-    float4 l0q = ColliderVertexL0[i * 2u + 0u];
-    float4 l0n = ColliderVertexL0[i * 2u + 1u];
-    float3 n0 = l0n.xyz;
-    float n0len = length(n0);
-    n0 = n0len > 1e-6 ? n0 / n0len : vn;
-
-    // 基准只用导出侧烘的 t0（绑定姿态下顶点到碰撞体表面的带符号距离，实测
-    // 2.98e-5..1.37e-4，235 个顶点里 0 个负值），语义取自生成器 docstring：
-    // 「运行时阈值：任何位移后该顶点到表面的距离不得低于 t0」。绝不能换成实时射线
-    // 长度 —— 运行期射线长度对退化三角形会返回很大但没到 1e29 的值，那个「无限远」一旦
-    // 进基准，投影就会把顶点推飞。
-    // gap = 顶点应当停留的带符号距离（表面记 0，外侧为正）。COLLISION_BASE_SIGN = +1.0
-    // ⇒ gap = +t0（约 7e-5）=「不比绑定姿态更靠近表面」，也就是丝袜贴在大腿上的实际
-    // 状态。这里刻意不做 max(base, 0.0)：夹取会抹平符号约定（历史 bug：base 为负时被夹
-    // 成 0，负阈值语义整体丢失，碰撞退化成「只在恰好为 0 时触发」）。
-    // 【2026-10-11 修正】原写法 max(abs(t0), COLLISION_MIN_GAP) 配 MIN_GAP = 0.001，
-    // 而 t0 全部小于 0.001 ⇒ 阈值被整体抬成常数 0.001（1.43mm），235/235 个顶点在
-    // 绑定姿态下就满足 t0 < gap ⇒ 一进拖拽就 100% 违约、整圈顶点被推离表面。
-    // MIN_GAP 已降为 1e-6 纯防零，阈值回到每顶点各自的 t0。
-    float base = COLLISION_BASE_SIGN * max(abs(l0q.w), COLLISION_MIN_GAP);
-    float gap = base * COLLISION_GAP_SCALE;
 
     // ── 为什么不是「只查终点」────────────────────────────────────────────
     // 网格只覆盖表面附近那一层壳（非空格 405/42630），顶点一旦深入内部，查询要么
@@ -1422,6 +1410,61 @@ float3 CollisionSolveGrid(uint i, float3 p0, float3 offset, float3 vn)
     }
 
     return p;
+}
+
+// 逐顶点碰撞求解入口：算好该顶点的法线与阈值，跑路径求解，最后压上最终不变量。
+//
+// 【最终不变量 · 2026-10-23】相对起点自身的起点法线 n0，位移不得含向内分量。
+// 用户 m00001/m00030 的场景：拖拽半径很大时，丝袜某一圈上的顶点**整圈同时**被拽走，
+// 中间隔着大腿 —— 正确的行为是「一部分顶点能动、正对腿的那部分被拦住」，实测却是整圈
+// 一起穿到腿的另一侧。
+// 光靠 CollisionSolveGridCore 挡不住，两个结构性的洞：
+//   1) 终点预判的早退只看终点的带符号距离。整圈被同向推出去时终点落在**外侧**，
+//      dEnd 为正 ⇒ 整圈原样放行（网格落空那支同样直接 return）；
+//   2) 路径求解只保证「采样到的旧路径」和终点，不保证它**改完之后的新**路径 ——
+//      pStarOut + rem 里的 rem 只裁掉沿 pushDir 的分量，顶点仍可能沿弦切方向擦进表面；
+//      COLLISION_CORE_STEPS = 1 也不迭代。
+// CPU 仿真实测（tools/check_drag_collision_ring_tunnel.py，圆柱 R=0.075、96 个顶点
+// 整圈同向位移 0.15/0.35/0.50、8 个场景）：修前 304 个顶点沿实际位移穿进实体、最深
+// 74.9mm（= 整个腿直径）、333 个顶点跨到另一侧；只加这一层夹取后陷穿 0、最深 0.00mm。
+// 为什么不改成「方向门控 + 强制进完整求解」：那样 48/96 个顶点要跑满 16 次 CCD +
+// 64 轮投影，直接回到每帧 150ms 的旧账上；而夹取只多一次 dot，零次网格查询。
+// 几何依据：对凸碰撞体，过表面点 p0 的切平面是支撑平面，实体整个落在它的内侧 ⇒
+// 位移停在 {dot(q - p0, n0) >= 0} 里就不可能进实体。凹处（两腿之间）只有近似性，
+// 那里仍旧靠路径求解兜底。松手回弹同样走这条路径，所以回弹也不会越过阈值。
+float3 CollisionSolveGrid(uint i, float3 p0, float3 offset, float3 vn)
+{
+    // 【根因修复 2026-10-11】ColliderVertexL0 是每顶点 8 个 float32：
+    //   [i*2+0] = float4(q0.xyz, t0)    t0 = 绑定姿态带符号距离（实测 2.98e-5..1.37e-4）
+    //   [i*2+1] = float4(n0.xyz, valid) valid = 0/1
+    // 旧代码从 [i*2+1] 取 .w 当基准，读到的是 valid（可拖拽顶点恒 1.0）而不是 t0，
+    // 于是 base = -1.0。必须从 [i*2+0] 取 t0。
+    float4 l0q = ColliderVertexL0[i * 2u + 0u];
+    float4 l0n = ColliderVertexL0[i * 2u + 1u];
+    float3 n0 = l0n.xyz;
+    float n0len = length(n0);
+    n0 = n0len > 1e-6 ? n0 / n0len : vn;
+
+    // 基准只用导出侧烘的 t0（绑定姿态下顶点到碰撞体表面的带符号距离，实测
+    // 2.98e-5..1.37e-4，235 个顶点里 0 个负值），语义取自生成器 docstring：
+    // 「运行时阈值：任何位移后该顶点到表面的距离不得低于 t0」。绝不能换成实时射线
+    // 长度 —— 运行期射线长度对退化三角形会返回很大但没到 1e29 的值，那个「无限远」一旦
+    // 进基准，投影就会把顶点推飞。
+    // gap = 顶点应当停留的带符号距离（表面记 0，外侧为正）。COLLISION_BASE_SIGN = +1.0
+    // ⇒ gap = +t0（约 7e-5）=「不比绑定姿态更靠近表面」，也就是丝袜贴在大腿上的实际
+    // 状态。这里刻意不做 max(base, 0.0)：夹取会抹平符号约定（历史 bug：base 为负时被夹
+    // 成 0，负阈值语义整体丢失，碰撞退化成「只在恰好为 0 时触发」）。
+    // 【2026-10-11 修正】原写法 max(abs(t0), COLLISION_MIN_GAP) 配 MIN_GAP = 0.001，
+    // 而 t0 全部小于 0.001 ⇒ 阈值被整体抬成常数 0.001（1.43mm），235/235 个顶点在
+    // 绑定姿态下就满足 t0 < gap ⇒ 一进拖拽就 100% 违约、整圈顶点被推离表面。
+    // MIN_GAP 已降为 1e-6 纯防零，阈值回到每顶点各自的 t0。
+    float base = COLLISION_BASE_SIGN * max(abs(l0q.w), COLLISION_MIN_GAP);
+    float gap = base * COLLISION_GAP_SCALE;
+
+    float3 solved = CollisionSolveGridCore(p0, offset, n0, gap);
+
+    // 最终不变量：剪掉位移沿 n0 的负分量（切向原样保留，滑移手感不变）。
+    return GuardInwardHalfSpace(p0, solved, n0);
 }
 
 // 顶点 p 是否满足全部碰撞约束。绑定姿态 p0 处每个约束都取等号
@@ -2013,6 +2056,11 @@ void main(uint3 threadID : SV_DispatchThreadID)
         vnUnit = GuardFinite3(vnUnit, float3(0.0, 1.0, 0.0));   // t33 守卫
         float3 solved = CollisionSolve(i, localPos, totalOffset, vnUnit);
         solved = GuardFinite3(solved, localPos);                // t33 守卫
+        // 最终不变量（见 GuardInwardHalfSpace）：CollisionSolve 的每条出口都要过这一关。
+        // 三角网格路径内部已经压过一次（幂等），点云回退路径没有 —— 这里统一兜住，
+        // 以后新增求解器也不必记得自己加。
+        float4 invL0n = ColliderVertexL0[i * 2u + 1u];
+        solved = GuardInwardHalfSpace(localPos, solved, SafeNormalize(invL0n.xyz, vnUnit));
         v.position = GuardClampDelta(solved, localPos, GUARD_MAX_OFFSET);
     }
 
