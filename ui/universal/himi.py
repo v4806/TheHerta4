@@ -137,8 +137,8 @@ def _himi_buffer_byte_size(payload) -> int:
 #
 #   * `<mod>/res/` 下**只有一个** `himi_attach.hlsl`，ini 里 5 条 `cs =` **指向同一路径**；
 #   * 因此「本族在合并骨架里的目标基址」**不能再逐族写进 #define** —— 必须在**同一个** shader
-#     内部推出来。做法：读**源 palette 资源自身**的槽位数（184/71/51/19/18），
-#     在一张**固定表**里查出目标基址（184→0、18→184、71→202、19→273、51→292）。
+#     内部推出来。做法：读**源 palette 资源自身**的槽位数，在表里查出目标基址（一族一行，
+#     注释里标该族自己的族 ID）。
 #   * 槽位数一律走 `GetDimensions`（运行期真值），**绝不读 `IniParams`**：
 #     ini 参数纹理布局随 3DMigoto fork 变化（标准版 `x1/y1` 落 `IniParams[0]`，
 #     Armor fork 从 `[1]` 起），读错位置只会读到未设置的 0 ⇒ CS 静默不写 ⇒ 骨架留空
@@ -146,25 +146,86 @@ def _himi_buffer_byte_size(payload) -> int:
 #   * `HIMI_MERGED_SKELETON_SLOTS` 是**该 ini 这一版合并骨架的总槽位数**，由导出侧写进
 #     文件；它只用于「写入越界保护」的上界，**不参与**基址推导（基址只由源槽位数决定）。
 #
-# 为什么基址表是常量而不是从 ini 传：合并骨架的槽位排布是导出侧决定的（`plan.family_ranges`），
-# 而 CS 文件在 mod 里是**静态文本**。把「源槽位数 → 基址」写成表，等价于把排布**冻结进 shader**；
-# 排布一变（槽位数变了）表格就不再覆盖，此时 `base_slot = uint(-1)` 会让所有写入被
-# 越界保护挡掉 —— **宁可一根骨都不写，也不写错位置**。
+# 基址表的**来源**只有一个：本次 `plan.family_ranges`。每族在合并骨架里的 (span, base) 由导出侧
+# 排布决定，表由 `merged_attach_base_table_lines()` 按它生成后再渲染进 CS —— 表与 ini 的
+# `array=` / `Dispatch` 因此**同源**。旧口径（表是参考角色那一份的冻结常量）会与本族自己打架：
+# 本族 span 恰好等于参考角色某族、基址却不同（实测 `077983c9`：span 51、base 0，参考表里 51→292）
+# ⇒ 运行期 `base_slot != identity_base` 整族拒写，导出期 F6 硬门 Fatal。表不能有第二个来源。
+# 运行期查不到（palette 维度不在表里）时 `base_slot` 停在 0xFFFFFFFF，越界保护挡掉全部写入 ——
+# **宁可一根骨都不写，也不写错位置**。
 
 #: 合并 attach CS 的文件名（**一个**，不是每族一个）
 MERGED_ATTACH_HLSL_BASENAME = "himi_attach.hlsl"
 #: ini 里引用的相对路径（从 ini 自身所在目录 = mod 根算起）
 MERGED_ATTACH_HLSL_PATH = "./res/" + MERGED_ATTACH_HLSL_BASENAME
+#: 【t94】渲染段自蒙皮 CS：与 attach 同目录（`Toolset/`），一个文件全部族共用。
+MERGED_SKIN_HLSL_BASENAME = himi_runtime.MERGED_SKIN_CS_BASENAME
+MERGED_SKIN_HLSL_PATH = himi_runtime.MERGED_SKIN_CS_PATH
+#: 路线开关：关掉 = 不发射蒙皮段/声明、不换 `vb0`（回到"只有 attach"的旧产物）。
+MERGED_SKIN_ROUTE = True
 #: HLSL 里的槽位/基址常量名（测试据它核对，不与 `common/himi_merged_runtime.py` 的
 #: 逐族 `HIMI_ATTACH_BASE` 接口混用）
 MERGED_ATTACH_SLOTS_MACRO = "HIMI_MERGED_SKELETON_SLOTS"
-#: 字符串形式的基址表（同时用于渲染与测试核对）
-MERGED_ATTACH_BASE_TABLE_LINES = (
-    "    if (source_slots == 184u) { base_slot = 0u; }        // 2c706fbd",
-    "    else if (source_slots == 18u) { base_slot = 184u; }   // 694025c6",
-    "    else if (source_slots == 71u) { base_slot = 202u; }   // 70a4da3e",
-    "    else if (source_slots == 19u) { base_slot = 273u; }   // b35cfc6c",
-    "    else if (source_slots == 51u) { base_slot = 292u; }   // def0c0ae",
+#: 基址表行里 `//` 落在第几列（不足则至少留 3 个空格）—— 纯排版，不参与任何判据。
+MERGED_ATTACH_BASE_TABLE_COMMENT_COLUMN = 58
+#: 基址表的**参考角色样例**（`role_0512e26f` 的 343 槽真实排布）。
+#:
+#: 它**不是**生产路径的来源：真导出时表一律由 :func:`merged_attach_base_table_lines`
+#: 按本次 ``plan.family_ranges`` 生成（唯一权威来源）。这五族留在这里，是为了给测试与
+#: 「没有 plan 的参考渲染」一份可核对的样本 —— 换角色不需要改这里，也不需要改代码。
+MERGED_ATTACH_BASE_TABLE_SAMPLE_RANGES = {
+    "2c706fbd": {"base": 0, "slots": 184, "own_block": True},
+    "694025c6": {"base": 184, "slots": 18, "own_block": True},
+    "70a4da3e": {"base": 202, "slots": 71, "own_block": True},
+    "b35cfc6c": {"base": 273, "slots": 19, "own_block": True},
+    "def0c0ae": {"base": 292, "slots": 51, "own_block": True},
+}
+
+
+def merged_attach_base_table_lines(ranges) -> list:
+    """按本次 ``plan.family_ranges`` 生成基址表行（CS 里那张表**唯一**的来源）。
+
+    为什么必须是生成而不是常量：每族的 ``(span, base)`` 只由导出侧排布决定，而 ini 的
+    ``array=`` / ``Dispatch`` 也来自同一份排布。表若是别处抄来的冻结副本，就会在「本族
+    span 恰好等于参考角色某族、基址却不同」时自相矛盾 —— 运行期 ``base_slot != identity_base``
+    整族拒写，导出期 F6 硬门 Fatal（实测角色 ``077983c9``：span 51 / base 0，
+    参考表里 51→292）。
+
+    行形状（与解析侧 `_BASE_TABLE_ROW_RE` 严格配对）::
+
+        if (source_slots == <本族源槽位数>u) { base_slot = <本族合并基址>u; }   // <族 ID>
+
+    * 第一行用 ``if``、其余用 ``else if``；
+    * 按 ``base`` 升序排（与槽位排布同序，人读友好；运行期查表的语义与顺序无关）；
+    * 注释里标**该族自己的族 ID**（不是参考角色的）；
+    * 借位族（``own_block`` 为假）与 span ≤ 0 的族**不进表**（它们没有自己的槽块可写）。
+    """
+    wanted: list = []
+    for family, info in dict(ranges or {}).items():
+        info = dict(info or {})
+        if not bool(info.get("own_block", False)):
+            continue
+        try:
+            span = int(info.get("slots", 0) or 0)
+            base = int(info.get("base", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if span <= 0 or base < 0:
+            continue
+        wanted.append((base, span, str(family)))
+    wanted.sort()
+    lines: list = []
+    for index, (base, span, family) in enumerate(wanted):
+        head = "if" if index == 0 else "else if"
+        row = f"    {head} (source_slots == {span}u) {{ base_slot = {base}u; }}"
+        pad = " " * max(3, int(MERGED_ATTACH_BASE_TABLE_COMMENT_COLUMN) - len(row))
+        lines.append(f"{row}{pad}// {family}")
+    return lines
+
+
+#: 上表渲染出来的样子（**由生成器算出来**，不手写 —— 样本与生成器不可能漂移）。
+MERGED_ATTACH_BASE_TABLE_SAMPLE_LINES = tuple(
+    merged_attach_base_table_lines(MERGED_ATTACH_BASE_TABLE_SAMPLE_RANGES)
 )
 #: 【t74】运行期 X 的文本探针：`(HLSL 片段, 缺它时的报错)`。
 #: 缺失任意一条都必须让 `merged_attach_hlsl_problems` 报错（测试用删行变异逐条证红）——
@@ -262,17 +323,35 @@ HIMI_RUNTIME_X_PROBES = (
 _CS_REFERENCE_RE = re.compile(r"^\s*cs\s*=\s*(\S*)", re.IGNORECASE)
 
 
-def merged_attach_hlsl_text(decl=None) -> str:
+def merged_attach_hlsl_text(decl=None, base_table_lines=None, ranges=None) -> str:
     """渲染**单个**合并 attach CS（5 个族共用）。
 
     ``decl`` 只用于签出该 ini 这一版合并骨架的总槽位数（写越界保护的上界）；缺省取
     参考声明。内容与「每族一个 CS + ``#define HIMI_ATTACH_BASE``」的旧口径**不兼容**：
     这里没有基址宏、只有运行期查表（见文件头那段注释）。
+
+    基址表那几行由 ``base_table_lines`` / ``ranges`` 决定（**唯一权威来源是 plan**）：
+
+    * 给了 ``base_table_lines`` ⇒ **逐字**用它（离线工具与「陈旧表」两态用它造反例）；
+    * 否则给了 ``ranges``（= 本次 ``plan.family_ranges``）⇒ 按每族 span/base 生成
+      （:func:`merged_attach_base_table_lines`）；
+    * 两者都没有 ⇒ 用参考角色样例（``MERGED_ATTACH_BASE_TABLE_SAMPLE_RANGES``）：
+      只有测试与「没有 plan 的参考渲染」走这条路，真导出永远传 ``ranges``。
     """
     if decl is None:
         decl = himi_runtime.build_merged_skeleton_decl(
             himi_runtime.REFERENCE_ROLE_KEY, himi_runtime.REFERENCE_SLOT_COUNT
         )
+    table_lines = [str(line) for line in base_table_lines] if base_table_lines else None
+    if table_lines is None:
+        table_lines = merged_attach_base_table_lines(
+            MERGED_ATTACH_BASE_TABLE_SAMPLE_RANGES if ranges is None else ranges
+        )
+    # 借用槽的来源族（按块基址升序 = 借用表第 2 分量的编号空间）。没有 plan 的参考渲染
+    # 用同一份样例区间，保证「参考文本」与真产物同形（否则判据只能覆盖真导出这一条路）。
+    palette_families = himi_runtime.borrow_palette_families(
+        MERGED_ATTACH_BASE_TABLE_SAMPLE_RANGES if ranges is None else ranges
+    )
     slots = int(getattr(decl, "slots", 0) or 0)
     skeleton_name = str(getattr(decl, "name", "") or "")
     lines: list = []
@@ -284,11 +363,12 @@ def merged_attach_hlsl_text(decl=None) -> str:
     lines.append("// 每个段只是把**自己那一族的当帧 palette 副本**绑到 cs-t0、把合并骨架绑到 cs-u0。")
     lines.append("//")
     lines.append("// 【为什么没有 #define HIMI_ATTACH_BASE】旧口径每族一个文件、基址写死在各文件里。")
-    lines.append("// 合并成一个文件后，基址必须由**运行期真值**推出来：读源 palette 自身的槽位数")
-    lines.append("// （184/71/51/19/18），查下面那张**固定表**得到该族在合并骨架里的起始槽。")
-    lines.append("// 表是「导出侧排布」的冻结副本：排布变了（槽位数变了）表就不再覆盖，此时")
-    lines.append("// base_slot 保持 0xFFFFFFFF，越界保护会把本 dispatch 的所有写入挡掉 ——")
-    lines.append("// **宁可一根骨都不写，也绝不写进别的族的槽位**。")
+    lines.append("// 合并成一个文件后，基址必须由**运行期真值**推出来：读源 palette 自身的槽位数，")
+    lines.append("// 查下面那张表得到该族在合并骨架里的起始槽（一族一行）。")
+    lines.append("// 表由导出侧按**本次** `plan.family_ranges` 生成（与 ini 的 array/Dispatch 同源）：")
+    lines.append("// 每一行 = 「本族 palette 的槽位数 → 本族在合并骨架里的起始槽」。源槽数不在表里")
+    lines.append("// （palette 池换了尺寸）时 base_slot 保持 0xFFFFFFFF，越界保护会把本 dispatch 的")
+    lines.append("// 所有写入挡掉 —— **宁可一根骨都不写，也绝不写进别的族的槽位**。")
     lines.append("//")
     lines.append("// 【机制链（逐帧，顺序不可换）】")
     lines.append("//   ① deform VB 段先捕获**当帧** palette：")
@@ -337,6 +417,28 @@ def merged_attach_hlsl_text(decl=None) -> str:
         "（ini: Buffer + format = R32G32B32A32_FLOAT + filename；16 字节 = 本族 base/span）"
     )
     lines.append("Buffer<float4> himi_attach_range : register(t1);")
+    lines.append("")
+    lines.append("// ---- 【t91 借用槽】来源族的 palette 副本 ----")
+    lines.append("// 块尾那几根骨是**别的族**引用过来的：它们的值必须是 X_源 · P_源，而 P_源 只在**来源族**")
+    lines.append("// 手里 ⇒ 借用方自己把那一份捕获下来（ini: 该族的 VB/IB 段里 `ResourceHI3PaletteFam_<fam>")
+    lines.append("// = copy vs-t0 unless_null`，再由本段 `cs-t2/t3/t5/…` 引进来）。")
+    lines.append("// 绑定顺序 = 来源族序号（块基址升序）：0 → t2、1 → t3、2 → t5 …（t4 留给 BorrowMap；")
+    lines.append("// t0/t1 是本族 palette 与身份资源，永不挪作它用）。")
+    for rank, family in enumerate(palette_families):
+        lines.append(
+            f"// cs-{himi_runtime.borrow_palette_register(rank)} = ref "
+            f"ResourceHI3PaletteFam_{family}（来源族 #{rank}）"
+        )
+        lines.append(
+            f"Buffer<float4> {himi_runtime.borrow_palette_hlsl_name(rank)} : "
+            f"register({himi_runtime.borrow_palette_register(rank)});"
+        )
+    lines.append("// ---- 【t91 借用槽】本族的借用表 ----")
+    lines.append("// cs-t4 = ref ResourceHI3BorrowMap_<fam>（ini: Buffer + format = R32_UINT +")
+    lines.append("//   stride = 16 + array = 行数 + filename = <缓冲目录>/<fam>-BorrowMap.buf）")
+    lines.append("// 每行 = (目标槽, 来源族序号, 源局部槽, 0)；行号 = bone_index - 源槽数；")
+    lines.append("// 目标槽 = 0xFFFFFFFF ⇒ 本线程不写（空表就是一行这个哨兵）。")
+    lines.append("Buffer<uint4> himi_borrow_map : register(t4);")
     lines.append("// cs-u0 = ref " + skeleton_name)
     lines.append("// （ini: RWBuffer + format = R32G32B32A32_FLOAT + array = 3 × 槽位数 + bind_flags）")
     lines.append(decl.hlsl_declaration())
@@ -351,7 +453,7 @@ def merged_attach_hlsl_text(decl=None) -> str:
     lines.append("{")
     lines.append("    float4 himi_obj_rows[8];")
     lines.append("};")
-    lines.append("// cs-u1 = ref ResourceHI3ObjectMatrix_role_<role>")
+    lines.append("// cs-u1 = ref ResourceHI3ObjectMatrix_<role>")
     lines.append("// （ini: RWBuffer + format = R32G32B32A32_FLOAT + array = 3 × 族数")
     lines.append("//   + bind_flags = shader_resource unordered_access）")
     lines.append("// 表的**唯一**布局：第 f 族占 [f*3 + 0..2]，表项 i = 该族 3×4 矩阵第 i 行**逐字**")
@@ -484,10 +586,10 @@ def merged_attach_hlsl_text(decl=None) -> str:
     lines.append("    himi_src_palette.GetDimensions(palette_elements);")
     lines.append("    uint source_slots = palette_elements / 3u;")
     lines.append("")
-    lines.append("    // 【本族识别 + 目标基址】由源槽位数查固定表 —— 这是本文件里**唯一**的排布知识来源，")
+    lines.append("    // 【本族识别 + 目标基址】由源槽位数查表 —— 这是本文件里**唯一**的排布知识来源，")
     lines.append("    // 不读 IniParams、不读逐族 #define。查不到时保持 0xFFFFFFFF ⇒ 全部写入被越界保护挡掉。")
     lines.append("    uint base_slot = 0xFFFFFFFFu;")
-    lines.extend(MERGED_ATTACH_BASE_TABLE_LINES)
+    lines.extend(table_lines)
     lines.append("")
     lines.append("    // 【F5 本族身份资源（cs-t1）】它由导出侧按**本次** plan.family_ranges 生成")
     lines.append("    // （16 字节 = (base, span, version, magic)），是 base/span 的**权威**来源。")
@@ -523,10 +625,162 @@ def merged_attach_hlsl_text(decl=None) -> str:
     lines.append(f"    {skeleton_name}.GetDimensions(skeleton_elements);")
     lines.append("    uint skeleton_slots = skeleton_elements / 3u;")
     lines.append("")
-    lines.append("    // 逐 dispatch 的越界保护：源越界、族未识别、**本族 span**、目标越界，任一成立就不写。")
+    lines.append("    // 逐 dispatch 的越界保护：**借用槽**（bone_index 越过源槽数）、族未识别、")
+    lines.append("    // **本族 span**、目标越界，任一成立就不写。借用槽那一支必须先判 —— 借用槽就在")
+    lines.append("    // 本族块尾，它的 bone_index 必然 ≥ 源槽数（palette 维度 = 本族 span），")
+    lines.append("    // 放到 span 截断之后就会被截掉，块尾那几个槽永远没人写。")
+    lines.append("    // 【t91 借用槽】bone_index 越过本族源槽数 ⇒ 本线程负责的是**块尾的借用槽**：")
+    lines.append("    // 那几根骨属于**别的族**，值取 X_源 · P_源（X_源 = M_宿主⁻¹·M_源）。")
+    lines.append("    //   · 为什么乘 X_源 而本族自己的槽乘 X_本族：借用顶点已经烘在**宿主族物体空间**里，")
+    lines.append("    //     游戏侧那一刻只有 M_宿主 一笔 ⇒ 要让 M_宿主·S·v = M_源·P_源·v 成立，")
+    lines.append("    //     S 只能是 M_宿主⁻¹·M_源·P_源；本族自己的骨是 M_本族·P_本族·v，乘的是 X_本族。")
+    lines.append("    //     两个槽的值不一样 ⇒ 借用骨必须在本族块尾另占一个槽（不能复用源族的槽）。")
+    lines.append("    //   · 为什么由**本族**（借用方）写：这些槽在本族块里，只有本族的 dispatch 有写权；")
+    lines.append("    //     P_源 由上面的 palette 副本提供 ⇒ 不需要来源族先跑、也不需要它知道谁借了它。")
+    lines.append("    //   · 表行号 = bone_index - 源槽数（行表由导出期算好，目标槽 = 块尾连续分配）。")
     lines.append("    if (bone_index >= source_slots)")
     lines.append("    {")
-    lines.append("        return;")
+    lines.append("        uint borrow_index = bone_index - source_slots;")
+    lines.append("        uint borrow_elements = 0u;")
+    lines.append("        himi_borrow_map.GetDimensions(borrow_elements);")
+    lines.append("        if (borrow_index >= borrow_elements)")
+    lines.append("        {")
+    lines.append("            return;   // 越过借用表长度：本线程没有对应行（dispatch 按块长向上取整 ⇒ 常见）")
+    lines.append("        }")
+    lines.append("        uint4 borrow_entry = himi_borrow_map[borrow_index];")
+    lines.append("        if (borrow_entry.x == 0xFFFFFFFFu)")
+    lines.append("        {")
+    lines.append("            return;   // 空行（哨兵）：本族没有这么多借用槽")
+    lines.append("        }")
+    lines.append("        uint borrow_rank = borrow_entry.y;")
+    lines.append("        uint borrow_dst = borrow_entry.x * 3u;")
+    lines.append("        uint borrow_src = borrow_entry.z * 3u;")
+    lines.append("        // 只防骨架侧的写越界：源侧的“源局部槽 < 源族槽数”由导出期校验（")
+    lines.append("        // borrow_map_layout_problems），运行期多读一行也只是拿到 0（D3D11 有界读），")
+    lines.append("        // 而按本族 palette 维度去判会**错杀**来源族更大的那些行。")
+    lines.append("        if (borrow_dst + 2u >= skeleton_elements)")
+    lines.append("        {")
+    lines.append("            return;   // 越界保护：宁可少写一个槽，也不写坏别人的槽")
+    lines.append("        }")
+    lines.append("        // 按来源族序号取那一族的 palette 副本（序号 = 块基址升序，与 ini 的 cs-tN 同源）")
+    lines.append("        float4 borrow_b0 = float4(0.0, 0.0, 0.0, 0.0);")
+    lines.append("        float4 borrow_b1 = float4(0.0, 0.0, 0.0, 0.0);")
+    lines.append("        float4 borrow_b2 = float4(0.0, 0.0, 0.0, 0.0);")
+    for rank in range(max(0, len(palette_families) - 1)):
+        keyword = "if" if rank == 0 else "else if"
+        lines.append(f"        {keyword} (borrow_rank == {rank}u)")
+        lines.append("        {")
+        lines.append(
+            f"            borrow_b0 = {himi_runtime.borrow_palette_hlsl_name(rank)}[borrow_src + 0u];"
+        )
+        lines.append(
+            f"            borrow_b1 = {himi_runtime.borrow_palette_hlsl_name(rank)}[borrow_src + 1u];"
+        )
+        lines.append(
+            f"            borrow_b2 = {himi_runtime.borrow_palette_hlsl_name(rank)}[borrow_src + 2u];"
+        )
+        lines.append("        }")
+    if palette_families:
+        last_rank = len(palette_families) - 1
+        prefix = "else" if last_rank > 0 else ""
+        lines.append(f"        {prefix}".rstrip() if prefix else "        // 只有一族可借时无条件用它（序号越界不该出现，兜底用最后一族）")
+        if prefix:
+            lines.append("        {")
+        lines.append(
+            f"        borrow_b0 = {himi_runtime.borrow_palette_hlsl_name(last_rank)}[borrow_src + 0u];".replace(
+                "        borrow_b0", "            borrow_b0"
+            )
+            if prefix
+            else f"        borrow_b0 = {himi_runtime.borrow_palette_hlsl_name(last_rank)}[borrow_src + 0u];"
+        )
+        lines.append(
+            f"        borrow_b1 = {himi_runtime.borrow_palette_hlsl_name(last_rank)}[borrow_src + 1u];".replace(
+                "        borrow_b1", "            borrow_b1"
+            )
+            if prefix
+            else f"        borrow_b1 = {himi_runtime.borrow_palette_hlsl_name(last_rank)}[borrow_src + 1u];"
+        )
+        lines.append(
+            f"        borrow_b2 = {himi_runtime.borrow_palette_hlsl_name(last_rank)}[borrow_src + 2u];".replace(
+                "        borrow_b2", "            borrow_b2"
+            )
+            if prefix
+            else f"        borrow_b2 = {himi_runtime.borrow_palette_hlsl_name(last_rank)}[borrow_src + 2u];"
+        )
+        if prefix:
+            lines.append("        }")
+    lines.append("        // X_源 = M_宿主⁻¹ · M_源：两行都在表里（本帧都写过）才实时算；")
+    lines.append("        // 否则退回本族载荷里的 X 的逆（宿主族自己借时 = 单位阵 ⇒ 先原样写 P_源，")
+    lines.append("        // 下一帧自愈）——绝不把烘死的常量塞进来。")
+    lines.append("        HimiAffine borrow_x;")
+    lines.append("        borrow_x.r0 = himi_attach_range[4];")
+    lines.append("        borrow_x.r1 = himi_attach_range[5];")
+    lines.append("        borrow_x.r2 = himi_attach_range[6];")
+    lines.append("        bool borrow_x_ready = (asuint(attach_range.z) >= 4u);")
+    lines.append("        if (borrow_x_ready)")
+    lines.append("        {")
+    lines.append("            uint borrow_base_index = asuint(himi_attach_range[7].y);")
+    lines.append("            uint borrow_table_elements = 0u;")
+    lines.append("            himi_object_matrix.GetDimensions(borrow_table_elements);")
+    lines.append("            uint borrow_base_row = borrow_base_index * 3u;")
+    lines.append("            uint borrow_src_row = borrow_rank * 3u;")
+    lines.append("            if (borrow_table_elements >= 3u && borrow_src_row + 2u < borrow_table_elements")
+    lines.append("                && borrow_base_row + 2u < borrow_table_elements)")
+    lines.append("            {")
+    lines.append("                float4 borrow_base0 = himi_object_matrix[borrow_base_row + 0u];")
+    lines.append("                float4 borrow_base1 = himi_object_matrix[borrow_base_row + 1u];")
+    lines.append("                float4 borrow_base2 = himi_object_matrix[borrow_base_row + 2u];")
+    lines.append("                float4 borrow_src0 = himi_object_matrix[borrow_src_row + 0u];")
+    lines.append("                float4 borrow_src1 = himi_object_matrix[borrow_src_row + 1u];")
+    lines.append("                float4 borrow_src2 = himi_object_matrix[borrow_src_row + 2u];")
+    lines.append("                bool borrow_base_ready = (borrow_base0.x != 0.0 || borrow_base0.y != 0.0")
+    lines.append("                    || borrow_base0.z != 0.0 || borrow_base0.w != 0.0")
+    lines.append("                    || borrow_base1.x != 0.0 || borrow_base1.y != 0.0")
+    lines.append("                    || borrow_base1.z != 0.0 || borrow_base1.w != 0.0")
+    lines.append("                    || borrow_base2.x != 0.0 || borrow_base2.y != 0.0")
+    lines.append("                    || borrow_base2.z != 0.0 || borrow_base2.w != 0.0);")
+    lines.append("                bool borrow_src_ready = (borrow_src0.x != 0.0 || borrow_src0.y != 0.0")
+    lines.append("                    || borrow_src0.z != 0.0 || borrow_src0.w != 0.0")
+    lines.append("                    || borrow_src1.x != 0.0 || borrow_src1.y != 0.0")
+    lines.append("                    || borrow_src1.z != 0.0 || borrow_src1.w != 0.0")
+    lines.append("                    || borrow_src2.x != 0.0 || borrow_src2.y != 0.0")
+    lines.append("                    || borrow_src2.z != 0.0 || borrow_src2.w != 0.0);")
+    lines.append("                if (borrow_base_ready && borrow_src_ready)")
+    lines.append("                {")
+    lines.append("                    HimiAffine borrow_m_base;")
+    lines.append("                    borrow_m_base.r0 = borrow_base0;")
+    lines.append("                    borrow_m_base.r1 = borrow_base1;")
+    lines.append("                    borrow_m_base.r2 = borrow_base2;")
+    lines.append("                    HimiAffine borrow_m_src;")
+    lines.append("                    borrow_m_src.r0 = borrow_src0;")
+    lines.append("                    borrow_m_src.r1 = borrow_src1;")
+    lines.append("                    borrow_m_src.r2 = borrow_src2;")
+    lines.append("                    borrow_x = himi_affine_mul(himi_affine_inverse(borrow_m_base), borrow_m_src);")
+    lines.append("                }")
+    lines.append("            }")
+    lines.append("        }")
+    lines.append("        else")
+    lines.append("        {")
+    lines.append("            borrow_x = himi_affine_inverse(borrow_x);")
+    lines.append("        }")
+    lines.append("        // 列向量口径：X · P = 逐行点积（P 拆成三列 + 平移列）")
+    lines.append("        float3 borrow_d0 = float3(borrow_b0.x, borrow_b1.x, borrow_b2.x);")
+    lines.append("        float3 borrow_d1 = float3(borrow_b0.y, borrow_b1.y, borrow_b2.y);")
+    lines.append("        float3 borrow_d2 = float3(borrow_b0.z, borrow_b1.z, borrow_b2.z);")
+    lines.append("        float3 borrow_dt = float3(borrow_b0.w, borrow_b1.w, borrow_b2.w);")
+    lines.append("        float3 borrow_a0 = float3(borrow_x.r0.x, borrow_x.r0.y, borrow_x.r0.z);")
+    lines.append("        float3 borrow_a1 = float3(borrow_x.r1.x, borrow_x.r1.y, borrow_x.r1.z);")
+    lines.append("        float3 borrow_a2 = float3(borrow_x.r2.x, borrow_x.r2.y, borrow_x.r2.z);")
+    lines.append(f"        {skeleton_name}[borrow_dst + 0u] = float4(")
+    lines.append("            dot(borrow_a0, borrow_d0), dot(borrow_a0, borrow_d1),")
+    lines.append("            dot(borrow_a0, borrow_d2), dot(borrow_a0, borrow_dt) + borrow_x.r0.w);")
+    lines.append(f"        {skeleton_name}[borrow_dst + 1u] = float4(")
+    lines.append("            dot(borrow_a1, borrow_d0), dot(borrow_a1, borrow_d1),")
+    lines.append("            dot(borrow_a1, borrow_d2), dot(borrow_a1, borrow_dt) + borrow_x.r1.w);")
+    lines.append(f"        {skeleton_name}[borrow_dst + 2u] = float4(")
+    lines.append("            dot(borrow_a2, borrow_d0), dot(borrow_a2, borrow_d1),")
+    lines.append("            dot(borrow_a2, borrow_d2), dot(borrow_a2, borrow_dt) + borrow_x.r2.w);")
+    lines.append("        return;   // 借用槽写完即止：本线程不再走本族槽那条路")
     lines.append("    }")
     lines.append("    if (base_slot == 0xFFFFFFFFu)")
     lines.append("    {")
@@ -715,6 +969,60 @@ def merged_attach_hlsl_text(decl=None) -> str:
     return "\n".join(lines)
 
 
+#: 从基址表行里抽出 ``(源槽位数, 基址)``（表行形状由 :func:`merged_attach_base_table_lines`
+#: 生成；解析侧只认这个形状，形状一改这里必须一起改）。
+_BASE_TABLE_ROW_RE = re.compile(r"source_slots\s*==\s*(\d+)u\)\s*\{\s*base_slot\s*=\s*(\d+)u;")
+
+
+def merged_attach_base_table_lines_in_text(text) -> list:
+    """从**渲染好的 CS 全文**里把基址表那几行原样取出来（含行尾的族注释）。"""
+    rows: list = []
+    for raw in str(text or "").splitlines():
+        stripped = raw.strip()
+        if stripped.startswith("if (source_slots ==") or stripped.startswith(
+            "else if (source_slots =="
+        ):
+            rows.append(raw.rstrip())
+    return rows
+
+
+def merged_attach_base_table_text_problems(text) -> list:
+    """CS 里那张基址表的**形状**判据（纯文本、**不比对任何常量** —— 表的内容随 plan 变）。
+
+    * 必须**恰好**有一条起始 ``if (source_slots == …)`` 行，且它是表的第一行；
+      少了它 ``base_slot`` 会停在 ``0xFFFFFFFF`` ⇒ 整族拒写（模型静默消失）；
+    * 其余行必须是 ``else if (…)``（漏掉 ``else`` 说明表被手改坏了）；
+    * 每行都必须解析得出 ``(源槽位数, 基址)``，且**源槽位数不得重复**：运行期只按源槽位数
+      查表，两族同 span ⇒ 后写的覆盖先写的（这是唯一还剩下、必须 Fatal 的真矛盾）。
+    """
+    code = _strip_hlsl_comments(text)
+    rows = merged_attach_base_table_lines_in_text(code)
+    if not rows:
+        return [
+            "缺基址表（必须有一行 `if (source_slots == <n>u) { base_slot = <m>u; }`）"
+            "—— 没有它基址永远是 0xFFFFFFFF，整族拒写"
+        ]
+    problems: list = []
+    starts = [row for row in rows if row.lstrip().startswith("if (")]
+    if len(starts) != 1:
+        problems.append(f"基址表必须只有一条起始 `if (` 行，实际 {len(starts)} 条")
+    if not rows[0].lstrip().startswith("if ("):
+        problems.append("基址表第一行必须是 `if (`（否则 base_slot 停在 0xFFFFFFFF、整族拒写）")
+    spans: dict = {}
+    for row in rows:
+        match = _BASE_TABLE_ROW_RE.search(row)
+        if not match:
+            problems.append(f"基址表行无法解析：{row}")
+            continue
+        span = int(match.group(1))
+        if span in spans:
+            problems.append(
+                f"基址表出现重复的源槽位数 {span}（两族会撞同一个基址，后写的覆盖先写的）"
+            )
+        spans[span] = int(match.group(2))
+    return problems
+
+
 def merged_attach_hlsl_problems(text: str) -> list:
     """**单文件合并 attach CS 的判据**（纯函数，返回违规清单；空 = 通过）。
 
@@ -753,10 +1061,9 @@ def merged_attach_hlsl_problems(text: str) -> list:
         problems.append(
             "合并成单文件后不得再出现逐族 #define HIMI_ATTACH_BASE（基址必须由源槽位数查表算出）"
         )
-    for probe in MERGED_ATTACH_BASE_TABLE_LINES:
-        # 判据跑在**去注释**后的代码上，所以探针也要先去注释再比（否则注释字样会假阳性）。
-        if _strip_hlsl_comments(probe).strip() not in code:
-            problems.append(f"基址表缺行：{probe.strip()}")
+    # 基址表：形状与唯一性（内容随 plan 变，所以这里不比任何常量；见
+    # merged_attach_base_table_lines / merged_attach_base_table_text_problems）。
+    problems.extend(merged_attach_base_table_text_problems(text))
     if "base_slot = base_slot" in code or "base_slot + bone_index" not in code:
         problems.append("写侧必须按 (base_slot + bone_index) 取目标槽位")
     if "bone_index * 3u" not in code:
@@ -871,7 +1178,7 @@ def merged_attach_hlsl_problems(text: str) -> list:
     version_gate = _strip_hlsl_comments("if (asuint(attach_range.z) >= 4u)").strip()
     if code.count(baked_decl) != 1:
         problems.append(
-            "【t74】兜底 X 必须**恰好一次**读入（float4 attach_x0/1/2 = himi_attach_range[4..6]），"
+            "【t39-X / t74】兜底 X 必须**恰好一次**读入（float4 attach_x0/1/2 = himi_attach_range[4..6]），"
             f"实际出现 {code.count(baked_decl)} 次"
         )
     else:
@@ -924,6 +1231,78 @@ def merged_attach_hlsl_problems(text: str) -> list:
     return problems
 
 
+def merged_attach_borrow_problems(text: str) -> list:
+    """【t91】借用槽写入块的结构自检（与 :func:`merged_attach_hlsl_problems` 分开）。
+
+    为什么单独一个函数：借用槽是**可选**能力（本族没有跨族引用时借用表只有一行哨兵、整块
+    不生效），把它并进主判据会让「旧 CS 文本」通不过 —— 主判据还被历史产物/测试文本复用。
+
+    钉的都是「改坏就会**静默写出错位的骨**」的点：
+
+    1. 借用行的来源是 ``himi_borrow_map``（每族一张表、绑在本族 dispatch 的 cs-t4）；
+       载荷 ``himi_attach_range`` 里**不该**再有借用行（`[8u` 出现即说明旧机制漏删）；
+    2. 行三列语义与导出侧一致：``.x`` 目标槽、``.y`` 来源族序号、``.z`` 源局部槽；
+       ``.x == 0xFFFFFFFF`` 是空行哨兵，必须先判掉再取其他分量；
+    3. 分支入口是 ``bone_index >= source_slots``（本族 palette 维度），且**必须早于**
+       ``if (base_slot == 0xFFFFFFFFu)`` 与 span 截断 —— 借用槽就在块尾，晚判就被截掉，
+       块尾那几个槽永远没人写（= 静默黑掉/错位的骨）；
+    4. 骨的值必须取**来源族**的 palette（``himi_borrow_palette_*[borrow_src …]``），
+       拿本族 palette 就是原来的错解（P_本族 用在别人的骨上）；
+    5. X_源 = M_宿主⁻¹·M_源 必须每帧从物体矩阵表现算（两行都就绪才算），
+       否则退回载荷里本族 X 的逆 —— 绝不能把烘死常量直接写进别人的槽；
+    6. 骨架侧越界保护必须**先于**写入。
+    """
+    code = _strip_hlsl_comments(text)
+    problems: list = []
+    for token in (
+        "uint4 borrow_entry = himi_borrow_map[borrow_index];",
+        "if (borrow_entry.x == 0xFFFFFFFFu)",
+        "uint borrow_rank = borrow_entry.y;",
+        "uint borrow_dst = borrow_entry.x * 3u;",
+        "uint borrow_src = borrow_entry.z * 3u;",
+        "if (bone_index >= source_slots)",
+        "himi_borrow_palette_a[borrow_src + 0u]",
+        "if (borrow_dst + 2u >= skeleton_elements)",
+    ):
+        if token not in code:
+            problems.append(f"【t91】借用槽块缺少必要语句（{token}）")
+    # 旧机制（载荷里的借用行）必须彻底消失：留着的话 CS 会读一段永远不存在的载荷
+    if "himi_attach_range[8u" in code:
+        problems.append(
+            "【t91】载荷里不该再有借用行（himi_attach_range[8u …] 出现在 CS 里）"
+            "⇒ 借用关系已改由 himi_borrow_map 承载"
+        )
+    # 哨兵判断必须先于取 .y/.z（否则空行会把 0xFFFFFFFF 当地址用）
+    sentinel = "if (borrow_entry.x == 0xFFFFFFFFu)"
+    rank_read = "uint borrow_rank = borrow_entry.y;"
+    if sentinel in code and rank_read in code and code.index(sentinel) > code.index(rank_read):
+        problems.append("【t91】借用表的空行哨兵（borrow_entry.x == 0xFFFFFFFFu）必须判在取 .y/.z 之前")
+    # 入口位置：借用分支必须早于族未识别与 span 截断
+    entry = "if (bone_index >= source_slots)"
+    for later in ("if (base_slot == 0xFFFFFFFFu)", "if (span_slots > 0u && bone_index >= span_slots)"):
+        if entry in code and later in code and code.index(entry) > code.index(later):
+            problems.append(
+                f"【t91】借用槽分支必须早于 {later}（否则块尾的借用槽会被当成越界截掉）"
+            )
+    # 越界保护必须先于写入
+    guard = "if (borrow_dst + 2u >= skeleton_elements)"
+    write_token = "[borrow_dst + 0u]"
+    if guard in code and write_token in code and code.index(guard) > code.index(write_token):
+        problems.append("【t91】借用槽的骨架侧越界保护必须在写入**之前**（否则会写坏别人的槽）")
+    # X_源 必须运行期算、且只算一次
+    x_runtime = code.count("himi_affine_mul(himi_affine_inverse(borrow_m_base), borrow_m_src)")
+    if x_runtime != 1:
+        problems.append(
+            "【t91】X_源 = M_宿主⁻¹·M_源 必须从物体矩阵表现算**恰好一次**"
+            f"（himi_affine_mul(himi_affine_inverse(borrow_m_base), borrow_m_src)），实际 {x_runtime} 次"
+        )
+    if "himi_object_matrix[borrow_base_row + 0u]" not in code:
+        problems.append("【t91】借用槽必须读宿主族那三行（M_宿主）来算 X_源")
+    if "himi_object_matrix[borrow_src_row + 0u]" not in code:
+        problems.append("【t91】借用槽必须读来源族那三行（M_源）来算 X_源")
+    return problems
+
+
 def _strip_hlsl_comments(text: str) -> str:
     """去掉 HLSL 的 ``//`` 行注释与 ``/* */`` 块注释后再判结构。
 
@@ -935,22 +1314,26 @@ def _strip_hlsl_comments(text: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# 【F6】冻结基址表 vs 本次 plan.family_ranges 的导出期硬门
+# 【F6】基址表 ← 本次 plan.family_ranges（**唯一权威来源**）
+#
+# 生成器在常量区（:func:`merged_attach_base_table_lines`，紧跟参考样例），这里只剩
+# 「从渲染好的 CS 里抠出表」与「表 vs plan 的审计」两件事。
 # --------------------------------------------------------------------------- #
-#: 从基址表行里抽出 ``(源槽位数, 基址)``（表行形状由 `MERGED_ATTACH_BASE_TABLE_LINES` 冻结）。
-_BASE_TABLE_ROW_RE = re.compile(r"source_slots\s*==\s*(\d+)u\)\s*\{\s*base_slot\s*=\s*(\d+)u;")
 
 
-def merged_attach_base_table_rows() -> list:
-    """把冻结基址表解析成 ``[(slots, base, family), …]``（**只读**，供 F6 硬门与测试用）。
+def merged_attach_base_table_rows(table_lines=None) -> list:
+    """把基址表行解析成 ``[(slots, base, family), …]``（**只读**，供 F6 硬门与测试用）。
 
-    表是「槽位数 → 基址」的**字符串常量**（``ui/universal/himi.py`` 的模块级常量），而
-    ini 的 ``array=`` / ``Dispatch`` 来自**动态** ``plan.family_ranges``。两者此前没有任何
-    比对 ⇒ 换角色 / 重建工作空间使 span 变化时，表不再覆盖 ⇒ ``base_slot`` 停在
-    ``0xFFFFFFFF`` ⇒ 5 族全不写 ⇒ 骨架全零 ⇒ 模型**静默消失**（报告 50 §1.2 入口 ②）。
+    ``table_lines`` 缺省 = 参考角色样例（``MERGED_ATTACH_BASE_TABLE_SAMPLE_LINES``）；
+    生产路径的表由 :func:`merged_attach_base_table_lines` 按 plan 生成后传进来。
     """
+    lines = (
+        MERGED_ATTACH_BASE_TABLE_SAMPLE_LINES
+        if table_lines is None
+        else tuple(table_lines)
+    )
     rows: list = []
-    for line in MERGED_ATTACH_BASE_TABLE_LINES:
+    for line in lines:
         match = _BASE_TABLE_ROW_RE.search(str(line))
         if not match:
             continue
@@ -959,31 +1342,36 @@ def merged_attach_base_table_rows() -> list:
     return rows
 
 
-def merged_attach_base_table_audit(ranges, slot_count: int = 0) -> dict:
-    """【F6】冻结基址表 vs 本次 ``plan.family_ranges`` 的审计：``{"problems", "notices"}``。
+def merged_attach_base_table_audit(ranges, slot_count: int = 0, table_lines=None) -> dict:
+    """【F6】**CS 里那张基址表** vs 本次 ``plan.family_ranges`` 的审计：``{"problems", "notices"}``。
 
-    为什么必须是**两级**而不是「一律 Fatal」（t4 修正）：
+    比对对象是「**实际渲染进 CS 的那张表**」，不是任何常量：
 
-    * 表是「槽位数 → 基址」的**历史冻结副本**（``MERGED_ATTACH_BASE_TABLE_LINES``），而
-      ini 的 ``array=``/``Dispatch`` 来自**动态** ``plan.family_ranges``。两者此前没有任何
-      比对 ⇒ 换角色 / 重建工作空间使 span 变化时，表不再覆盖 ⇒ ``base_slot`` 停在
-      ``0xFFFFFFFF`` ⇒ 5 族全不写 ⇒ 骨架全零 ⇒ 模型**静默消失**（报告 50 §1.2 入口 ②）。
-    * **t4/F5 起运行期的权威来源是身份资源**（``cs-t1`` = 每族 16 字节的 ``(base, span)``），
-      所以「plan 的 span 不在表里」**不再等于会消失** —— 那种角色照样能正确写入。把它当
-      Fatal 会让 HIMI **只对这一个角色可用**（换角色必然中止导出），方向反了。
+    * ``table_lines`` 缺省 ⇒ 按本次 ``ranges`` 生成（= 导出侧要渲染的那张表）⇒ 审计退化为
+      **自洽**判据：它能抓的只剩「同一源槽位数出现在两族」（运行期只按源槽位数查表
+      ⇒ 后写的覆盖先写的）与「表行形状被写坏」；
+    * ``table_lines`` 显式传入 ⇒ 审计一张**外来的表**（部署里已经躺着的那份 CS、或测试造的
+      陈旧表）。这时才可能出现「同 span 不同 base」的真矛盾。
+
+    为什么要两级（t4 口径保留）：
+
+    * 运行期的权威来源是身份资源（``cs-t1`` = 每族 16 字节的 ``(base, span)``），所以
+      「plan 的 span 不在表里」**不等于会消失**，不该 Fatal —— 把它当 Fatal 会让 HIMI
+      只对某一个角色可用（换角色必然中止导出），方向反了；
     * 真正危险的是**表与 plan 直接矛盾**（同一个 span 在表里映射到别的 base）⇒ 运行期
-      会**拒写**那一族（fail-closed，安全但不完整）⇒ 这种必须 **Fatal**，不能静默。
+      ``base_slot != identity_base`` 会**整族拒写**（fail-closed，安全但不完整）。
 
     ``problems``（⇒ 调用方 Fatal）：表行无法解析 / 表内重复 span / **同 span 不同 base**。
     ``notices``（⇒ 打印，不阻断）：plan 的 span 表里没有（身份资源兜住）/ 表里有 plan 里
-    没有的旧行 / 表的 span 之和 ≠ 本次骨架槽位数。**notices 绝不静默**。
+    没有的行 / 表的 span 之和 ≠ 本次骨架槽位数。**notices 绝不静默**。
     """
     problems: list = []
     notices: list = []
-    rows = merged_attach_base_table_rows()
-    if len(rows) != len(MERGED_ATTACH_BASE_TABLE_LINES):
+    lines = merged_attach_base_table_lines(ranges) if table_lines is None else list(table_lines)
+    rows = merged_attach_base_table_rows(lines)
+    if len(rows) != len(lines):
         problems.append(
-            f"基址表有 {len(MERGED_ATTACH_BASE_TABLE_LINES) - len(rows)} 行无法解析"
+            f"基址表有 {len(lines) - len(rows)} 行无法解析"
             "（形状必须仍是 `if (source_slots == <n>u) { base_slot = <m>u; }`）"
         )
     spans: dict = {}
@@ -1008,9 +1396,8 @@ def merged_attach_base_table_audit(ranges, slot_count: int = 0) -> dict:
         if entry is None:
             notices.append(
                 f"基址表没有 {family} 的映射（本族槽位数 {count}、基址 {base}）："
-                "运行期不再依赖冻结表（cs-t1 身份资源是从本次 plan 生成的），"
-                "但表因此只作交叉核对 —— 若你想让表继续覆盖这一族，请把它加进 "
-                "MERGED_ATTACH_BASE_TABLE_LINES"
+                "运行期不依赖这张表就能写（cs-t1 身份资源是从本次 plan 生成的），"
+                "但表因此只作交叉核对"
             )
             continue
         table_base, table_family = entry
@@ -1025,7 +1412,7 @@ def merged_attach_base_table_audit(ranges, slot_count: int = 0) -> dict:
             continue
         notices.append(
             f"基址表多出一行（槽位数 {slots} → 基址 {base}，标注 {family or '?'}）："
-            "本次导出的家族区间里没有这个 span（表是历史冻结副本，只作交叉核对）"
+            "本次导出的家族区间里没有这个 span（这张表不是按本次 plan 生成的？）"
         )
     total = int(slot_count or 0)
     if total > 0 and rows:
@@ -1033,15 +1420,17 @@ def merged_attach_base_table_audit(ranges, slot_count: int = 0) -> dict:
         if table_total != total:
             notices.append(
                 f"基址表 span 之和 {table_total} ≠ 本次骨架槽位数 {total}"
-                "（换角色/重建工作空间后表只作交叉核对）"
+                f"（差 {total - table_total} 个槽没有写方：身份载荷的 span 是历史子集时正常）"
             )
     return {"problems": problems, "notices": notices}
 
 
-def merged_attach_base_table_problems(ranges, slot_count: int = 0) -> list:
+def merged_attach_base_table_problems(ranges, slot_count: int = 0, table_lines=None) -> list:
     """【F6 硬门】只返回**必须 Fatal** 的矛盾项（= :func:`merged_attach_base_table_audit` 的
     ``problems``）；诊断项在 ``notices`` 里单独取（见该函数的「为什么必须两级」）。"""
-    return list(merged_attach_base_table_audit(ranges, slot_count).get("problems") or [])
+    return list(
+        merged_attach_base_table_audit(ranges, slot_count, table_lines).get("problems") or ()
+    )
 
 
 def merged_deform_key_problems(rebinds) -> list:
@@ -1230,11 +1619,19 @@ def verify_attach_range_references(ini_text: str, mod_root: str) -> list:
         ):
             declared[current] = line.split("=", 1)[1].strip() if "=" in line else ""
     problems: list = []
+    prefix = himi_runtime.ATTACH_RANGE_RESOURCE_PREFIX
+    # 只认身份资源：`[CustomShaderHI3MergedSkin_*]` 段（t100 起没有任何 run，段仍保留）里的
+    # `cs-t1 = ref Resource<fam>Blend` 绑的是 VB 缓冲，不是身份载荷；把它算进来会让这条门在
+    # 每次导出都假报「没有 [Resource<fam>Blend] 声明」⇒ 契约降级成普通导出（t109）。
     referenced = [
-        match.group(1)
-        for match in re.finditer(
-            r"^\s*cs-t1\s*=\s*ref\s+(\S+)", text, flags=re.IGNORECASE | re.MULTILINE
+        name
+        for name in (
+            match.group(1)
+            for match in re.finditer(
+                r"^\s*cs-t1\s*=\s*ref\s+(\S+)", text, flags=re.IGNORECASE | re.MULTILINE
+            )
         )
+        if name.startswith(prefix)
     ]
     if not referenced:
         problems.append(
@@ -1279,6 +1676,88 @@ def verify_attach_range_references(ini_text: str, mod_root: str) -> list:
                 f" 要求 {himi_runtime.ATTACH_RANGE_BYTES} B"
                 "（头部 + 单位阵 3×4 + X_f 3×4 + 族索引 [7]）⇒ "
                 "CS 读不到 X_f / 族索引（短载荷会让 himi_attach_range[4..7] 越界），必须重新导出"
+            )
+    return problems
+
+
+def verify_borrow_map_references(ini_text: str, mod_root: str) -> list:
+    """【t91 硬门】每张 ``[ResourceHI3BorrowMap_<fam>]`` 都必须有真实文件，且长度 = ``array × 16``。
+
+    为什么也要硬拦：借用表是**唯一**告诉 CS「块尾那几个槽该写谁」的地方。表缺了 ⇒ CS 侧
+    ``GetDimensions`` 拿到 0 行 ⇒ 块尾借用槽**永远没人写**（deform 读零 ⇒ 借用骨塌成一团），
+    而 ini 里其他东西全都合法 ⇒ 只能靠这条门在导出期拦住。长度也要对：``array`` 是 ini 声明的
+    行数，D3D 侧的视图就按它给维度，文件比它短 ⇒ CS 读到 0 行外的东西（同样全部空缺）。
+
+    与 :func:`verify_attach_range_references` 分开：身份资源恒 128 B，借用表长度随借用骨数变。
+    """
+    text = str(ini_text or "")
+    root = os.path.abspath(str(mod_root or "").strip() or ".")
+    # 段名 → (filename, array)
+    declared: dict = {}
+    current = ""
+    current_fields: dict = {}
+    prefix = himi_runtime.BORROW_MAP_RESOURCE_PREFIX
+
+    def flush():
+        if current.startswith(prefix):
+            declared[current] = dict(current_fields)
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("[") and line.endswith("]"):
+            flush()
+            current = line[1:-1].strip()
+            current_fields = {}
+            continue
+        if "=" in line and not line.startswith(";"):
+            key, value = line.split("=", 1)
+            current_fields[key.strip().lower()] = value.strip()
+    flush()
+    problems: list = []
+    if not declared:
+        return problems  # 没有借用表声明的产物（未触发借用）不是错误
+    referenced = {
+        match.group(1).lower()
+        for match in re.finditer(r"^\s*cs-t4\s*=\s*ref\s+(\S+)", text, flags=re.IGNORECASE | re.MULTILINE)
+    }
+    for name, fields in sorted(declared.items()):
+        if name.lower() not in referenced:
+            problems.append(f"[{name}] 声明了却没有任何 `cs-t4 = ref {name}`（借用表没有绑上 CS）")
+        value = fields.get("filename", "")
+        if not value:
+            problems.append(f"[{name}] 的 filename 为空（借用表必须指向真实文件）")
+            continue
+        normalised = value.replace("\\", "/")
+        relative = normalised[2:] if normalised.startswith("./") else normalised
+        candidate = os.path.abspath(os.path.join(root, os.path.normpath(relative)))
+        try:
+            inside = os.path.commonpath([root, candidate]) == root
+        except ValueError:
+            inside = False
+        if not inside:
+            problems.append(f"[{name}] 的 filename 越出 mod 目录：{value}")
+            continue
+        if not os.path.isfile(candidate):
+            problems.append(f"[{name}] 的 filename 引用的文件不存在（{candidate}）")
+            continue
+        try:
+            rows = int(fields.get("array", "") or 0)
+        except (TypeError, ValueError):
+            rows = 0
+        if rows <= 0:
+            problems.append(f"[{name}] 的 array 必须是正整数（当前 {fields.get('array', '')!r}）")
+            continue
+        try:
+            size = os.path.getsize(candidate)
+        except OSError as exc:
+            problems.append(f"[{name}] 的 filename 无法取大小（{exc}）")
+            continue
+        expected = himi_runtime.BORROW_MAP_ROW_BYTES * rows
+        if size != expected:
+            problems.append(
+                f"[{name}] 的借用表长度是 {size} B，而 ini 声明 array = {rows}"
+                f"（每行 {himi_runtime.BORROW_MAP_ROW_BYTES} B）⇒ 应为 {expected} B；"
+                "长度不符时 CS 的 GetDimensions 与导出期算出的行数不一致，块尾借用槽会空着"
             )
     return problems
 
@@ -1532,9 +2011,13 @@ class ExportHIMI(ExportUnity):
         self._himi_stub_object_names: list = []
         self._himi_stub_draw_calls: list = []
         self._himi_stub_bares: set = set()
+        #: 【t106】自动补站位的族（"槽没有写方" 的那批）及其槽号，供诊断/上层读取。
+        self._himi_stub_writer_slots: dict = {}
         self._himi_stub_decision = None
         self._himi_plan = None
         self._himi_plan_ready = False
+        # 【t98】导出 Blend 里没有写方的合并骨架槽（逐族）⇒ 导出 Fatal，见 _himi_apply_borrow_layout
+        self._himi_borrow_orphans = {}
         self._himi_contract_decision = None
         self._himi_resource_emitted = False
         self._himi_publish_result = {}
@@ -1760,6 +2243,13 @@ class ExportHIMI(ExportUnity):
         self._himi_stub_decision = decision
         for line in decision.diagnostics:
             print(f"{_STUB_LOG_PREFIX} {line}")
+        self._himi_add_missing_writer_stubs(
+            decision,
+            workspace_root=workspace_root,
+            scene_present=scene_present,
+            used_group_ids=used_group_ids,
+            family_map=family_map,
+        )
 
         created: list = []
         for bare in decision.stub_members:
@@ -1797,6 +2287,66 @@ class ExportHIMI(ExportUnity):
             )
         return created
 
+    def _himi_add_missing_writer_stubs(
+        self,
+        decision,
+        *,
+        workspace_root: str,
+        scene_present,
+        used_group_ids,
+        family_map,
+    ) -> list:
+        """t106：把「保管着本次导出引用的槽、却没有写方」的家族补成 3 点站位。
+
+        场景（用户实机）：只选宿主族 ``077983c9`` 做快速局部导出，宿主 Blend 却引用了槽
+        216 —— 那槽由 ``1b62725d-1740-0`` 注册。它已被合并进宿主（它的顶点在宿主顶点池
+        里逐字节存在），因此**不需要再画几何**；但那批 palette 是槽 216 唯一的写方，
+        缺了它运行期读到零矩阵 ⇒ 顶点被拉向原点（模型爆炸）。
+
+        所以这里给「保管这些槽的族」补 3 点站位：站位的 IB 段会把它的 palette/attach
+        段带进产物，几何仍由宿主的 draw 画一次。找不到组件数据时**不猜**：留给导出期的
+        orphan 门说清楚缺什么。
+        """
+        payload = himi_runtime.workspace_slot_owners(workspace_root) or {}
+        owners = dict(payload.get("owners") or {})
+        if not owners:
+            return []
+        present = {str(bare) for bare in (scene_present or ()) if str(bare)}
+        by_bare: dict = {}
+        used = {int(slot) for slot in (used_group_ids or ()) if int(slot) >= 0}
+        for slot in sorted(used):
+            bare = str(owners.get(slot) or "")
+            if not bare or bare in present:
+                continue
+            by_bare.setdefault(bare, []).append(slot)
+        if not by_bare:
+            return []
+        available = {
+            str(member) for members in (family_map or {}).values() for member in members
+        }
+        added: list = []
+        for bare in sorted(by_bare):
+            slots = by_bare[bare]
+            if bare in decision.stub_members:
+                continue
+            if available and bare not in available:
+                print(
+                    f"{_STUB_LOG_PREFIX} 部件 {bare} 保管着合并骨架槽 {slots}，工作空间里却"
+                    "没有它的组件数据 ⇒ 无法补站位（导出期 orphan 门会说明缺什么）"
+                )
+                continue
+            if bare in decision.skipped_members:
+                decision.skipped_members.remove(bare)
+            decision.stub_members.append(bare)
+            self._himi_stub_writer_slots[str(bare)] = list(slots)
+            added.append(bare)
+            print(
+                f"{_STUB_LOG_PREFIX} 部件 {bare} 保管着本次导出引用的合并骨架槽 {slots}，"
+                "但它不在场景里 ⇒ 自动补一个 3 点站位（几何已在别的部件顶点池里，"
+                "站位只负责给这些槽写矩阵）"
+            )
+        return added
+
     def _himi_cleanup_stub_objects(self) -> None:
         """导出结束后移除站位对象、网格与注入蓝图的 DrawCall（事务闭合）。"""
         tracked = list(getattr(self, "_himi_stub_draw_calls", []) or [])
@@ -1821,6 +2371,7 @@ class ExportHIMI(ExportUnity):
         self._himi_stub_object_names = []
         self._himi_stub_draw_calls = []
         self._himi_stub_bares = set()
+        self._himi_stub_writer_slots = {}
 
     def himi_stub_decision(self):
         """本次导出的站位决策（无决策时为 ``None``）。"""
@@ -1914,6 +2465,275 @@ class ExportHIMI(ExportUnity):
             if int(entry.get("vg_count", 0) or 0) > 0
         ]
 
+    def _himi_discover_borrow_slots(self, plan, *, slot_count: int):
+        """【t98】从**本次导出的 Blend 字节**里发现跨族引用槽，并报出无写方的孤儿槽。
+
+        为什么不能用工作空间元数据：``part.referenced_slots`` 取自组件 json 的 VGMap，
+        而 VGMap 只映射**物体自己的**局部顶点组（实测 077:51 项→全局 0..50、09c:165 项→
+        51..215、1b6:1 项→216），于是「引用集 − 注册集」恒空。跨族引用只出现在**池化行**
+        上：同一个 draw 里拼进来的别族几何，它的骨号是全局合并槽。
+
+        逐值判归属（与 ``_himi_remap_merged_blend_to_blocks`` 同一口径）：
+        1. 落在本族注册块里 ⇒ 本族，忽略；
+        2. ``0 <= slot < 本族槽数`` ⇒ 局部编号（重映射会加基址），不算借用；
+        3. 落在**别族**的注册块里 ⇒ 借用；
+        4. 谁都不认领 ⇒ 孤儿（导出直接 Fatal：运行期那根索引读到零矩阵）。
+        """
+        borrowed: dict = {}
+        orphans: dict = {}
+        parts = list(getattr(plan, "parts", None) or ())
+        if not parts:
+            return borrowed, orphans
+        try:
+            base_ranges = himi_runtime.compute_family_ranges(
+                parts, int(slot_count or 0), complete=False
+            )
+        except Exception:  # noqa: BLE001 - 发现失败不影响既有导出路径
+            return borrowed, orphans
+        owner_of: dict = {}
+        own_base_of: dict = {}
+        own_slots_of: dict = {}
+        for family, info in (base_ranges or {}).items():
+            body = dict(info)
+            if not bool(body.get("own_block", False)):
+                continue
+            base = int(body.get("own_base", body.get("base", 0)) or 0)
+            slots = int(body.get("slots", 0) or 0)
+            own_base_of[str(family)] = base
+            own_slots_of[str(family)] = slots
+            for slot in range(base, base + slots):
+                owner_of[slot] = str(family)
+        if not owner_of:
+            return borrowed, orphans
+        for drawib_model in getattr(self, "drawib_model_list", None) or ():
+            family = str(getattr(drawib_model, "draw_ib", "") or "")
+            if family not in own_base_of:
+                continue
+            payload = self._himi_exported_blend_bytes(drawib_model)
+            if not payload:
+                continue
+            try:
+                span = himi_runtime.blend_indices_span(
+                    drawib_model.d3d11GameType.D3D11ElementList
+                )
+            except Exception:  # noqa: BLE001
+                continue
+            if int(span.get("width", 0) or 0) <= 0:
+                continue
+            try:
+                values = himi_runtime.extract_blend_index_values(payload, span)
+            except Exception:  # noqa: BLE001
+                continue
+            base = own_base_of[family]
+            slots = own_slots_of[family]
+            for slot in sorted(int(value) for value in (values or ())):
+                if base <= slot < base + slots:
+                    continue
+                if 0 <= slot < max(1, slots):
+                    continue
+                owner = owner_of.get(slot)
+                if owner is None:
+                    orphans.setdefault(family, set()).add(slot)
+                elif owner != family:
+                    borrowed.setdefault(family, set()).add(slot)
+        return borrowed, orphans
+
+    def _himi_orphan_message(self, slot_count: int) -> str:
+        """【t99】把「没有写方的合并骨架槽」翻译成**可执行的处置**（含每个槽的归属家族）。
+
+        t98 只报槽号，真实导出里那条消息回答不了「我该怎么做」：槽 216 属于 1b62725d，
+        它已落盘、只是没进本次导出 —— 用户把它一起选中即可。归属取自工作空间里**已落盘**
+        部件的 VGMap（:func:`himi_runtime.workspace_slot_owners`），与本次导出集无关，
+        因此能区分「没进本次导出」/「工作空间里也没有写方」这两种完全不同的处置。
+        """
+        try:
+            detail = himi_runtime.describe_ownerless_slots(
+                GlobalConfig.path_workspace_folder(),
+                self._himi_borrow_orphans,
+                exported_bares=[
+                    str(getattr(model, "draw_ib", "") or "")
+                    for model in (getattr(self, "drawib_model_list", None) or ())
+                ],
+            )
+        except Exception:  # noqa: BLE001 - 取证失败不得掩盖原始错误
+            detail = {"lines": [], "missing_bares": []}
+        lines = [str(line) for line in (detail.get("lines") or []) if str(line).strip()]
+        missing = [
+            str(name) for name in (detail.get("missing_bares") or []) if str(name).strip()
+        ]
+        message = (
+            "导出 Blend 引用了本次导出里没有写方的合并骨架槽（运行期读到零矩阵 ⇒ "
+            "顶点被拉向原点、模型爆炸）："
+            + "；".join(
+                f"{family} 引用槽 {slots}"
+                for family, slots in sorted(self._himi_borrow_orphans.items())
+            )
+            + f"。合并骨架共 {int(slot_count or 0)} 槽。"
+        )
+        if lines:
+            message += "".join(f"\n- {line}" for line in lines) + "\n"
+        if missing:
+            message += (
+                "处置：把 "
+                + "、".join(missing)
+                + " 一起选中再导出（它保管着这些槽的 palette，本批部件与它共用同一批 draw "
+                "顶点，缺了它就没人给这些槽写矩阵）；确实只想导一部分时，请先取消合并骨骼。"
+            )
+        else:
+            message += (
+                "处置：这些槽在工作空间里也没有写方 —— 请在 LOD0/ 下补齐对应族的组件 json"
+                "（或重新导入该族）后再导出。"
+            )
+        return message
+
+    def _himi_refresh_borrow_layout(self) -> dict:
+        """【t98】用**最终** Blend 字节重算一次借用布局（落盘前唯一一次机会）。
+
+        时机：``generate_buffer_files`` 里 ``_himi_remap_ordinary_blend_to_local`` 之后、
+        ``_himi_remap_merged_blend_to_blocks`` 之前 —— 此刻每个 DrawIB 的
+        ``category_buffer_dict["Blend"]`` 已是「本 draw 全部顶点（含池化行）+ 全局槽号」，
+        而骨架 buf / AttachRange / palette / 借用表 / attach 段都还没写盘。
+        """
+        plan = self.himi_merged_runtime_plan()
+        if not getattr(plan, "ok", False) or not getattr(plan, "family_ranges", None):
+            return {}
+        self._himi_borrow_ledger = {}
+        return self._himi_apply_borrow_layout(plan)
+
+    def _himi_apply_borrow_layout(self, plan) -> dict:
+        """【t84】把「顶点**实际引用**到的跨族骨」排进各族的块里（就地改 plan，唯一一处）。
+
+        为什么必须在这里改：``plan.family_ranges`` 是**唯一事实源** —— 基址表、AttachRange
+        载荷、ini 段、``slot_count``、Blend 索引重写全部从它派生。在计划入口改一次，下游
+        不可能互相不一致。
+
+        语义：每族的块 = 自己的 palette 槽（原顺序）+ 它顶点引用到的**别族**槽（升序追加
+        在块尾）。块尾那些槽由**源族**的 dispatch 写 ``X_借用方 · P_源``（见 CS 的 t84 块），
+        于是借用顶点拿到的矩阵仍然在**借用方**的空间里 ⇒ 不再跟别人的骨骼跑。
+
+        没有借用时**一个字段都不改**（既有无借用路径的输出逐字节不变）。
+        """
+        if not getattr(plan, "ok", False) or not getattr(plan, "family_ranges", None):
+            return {}
+        # 【t98】借用集的**事实来源**是「本次导出 Blend 里权重>0 的全局槽」。
+        # t94 那条「局部顶点组反查 − 自己写入」在本工程里恒为空（VGMap 只映射物体自己的
+        # 顶点组 ⇒ 反查集 ≡ 注册集 ⇒ 差集恒空），所以整套借用机制从来没被触发过。跨族引用
+        # 真正出现在 **池化行** 上（同一个 draw 里拼进来的别族几何），那些行的骨号是全局
+        # 合并槽；被池化它们的那笔 draw 的 X_f 摆位 ⇒ 必须由引用方写借用槽才正确。
+        old_slot_count = max(
+            0,
+            int(getattr(plan, "slot_count", 0) or 0)
+            - int(getattr(plan, "skeleton_extra_slots", 0) or 0),
+        )
+        referenced: dict = {}
+        borrow_plan = dict(getattr(plan, "borrow_plan", None) or {})
+        for family, slots in dict(borrow_plan.get("family_borrows") or {}).items():
+            values = {int(slot) for slot in (slots or ())}
+            if values:
+                referenced.setdefault(str(family), set()).update(values)
+        discovered, orphans = self._himi_discover_borrow_slots(plan, slot_count=old_slot_count)
+        for family, slots in discovered.items():
+            values = {int(slot) for slot in (slots or ())}
+            if values:
+                referenced.setdefault(str(family), set()).update(values)
+        self._himi_borrow_orphans = {
+            str(family): sorted(int(slot) for slot in (slots or ()))
+            for family, slots in (orphans or {}).items()
+            if slots
+        }
+        if self._himi_borrow_orphans:
+            from ...utils.format_utils import Fatal
+
+            raise Fatal(self._himi_orphan_message(old_slot_count))
+        if not referenced:
+            return {}
+        # 【t98】每次重排都从 `part.slot_values` **重新派生** own_base/base
+        # （`compute_family_ranges` 是纯函数，不叠加位移），所以不再需要 t94 的
+        # 「已经 shift 过就只复核」分支。`complete=False`：块尾借用槽让
+        # ∑block_slots > 缓存槽数，覆盖性由「借用行 source_local 合法」保证。
+        try:
+            ranges = himi_runtime.compute_family_ranges(
+                plan.parts,
+                old_slot_count,
+                complete=False,
+                borrowed_slots=referenced,
+            )
+        except Exception as exc:  # noqa: BLE001 - 借用重排失败绝不打断导出
+            self._himi_notify(
+                f"跨族借用槽重排失败（本次按旧排布导出，借用顶点仍会错位）：{exc}",
+                warning=True,
+            )
+            return {}
+        new_slot_count = int(himi_runtime.ranges_slot_count(ranges))
+        # 【t98】t94 的「借用集必须与局部顶点组反查逐项相等」硬门作废：反查口径在池化行上
+        # 本来就是空集，留着它会把每一个**真实的**借用判红。改判据见下面的排布自检与
+        # 覆盖性自检（无写方槽 ⇒ Fatal，上面 already 处理）。
+        borrow_mismatch = himi_runtime.borrow_slot_problems(plan.parts, ranges)
+        if borrow_mismatch:
+            self._himi_notify(
+                "借用槽与「局部顶点组反查」不一致（t98 起以导出 Blend 为准，仅供参考）："
+                + "；".join(borrow_mismatch),
+                warning=True,
+            )
+        borrows = {
+            str(family): list(info.get("borrow") or ())
+            for family, info in (ranges or {}).items()
+            if list(dict(info).get("borrow") or ())
+        }
+        if not borrows:
+            return {}
+        new_slot_count = int(himi_runtime.ranges_slot_count(ranges))
+        # 【t93 硬门】块尾借用槽一旦排进去，运行期就靠「借用表 + 身份资源 + 块基址」三样同时
+        # 成立才写得对；任何一项与布局不一致，产出的就是「看着导出了、进游戏错位」的东西
+        # （顶点索引指向别人的槽，或借用行读别人的 palette）。所以判红即 **Fatal**，不是
+        # warning —— 排布已经改动源，退回旧排布也不再正确（旧编号在新区间里是别人的槽）。
+        layout_problems = himi_runtime.borrow_map_layout_problems(
+            ranges, himi_runtime.borrow_map_rows_by_family(ranges)
+        )
+        layout_problems += himi_runtime.attach_range_layout_problems(
+            ranges, skeleton_slots=new_slot_count
+        )
+        if layout_problems:
+            from ...utils.format_utils import Fatal
+
+            raise Fatal(
+                "跨族借用槽的排布自检未通过（借用表 / 身份资源会让运行期读错槽）："
+                + "；".join(layout_problems)
+            )
+        plan.family_ranges = ranges
+        plan.slot_count = new_slot_count
+        plan.skeleton_extra_slots = max(0, new_slot_count - old_slot_count)
+        ledger = {"old_slot_count": old_slot_count, "new_slot_count": new_slot_count, "families": {}}
+        for family, info in sorted(
+            (str(name), dict(body)) for name, body in ranges.items()
+        ):
+            if not bool(info.get("own_block", False)):
+                continue
+            borrow = list(info.get("borrow") or ())
+            ledger["families"][family] = {
+                "base": int(info.get("base", 0) or 0),
+                "slots": int(info.get("slots", 0) or 0),
+                "block_slots": int(info.get("block_slots", info.get("slots", 0)) or 0),
+                "borrow": [(int(row["target_slot"]), int(row["source_slot"]), str(row["source_family"])) for row in borrow],
+            }
+            if borrow:
+                self._himi_notify(
+                    f"{family}: 块 [{int(info.get('base', 0))}, "
+                    f"{int(info.get('base', 0)) + int(info.get('block_slots', 0))}) 里追加 "
+                    f"{len(borrow)} 个借用槽 ⇒ "
+                    + "、".join(
+                        f"槽{int(row['target_slot'])}←{row['source_family']}的{int(row['source_slot'])}"
+                        for row in borrow
+                    )
+                )
+        self._himi_notify(
+            f"跨族借用槽已排入计划：合并骨架 {old_slot_count} → {new_slot_count} 槽"
+            f"（追加 {plan.skeleton_extra_slots} 个块尾槽；每个借用槽由**借用方自己的** dispatch "
+            "写 X_源·P_源，来源族的 palette 以 cs-tN 副本绑进来）"
+        )
+        self._himi_borrow_ledger = ledger
+        return ledger
+
     def himi_merged_runtime_plan(self):
         """本次导出的运行时计划（只读工作空间缓存；dump 删了也能算）。
 
@@ -1939,6 +2759,8 @@ class ExportHIMI(ExportUnity):
                 ok=False, message=f"HIMI 合并骨架运行时计划计算异常：{exc}", source="exception"
             )
             plan.diagnostics.append(plan.message)
+        # 【t84】跨族借用：在**计划入口**把借用槽排进各族块（下游全部同源）。
+        self._himi_apply_borrow_layout(plan)
         for line in plan.diagnostics:
             print(f"{_LOG_PREFIX} {line}")
         self._himi_plan = plan
@@ -2073,17 +2895,18 @@ class ExportHIMI(ExportUnity):
     # ------------------------------------------------------------------ #
 
     def _himi_verify_base_table_against_plan(self, plan) -> None:
-        """【F6】冻结基址表 vs 本次 ``plan.family_ranges``：**矛盾就 Fatal**，其余大声诊断。
+        """【F6】本次 plan 生成的那张基址表 vs 本族区间：**矛盾就 Fatal**，其余大声诊断。
 
-        根因（报告 50 §1.2 入口 ② / §6-1）：表是**字符串常量**，ini 的 ``array=``/``Dispatch``
-        来自动态 plan，两者此前没有任何比对 ⇒ 换角色 / 重建工作空间使 span 变化时，
-        5 族在运行期全部查不到基址、一根骨都不写 ⇒ 骨架全零 ⇒ 模型**静默消失**。
-        优先 Fatal（不静默降级）：不给用户一个「看上去导出了、进游戏没了」的产物。
+        表**就是**由 ``plan.family_ranges`` 生成的（``merged_attach_base_table_lines``），
+        所以正常情况下这道门必然通过 —— 它抓的是生成器自己出问题的那一种：**两族源槽位数
+        相同**。运行期只按源槽位数查表，两族同 span ⇒ 后写的覆盖先写的（第二族整族写到第一族
+        的槽块上）⇒ 必须在写盘前 Fatal，不能产出一个「看上去导出了、进游戏是错位 / 消失」的
+        产物。
 
-        **t4 修正**：F5 的身份资源（``cs-t1``）让运行期 base/span 来自**本次 plan**，所以
-        「plan 的 span 不在表里」不再等于会消失（那种角色照样正确写入）—— 把它也当 Fatal
-        会让 HIMI 只对当前这一个角色可用。⇒ 只有**表与 plan 直接矛盾**（同 span 不同 base）
-        才 Fatal；其余（表缺该 span / 表有多余旧行 / ∑span ≠ 槽位数）写成**诊断**。
+        历史（报告 50 §1.2 入口 ②）：表曾是参考角色那一份的**冻结副本**，与本族排布无关联
+        ⇒ 「同 span 不同 base」时运行期 ``base_slot != identity_base`` 整族拒写、5 族全不写
+        ⇒ 骨架全零 ⇒ 模型静默消失。把表改成由 plan 生成之后，这种矛盾不可能再出现；
+        本门留下的是它的**结构性残余**（重复 span）+ 诊断（∑span ≠ 槽位数）。
         """
         from ...utils.format_utils import Fatal
 
@@ -2102,7 +2925,8 @@ class ExportHIMI(ExportUnity):
         problems = list(audit.get("problems") or ())
         if problems:
             raise Fatal(
-                "合并骨架基址表与本次家族区间**直接矛盾** ⇒ 中止导出（运行期会整族拒写）："
+                "合并骨架基址表与本次家族区间**直接矛盾** ⇒ 中止导出"
+                "（运行期会整族拒写，或两族撞同一个槽块）："
                 + "；".join(problems)
             )
 
@@ -2181,7 +3005,14 @@ class ExportHIMI(ExportUnity):
         # 不再是「半校准」：它既不进顶点缓冲，也不进身份载荷的 [1..3]（那里恒为单位阵）。因此这里
         # 不再因为摆放缺失而降级合并骨架（降级会白白丢掉合并产物），只把读失败当诊断打出来。
         # 真正**参与写槽**的族级矩阵只有 X_f（来自抓帧 cb3）⇒ 它的三态门与摆放无关，必须独立判定。
-        if bool(GlobalProterties.import_merged_vgmap()) and getattr(plan, "has_rebinds", False):
+        # 【门控】只要本次导出走的是**共享骨架 + 分族写槽**这条通路，每族就要自己的 X_f：
+        # 各族顶点是按宿主空间烘的、骨矩阵却分块写进同一张骨架，非宿主族不乘 X 就按宿主摆
+        # （历史实测偏差 1.0~3.8 游戏单位，就是头发这类非宿主子网格的偏移量级）。
+        # 这与「有没有把物体合并到一起」无关 —— 合并只决定有没有借用槽。
+        if (
+            bool(GlobalProterties.import_merged_vgmap())
+            and getattr(plan, "has_rebinds", False)
+        ):
             self._himi_family_placements()
             placement_problems = list(getattr(self, "_himi_placements_problems", []) or [])
             if placement_problems:
@@ -2193,19 +3024,26 @@ class ExportHIMI(ExportUnity):
                 )
             # 【t39-X】族级物体矩阵 `X_f = M_base⁻¹·M_f`：合并后整块只在**宿主族一笔 draw**
             # 里渲染，缺了它各族就按宿主族摆放（实测偏差 1.0~3.8 游戏单位）。三态：
-            #   * 全部族都有合法 X_f ⇒ 写槽 S = X_f·P_f（正常路径，方案 B 唯一的族级矩阵）；
-            #   * **部分**缺失/不合法 ⇒ `Fatal` 并**指名缺哪族、为什么** —— 这次的证据
-            #     是抓帧 vs-cb3 的对象矩阵，缺一族的成因是确定的，半校准比不校准更坏；
-            #   * 一个都没有（老工作空间没有抓帧）⇒ `_himi_family_x` 里大声警告、不校准，
+            #   * 全部族都有合法 X_f ⇒ 载荷 [4..6] 写 X_f（冷启动兜底，方案 B 的族级矩阵）；
+            #   * **部分**缺失/不合法 ⇒ 只警告、不中止：校准的权威在运行期（CS 每帧按骨算
+            #     X = M_宿主⁻¹·M_来源，见借用槽与 cs-u1 表），导出期 X_f 只是「表还没热起来的
+            #     头一两帧」的兜底。半校准在这里不等于坏产物：缺的族退回单位阵，下一帧自愈。
+            #   * 一个都没有（老工作空间没有抓帧）⇒ `_himi_family_x` 里警告、不校准，
             #     导入/导出照常（CS 读到全零 X ⇒ 跳过左乘，与旧行为逐字节等价）。
             self._himi_family_x()
             family_x_problems = list(getattr(self, "_himi_family_x_problems", []) or [])
             if family_x_problems:
-                raise Fatal(
-                    "族级物体矩阵（t39-X）只拿到一部分族的 X_f（半校准的产物比不校准更坏）："
+                self._himi_notify(
+                    "族级物体矩阵（t39-X）缺一部分族，退回单位阵兜底"
+                    "（运行期 CS 每帧自算 X，不影响最终校准）："
                     + "；".join(family_x_problems[:6])
-                    + ("；…" if len(family_x_problems) > 6 else "")
+                    + ("；…" if len(family_x_problems) > 6 else ""),
+                    warning=True,
                 )
+        elif bool(GlobalProterties.import_merged_vgmap()):
+            # 开了「融合统一顶点组」但本次没有 rebind pass（整个模型都没被重绑）⇒ 没有共享
+            # 骨架可写，族级物体矩阵无从谈起。
+            self._himi_notify("本次没有重新绑定的对象 ⇒ 不生成共享骨架，跳过族级物体矩阵（t39-X）")
         snapshot = plan.contract_snapshot(
             checkbox_enabled=bool(GlobalProterties.import_merged_vgmap())
         )
@@ -2414,6 +3252,43 @@ class ExportHIMI(ExportUnity):
         items.sort(key=lambda item: (int(item[1]["base"]), item[0]))
         return items
 
+    def _himi_inject_deform_capture(self, ini_builder, drawib_model, *, before: int) -> None:
+        """给**不重绑**的族补三行捕获（本族 deform pass 是该块槽的唯一写方）。
+
+        【t95】与 :meth:`_himi_rebind_for` 解耦：重绑只决定「本族自己的顶点要不要走合并
+        骨架」，而 attach 段决定「骨架里本族那块槽当帧有没有内容」——它是**别人的**输入。
+        两者共用一个门 ⇒ 未通过 G1 的族不生成 capture/run ⇒ 它的槽恒零 ⇒ 任何索引到该块
+        的顶点都拿零矩阵（模型爆炸/塌到原点），且**在游戏里完全静默**。
+
+        行文本同源于 :func:`himi_runtime.render_attach_capture_lines`（palette → cb3 →
+        run），本模块不另写一份；插入位置 = 基类 VB 段内 draw 行之前。
+        """
+        family = str(getattr(drawib_model, "draw_ib", "") or "")
+        if not family or self.himi_family_range(family) is None:
+            return
+        capture_lines = himi_runtime.render_attach_capture_lines(family)
+        after = list(getattr(ini_builder, "ini_section_list", []) or ())
+        touched = 0
+        for section in after[int(before or 0):]:
+            if getattr(section, "SectionType", None) != M_SectionType.TextureOverrideVB:
+                continue
+            lines = list(getattr(section, "SectionLineList", []) or ())
+            out: list = []
+            inserted = False
+            for line in lines:
+                if not inserted and str(line).strip().startswith("draw"):
+                    out.extend(capture_lines)
+                    inserted = True
+                    touched += 1
+                out.append(line)
+            if inserted:
+                section.SectionLineList[:] = out
+        if not touched:
+            print(
+                f"{_LOG_PREFIX} 提示 {family}: VB 段里没有 draw 行 ⇒ 未插本族捕获行/attach"
+                "（该族块槽本次不会被写入）"
+            )
+
     def _himi_exported_blend_bytes(self, drawib_model):
         """本次导出真正写出的 Blend 字节（numpy uint8 扁平数组 → bytes）。"""
         buffers = getattr(drawib_model, "category_buffer_dict", None) or {}
@@ -2480,9 +3355,16 @@ class ExportHIMI(ExportUnity):
         """
         rebind = self._himi_rebind_for(drawib_model)
         if rebind is None:
+            # 【t95】不重绑 ≠ 不写槽。attach 段写的是**骨架里本族那块槽**，与本族顶点
+            # 怎么画无关；旧实现把「写槽」和「重绑 vs-t0」共用一个门 ⇒ 未通过 G1 的族
+            # 连 capture/run 都不生成 ⇒ 那块槽从未被写 ⇒ 引用它的顶点拿零矩阵
+            # （13:54 产物：09c6e58a 的 165 个槽全空）。这里走基类段 + 后处理插入，
+            # 与 IB 侧同一种模式：只补捕获，不动 vs-t0 / handling / draw。
+            before = len(list(getattr(ini_builder, "ini_section_list", []) or ()))
             super().add_unity_vs_texture_override_vb_sections(
                 ini_builder=ini_builder, drawib_model=drawib_model
             )
+            self._himi_inject_deform_capture(ini_builder, drawib_model, before=before)
             return
 
         d3d11_game_type = drawib_model.d3d11GameType
@@ -2626,32 +3508,29 @@ class ExportHIMI(ExportUnity):
         return result
 
     def _himi_family_index_map(self, plan=None) -> dict:
-        """【t74】``{family: (own_index, base_index)}``：物体矩阵表（``cs-u1``）里的族序号。
+        """【t74/t92】``{family: (own_index, base_index)}``：物体矩阵表（``cs-u1``）里的族序号。
 
         索引空间**唯一** = :meth:`himi_family_range_items` 的次序（= 发 ini 段的次序），
         导出侧写载荷 ``[7] = (own, base)`` 与运行期 CS 读它必须是同一套，否则每族会拿别族的
-        M 去算 X。宿主族判不出来 / 不在参与族里 ⇒ 返回 ``{}``：载荷 [7] 全零、CS 的运行期
-        分支退化为「X = 单位阵」，而此时 ``_himi_family_x`` 也必然一个 X 都给不出（同一判据），
-        单位阵与「不左乘」数值等价 ⇒ 与旧产物逐字节一致。
+        M 去算 X。
 
-        序号为什么不用 ``plan.family_ranges`` 的下标：借位族（``own_block=False``）不发段、也不写表，
-        但它在 ``family_ranges`` 里占一个键 —— 用它的下标当族序号会让表里出现永远全零的空段。
+        **``base`` 恒等于 ``own``（t92）**：每族的骨只由它自己的那笔 draw 消耗，游戏那一刻
+        用的就是本族的对象矩阵 ⇒ ``X = M_own⁻¹·M_own = 单位阵``，本族槽写 ``P_f`` 即可。
+        跨族只在**借用槽**上出现，而那些槽在本族块尾、由本族的 dispatch 写
+        ``X_源 = M_本族⁻¹·M_源``（来源族由 ``BorrowMap`` 指明）—— 所以「宿主族」这个概念
+        从写槽路径里彻底退出了。
+
+        之前按「Position 缓冲最大者」定宿主、让所有族都 ``base = 宿主``，等于给每个自成
+        一 draw 的族乘了一次 ``M_宿主⁻¹·M_族``：实测 ``077983c9``（头发）被宿主
+        ``09c6e58a`` 转了 13.66°、平移 0.29 —— 头发在自己位置里却被二次变换。判据必须
+        是「这族的几何由哪一笔 draw 渲染」，不是「谁的缓冲最大」。
         """
         if plan is None:
             plan = self.himi_merged_runtime_plan()
         families = [str(family) for family, _info in (self.himi_family_range_items() or [])]
         if not families:
             return {}
-        try:
-            host = self._himi_host_family(plan)
-        except Exception:  # noqa: BLE001 - 族索引是可选增强：宿主族判不出来就关掉运行期分支，
-            # 不能让它把整笔身份资源发布拖红（载荷里的兜底 X_f 仍然正确）。
-            return {}
-        host_family = str(host.get("family") or "") if isinstance(host, dict) and host.get("ok") else ""
-        if host_family not in families:
-            return {}
-        base_index = families.index(host_family)
-        return {family: (index, base_index) for index, family in enumerate(families)}
+        return {family: (index, index) for index, family in enumerate(families)}
 
     def _himi_publish_attach_ranges(self, plan, folder_name: str) -> dict:
         """【F5 + t39-X + t74 + t78】把每族的身份资源（128 B = base/span/ver/magic + **单位阵** + ``X_f`` + 族索引）写进 mod 缓冲目录。
@@ -2710,6 +3589,7 @@ class ExportHIMI(ExportUnity):
                 placements=placement_rows,
                 family_xs=family_xs,
                 indices=family_indices,
+                skeleton_slots=int(getattr(plan, "slot_count", 0) or 0),
             )
         except Exception as exc:  # noqa: BLE001 - 同上：导出通道不得被本模块异常打断
             result = {"ok": False, "written": False, "files": [], "message": f"身份资源发布异常：{exc}"}
@@ -2935,12 +3815,42 @@ class ExportHIMI(ExportUnity):
                 family_bares[family] = bare
         if not family_bares:
             return self._himi_family_x_none("没有任何参与族能给出部件名")
-        record = himi_family_x.compute_family_x(
-            GlobalConfig.path_workspace_folder(),
+        workspace_root = GlobalConfig.path_workspace_folder()
+        host_evidence = str(host.get("note") or "")
+        # 【X 源】逐族定源（common/himi_family_x.py::resolve_family_x）：
+        #   1. **palette 反解** —— 用本次工作空间的族 palette（导出时现算）：同一根骨在两族
+        #      palette 里是同一份表达 ⇒ X_f = P_base[k]·P_f[j]⁻¹。不读帧分析目录，因此不会拿到
+        #      「上一次场景」的 object matrix —— 改过拆并关系后，那正是会过期的来源。
+        #   2. **抓帧 vs-cb3** —— 只给 palette 解不出的族兜底（单槽族 / 与宿主无共享骨），
+        #      且按「配置里那帧 vs 最新一帧」判新鲜度；换源与逐族来源都写进 FamilyX 记录。
+        record = himi_family_x.resolve_family_x(
+            workspace_root,
             host_family=host_family,
             family_bares=family_bares,
-            host_evidence=str(host.get("note") or ""),
+            host_evidence=host_evidence,
+            mod_root=himi_family_x.resolve_mod_root(workspace_root),
+            prefer_freshest=True,
         )
+        fallback_families = sorted(
+            family
+            for family, value in dict((record or {}).get("sources") or {}).items()
+            if str(value) == "frame-vs-cb3"
+        )
+        if fallback_families:
+            self._himi_notify(
+                "族级物体矩阵 X_f："
+                + str(len(fallback_families))
+                + " 族 palette 反解不出（"
+                + "、".join(fallback_families[:3])
+                + "）⇒ 这几族退回抓帧 vs-cb3 兜底（"
+                + str(
+                    (record or {}).get("frame_note")
+                    or (record or {}).get("source_frame")
+                    or "抓帧目录"
+                )
+                + "）；逐族来源已写进 Config/HIMIMergedSkeleton.json 的 FamilyX.Sources",
+                warning=True,
+            )
         self._himi_family_x_record = record or {}
         problems = list((record or {}).get("problems") or [])
         families = dict((record or {}).get("x") or {})
@@ -2950,15 +3860,18 @@ class ExportHIMI(ExportUnity):
                 "；".join(problems[:4]) if problems else "抓帧里没有任何一族有合法对象矩阵"
             )
         if problems:
-            # 【部分】= 半校准比不校准更坏 ⇒ 契约钩子据此 Fatal 并指名缺哪族、为什么。
+            # 【部分】= 有族算不出 X_f。权威在运行期（CS 每帧按骨算），这里只记录问题、
+            # 把拿到的族照常交出去；缺的族在载荷里落零 ⇒ CS 跳过左乘（退回单位阵）。
             self._himi_family_x_problems = problems
-            return {}
+            self._himi_family_x_cache = families
+            return families
         missing = sorted(set(allowed) - set(families))
         if missing:
             self._himi_family_x_problems = [
                 f"{family}: 没有可用的 X_f（抓帧 vs-cb3 里没有合法对象矩阵）" for family in missing
             ]
-            return {}
+            self._himi_family_x_cache = families
+            return families
         self._himi_family_x_cache = families
         print(
             f"{_LOG_PREFIX} 族级物体矩阵：{len(families)} 族"
@@ -3477,6 +4390,208 @@ class ExportHIMI(ExportUnity):
         return ledger
 
 
+    def _himi_remap_merged_blend_to_blocks(self) -> dict:
+        """【t84】合并路径：把每个 DrawIB 的 Blend 索引重定到**它所属族的新块**。
+
+        为什么必须在写盘前做：``Meshes/<draw_ib>-Blend.buf`` 里那 4 个 u32 索引就是
+        游戏 deform VS 查合并骨架的槽号。t84 之后每族的块不再等于「全体族的全局槽」：
+        自己的槽搬到了新基址，跨族借用的骨搬到了**本族块尾**。索引不跟着重定，顶点就会
+        查到别人的槽（几何跟着别人的骨骼跑）。
+
+        换算三级（对每个权重 > 0 的通道）：
+
+        1. **本族注册槽** ``i ∈ [own_base, own_base + slots)`` ⇒ ``i``（旧全局编号）；
+        2. **借用槽**（``i`` 落在别族块里）⇒ ``i``，再经本族 ``family_slot_map`` 落到块尾目标槽；
+        3. **局部编号**（``i ∈ [0, slots)`` 但不在本族注册范围里，且命名空间判据不是 global）
+           ⇒ ``own_base + i``。这一条修的是真实产物里的 ``1b62725d``：它的 3 个顶点写的是
+           **局部 0**，而它的槽是 216 ⇒ 以前没有任何一步把基址加回去，游戏按槽 0 查到了
+           别的族的骨。
+
+        **【t95 改门】** 旧版只在「计划里真的有借用」时才动字节（``shifted`` 门）⇒ 没有借用表
+        的产物（今天的所有产物）**一个字节都不改**，于是 09c6e58a 这类「块基址 = 51、Blend 里
+        却写局部 0..164」的族永远不被加回基址，而合并骨架又被宿主族绑上去了 ⇒ 它那 18636 个
+        顶点按槽 0..164 查到别人的骨（实测 93.93% 行）= 模型爆炸的主因。现在改成：
+
+        * 索引修正**与借用布局解耦**，只要有 ``family_ranges`` 就跑（base=0 的族是恒等变换）；
+        * 有借用时才追加 ``borrow_blend_remap_problems`` 的 Fatal（无借用的全局布局里，
+          跨族引用本身就是合法的全局槽，不能判红）。
+
+        返回账目：``{"rewritten", "channels", "local_rebased", "borrowed", "passthrough",
+        "unowned", "unmapped", "skipped", "families"}``。
+        """
+        ledger = {
+            "rewritten": 0,
+            "channels": 0,
+            "local_rebased": 0,
+            "borrowed": 0,
+            "passthrough": 0,
+            "unowned": 0,
+            "unmapped": 0,
+            "skipped": True,
+            "families": {},
+        }
+        plan = self.himi_merged_runtime_plan()
+        ranges = dict(getattr(plan, "family_ranges", None) or {})
+        if not ranges or not self._himi_merged_attach_active():
+            return ledger
+        shifted = any(list(dict(info).get("borrow") or ()) for info in ranges.values())
+        slot_maps = himi_runtime.family_slot_map(ranges)
+        own_base_of = {}
+        own_slots_of = {}
+        for name, info in ranges.items():
+            data = dict(info or {})
+            if not bool(data.get("own_block", False)):
+                continue
+            base = int(data.get("base", 0) or 0)
+            own_base_of[str(name)] = int(data.get("own_base", base) or 0)
+            own_slots_of[str(name)] = int(data.get("slots", 0) or 0)
+        if not slot_maps:
+            return ledger
+        # 【t95】「有人写」的槽集合：本族块 + 块尾借用槽（block_slots 已含后者）。落在外面的
+        # 全局引用在运行期读到的是**零矩阵** ⇒ 那些通道把顶点拉向原点。这不是重绑能救的：
+        # 它的写方是本次导出里没有数据的家族（实测 077983c9 有 383 个通道引用 1b62725d 的
+        # 槽 216，而 1b62725d 没有 palette/attach 段）—— 只能说出来，不能假装修好。
+        covered_slots = set()
+        for name, info in ranges.items():
+            data = dict(info or {})
+            base = int(data.get("base", 0) or 0)
+            block = int(data.get("block_slots", data.get("slots", 0)) or 0)
+            if block > 0:
+                covered_slots.update(range(base, base + block))
+        try:
+            import numpy
+            import struct
+        except Exception:  # noqa: BLE001 - 没有 numpy 就不动字节（绝不写坏）
+            return ledger
+        ledger["skipped"] = False
+        # 【t93】重定后仍被引用的索引，逐族留底 —— 块尾借用槽生效后这些值必须全部落在
+        # 本族块 [base, base+block_slots) 里，落外面就是「顶点查到别人的槽」。
+        seen_indices: dict = {}
+        for drawib_model in self.drawib_model_list or ():
+            draw_ib = str(getattr(drawib_model, "draw_ib", "") or "")
+            rebind = self._himi_rebind_for(drawib_model)
+            # 【t95】族按 ranges 的键认（= DrawIB），不再要求 rebind：命名空间修正是**前提**，
+            # 不是重绑的结果 —— 旧写法里 rebind 为 None（判定 local）就 continue，于是
+            # 「判定 local ⇒ 不加基址 ⇒ 还是 local」死锁，永远出不了这个环。
+            family = draw_ib if draw_ib in slot_maps else str(
+                (rebind or {}).get("family", "") or ""
+            )
+            mapping = slot_maps.get(family)
+            if not mapping:
+                continue
+            blend = (getattr(drawib_model, "category_buffer_dict", None) or {}).get("Blend")
+            if blend is None:
+                continue
+            verdict = str(
+                (
+                    self._himi_blend_namespace_verdict(
+                        drawib_model, rebind if isinstance(rebind, dict) else {}
+                    )
+                    or {}
+                ).get("verdict", "")
+                or ""
+            )
+            own_base = int(own_base_of.get(family, 0) or 0)
+            own_slots = int(own_slots_of.get(family, 0) or 0)
+            arr = numpy.asarray(blend)
+            buf = bytearray(arr.tobytes())
+            rows = len(buf) // 32
+            touched = 0
+            channels = 0
+            for row in range(rows):
+                weights = struct.unpack_from("<4f", buf, row * 32)
+                indices = list(struct.unpack_from("<4i", buf, row * 32 + 16))
+                changed = False
+                for channel, (weight, slot) in enumerate(zip(weights, indices)):
+                    if weight <= 0.0:
+                        continue
+                    channels += 1
+                    global_slot = int(slot)
+                    in_own = own_base <= global_slot < own_base + own_slots
+                    if not in_own and verdict != "global" and 0 <= global_slot < max(1, own_slots):
+                        # 局部编号（1b62725d 的 0）：加回基址。仅在「不是本族注册槽」时生效，
+                        # 所以 base=0 的族是本映射的恒等变换，不会误伤。
+                        global_slot = own_base + global_slot
+                        ledger["local_rebased"] += 1
+                        in_own = own_base <= global_slot < own_base + own_slots
+                    if global_slot not in covered_slots:
+                        ledger["unowned"] += 1
+                    new_slot = mapping.get(global_slot)
+                    if new_slot is None:
+                        # 【t98】映射表没有这个槽：旧行为把它当「全局布局下合法的跨族引用」
+                        # 原样保留（passthrough）—— 但那正是错位来源。现在借用集由导出 Blend
+                        # 发现，跨族引用一律有块尾目标槽；走到这里说明发现集漏了它，
+                        # 布局已带借用槽时（shifted）由下面的硬门 Fatal，不会再静默放行。
+                        if global_slot not in covered_slots:
+                            ledger["unowned"] += 1
+                        ledger["unmapped"] += 1
+                        ledger["passthrough"] += 1
+                        continue
+                    if not in_own and new_slot >= own_base + own_slots:
+                        ledger["borrowed"] += 1
+                    seen_indices.setdefault(family, set()).add(int(new_slot))
+                    if new_slot != int(slot):
+                        indices[channel] = int(new_slot)
+                        changed = True
+                if changed:
+                    struct.pack_into("<4i", buf, row * 32 + 16, *indices)
+                    touched += 1
+            if touched:
+                try:
+                    arr.view(numpy.uint8)[:] = numpy.frombuffer(bytes(buf), dtype=numpy.uint8)
+                except Exception:  # noqa: BLE001 - 写不回去就保持原样
+                    continue
+                # 字节变了 ⇒ 之前缓存的命名空间判定作废：重绑门必须看**修正后**的产物，
+                # 否则「先判 local ⇒ 后修好」这条路径会让 vs-t0 永远绑不上去。
+                self._himi_blend_verdicts.pop(draw_ib, None)
+                ledger["rewritten"] += 1
+                ledger["channels"] += channels
+                ledger["families"][family] = ledger["families"].get(family, 0) + touched
+                self._himi_notify(
+                    f"{draw_ib}: Blend 索引已重定到族 {family} 的新块"
+                    f"（{touched} 行 / {channels} 个权重大于 0 的通道，命名空间判定 {verdict or '未知'}）"
+                )
+        # 【t93 硬门】块尾借用槽已经改了各族的块基址 ⇒ 旧编号在这个布局里不再是「本族的槽」。
+        # 此时还有未映射通道、或任何索引落在本族块外，都是一个必然错位的产物（几何跟着别人的
+        # 骨骼跑）。**Fatal 而不是 warning**：默认警告只写日志，实测这种错位会被当成"导出成功"。
+        if shifted:
+            remap_problems = himi_runtime.borrow_blend_remap_problems(
+                ledger, seen_indices, ranges
+            )
+            if remap_problems:
+                from ...utils.format_utils import Fatal
+
+                raise Fatal(
+                    "合并骨架的 Blend 重定后仍有错位通道（块尾借用槽已生效，旧编号不再合法）："
+                    + "；".join(remap_problems)
+                    + "；复核用 tools/himi_t91_check.py 对产物跑一遍"
+                )
+        if ledger["unowned"]:
+            orphan_families = sorted(
+                {
+                    str(dict(info).get("family_index", ""))
+                    for info in ranges.values()
+                    if not bool(dict(info).get("own_block", False))
+                }
+                - {""}
+            )
+            self._himi_notify(
+                f"警告：{ledger['unowned']} 个权重大于 0 的通道引用了没有任何写方的槽"
+                f"（骨架 {int(getattr(plan, 'slot_count', 0) or 0)} 槽里"
+                f"只有 {len(covered_slots)} 个槽有块）⇒ 运行期读到零矩阵、那些顶点会被拉向原点。"
+                "这些槽属于本次导出里没有数据的家族"
+                + (f"（借位族 {', '.join(orphan_families[:4])}）" if orphan_families else "")
+                + "：把缺失的部件一起导出、或重新导入让数据齐全",
+                warning=True,
+            )
+        if ledger["local_rebased"]:
+            self._himi_notify(
+                "合并骨架：把局部骨骼编号加回族基址 "
+                f"{ledger['local_rebased']} 个通道（涉及 {len(ledger['families'])} 个族）"
+                f"；跨族全局引用 {ledger['passthrough']} 个通道原样保留"
+            )
+        return ledger
+
     def _himi_scan_bind_positions(self) -> dict:
         """【t74 + t76】H-A 硬门：产物里有没有"位置被写成别行的位置"的行（导出段拉丝的直接成因）。
 
@@ -3550,6 +4665,18 @@ class ExportHIMI(ExportUnity):
         self._himi_write_blend_origin()
         # 【t73·兜底原则】普通/降级导出 ⇒ 把全局编号搬回**局部编号**（本族减基址；跨族记数 + 警告）
         self._himi_remap_ordinary_blend_to_local()
+        # 【t98】此刻 Blend 才是最终形态（本 draw 全部顶点 + 全局槽号）：按它重算一次借用布局，
+        # 否则跨族（池化行）引用永远不会被排进借用槽 —— 那正是「模型爆炸/错位」的现场。
+        self._himi_refresh_borrow_layout()
+        # 【t84】合并路径：把 Blend 索引重定到各族的**新块**（含块尾借用槽）
+        ledger = self._himi_remap_merged_blend_to_blocks()
+        if ledger.get("rewritten"):
+            print(
+                f"{_LOG_PREFIX} 合并路径已重定 {ledger['rewritten']} 个 DrawIB 的 Blend 索引"
+                f"（{ledger['channels']} 个通道；局部重新加基址 {ledger['local_rebased']} 个，"
+                f"借用通道 {ledger['borrowed']} 个，未映射 {ledger['unmapped']} 个）"
+            )
+        self._himi_blend_block_remap_ledger = ledger
         written = super().generate_buffer_files(output_folder)
         # 【t74】H-A 自检：产物写完之后查"位置被写成别行的位置"（判红 ⇒ 降级，不 Fatal）
         self._himi_scan_bind_positions()
@@ -3754,6 +4881,17 @@ class ExportHIMI(ExportUnity):
                 f"{buffer_folder}/{himi_runtime.attach_range_basename(family)}",
             ):
                 palette_section.append(line)
+        # 【t91】每族的**借用表**声明（`cs-t4`，每行 16 B = 目标槽/来源族序号/源局部槽/0）。
+        # 与身份资源不同：表长随借用骨数变，所以 array 就是行数（空表恒 1 行哨兵）——
+        # 声明与实际文件必须同长，否则 CS 侧 GetDimensions 拿到的行数就不是导出期算的那个。
+        for family, _info in items:
+            rows = himi_runtime.borrow_map_rows(plan.family_ranges, family)
+            for line in himi_runtime.borrow_map_ini_lines(
+                family,
+                f"{buffer_folder}/{himi_runtime.borrow_map_basename(family)}",
+                len(rows),
+            ):
+                palette_section.append(line)
         palette_section.new_line()
         ini_builder.append_section(palette_section)
         if not skeleton_name:
@@ -3763,6 +4901,9 @@ class ExportHIMI(ExportUnity):
             )
             return
         emitted_paths: list = []
+        # 来源族副本的**序号顺序**（= 块基址升序）由 plan 决定，ini 的 cs-tN 与 CS 里的
+        # palette 声明必须同源 —— 两边都从这一个函数取，序号就不可能对不上。
+        palette_families = himi_runtime.borrow_palette_families(plan.family_ranges)
         for family, info in items:
             attach_section = M_IniSection(M_SectionType.MergedSkeleton)
             for line in himi_runtime.render_attach_section_lines(
@@ -3771,6 +4912,11 @@ class ExportHIMI(ExportUnity):
                 slots=int(info["slots"]),
                 skeleton_name=skeleton_name,
                 object_matrix_name=object_matrix_name,
+                # 【t91】Dispatch 覆盖**整块**（本族 span + 块尾借用槽），不是只覆盖 span：
+                # 借用槽由本族 dispatch 自己写，少算一槽就等于少一个块尾槽没人写。
+                block_slots=int(info.get("block_slots", info["slots"]) or info["slots"]),
+                borrow_map_name=himi_runtime.borrow_map_resource_name(family),
+                palette_families=palette_families,
             ):
                 # 【单文件改写】只动 `cs =` 那一行，其余逐字保留（含 Dispatch / 解绑行）。
                 if line.startswith("cs = "):
@@ -3786,6 +4932,181 @@ class ExportHIMI(ExportUnity):
                 "合并骨架 attach 段的 `cs =` 引用自检失败：" + "；".join(problems)
             )
         self._himi_attach_cs_paths = emitted_paths
+        # 【t94】渲染段蒙皮段（声明 + CS 段）：紧跟在 attach 之后发，名字同源。
+        self._himi_emit_family_skin_sections(ini_builder, plan, folder_name)
+
+    # ------------------------------------------------------------------ #
+    # t94：渲染段自蒙皮 pass（每族一段 + 一张自建输出缓冲）
+    # ------------------------------------------------------------------ #
+
+    def _himi_skin_route_active(self) -> bool:
+        """蒙皮段是否发射：与 attach 同门（合并骨架路径激活 + 本次计划可用）。
+
+        ``MERGED_SKIN_ROUTE = False`` 可整条关掉（回到「只有 attach」的旧产物，测试/兜底用）。
+        """
+        if not bool(MERGED_SKIN_ROUTE):
+            return False
+        try:
+            return bool(self._himi_merged_attach_active())
+        except Exception:  # noqa: BLE001 - 判不出就按"不发"（安全侧：不写半截产物）
+            return False
+
+    def _himi_skin_rows(self, family: str) -> int:
+        """该族要被蒙皮的行数 = 它自己上传的 Position 行数（= deform 重放的行数）。
+
+        首选 ``draw_number``（本次导出权威行数，与 ``draw = <行数>, 0`` 同源）；取不到时
+        退回产物 ``Meshes/<fam>-Position.buf`` 的字节数 / 44（44 B/行 = P12 N12 C4 TA16）。
+        """
+        name = str(family or "")
+        if not name:
+            return 0
+        for drawib_model in self.drawib_model_list or ():
+            if str(getattr(drawib_model, "draw_ib", "") or "") != name:
+                continue
+            rows = int(getattr(drawib_model, "draw_number", 0) or 0)
+            if rows > 0:
+                return rows
+        try:
+            buffer_folder = GlobalConfig.path_generatemod_buffer_folder()
+        except Exception:  # noqa: BLE001
+            return 0
+        path = os.path.join(
+            str(buffer_folder or ""), name + "-Position.buf"
+        )
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return 0
+        stride = int(himi_runtime.SKIN_OUT_STRIDE)
+        if size <= 0 or size % stride:
+            return 0
+        return size // stride
+
+    def _himi_emit_family_skin_sections(
+        self, ini_builder, plan, folder_name: str
+    ) -> dict:
+        """逐族发射：① ``[ResourceHI3SkinOut_<fam>]`` 声明 ② ``[CustomShaderHI3MergedSkin_<fam>]`` 段。
+
+        为什么在这里发（资源段这一遍）而不是更早：``array`` 是该族**行数**，它只有在拿到
+        ``draw_number``（deform 重放行数）之后才有值。段体（绑定/顺序）由
+        ``himi_runtime.skin_section_lines`` 给，本模块不另写一份文本。
+
+        返回 ``{family: {"rows", "run", "bind"}}``：IB 段插 ``run = …Skin_<fam>`` 与
+        ``vb0 = ResourceHI3SkinOut_<fam>`` 时只查这张表（名字与声明同源）。
+        """
+        if not self._himi_skin_route_active():
+            return {}
+        items = self.himi_family_range_items()
+        if not items:
+            return {}
+        decl = plan.resource(str(folder_name or himi_runtime.MERGED_SKELETON_DEFAULT_FOLDER))
+        skeleton_name = str(getattr(decl, "name", "") or "")
+        if not skeleton_name:
+            self._himi_notify(
+                "找不到合并骨架资源名 ⇒ 不发蒙皮段（cs-t2 无目标）", warning=True
+            )
+            return {}
+        decls: list = []
+        emitted: list = []
+        for family, _info in items:
+            rows = self._himi_skin_rows(family)
+            if rows <= 0:
+                self._himi_notify(
+                    f"{family}: 取不到该族的 Position 行数 ⇒ 不发蒙皮段"
+                    "（该族几何仍由 deform 流输出重放产出，借骨部分会慢一帧）",
+                    warning=True,
+                )
+                continue
+            try:
+                skin_decl = himi_runtime.build_skin_out_decl(family, rows)
+            except Exception as exc:  # noqa: BLE001 - 声明不合法就不发这一段
+                self._himi_notify(
+                    f"{family}: 蒙皮输出缓冲声明不合法（{exc}）⇒ 不发该族蒙皮段",
+                    warning=True,
+                )
+                continue
+            decls.extend(skin_decl.ini_lines())
+            emitted.append((family, rows))
+        if not emitted:
+            return {}
+        resource_section = M_IniSection(M_SectionType.ResourceBuffer)
+        for line in decls:
+            resource_section.append(line)
+        resource_section.new_line()
+        ini_builder.append_section(resource_section)
+        sections: dict = {}
+        for family, rows in emitted:
+            skin_section = M_IniSection(M_SectionType.MergedSkeleton)
+            for line in himi_runtime.skin_section_lines(
+                family,
+                rows=rows,
+                skeleton_name=skeleton_name,
+                hlsl_path=MERGED_SKIN_HLSL_PATH,
+            ):
+                skin_section.append(line)
+            skin_section.new_line()
+            ini_builder.append_section(skin_section)
+            sections[str(family)] = {
+                "rows": int(rows),
+                "run": "run = " + himi_runtime.skin_section_name(family),
+                "bind": himi_runtime.SKIN_OUT_BIND_SLOT
+                + " = "
+                + himi_runtime.skin_out_resource_name(family),
+            }
+        self._himi_skin_sections = dict(sections)
+        return dict(sections)
+
+    def himi_skin_sections(self) -> dict:
+        """本次发射的蒙皮段账目（``{family: {"rows","run","bind"}}``；供测试/上层读）。"""
+        return dict(getattr(self, "_himi_skin_sections", None) or {})
+
+    def _himi_write_skin_cs(self) -> dict:
+        """把 ``Toolset/himi_merged_skin.hlsl`` 拷进 ``<mod>/res/``（幂等、字节比对）。"""
+        if not self._himi_skin_route_active():
+            return {"skipped": True, "reason": "skin_route_inactive"}
+        addon_root = os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        )
+        source = os.path.join(addon_root, "Toolset", MERGED_SKIN_HLSL_BASENAME)
+        if not os.path.isfile(source):
+            result = {"ok": False, "path": "", "message": f"未找到蒙皮 CS：{source}"}
+            self._himi_skin_cs_result = result
+            from ...utils.format_utils import Fatal
+
+            raise Fatal(
+                f"缺渲染段蒙皮 CS（{source}）⇒ 蒙皮段会引用不存在的 shader "
+                "（3DMigoto 对编译失败的 shader 静默跳过 ⇒ 整具模型塌到原点）"
+            )
+        with open(source, "rb") as handle:
+            payload = handle.read()
+        target_dir = os.path.join(GlobalConfig.path_generate_mod_folder(), "res")
+        os.makedirs(target_dir, exist_ok=True)
+        path = os.path.join(target_dir, MERGED_SKIN_HLSL_BASENAME)
+        written = True
+        try:
+            with open(path, "rb") as handle:
+                written = handle.read() != payload
+        except OSError:
+            written = True
+        if written:
+            with open(path, "wb") as handle:
+                handle.write(payload)
+        result = {
+            "ok": True,
+            "path": path,
+            "written": written,
+            "bytes": len(payload),
+            "message": ("已写入" if written else "内容一致、未重写")
+            + f" res/{MERGED_SKIN_HLSL_BASENAME}",
+        }
+        self._himi_skin_cs_result = result
+        if written:
+            print(f"{_LOG_PREFIX} {result['message']} → {path}")
+        return result
+
+    def himi_skin_cs_result(self) -> dict:
+        """`res/himi_merged_skin.hlsl` 的落盘结果字典。"""
+        return dict(getattr(self, "_himi_skin_cs_result", None) or {})
 
     def add_unity_vs_texture_override_ib_sections(self, ini_builder: M_IniBuilder, drawib_model):
         """基类 IB 段 + 每一笔 ``drawindexed`` **之前**插 ``cb3 捕获`` + ``run = <该族 attach>``。
@@ -3810,9 +5131,9 @@ class ExportHIMI(ExportUnity):
             ini_builder=ini_builder, drawib_model=drawib_model
         )
         rebind = self._himi_rebind_for(drawib_model)
-        if rebind is None:
-            return
-        family = str(rebind.get("family") or drawib_model.draw_ib)
+        # 【t95】渲染段的「cb3 捕获 → run attach」职责是让本族那块槽当帧被写，
+        # 与「本族顶点要不要重绑 vs-t0」无关 ⇒ 不再以 rebind is None 短路。
+        family = str((rebind or {}).get("family") or getattr(drawib_model, "draw_ib", "") or "")
         if self.himi_family_range(family) is None:
             return
         after = list(getattr(ini_builder, "ini_section_list", []) or ())
@@ -3853,8 +5174,10 @@ class ExportHIMI(ExportUnity):
     def _himi_write_attach_cs(self) -> dict:
         """把**单个**合并 attach CS 写进 `<mod>/res/himi_attach.hlsl`（幂等）。
 
-        内容不依赖 `plan`（基址在 shader 内部由源槽位数查表算），所以这里用参考声明渲染，
-        只把**合并骨架总槽位数**签出来做越界保护上界；`plan` 存在时用它的真实槽位数。
+        ``decl`` 只签出**合并骨架总槽位数**（越界保护上界）；基址表则**由本次 plan 生成**
+        （``merged_attach_base_table_lines``）—— 表与 ini 的 ``array=`` / ``Dispatch`` 因此
+        同源，换角色不需要改代码。落盘前把「**实际渲染进 CS 的那张表**」再与 plan 审计一遍
+        （表是外部塞进来的 / 生成器漂移时才可能出问题）。
         """
         plan = self.himi_merged_runtime_plan()
         decl = None
@@ -3870,8 +5193,35 @@ class ExportHIMI(ExportUnity):
             decl = himi_runtime.build_merged_skeleton_decl(
                 himi_runtime.REFERENCE_ROLE_KEY, slots
             )
-        text = merged_attach_hlsl_text(decl)
+        ranges = dict(getattr(plan, "family_ranges", None) or {})
+        if not ranges:
+            # 没有 plan（合并路径没激活 / 退化调用）⇒ 退回参考样例，与旧行为逐字一致。
+            ranges = dict(MERGED_ATTACH_BASE_TABLE_SAMPLE_RANGES)
+        table_lines = merged_attach_base_table_lines(ranges)
+        text = merged_attach_hlsl_text(decl, base_table_lines=table_lines)
         problems = merged_attach_hlsl_problems(text)
+        # 【t84】借用槽块：只有本次计划真的有借用时才判（没有借用时该块根本不生效，
+        # 但模板里始终渲染 —— 判据只看「模板是否还带着正确写法」）。
+        borrow_enabled = any(
+            list(dict(info).get("borrow") or ())
+            for info in (ranges or {}).values()
+        )
+        if borrow_enabled:
+            problems.extend(merged_attach_borrow_problems(text))
+        if not problems:
+            rendered = merged_attach_base_table_lines_in_text(text)
+            if rendered != list(table_lines):
+                problems.append(
+                    "渲染出的 CS 里那张基址表与本次 plan 生成的行不一致（模板/生成器漂移）："
+                    f"渲染 {rendered} vs 生成 {list(table_lines)}"
+                )
+            else:
+                problems.extend(
+                    merged_attach_base_table_audit(
+                        ranges, slots, table_lines=rendered
+                    ).get("problems")
+                    or ()
+                )
         if problems:
             # 【t73·兜底原则】合并专属自检失败 ⇒ 降级（本族的 CS 内容不可信，就不发这一段）。
             self._himi_degrade_to_ordinary(
@@ -3938,7 +5288,9 @@ class ExportHIMI(ExportUnity):
                 ini_text = handle.read()
         except OSError as exc:
             return [f"产物 ini 读不回来（{ini_path}）：{exc}"]
-        return verify_attach_range_references(ini_text, GlobalConfig.path_generate_mod_folder())
+        return verify_attach_range_references(
+            ini_text, GlobalConfig.path_generate_mod_folder()
+        ) + verify_borrow_map_references(ini_text, GlobalConfig.path_generate_mod_folder())
 
     def _himi_raise_for_attach_range_references(self, ini_path: str) -> None:
         problems = self._himi_enforce_attach_range_references(ini_path)
@@ -4161,7 +5513,11 @@ __all__ = [
     "MERGED_ATTACH_HLSL_BASENAME",
     "MERGED_ATTACH_HLSL_PATH",
     "MERGED_ATTACH_SLOTS_MACRO",
-    "MERGED_ATTACH_BASE_TABLE_LINES",
+    "MERGED_ATTACH_BASE_TABLE_SAMPLE_RANGES",
+    "MERGED_ATTACH_BASE_TABLE_SAMPLE_LINES",
+    "merged_attach_base_table_lines",
+    "merged_attach_base_table_lines_in_text",
+    "merged_attach_base_table_text_problems",
     "merged_attach_hlsl_text",
     "merged_attach_hlsl_problems",
     "merged_attach_reference_problems",
@@ -4169,6 +5525,7 @@ __all__ = [
     "merged_attach_base_table_problems",
     "verify_cs_references",
     "verify_attach_range_references",
+    "verify_borrow_map_references",
     "deform_replay_block_problems",
     "merged_deform_key_problems",
     "deform_draw_structure_problems",

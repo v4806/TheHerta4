@@ -167,7 +167,9 @@ class HIMIFamilyRangeError(HIMIResourceDeclError):
     """
 
 
-def compute_family_ranges(parts, slot_count: int, *, complete: bool = True) -> dict:
+def compute_family_ranges(
+    parts, slot_count: int, *, complete: bool = True, borrowed_slots=None
+) -> dict:
     """每族的 attach 块：``{family: {"base", "slots", "own_block"}}``（t51 §4.2 ②）。
 
     数据源 = 各组件 ``part_from_json_payload`` 里的 ``slot_values``（**数据层注册给它的
@@ -202,6 +204,28 @@ def compute_family_ranges(parts, slot_count: int, *, complete: bool = True) -> d
     **子集导出的一个边界**：``own_block=False`` 的（借位）家族，其槽位由**别的家族**的块
     写入 ⇒ 只导出它自己时骨架里没有它的写方（``family_block_slots`` 不含这些槽）。
     调用方（``plan_from_metadata``）用 :func:`uncovered_slot_ranges` 把这种空缺写成诊断。
+
+    **④ 借用槽（``borrowed_slots``，t84）**
+
+    ``borrowed_slots = {family: 它顶点实际引用到的全局槽}``（来自工作空间 ``<bare>-Blend.buf``
+    的权重 > 0 槽经 ``VGMap`` 映射）。注册块只覆盖「数据层登记」的槽，而跨组合并进来的
+    几何会**引用别族注册的谷**：共享槽里放的是 ``X_g · P_g``，借用方需要 ``X_f · P_g`` ⇒
+    同一根骨在两边要的值不同，一块槽位不可能同时满足。
+
+    所以每族块 = **自己的注册槽（原顺序、原局部编号）+ 它借用的别族槽（全局槽升序追加
+    在块尾）**。借用槽由**借用方自己**的 attach dispatch 写入 ``X_源 · P_源``（行从该族的
+    BorrowMap 取，``P_源`` 由来源族的 ``cs-tN`` palette 副本提供），因此：不需要来源族先跑、
+    也不需要它知道谁借了它；不动顶点缓冲；X 仍是运行期每帧现算。
+
+    触发借用时返回的字典**每族**多三个键（没有借用时字典与旧版**逐键相同**）：
+
+    * ``own_base`` —— 注册块原来的全局基址（= 旧 ``base``，用于局部编号 ↔ 全局槽换算）；
+    * ``block_slots`` —— 新块长度 = ``slots + len(borrow)``；
+    * ``borrow`` —— 借用行列表，每行 ``{target_slot, source_slot, source_local,
+      source_family, source_family_index}``：``target_slot`` 在**本族**块尾，
+      ``source_local`` 是**源族** palette 里的局部槽号，``source_slot`` 是源族新块里的槽。
+
+    新骨架总槽数用 :func:`ranges_slot_count` 求（= 最大 ``base + block_slots``）。
     """
     per_family: dict = {}
     for part in parts or ():
@@ -242,8 +266,29 @@ def compute_family_ranges(parts, slot_count: int, *, complete: bool = True) -> d
                 f"{family}: 区间 [{base},{base + span}) 越出骨架槽位 [0,{total})"
             )
         owners[family] = {"base": int(base), "slots": int(span), "own_block": True}
-    cursor = 0
+    # 【t84】借用槽规划：先把「注册块 → 拥有者」建成全局槽索引，再逐族收集它引用的别族槽。
+    owner_of: dict = {}
+    for family, info in owners.items():
+        block_base = int(info["base"])
+        for slot in range(block_base, block_base + int(info["slots"])):
+            owner_of[slot] = family
+    extra_of: dict = {}
+    for family in owners:
+        wanted: set = set()
+        for value in (borrowed_slots or {}).get(family, ()) or ():
+            try:
+                slot = int(value)
+            except (TypeError, ValueError):
+                continue
+            if slot >= 0 and owner_of.get(slot) not in (None, family):
+                wanted.add(slot)
+        extra_of[family] = sorted(wanted)
+    shifted = any(extra_of.values())
+    cursor = 0          # 旧排布（注册块）的校验游标 —— 判据与报错文案保持原样
+    new_cursor = 0      # 新排布（注册块 + 借用槽）的写入游标
     out: dict = {}
+    block_of: dict = {}
+    order_of: dict = {}
     for index, (family, info) in enumerate(
         sorted(owners.items(), key=lambda item: (int(item[1]["base"]), str(item[0])))
     ):
@@ -264,22 +309,106 @@ def compute_family_ranges(parts, slot_count: int, *, complete: bool = True) -> d
                 f"骨架槽 [{cursor},{base}) 没有写方（空洞 ⇒ deform 读零）"
             )
         cursor = base + span
-        out[family] = info
+        extra = extra_of[family]
+        entry = {"base": new_cursor if shifted else base, "slots": span, "own_block": True}
+        if shifted:
+            # 只有触发借用时才多这三个键：没有借用时字典与旧版逐键相同（既有测试/产物不变）。
+            entry["own_base"] = base
+            entry["block_slots"] = span + len(extra)
+        block_of[family] = (entry, extra)
+        order_of[family] = index
+        new_cursor += span + len(extra)
+        out[family] = entry
     if complete and total > 0 and cursor != total:
         raise HIMIFamilyRangeError(
             f"家族区间总长 {cursor} ≠ 骨架槽数 {total}（∑span 必须等于 ReferencedSlotTotal）"
         )
+    if shifted:
+        for family, (entry, extra) in block_of.items():
+            rows = []
+            for offset, global_slot in enumerate(extra):
+                source_family = owner_of[global_slot]
+                source_entry = block_of[source_family][0]
+                source_local = int(global_slot) - int(source_entry["own_base"])
+                rows.append(
+                    {
+                        # 目标槽：**本族**块尾（借用方自己的 span 之内 ⇒ Blend 索引全落在自己块里）
+                        "target_slot": int(entry["base"]) + int(entry["slots"]) + offset,
+                        # 源：源族 palette 的**局部**槽号 + 它在源族新块里的落点（交叉核对用）
+                        "source_local": int(source_local),
+                        "source_slot": int(source_entry["base"]) + int(source_local),
+                        "source_family": str(source_family),
+                        "source_family_index": int(order_of[source_family]),
+                    }
+                )
+            entry["borrow"] = rows
+            # 源族按新基址升序编号 = 物体矩阵表（cs-u1）与载荷 [7] 的族序号空间。
+            entry["family_index"] = int(order_of[family])
     out.update(borrowed)
     return out
 
 
+def ranges_slot_count(ranges) -> int:
+    """attach 排布需要的骨架槽数 = ``max(base + block_slots)``（无借用时 = 旧的 ``∑span``）。"""
+    end = 0
+    for info in (ranges or {}).values():
+        data = dict(info or {})
+        span = int(data.get("block_slots", data.get("slots", 0)) or 0)
+        if span <= 0:
+            continue
+        end = max(end, int(data.get("base", 0) or 0) + span)
+    return end
+
+
+def own_base_of(ranges, row) -> int:
+    """借用行里源族注册块的**旧**基址（= 局部槽 → 全局槽的换算基准）。"""
+    source = dict((ranges or {}).get(str((row or {}).get("source_family", ""))) or {})
+    base = int(source.get("base", 0) or 0)
+    return int(source.get("own_base", base) or 0)
+
+
+def family_slot_map(ranges) -> dict:
+    """``{family: {全局槽: 新块内槽}}``（t84；逐族一张表，**同一全局槽在不同族里落点不同**）。
+
+    * 注册槽：``global`` 落在本族新块的 ``base + (global - own_base)``；
+    * 借用槽：``global`` 落在块尾的目标槽 ``borrow[].target_slot``。
+
+    借用方必须拿自己那份副本（``X_本族 · P_源``），所以映射**不能**是全局一张表 ——
+    这也是 Blend 索引重写必须按「该 DrawIB 属于哪个家族」查表的原因。
+    """
+    out: dict = {}
+    for family, info in (ranges or {}).items():
+        data = dict(info or {})
+        if not bool(data.get("own_block", False)):
+            continue
+        span = int(data.get("slots", 0) or 0)
+        if span <= 0:
+            continue
+        base = int(data.get("base", 0) or 0)
+        own_base = int(data.get("own_base", base) or 0)
+        mapping = {own_base + offset: base + offset for offset in range(span)}
+        for row in list(data.get("borrow") or ()):
+            try:
+                global_slot = own_base_of(ranges, row) + int(row["source_local"])
+            except Exception:  # noqa: BLE001 - 缺字段就不进表（由布局闸报错）
+                continue
+            mapping[global_slot] = int(row["target_slot"])
+        out[str(family)] = mapping
+    return out
+
+
 def family_block_slots(ranges) -> set:
-    """所有 ``own_block=True`` 家族覆盖的全局槽（借位族不贡献槽位）。"""
+    """所有 ``own_block=True`` 家族覆盖的全局槽（借位族不贡献槽位）。
+
+    块长取 ``block_slots``（= 注册槽 + 借用槽，t84）：借用槽由**源族**的 dispatch 写入，
+    所以它们同样有写方，不能算成空缺。
+    """
     slots: set = set()
     for info in (ranges or {}).values():
-        span = int(info.get("slots", 0) or 0)
+        data = dict(info or {})
+        span = int(data.get("block_slots", data.get("slots", 0)) or 0)
         if span > 0:
-            base = int(info.get("base", 0) or 0)
+            base = int(data.get("base", 0) or 0)
             slots.update(range(base, base + span))
     return slots
 
@@ -295,9 +424,12 @@ def uncovered_slot_ranges(ranges, slot_count: int) -> list:
     if total <= 0:
         return []
     covered = sorted(
-        (int(info["base"]), int(info["base"]) + int(info["slots"]))
+        (
+            int(info["base"]),
+            int(info["base"]) + int(info.get("block_slots", info.get("slots", 0)) or 0),
+        )
         for info in (ranges or {}).values()
-        if int(info.get("slots", 0) or 0) > 0
+        if int(info.get("block_slots", info.get("slots", 0)) or 0) > 0
     )
     gaps: list = []
     cursor = 0
@@ -502,6 +634,62 @@ def validate_resource_decl(decl: HIMIResourceDecl) -> None:
             )
         return
 
+    if decl.kind == BORROW_MAP_KIND:
+        if decl.ini_type != BORROW_MAP_INI_TYPE:
+            raise HIMIResourceDeclError(
+                f"借用表 {decl.name} 必须是 type = {BORROW_MAP_INI_TYPE}（CS 侧按 uint4 取行）"
+            )
+        if decl.ini_format != BORROW_MAP_INI_FORMAT:
+            raise HIMIResourceDeclError(
+                f"借用表 {decl.name} 必须声明 format = {BORROW_MAP_INI_FORMAT}"
+                "（4×u32 视图；写成 float 会把槽号解释成小数 ⇒ 全行作废）"
+            )
+        if int(decl.stride or 0) != BORROW_MAP_STRIDE:
+            raise HIMIResourceDeclError(
+                f"借用表 {decl.name} 必须 stride = {BORROW_MAP_STRIDE}（一行 4×u32），"
+                f"实际 {decl.stride}"
+            )
+        if int(decl.array or 0) <= 0:
+            raise HIMIResourceDeclError(f"借用表 {decl.name} 的行数必须为正（空表写一行哨兵）")
+        if decl.bind_flags:
+            raise HIMIResourceDeclError(
+                f"借用表 {decl.name} 绝不能声明 bind_flags（它只作为 cs-t4 的 SRV，无 UAV 侧）"
+            )
+        if not decl.filename:
+            raise HIMIResourceDeclError(
+                f"借用表 {decl.name} 必须带 filename：行表随导出生成（不是每帧重写的运行期表）"
+            )
+        return
+
+    if decl.kind == SKIN_OUT_KIND:
+        if decl.ini_type != SKIN_OUT_INI_TYPE:
+            raise HIMIResourceDeclError(
+                f"蒙皮输出缓冲 {decl.name} 必须是 type = {SKIN_OUT_INI_TYPE}"
+            )
+        if decl.ini_format != SKIN_OUT_INI_FORMAT:
+            raise HIMIResourceDeclError(
+                f"蒙皮输出缓冲 {decl.name} 必须声明 format = {SKIN_OUT_INI_FORMAT}"
+                "（部署产物逐字如此；与 stride 并存是有意的）"
+            )
+        if int(decl.stride or 0) != SKIN_OUT_STRIDE:
+            raise HIMIResourceDeclError(
+                f"蒙皮输出缓冲 {decl.name} 必须 stride = {SKIN_OUT_STRIDE}（一行 44 B），"
+                f"实际 {decl.stride}"
+            )
+        if int(decl.array or 0) <= 0:
+            raise HIMIResourceDeclError(f"蒙皮输出缓冲 {decl.name} 的行数必须为正")
+        if decl.filename:
+            raise HIMIResourceDeclError(
+                f"蒙皮输出缓冲 {decl.name} 绝不能带 filename（每帧由 CS 重写）"
+            )
+        for flag in ("shader_resource", "unordered_access", "vertex_buffer"):
+            if flag not in (decl.bind_flags or ""):
+                raise HIMIResourceDeclError(
+                    f"蒙皮输出缓冲 {decl.name} 的 bind_flags 必须含 {flag}"
+                    "（shader_resource/unordered_access/vertex_buffer 三者缺一就创建失败）"
+                )
+        return
+
     raise HIMIResourceDeclError(f"未知资源形态 kind={decl.kind!r}")
 
 
@@ -617,7 +805,7 @@ def cb3_capture_reference_line(family: str) -> str:
 #: deform draw 的 cb3 ⇒ 让它顺手把「校验过的物体矩阵」写进这张表，宿主族那笔再读回来。
 #: draw 顺序（实测 log.txt：70a4da3e → 宿主 2c706fbd → b35cfc6c → def0c0ae → 694025c6）
 #: ⇒ 宿主读到的永远是**上一帧**各族写下的值，与「合并 draw 用上一帧的槽」同一口径。
-OBJECT_MATRIX_RESOURCE_PREFIX = "ResourceHI3ObjectMatrix_role_"
+OBJECT_MATRIX_RESOURCE_PREFIX = "ResourceHI3ObjectMatrix_"
 OBJECT_MATRIX_INI_TYPE = "RWBuffer"
 OBJECT_MATRIX_INI_FORMAT = "R32G32B32A32_FLOAT"
 OBJECT_MATRIX_INI_BIND_FLAGS = "shader_resource unordered_access"
@@ -628,7 +816,14 @@ OBJECT_MATRIX_REGISTER = "cs-u1"
 
 
 def object_matrix_resource_name(role_key: str) -> str:
-    """``ResourceHI3ObjectMatrix_role_<role_key>``（角色级：一张表装本角色全部族）。"""
+    """``ResourceHI3ObjectMatrix_<role_key>``（角色级：一张表装本角色全部族）。
+
+    前缀里**不带** ``role_``：``role_key`` 自己通常就以 ``role_`` 开头
+    （``himi_skeleton.derive_role_key`` 对纯 CJK 目录名必然产出 ``role_<sha1[8]>``），
+    再加一层就得到 ``ResourceHI3ObjectMatrix_role_role_06c391d0`` 这种重复。
+    命名口径与 ``merged_skeleton_resource_name`` 的 ``ResourceHI3MergedSkeleton_<role_key>``
+    对齐：一条前缀 + 角色键。
+    """
     return OBJECT_MATRIX_RESOURCE_PREFIX + str(role_key or "").strip()
 
 
@@ -775,6 +970,9 @@ def render_attach_section_lines(
     skeleton_name: str,
     hlsl_path: str = "",
     object_matrix_name: str = "",
+    block_slots: int = 0,
+    borrow_map_name: str = "",
+    palette_families=(),
 ) -> list[str]:
     """``[CustomShaderHI3MergedSkeletonAttach_<fam>]`` 段体（**模组侧参考实现**的形状）。
 
@@ -793,17 +991,27 @@ def render_attach_section_lines(
       对应的 .hlsl 由导出侧复制到 ``<mod>/res/``）。**不要**写成 ``../res/…``：ini 里的相对
       路径是从 ini 自身所在目录（mod 根）算起的。
     * ``Dispatch = ceil(slots / 64)``（下界 1），段末 ``cs-u0 = null`` 解绑。
+    * **借用槽（t91）**：``block_slots`` = 本族块长（本族 span + 块尾借用槽数），``Dispatch``
+      按它算 —— 块尾那几个槽要靠 ``bone_index >= 源槽数`` 的线程写，dispatch 少了它们写不上；
+      ``palette_families`` 给出全部来源族（按块基址升序），逐族绑 ``cs-t2/t3/t5/…``；
+      ``borrow_map_name`` 给本族的行表（``cs-t4``）。**每个段都绑全部来源族**（同一个 CS 文件
+      给所有族用，段间同形才不会有"谁绑了什么"的分叉）。
 
     ``base`` 仍必须传：它决定该族 CS 文件里的 ``#define``（写错 = 把本族矩阵写进别的族的槽位），也用于 :func:`family_ranges` 的一致性核对。
     """
     base = int(base or 0)
     slots = int(slots or 0)
+    block = int(block_slots or 0) or slots
     if slots <= 0:
         raise HIMIResourceDeclError(f"{family}: attach 段的槽数（Dispatch 依据）必须 > 0")
+    if block < slots:
+        raise HIMIResourceDeclError(
+            f"{family}: 块长 {block} 小于本族 span {slots}（借用槽只能追加在块尾）"
+        )
     if base < 0:
         raise HIMIResourceDeclError(f"{family}: attach 段的基址不能为负（{base}）")
     path = str(hlsl_path or "").strip() or family_attach_hlsl_path(family)
-    dispatch = max(1, -(-slots // 64))
+    dispatch = max(1, -(-block // 64))
     lines = [
         f"[{attach_section_name(family)}]",
         "flags = optimization_level3 all_resources_bound skip_validation",
@@ -817,13 +1025,23 @@ def render_attach_section_lines(
     if matrix_name:
         # 每族都在自己那笔里写自己那段，宿主族那笔读回别的族写下的段
         lines.append(f"{OBJECT_MATRIX_REGISTER} = ref {matrix_name}")
-    lines.extend(
-        [
-            f"cs-u0 = ref {skeleton_name}",
-            f"Dispatch = {dispatch}, 1, 1",
-            "cs-u0 = null",
-        ]
-    )
+    lines.append(f"cs-u0 = ref {skeleton_name}")
+    # 借用槽的绑定按 **cs-tN 序号升序**发（t2/t3 → t4 → t5/…），与实机产物同序：
+    # 同一条链上读 ini 的人能一眼看出"哪个 t 是哪个来源族"，也便于逐行对照。
+    binds: dict = {}
+    for rank, source in enumerate(palette_families or ()):
+        binds[borrow_palette_register(rank)] = borrow_palette_reference_line(rank, str(source))
+    borrow_map = str(borrow_map_name or "").strip()
+    if borrow_map:
+        binds[BORROW_MAP_REGISTER] = f"cs-{BORROW_MAP_REGISTER} = ref {borrow_map}"
+    for register in sorted(binds, key=lambda item: int(str(item).lstrip("t") or 0)):
+        lines.append(binds[register])
+    lines.append(f"Dispatch = {dispatch}, 1, 1")
+    # 解绑顺序照实机产物的习惯：先放掉 t4 的借用表，再放 u0/u1 两个写入视图
+    # （u 视图放在段末，读 ini 的人一眼能看到"这一笔写完就撒手"）。
+    if borrow_map:
+        lines.append(f"cs-{BORROW_MAP_REGISTER} = null")
+    lines.append("cs-u0 = null")
     if matrix_name:
         lines.append(f"{OBJECT_MATRIX_REGISTER} = null")
     return lines
@@ -943,6 +1161,11 @@ class HIMIRebindPart:
     skeleton_digest: str = ""
     #: 该组件的全局槽值集合（json ``VGMap`` 的值）——决定 attach 段的 ``x1``/``y1``。
     slot_values: tuple = ()
+    #: 【t84】该组件顶点**实际引用**到的全局槽（工作空间 ``<bare>-Blend.buf`` 里权重 > 0
+    #: 的局部槽经 ``VGMap`` 映射）。与 :attr:`slot_values` 的区别是本字段包含**跨族借用**：
+    #: 一个部件可能把顶点绑到别的族的骨上（例如合并进来的挂件借宿主的手指骨）。
+    #: 空元组 = 读不到（不据此判定「没有借用」，只让布局退化成旧排布）。
+    referenced_slots: tuple = ()
 
     @property
     def family_key(self) -> str:
@@ -962,6 +1185,7 @@ class HIMIRebindPart:
             "gate_safe": bool(self.gate_safe),
             "skeleton_digest": self.skeleton_digest,
             "slot_values": [int(value) for value in self.slot_values],
+            "referenced_slots": [int(value) for value in self.referenced_slots],
         }
 
 
@@ -1049,6 +1273,389 @@ def referenced_local_slots(workspace_root: str, unique_str: str):
     return tuple(int(slot) for slot in slots)
 
 
+def referenced_global_slots(workspace_root: str, unique_str: str, json_payload: dict):
+    """该组件顶点实际引用到的**全局**槽（升序元组）；不可得 ⇒ ``()``。
+
+    两步：工作空间 ``<bare>-Blend.buf`` 里权重 > 0 的**局部**槽（:func:`referenced_local_slots`）
+    → json ``VGMap`` 映成全局槽。局部槽不在 ``VGMap`` 里说明该组件的缓存与骨架不同源，
+    直接丢掉该槽（不猜），由布局层当「没引用」。
+
+    为什么需要它（t84）：``slot_values`` 来自 ``BoneMatrixSlotCount``，那是**注册**槽；
+    合并进来挂件的顶点可能引用宿主族的骨（跨族借用），这些槽不在自己的注册集合里，
+    却被 Blend 真实索引到 —— 布局与 attach 都必须按**引用集**而不是注册集来排。
+    """
+    locals_ = referenced_local_slots(str(workspace_root or ""), str(unique_str or ""))
+    if not locals_:
+        return ()
+    mapping: dict = {}
+    for key, value in dict((json_payload or {}).get("VGMap") or {}).items():
+        try:
+            local = int(key)
+            slot = int(value)
+        except (TypeError, ValueError):
+            continue
+        if slot >= 0:
+            mapping[local] = slot
+    return tuple(sorted({mapping[int(local)] for local in locals_ if int(local) in mapping}))
+
+
+# --------------------------------------------------------------------------- #
+# 【t94】按**局部顶点组**判定「这根骨归谁」与「哪些骨是借来的」
+# --------------------------------------------------------------------------- #
+#
+# 口径（用户裁定）：合并骨架里一根骨（= 一个**合并身份**，三根同名/同矩阵的骨收敛到它）
+# 只占**一个**槽。一个物体该用哪些槽，看它**自己 mesh 上的局部顶点组**：
+#
+#   局部顶点组名 → 合并身份 → 合并槽（json ``VGMap``）
+#
+# 落在这个集合里、却不是本物体自己写进骨架的槽，就是它的**借用槽**（那根骨被合并进了
+# 另一个区间），必须写 BorrowMap 行并让蒙皮端做 ``X_源 = inv(M_本族)·M_源`` 的矫正。
+#
+# 旧实现（t84）的缺陷：借用集取自「工作区里**已去重**的干净 Blend」的局部索引 ×
+# ``VGMap``，而那些索引已经在 0..span-1 的**本族局部空间**里 ⇒ 映射回来恒等于自己的
+# 注册集 ⇒ 借用集结构性为空 ⇒ BorrowMap 永远只有哨兵行。这里改成：引用集与注册集
+# **分别**从物体的局部顶点组求出，再相减。
+
+
+def part_vg_map(json_payload) -> dict:
+    """``{局部顶点组槽号: 合并槽}``（json ``VGMap`` 的规范化视图；负值/坏值丢弃）。"""
+    mapping: dict = {}
+    for key, value in dict((json_payload or {}).get("VGMap") or {}).items():
+        try:
+            local = int(key)
+            slot = int(value)
+        except (TypeError, ValueError):
+            continue
+        if local >= 0 and slot >= 0:
+            mapping[local] = slot
+    return mapping
+
+
+def local_group_slots(json_payload) -> tuple:
+    """该物体**局部顶点组**反查到的合并槽（升序元组）——「它可能用到哪些骨」。
+
+    不做「排除 gap 槽」的裁剪：这个集合回答的是「我的顶点组指向哪些槽」，借用判定正是
+    拿它减去自己的注册块。gap 槽的裁剪在 :func:`part_registered_slots` 里做（它回答的是
+    「我自己写了哪些槽」，两者是不同的集合，不能共用一次裁剪）。
+    """
+    return tuple(sorted(set(part_vg_map(json_payload).values())))
+
+
+def part_registered_slots(json_payload) -> tuple:
+    """该物体**自己写进合并骨架**的槽（= 它的 palette 槽），按局部顶点组反推。
+
+    三档（精度降序）：
+
+    1. ``VGMap`` 里**前** ``BoneMatrixSlotCount`` 个局部槽映射到的值，且这些值**密集**
+       ⇒ 就是注册块。局部槽序 = palette 槽序，数据层给未引用局部槽补的 gap 槽排在后面
+       （``common/himi_skeleton.py:899-912`` 的「值 ≥ max(注册值)+1」）⇒ 这条是精确的，
+       而且**不假设自己的槽号最小**；
+    2. 否则退回「值升序取前 N 个」（旧 t84 口径；借用槽号比自己的块小时会错，只作兜底）；
+    3. 都没有 ⇒ 全量值（区间只会更大，由 :func:`compute_family_ranges` 的 fail-closed 兜住）。
+    """
+    mapping = part_vg_map(json_payload)
+    if not mapping:
+        return ()
+    try:
+        registered = int(dict(json_payload or {}).get("BoneMatrixSlotCount", 0) or 0)
+    except (TypeError, ValueError):
+        registered = 0
+    head = [mapping[local] for local in sorted(mapping)][:registered] if registered > 0 else []
+    head_set = sorted(set(head))
+    if registered > 0 and len(set(head)) == registered:
+        if head_set == list(range(head_set[0], head_set[0] + registered)):
+            return tuple(head_set)
+    ordered = sorted(set(mapping.values()))
+    if 0 < registered <= len(ordered):
+        return tuple(ordered[:registered])
+    return tuple(ordered)
+
+
+def resolve_borrow_slots(parts) -> dict:
+    """逐物体判定「自己写入的槽 / 引用到的槽 / 借用槽」，并汇总到族。
+
+    **认领顺序**与数据层注册合并身份的顺序一致（``common/himi_skeleton.build_merged_skeleton``
+    按 ``sorted(bare)`` 走组件）：一根骨（一个合并身份）只占一个槽，先注册的**族**是拥有者，
+    跨族引用/重复注册它 = 借用。这也是「一个合并身份只占一个槽」这条要求的落地方式：
+    不给后来者复制一份槽，而是让它借 + 在蒙皮端做 ``X_源 = inv(M_本族)·M_源`` 矫正。
+
+    注意「拥有」的判据是**族**而不是「谁先声明谁独占」：合并骨架里一个槽允许有多个
+    ``source_components``（同签名同局部的组件都会写它，见真实 json 的 slot 0..91 与
+    ``虚构游戏`` 的 slot 217 —— 那里 ``6e0ccfd4`` 与 ``bbbbf903`` 两个族都注册它），
+    同族多组件写同一个槽是**共同拥有**，不是借用；跨族才是借用。借用集因此是
+    「本族的注册集 ∪ 引用集」减去「本族拥有的槽」。
+
+    返回 ``{"owned": {unique_str: tuple}, "referenced": {unique_str: tuple},
+    "part_borrows": {unique_str: tuple}, "family_borrows": {family: tuple}}``。
+    空字典 = 没有任何物体带 VGMap（旧缓存 / 合成夹具），调用方按「没有借用」处理。
+    """
+    ordered_parts = sorted(
+        (part for part in (parts or ()) if str(getattr(part, "unique_str", "") or "")),
+        key=lambda part: (str(getattr(part, "bare", "") or ""), str(part.unique_str)),
+    )
+    owned: dict = {}
+    referenced: dict = {}
+    part_borrows: dict = {}
+    #: 槽 → 认领它的族。**按族认领，不按物体**：同族多个组件写同一个槽是共同拥有
+    #: （真实 json 的 ``source_components`` 本来就是多值），跨族写同一个槽才是「合并到了
+    #: 另一个区间」。
+    family_of_slot: dict = {}
+    for part in ordered_parts:
+        family = str(getattr(part, "family_key", "") or "")
+        for slot in getattr(part, "slot_values", ()) or ():
+            family_of_slot.setdefault(int(slot), family)
+    #: 「一根骨都没抢到」的族：它的全部注册槽都与别的族同槽 ⇒ 数据层按**合并身份**
+    #: （签名/矩阵指纹）把它们判成了同一根骨，矩阵逐位相同 ⇒ 写谁的都一样，**不需要**
+    #: 借用矫正。这种族不进区间（否则两族区间重叠），也不发 attach 段（t84 的「借位族」），
+    #: 但要在诊断里点名。
+    shared_identity_families: set = set()
+    for part in ordered_parts:
+        family = str(getattr(part, "family_key", "") or "")
+        local_set = {int(slot) for slot in (getattr(part, "slot_values", ()) or ())}
+        if not local_set:
+            continue
+        mine = tuple(sorted(slot for slot in local_set if family_of_slot.get(slot) == family))
+        if not mine:
+            shared_identity_families.add(family)
+        owned[part.unique_str] = mine
+    family_owned: dict = {}
+    family_referenced: dict = {}
+    for part in ordered_parts:
+        family = str(getattr(part, "family_key", "") or "")
+        family_owned.setdefault(family, set()).update(owned.get(part.unique_str, ()))
+        family_referenced.setdefault(family, set()).update(
+            int(slot) for slot in (getattr(part, "slot_values", ()) or ())
+        )
+        refs = tuple(int(slot) for slot in (getattr(part, "referenced_slots", ()) or ()))
+        if refs:
+            referenced[part.unique_str] = tuple(sorted(set(refs)))
+            family_referenced[family].update(refs)
+        mine = set(owned.get(part.unique_str, ()))
+        borrowed = tuple(sorted({slot for slot in refs if slot not in mine}))
+        if borrowed and family not in shared_identity_families:
+            part_borrows[part.unique_str] = borrowed
+    family_borrows: dict = {}
+    for family, slots in family_referenced.items():
+        if family in shared_identity_families:
+            continue
+        mine = family_owned.get(family) or set()
+        borrowed = tuple(sorted(slot for slot in slots if slot not in mine))
+        if borrowed:
+            family_borrows[family] = borrowed
+    return {
+        "owned": owned,
+        "referenced": referenced,
+        "part_borrows": part_borrows,
+        "family_borrows": family_borrows,
+        "shared_identity_families": tuple(sorted(shared_identity_families)),
+    }
+
+
+def borrow_slot_problems(parts, ranges, *, limit: int = 8) -> list:
+    """【判据】借用集必须与「局部顶点组反查结果」**逐项相等**（空 = 通过）。
+
+    逐族比对两样东西：
+
+    * 期望 = ``引用到的槽（局部顶点组反查） − 自己块内的槽``；
+    * 实际 = 排布里该族 ``borrow`` 行的 ``source_slot``（= 被借的那根骨在源族注册块里的
+      全局槽）。
+
+    任何一项不等都点名**族 + 槽号 + 方向**（少了 / 多了）——「少了」意味着某根骨被静默当成
+    自己的（顶点会跟着别人的骨骼跑），「多了」意味着凭空多写一行引用别人的 palette。
+    """
+    expected = resolve_borrow_slots(parts).get("family_borrows") or {}
+    problems: list = []
+    for family, info in sorted((str(name), dict(body)) for name, body in (ranges or {}).items()):
+        want = set(int(slot) for slot in (expected.get(family) or ()))
+        have = set(int(dict(row).get("source_slot", -1)) for row in (info.get("borrow") or ()))
+        have.discard(-1)
+        if not bool(info.get("own_block", False)):
+            # 借位族（没有自己的块）不写 BorrowMap：它的槽由拥有者的块写入。
+            continue
+        missing = sorted(want - have)
+        extra = sorted(have - want)
+        if missing:
+            shown = missing[: max(1, int(limit or 1))]
+            problems.append(
+                f"{family}: 局部顶点组反查出 {len(missing)} 个借用槽没有写进 BorrowMap"
+                f"（例 {shown}{'…' if len(missing) > len(shown) else ''}）⇒ 这些骨会被当成"
+                "本族的槽读写，顶点跟着别人的骨骼跑"
+            )
+        if extra:
+            shown = extra[: max(1, int(limit or 1))]
+            problems.append(
+                f"{family}: BorrowMap 里有 {len(extra)} 行不是它局部顶点组引用到的槽"
+                f"（例 {shown}{'…' if len(extra) > len(shown) else ''}）⇒ 排布凭空借了别人的骨"
+            )
+    return problems
+
+
+def family_blend_scope_problems(indices_by_family, ranges, *, limit: int = 8) -> list:
+    """【判据】每个**权重 > 0** 的 Blend 索引必须落在「本族块 ∪ 本族借用槽」内（空 = 通过）。
+
+    ``indices_by_family``：``{族: {该族 Blend 里权重 > 0 的索引}}``。块 = 注册槽
+    ``[base, base + block_slots)`` —— 注册槽在块头、借用槽在块尾（借用槽的连续性由
+    :func:`borrow_map_layout_problems` 单独钉住）。块外任何值都是错的，哪怕它本身是别族的
+    合法全局槽（那正是「顶点查到别人的槽」）。报错点名**族 + 该族的具体索引**。
+
+    族不在 ``ranges`` 里、或族没有自己的块（``own_block=False``）⇒ 不判：那时索引本来就
+    是局部编号 / 由拥有者的块写入。
+    """
+    problems: list = []
+    for family, values in sorted(
+        (str(name), set(body or ())) for name, body in (indices_by_family or {}).items()
+    ):
+        info = dict((ranges or {}).get(family) or {})
+        if not info or not bool(info.get("own_block", False)):
+            continue
+        base = int(info.get("base", 0) or 0)
+        own = int(info.get("slots", 0) or 0)
+        block = int(info.get("block_slots", own) or 0)
+        if block <= 0:
+            if values:
+                problems.append(
+                    f"{family}: 布局里没有块（block_slots={block}）却有顶点引用它"
+                )
+            continue
+        allowed = set(range(base, base + block))
+        allowed.update(
+            int(dict(row).get("target_slot", -1)) for row in (info.get("borrow") or ())
+        )
+        outside = sorted({int(value) for value in values if int(value) not in allowed})
+        if not outside:
+            continue
+        shown = outside[: max(1, int(limit or 1))]
+        problems.append(
+            f"{family}: {len(outside)} 个索引落在本族块 [{base},{base + block}) 之外"
+            f"（例 {shown}{'…' if len(outside) > len(shown) else ''}）"
+            "⇒ 这些顶点会查到别人的槽（本族块∪借用槽之外）"
+        )
+    return problems
+
+
+# --------------------------------------------------------------------------- #
+# 【t94】渲染段「缺蒙皮 pass」：每族一个 CS 段 + 一张自建输出缓冲
+# --------------------------------------------------------------------------- #
+#
+# 为什么必须有这一段：合并骨架每帧的写方只有**渲染段**紧前那批 attach dispatch，而可见
+# 几何原本由**变形段**那笔 `draw = <行数>, 0`（流输出重放）产出 —— 变形段整批排在渲染段
+# 之前 ⇒ 借来的那部分顶点只能拿到**上一帧**写进骨架的骨（一起跑就慢一帧、一动就抖）。
+#
+# 本段把蒙皮搬进渲染段、紧贴 `drawindexed` 之前：读该族**静态**源 Position + Blend + 当帧
+# 合并骨架，写进自建输出缓冲，再由宿主段 `vb0 = ResourceHI3SkinOut_<fam>` 把它当顶点缓冲画。
+# CS 本体是 `Toolset/himi_merged_skin.hlsl`（一个文件，全部族共用；导出时拷到 `res/`）。
+
+MERGED_SKIN_CS_BASENAME = "himi_merged_skin.hlsl"
+MERGED_SKIN_CS_PATH = "./res/" + MERGED_SKIN_CS_BASENAME
+#: 段名：``[CustomShaderHI3MergedSkin_<fam>]``。
+SKIN_SECTION_PREFIX = "CustomShaderHI3MergedSkin_"
+#: 自建输出缓冲名：``ResourceHI3SkinOut_<fam>``。
+SKIN_OUT_RESOURCE_PREFIX = "ResourceHI3SkinOut_"
+SKIN_OUT_KIND = "skin_out"
+SKIN_OUT_INI_TYPE = "Buffer"
+#: 部署产物（t90 实机跑通的那份）就是 ``format = R32_FLOAT`` + ``stride = 44`` 并存；
+#: ``stride`` 决定 ByteWidth，``format`` 只决定视图格式 —— 逐字照抄，别"优化"。
+SKIN_OUT_INI_FORMAT = "R32_FLOAT"
+#: 44 B/行 = P12 N12 C4 TA16（11 个 float），见 CS 的 `HIMIOutRow44`。
+SKIN_OUT_STRIDE = 44
+SKIN_OUT_INI_BIND_FLAGS = "shader_resource unordered_access vertex_buffer"
+#: 宿主段的绑定槽：``vb0 = ResourceHI3SkinOut_<fam>``。
+SKIN_OUT_BIND_SLOT = "vb0"
+#: 该族的**静态**源顶点/混合权重资源名前缀/后缀（导出器自己上传的那两个）。
+SKIN_SOURCE_POSITION_PREFIX = "Resource"
+SKIN_SOURCE_POSITION_SUFFIX = "Position"
+SKIN_SOURCE_BLEND_SUFFIX = "Blend"
+#: CS 的 ``[numthreads(64, 1, 1)]``。
+SKIN_THREAD_GROUP = 64
+
+
+def skin_section_name(family: str) -> str:
+    """``CustomShaderHI3MergedSkin_<fam>``."""
+    return SKIN_SECTION_PREFIX + str(family or "").strip()
+
+
+def skin_out_resource_name(family: str) -> str:
+    """``ResourceHI3SkinOut_<fam>``."""
+    return SKIN_OUT_RESOURCE_PREFIX + str(family or "").strip()
+
+
+def skin_source_position_name(family: str) -> str:
+    """该族的静态源顶点资源名（``Resource<fam>Position``）。"""
+    return SKIN_SOURCE_POSITION_PREFIX + str(family or "").strip() + SKIN_SOURCE_POSITION_SUFFIX
+
+
+def skin_source_blend_name(family: str) -> str:
+    """该族的静态 Blend 资源名（``Resource<fam>Blend``）。"""
+    return SKIN_SOURCE_POSITION_PREFIX + str(family or "").strip() + SKIN_SOURCE_BLEND_SUFFIX
+
+
+def skin_dispatch_count(rows: int) -> int:
+    """``ceil(rows / 64)``（至少 1 —— 0 会让 ini 里的 Dispatch 非法）。"""
+    count = int(rows or 0)
+    if count <= 0:
+        return 1
+    return max(1, (count + SKIN_THREAD_GROUP - 1) // SKIN_THREAD_GROUP)
+
+
+def build_skin_out_decl(family: str, rows: int) -> HIMIResourceDecl:
+    """构建（并校验）该族的自建输出缓冲声明。
+
+    ``array = 行数``（不是 ``行数 × 11``）：部署产物就是 44 B/行 × 行数，``stride`` 决定
+    ByteWidth，逐字照抄可跑的形态。
+    """
+    count = int(rows or 0)
+    if count <= 0:
+        raise HIMIResourceDeclError(
+            f"蒙皮输出缓冲 {skin_out_resource_name(family)} 的行数必须为正，实际 {rows}"
+        )
+    decl = HIMIResourceDecl(
+        name=skin_out_resource_name(family),
+        kind=SKIN_OUT_KIND,
+        ini_type=SKIN_OUT_INI_TYPE,
+        ini_format=SKIN_OUT_INI_FORMAT,
+        array=count,
+        stride=SKIN_OUT_STRIDE,
+        bind_flags=SKIN_OUT_INI_BIND_FLAGS,
+        filename="",  # 每帧由 CS 重写，绝不能带 filename（静态文件）
+        slots=0,
+    )
+    validate_resource_decl(decl)
+    return decl
+
+
+def skin_section_lines(
+    family: str,
+    *,
+    rows: int,
+    skeleton_name: str,
+    hlsl_path: str = MERGED_SKIN_CS_PATH,
+    skin_out_name: str = "",
+) -> list:
+    """``[CustomShaderHI3MergedSkin_<fam>]`` 段体（含段头，不含尾随空行）。
+
+    绑定与部署产物一致：``cs-t0`` 静态源顶点、``cs-t1`` 静态 Blend、``cs-t2`` 当帧合并骨架、
+    ``cs-u0`` 自建输出缓冲；末尾 ``cs-u0 = null`` 释放 UAV（下一族/下一次 draw 才拿得回来）。
+    """
+    out_name = str(skin_out_name or "") or skin_out_resource_name(family)
+    skeleton = str(skeleton_name or "").strip()
+    if not skeleton:
+        raise HIMIResourceDeclError(
+            f"{skin_section_name(family)}: 缺合并骨架资源名（cs-t2 无目标）"
+        )
+    lines = [
+        f"[{skin_section_name(family)}]",
+        "flags = optimization_level3 all_resources_bound skip_validation",
+        f"cs = {hlsl_path}",
+        f"cs-t0 = ref {skin_source_position_name(family)}",
+        f"cs-t1 = ref {skin_source_blend_name(family)}",
+        f"cs-t2 = ref {skeleton}",
+        f"cs-u0 = ref {out_name}",
+        f"Dispatch = {skin_dispatch_count(rows)}, 1, 1",
+        "cs-u0 = null",
+    ]
+    return lines
+
+
 @dataclass
 class HIMIExportRuntimePlan:
     """What the HIMI exporter needs to know about the merged skeleton.
@@ -1061,6 +1668,9 @@ class HIMIExportRuntimePlan:
     message: str = ""
     role_key: str = ""
     slot_count: int = 0
+    #: 【t84】块尾借用槽带来的**追加**槽数：``slot_count`` = 缓存骨架槽数 + 本值。
+    #: 骨架二进制按「缓存内容 + 这么多零槽」发布；CS 每帧覆盖这些槽，导出期内容无关。
+    skeleton_extra_slots: int = 0
     skeleton_basename: str = ""
     skeleton_source_path: str = ""
     skeleton_digest: str = ""
@@ -1075,6 +1685,10 @@ class HIMIExportRuntimePlan:
     palette_cache: dict = field(default_factory=dict)
     #: 每族 ``{family: {"base", "slots"}}``（attach 段的 x1/y1 来源，见 compute_family_ranges）。
     family_ranges: dict = field(default_factory=dict)
+    #: 【t94】逐物体的「自己写入 / 引用到 / 借用」集合（``resolve_borrow_slots`` 的返回值）。
+    #: 借用集从这里取，不再从 ``part.referenced_slots`` 现推 —— 后者现在是**引用集**
+    #: （局部顶点组反查全量，含自己的块），借用集 = 引用集 − 自己写入的槽。
+    borrow_plan: dict = field(default_factory=dict)
     plan_version: int = HIMI_RUNTIME_PLAN_VERSION
 
     # -- lookups --------------------------------------------------------- #
@@ -1231,8 +1845,15 @@ def plan_from_metadata(
     source: str = "workspace-cache",
     gate_oracle: dict | None = None,
     landed_data_bares=None,
+    borrowed_slots=None,
 ) -> HIMIExportRuntimePlan:
     """Pure core: metadata + parts → runtime plan（不碰磁盘）。
+
+    ``borrowed_slots`` = 逐族借用槽（``resolve_borrow_slots()["family_borrows"]``）。
+    它决定了族块要不要在块尾追加借用槽、以及 base 之后怎么平移 —— 因此必须在**这里**
+    就参与区间计算：跨族共享槽（真实工作空间 ``虚构游戏`` 的 slot 217）在没带借用集时
+    会让两个族都失去该槽 ⇒ 覆盖层 fail-closed 报「骨架槽 [217,218) 没有写方」。
+    带上借用集后，认领方持有该槽、另一族在块尾借用它，区间重新首尾相接。
 
     ``target_bares`` = 本次导出**真正可以合并**的部件（带合并数据、且合并数据与当前
     角色级骨架同源）；它同时是 G1 的**目标集合**（``HIMISkeletonMergeHelper.prepare
@@ -1511,8 +2132,20 @@ def plan_from_metadata(
         else:
             complete = _plan_covers_all_landed(plan, landed_data_bares)
             plan.family_ranges = compute_family_ranges(
-                plan.parts, int(slot_count), complete=complete
+                plan.parts,
+                int(slot_count),
+                complete=complete,
+                borrowed_slots=borrowed_slots,
             )
+            # 【t94】借用槽是**块尾追加**的：骨架要比缓存多出这些槽（publish 侧据此补零槽）。
+            extra = max(0, int(ranges_slot_count(plan.family_ranges)) - int(slot_count))
+            plan.skeleton_extra_slots = max(int(plan.skeleton_extra_slots or 0), extra)
+            if extra:
+                plan.slot_count = int(ranges_slot_count(plan.family_ranges))
+                plan.diagnostics.append(
+                    f"块尾借用槽：{len({fam for fam, info in plan.family_ranges.items() if dict(info).get('borrow')})}"
+                    f" 个族追加借用槽，骨架槽数 {int(slot_count)} → {plan.slot_count}"
+                )
             if not complete:
                 note = _subset_coverage_note(plan.family_ranges, int(slot_count))
                 if note:
@@ -2203,6 +2836,70 @@ def _discover_unique_strs(workspace_root: str) -> list:
     return found
 
 
+def workspace_slot_owners(workspace_root: str) -> dict:
+    """工作空间里**已落盘**的部件分别注册了哪些全局槽 ⇒ ``{"owners": {slot: bare}, "members": {bare: [...]}}``。
+
+    唯一用途是**解释孤儿槽**：导出期发现某族 Blend 引用了没有写方的槽时，必须能回答
+    「这槽本来属于谁、它还在不在工作空间」——否则用户只看到一串槽号，无从下手。
+    只读组件 json 的 VGMap（:func:`part_registered_slots`），不做 G1 判定、不读 dump。
+    """
+    owners: dict = {}
+    members: dict = {}
+    root = str(workspace_root or "").strip()
+    if not root or not os.path.isdir(root):
+        return {"owners": owners, "members": members}
+    for unique_str in sorted(_discover_unique_strs(root)):
+        payload = _load_component_payload(root, unique_str, None)
+        if not payload:
+            continue
+        bare = bare_from_unique_str(unique_str)
+        members.setdefault(bare, []).append(unique_str)
+        for slot in part_registered_slots(payload) or ():
+            owners.setdefault(int(slot), bare)
+    return {"owners": owners, "members": members}
+
+
+def describe_ownerless_slots(
+    workspace_root: str, families, *, exported_bares=None
+) -> dict:
+    """把「引用槽 → 谁该写它」翻译成可执行的中文句子。
+
+    参数 ``families`` = ``{引用方族: [槽…]}``（即导出期判出的孤儿账目）。
+    返回 ``{"lines": [...], "missing_bares": [...]}``：``missing_bares`` 是「已落盘但本次导出
+    没带」的家族（把它们一起选中重导即可），``lines`` 是逐槽解释。
+    """
+    table = workspace_slot_owners(workspace_root)
+    owners = dict(table.get("owners") or {})
+    exported = {str(name).strip() for name in (exported_bares or ()) if str(name).strip()}
+    lines: list = []
+    missing: list = []
+    for family, slots in sorted((str(k), list(v or ())) for k, v in dict(families or {}).items()):
+        for slot in sorted(int(value) for value in slots):
+            owner = str(owners.get(slot, "") or "")
+            if not owner:
+                lines.append(
+                    f"{family} 引用的槽 {slot} 在工作空间里没有任何写方"
+                    "（该族的组件 json 缺失或没有 VGMap）"
+                )
+                continue
+            if exported and owner not in exported:
+                lines.append(
+                    f"{family} 引用的槽 {slot} 属于家族 {owner}：它已落盘，但**没进本次导出**"
+                )
+                if owner not in missing:
+                    missing.append(owner)
+            elif owner == family:
+                lines.append(
+                    f"{family} 引用的槽 {slot} 记在自己名下，但它的块没有排进计划"
+                    "（家族槽区间不可得 ⇒ 本族不得合并导出）"
+                )
+            else:
+                lines.append(
+                    f"{family} 引用的槽 {slot} 属于家族 {owner}：它在本次导出里，但没有排进计划"
+                )
+    return {"lines": lines, "missing_bares": missing}
+
+
 def _runtime_plan_shell(
     metadata: dict, parts, *, message: str, source: str = ""
 ) -> HIMIExportRuntimePlan:
@@ -2276,10 +2973,25 @@ def load_workspace_plan(
     for unique_str in sorted(set(unique_strs)):
         payload = _load_component_payload(root, unique_str, plan)
         if payload:
-            # 精确口径由 `part_from_json_payload` 内部从 json 的 `BoneMatrixSlotCount` 取
-            # （= 被引用局部槽数 ⇒ 排除 gap slots），不需要在这里读盘。
-            parts.append(part_from_json_payload(unique_str=unique_str, json_payload=payload))
-    # ---- G1 目标集合：本次导出里**合并数据与当前骨架同源**的部件 ---- #
+            part = part_from_json_payload(unique_str=unique_str, json_payload=payload)
+            # 【t94】两条集合**分别**从该物体自己的局部顶点组求：
+            #   slot_values      = 它自己写进骨架的槽（注册候选，排除 gap 槽）
+            #   referenced_slots = 它局部顶点组反查到的槽（含借来的）
+            # 借用集 = 后者 − 前者（`resolve_borrow_slots` 按注册顺序认领）。旧实现把两者
+            # 都取自「已去重的干净 Blend」⇒ 相减恒空 ⇒ BorrowMap 永远只有哨兵行。
+            registered = part_registered_slots(payload)
+            if registered:
+                part.slot_values = tuple(registered)
+            part.referenced_slots = local_group_slots(payload) or referenced_global_slots(
+                root, unique_str, payload
+            )
+            parts.append(part)
+    # 认领（= 一个合并身份只占一个槽）：先注册的物体是拥有者，后来者引用它 = 借用。
+    borrow_plan = resolve_borrow_slots(parts)
+    for part in parts:
+        owned = borrow_plan["owned"].get(part.unique_str)
+        if owned is not None:
+            part.slot_values = tuple(owned)    # ---- G1 目标集合：本次导出里**合并数据与当前骨架同源**的部件 ---- #
     #
     # 「同源」= 该部件 json 记的 HIMIMergedSkeletonDigest 与角色级骨架一致（字段缺失
     # 时按同源处理，兼容早期缓存）。它必须在这里定下来：陈旧部件虽然带数据，但它的
@@ -2401,8 +3113,11 @@ def load_workspace_plan(
         source=source,
         gate_oracle=oracle,
         landed_data_bares=landed_data_bares or None,
+        borrowed_slots=(borrow_plan or {}).get("family_borrows") or None,
     )
     built.palette_cache = dict(palette_cache)
+    # 【t94】借用集的两个来源（引用集 / 自己写入集）都从这里带走：布局层不再自己推一次。
+    built.borrow_plan = dict(borrow_plan or {})
     # 角色键一致性（元数据被搬进别的角色工作空间时大声报出来）
     expected_role_key = derive_role_key(os.path.basename(os.path.abspath(root)))
     if built.ok and built.role_key and built.role_key != expected_role_key:
@@ -2467,7 +3182,9 @@ def publish_skeleton_binary(
     except OSError as exc:
         return {"ok": False, "path": "", "written": False, "bytes": 0, "message": str(exc)}
 
-    expected = int(plan.slot_count) * MERGED_SKELETON_STRIDE
+    expected = (
+        int(plan.slot_count) - int(getattr(plan, "skeleton_extra_slots", 0) or 0)
+    ) * MERGED_SKELETON_STRIDE
     if len(payload) != expected:
         return {
             "ok": False,
@@ -2475,10 +3192,17 @@ def publish_skeleton_binary(
             "written": False,
             "bytes": len(payload),
             "message": (
-                f"角色级骨架字节数不符：期望 {expected}（= {plan.slot_count} 槽 × 48），"
-                f"实际 {len(payload)}"
+                f"角色级骨架字节数不符：期望 {expected}（= "
+                f"{int(plan.slot_count) - int(getattr(plan, 'skeleton_extra_slots', 0) or 0)} 槽"
+                f" × 48），实际 {len(payload)}"
             ),
         }
+    # 【t84】块尾借用槽没有缓存来源：在**已核对过的**缓存骨架后补零槽。
+    # 追加的槽只由 attach CS 每帧写入，导出期内容无所谓；长度必须补齐到 plan.slot_count，
+    # 否则 ini 的 array=3×slot_count 与文件字节数不符（3Dmigoto 会按文件长度建 buffer）。
+    extra = int(getattr(plan, "skeleton_extra_slots", 0) or 0)
+    if extra > 0:
+        payload = payload + b"\x00" * (extra * MERGED_SKELETON_STRIDE)
     if plan.skeleton_digest and _sha256_file(source) != plan.skeleton_digest:
         return {
             "ok": False,
@@ -2746,6 +3470,16 @@ ATTACH_RANGE_FAMILY_X_BYTES = 48
 #: ``plan.family_ranges`` 决定），而槽位数与基址都不是族序号（实测 5 族的 base 是
 #: 0/184/202/273/292，无法反推 0..4）。
 ATTACH_RANGE_INDICES_OFFSET = 112
+#: 借用表（t84）的起始偏移 = ``ATTACH_RANGE_BYTES``：128 B 之后每行 16 B。
+#:
+#: 行布局 = ``(目标槽 u32, 源族 palette 局部槽 u32, 借用方族序号 u32, 0)``。
+#: 语义：**源族**（拥有该骨 palette 的那一族）的 attach dispatch 把这根骨的
+#: ``X_借用方 · P_源族`` 写进**借用方**块尾的目标槽。为什么放在**源族**的载荷里：
+#: 只有源族手里有 ``P``，而 ``X_借用方`` 可以从物体矩阵表（``cs-u1``）运行期读出来算 ⇒
+#: 不需要新绑定、不需要跨族协调、也不需要把 X 烘死。
+ATTACH_RANGE_BORROW_OFFSET = ATTACH_RANGE_BYTES
+#: 借用行长度（4×u32）。
+ATTACH_RANGE_BORROW_BYTES = 16
 #: 版本 4 = 载荷带 ``[7]`` 的族索引（X 改为运行期从 vs-cb3 实时计算，烘死的 X_f 降级为兜底）；
 #: 版本 3 = 载荷带 ``Q_f⁻¹``（t44 共同空间取反修复：palette 侧 `P·Q⁻¹` + 顶点侧 `Q·v`）；
 #: 版本 2 = 载荷带 ``Q_f``（t39–t43，**方向取反**，语义已废弃）；版本 1 = 16 B（无因子）。
@@ -2760,6 +3494,307 @@ ATTACH_RANGE_MAGIC = 0x48494D52
 ATTACH_RANGE_MAGIC_MACRO = "HIMI_ATTACH_RANGE_MAGIC"
 #: ini 侧身份资源的 ``filename`` 目录（与 VB/IB 一致，用当前缓冲目录名）。
 ATTACH_RANGE_DEFAULT_FOLDER = MERGED_SKELETON_DEFAULT_FOLDER
+
+
+# --------------------------------------------------------------------------- #
+# 借用槽（跨族借用）：每族一张 BorrowMap + 逐族 palette 副本
+# --------------------------------------------------------------------------- #
+# 【为什么要有借用槽】合并进一个骨架的部件里，总有少量顶点引用了**别的族**的骨
+# （实测：077983c9 的部件引用了 09c6e58a 的第 51/146/147 号骨）。这些顶点已经被烘进
+# **宿主族的物体空间**，所以它们的矩阵必须是 ``X_源 · P_源``（``X_源 = M_宿主⁻¹·M_源``）；
+# 而宿主族自己的槽要的是 ``X_宿主 · P_宿主``。同一个槽不可能同时满足两边 ⇒ 被借的骨
+# 必须在**借用方的块尾**另占一个槽（``compute_family_ranges`` 的 shifted 布局）。
+#
+# 【为什么值由借用方自己写】块尾那几个槽落在借用方的块里，只有它的 dispatch 有写权；
+# 它手里有 ``bone_index``（= 块内偏移）⇒ 只要再给它两样东西：
+#   ① 来源族的 palette 副本（``cs-t2/t3/t5/…``，由该族自己的 VB/IB 段 ``copy vs-t0`` 填）；
+#   ② 一张「目标槽 / 来源族序号 / 源局部槽」的行表（本文件写出的 ``-BorrowMap.buf``）。
+# 这样**来源族不必先跑、也不必知道谁借了它的骨**：它本帧没有 attach run 时，借用方读到的
+# 是它上一帧的 palette 副本（``unless_null`` 保住旧值），而不是空缓冲。
+#
+# 【为什么借用槽乘 X_源、本族槽乘 X_本族】见 CS 模板里那段注释：两边的"宿主"不同。
+BORROW_MAP_RESOURCE_PREFIX = "ResourceHI3BorrowMap_"
+#: 资源形态（``validate_resource_decl`` 与 ini 发射共用）。
+BORROW_MAP_KIND = "borrow_map"
+#: ini 形状：``Buffer`` + ``R32_UINT`` + ``stride = 16``（一行 4×u32）+ ``array = 行数``。
+BORROW_MAP_INI_TYPE = "Buffer"
+BORROW_MAP_INI_FORMAT = "R32_UINT"
+BORROW_MAP_STRIDE = 16
+#: 一行 = 4×u32 = ``(目标槽, 来源族序号, 源局部槽, 0)``。
+BORROW_MAP_ROW_BYTES = 16
+#: ``<fam>-BorrowMap.buf``（与 ``-AttachRange.buf`` 同目录）。
+BORROW_MAP_BASENAME_SUFFIX = "-BorrowMap.buf"
+#: 空行哨兵：``entry.x == 0xFFFFFFFF`` ⇒ 本线程不写。空表就写**一行**这个哨兵
+#: （ini 的 ``array`` 不能是 0，CS 也不喜欢零长度资源）。
+BORROW_MAP_EMPTY_SENTINEL = 0xFFFFFFFF
+#: BorrowMap 的绑定槽（``cs-t4``）。它占掉 t4，所以来源族 palette 的绑定是 t2/t3/t5/t6…
+BORROW_MAP_REGISTER = "t4"
+#: 来源族 palette 的 HLSL 名后缀（``himi_borrow_palette_a`` …）：与部署侧实测名称一致。
+BORROW_PALETTE_SUFFIXES = ("a", "b", "c", "d", "e", "f", "g", "h")
+
+
+def borrow_palette_register(rank: int) -> str:
+    """来源族 ``rank`` 的 palette 副本绑在哪个 ``cs-tN``。
+
+    ``t4`` 被 BorrowMap 占着（部署实机验证过的绑定顺序），所以 0/1 号来源族用 ``t2``/``t3``，
+    2 号及以后从 ``t5`` 接着排；``t0``/``t1`` 是**本族** palette 与身份资源，永不挪作它用。
+    顺序按**块基址升序**（= ``compute_family_ranges`` 给的 ``family_index``），与
+    ``BorrowMap`` 第 2 分量（来源族序号）同一个编号空间 ⇒ 运行期只做一次 ``rank → 声明`` 选择。
+    """
+    rank = int(rank)
+    if rank < 0 or rank >= len(BORROW_PALETTE_SUFFIXES):
+        raise HIMIResourceDeclError(
+            f"借用槽来源族序号 {rank} 超出可绑定范围 [0,{len(BORROW_PALETTE_SUFFIXES)})"
+        )
+    return f"t{2 + rank}" if rank < 2 else f"t{5 + rank - 2}"
+
+
+def borrow_palette_hlsl_name(rank: int) -> str:
+    """CS 里来源族 ``rank`` 的 palette 副本声明名（``himi_borrow_palette_a`` …）。"""
+    rank = int(rank)
+    if rank < 0 or rank >= len(BORROW_PALETTE_SUFFIXES):
+        raise HIMIResourceDeclError(
+            f"借用槽来源族序号 {rank} 超出可绑定范围 [0,{len(BORROW_PALETTE_SUFFIXES)})"
+        )
+    return "himi_borrow_palette_" + BORROW_PALETTE_SUFFIXES[rank]
+
+
+def borrow_palette_reference_line(rank: int, family: str) -> str:
+    """attach 段里 ``cs-tN = ref <来源族的 palette 副本>`` 行。"""
+    return f"cs-{borrow_palette_register(rank)} = ref {family_palette_name(family)}"
+
+
+def borrow_palette_families(ranges) -> list:
+    """``[来源族, …]`` —— **按块基址升序**（下标 = ``BorrowMap`` 里的来源族序号）。
+
+    一个 CS 文件给全族共用 ⇒ 每个 attach 段都得绑**全部**来源族的 palette（不管自己借没借），
+    否则运行期要按「谁绑了什么」分叉，而 ini 里那一堆 ``cs-tN`` 就没法逐段同形了。
+    只列 ``own_block=True`` 且 ``slots > 0`` 的族（借位族没有 palette 副本可绑）。
+    """
+    items = []
+    for family, info in dict(ranges or {}).items():
+        info = dict(info or {})
+        if not bool(info.get("own_block", False)):
+            continue
+        if int(info.get("slots", 0) or 0) <= 0:
+            continue
+        items.append((int(info.get("base", 0) or 0), str(family)))
+    items.sort()
+    return [family for _base, family in items]
+
+
+def borrow_map_resource_name(family: str) -> str:
+    """``ResourceHI3BorrowMap_<fam>``：该族的借用表（**借用方**名下的那张）。"""
+    return BORROW_MAP_RESOURCE_PREFIX + str(family or "").strip()
+
+
+def borrow_map_basename(family: str) -> str:
+    """``<fam>-BorrowMap.buf``（每行 16 B；空表 = 一行哨兵）。"""
+    return f"{str(family or '').strip()}{BORROW_MAP_BASENAME_SUFFIX}"
+
+
+def borrow_map_reference_line(family: str) -> str:
+    """attach 段里 ``cs-t4 = ref <本族 BorrowMap>`` 行。"""
+    return f"cs-{BORROW_MAP_REGISTER} = ref {borrow_map_resource_name(family)}"
+
+
+def borrow_map_rows(ranges, family: str) -> list:
+    """``[(目标槽, 来源族序号, 源局部槽), …]``（按目标槽升序，= BorrowMap 的行序）。
+
+    行序就是 CS 里的行号：``borrow_index = bone_index - 源槽数``，两者必须同序 ——
+    目标槽是**块尾连续**分配的（``compute_family_ranges``），所以按目标槽升序排即等于
+    按块内偏移排，运行期不需要再查表对位。
+
+    来源族序号一律按「块基址升序」现算（``borrow_palette_families``），不依赖行里有没有
+    ``source_family_index``：那个字段由 ``compute_family_ranges`` 的借用分支填，而 attach 段的
+    ``cs-tN`` 绑定也必须用同一个编号空间 —— 两处都从基址算，就不存在写漏一个字段就错位的可能。
+    """
+    ranges = dict(ranges or {})
+    order = borrow_palette_families(ranges)
+    info = dict(ranges.get(str(family or "")) or {})
+    rows = []
+    for row in info.get("borrow") or ():
+        row = dict(row)
+        source = str(row.get("source_family", "") or "")
+        try:
+            rank = order.index(source) if source in order else int(row.get("source_family_index", -1))
+            rows.append(
+                (int(row.get("target_slot", -1)), rank, int(row.get("source_local", -1)))
+            )
+        except (TypeError, ValueError):
+            continue
+    rows.sort()
+    return rows
+
+
+def borrow_map_rows_by_family(ranges) -> dict:
+    """``{族: [(目标槽, 来源族序号, 源局部槽), …]}`` —— 每个可发段的族都有一项（可为空表）。"""
+    out: dict = {}
+    for family, info in dict(ranges or {}).items():
+        info = dict(info or {})
+        if not bool(info.get("own_block", False)) or int(info.get("slots", 0) or 0) <= 0:
+            continue
+        out[str(family)] = borrow_map_rows(ranges, str(family))
+    return out
+
+
+def borrow_map_payload(rows) -> bytes:
+    """BorrowMap 载荷：每行 ``<4I`` = ``(目标槽, 来源族序号, 源局部槽, 0)``。
+
+    空表写**一行哨兵** ``(0xFFFFFFFF, 0, 0, 0)``：运行期靠 ``entry.x`` 早退，
+    ini 侧也不需要 ``array = 0`` 这种非法声明。
+    """
+    import struct as _struct
+
+    packed = []
+    for row in rows or ():
+        fields = list(row)
+        if len(fields) < 3:
+            raise HIMIResourceDeclError(f"借用行必须至少 3 个分量（目标槽/来源族/源局部槽）：{row!r}")
+        target, rank, local = (int(value) for value in fields[:3])
+        if target < 0 or rank < 0 or local < 0:
+            raise HIMIResourceDeclError(f"借用行分量不能为负：{row!r}")
+        packed.append(_struct.pack("<4I", target, rank, local, 0))
+    if not packed:
+        packed.append(_struct.pack("<4I", BORROW_MAP_EMPTY_SENTINEL, 0, 0, 0))
+    return b"".join(packed)
+
+
+def decode_borrow_map_payload(payload) -> list:
+    """``bytes`` → ``[(目标槽, 来源族序号, 源局部槽, 第 4 分量), …]``（判据/离线自检用）。"""
+    import struct as _struct
+
+    data = bytes(payload or b"")
+    if len(data) % BORROW_MAP_ROW_BYTES:
+        raise HIMIResourceDeclError(
+            f"借用表长度 {len(data)} 不是 {BORROW_MAP_ROW_BYTES} 的整数倍 ⇒ 文件被截断或写坏"
+        )
+    return [
+        _struct.unpack_from("<4I", data, offset)
+        for offset in range(0, len(data), BORROW_MAP_ROW_BYTES)
+    ]
+
+
+def build_borrow_map_decl(
+    family: str,
+    row_count: int,
+    *,
+    folder: str = MERGED_SKELETON_DEFAULT_FOLDER,
+    filename: str = "",
+) -> HIMIResourceDecl:
+    """``[ResourceHI3BorrowMap_<fam>]`` 声明（``Buffer`` + ``R32_UINT`` + ``stride = 16``）。
+
+    ``array`` 是**行数**（不是字节）；空表也至少 1 行（哨兵），见 :func:`borrow_map_payload`。
+    ``filename`` 显式给出时以它为准（导出侧按当前缓冲目录名拼），否则用 ``folder`` + 文件名。
+    """
+    rows = max(1, int(row_count or 0))
+    path = str(filename or "").strip() or (
+        f"{str(folder or '').strip()}/{borrow_map_basename(family)}"
+    )
+    return HIMIResourceDecl(
+        name=borrow_map_resource_name(family),
+        kind=BORROW_MAP_KIND,
+        ini_type=BORROW_MAP_INI_TYPE,
+        ini_format=BORROW_MAP_INI_FORMAT,
+        array=rows,
+        stride=BORROW_MAP_STRIDE,
+        bind_flags="",
+        filename=path,
+        slots=0,
+    )
+
+
+def borrow_map_ini_lines(family: str, filename: str, row_count: int = 0) -> list:
+    """BorrowMap 的 ``[Resource…]`` 段体（``type`` / ``format`` / ``stride`` / ``array`` / ``filename``）。
+
+    字段顺序由 :data:`RESOURCE_INI_FIELD_ORDER` 统一决定（与其它资源同源，不另写一遍）。
+    """
+    return build_borrow_map_decl(family, row_count, filename=filename).ini_lines()
+
+
+def borrow_map_layout_problems(ranges, maps) -> list:
+    """借用表与排布的一致性判据（发布前第二道闸，空 = 通过）。
+
+    * 每行目标槽必须落在**本族块尾** ``[base+span, base+block_slots)``；
+    * 来源族序号必须在 ``[0, 族数)`` 且**不是本族**（借自己的骨 = 排布算错了）；
+    * 源局部槽不得超出源族的 ``slots``（超出 ⇒ 读别人的 palette / 读出界）。
+    """
+    ranges = dict(ranges or {})
+    problems: list = []
+    order = borrow_palette_families(ranges)
+    for family, rows in dict(maps or {}).items():
+        info = dict(ranges.get(str(family)) or {})
+        if not info:
+            continue
+        base = int(info.get("base", 0) or 0)
+        own = int(info.get("slots", 0) or 0)
+        block = int(info.get("block_slots", own) or 0)
+        declared = info.get("family_index")
+        if declared is not None and str(family) in order:
+            if int(declared) != order.index(str(family)):
+                problems.append(
+                    f"{family}: family_index = {declared} 与块基址升序给出的序号 "
+                    f"{order.index(str(family))} 不一致（运行期 cs-tN 会绑错来源族）"
+                )
+        for target, rank, local in rows or ():
+            if target < base + own or target >= base + block:
+                problems.append(
+                    f"{family}: 借用行目标槽 {target} 不在块尾 [{base + own},{base + block})"
+                )
+            if rank < 0 or rank >= len(order):
+                problems.append(f"{family}: 借用行来源族序号 {rank} 越出 [0,{len(order)})")
+            elif order[rank] == str(family):
+                problems.append(f"{family}: 借用行指向自己（来源族序号 {rank}）")
+            else:
+                source = dict(ranges.get(order[rank]) or {})
+                source_slots = int(source.get("slots", 0) or 0)
+                if local < 0 or local >= source_slots:
+                    problems.append(
+                        f"{family}: 借用行源局部槽 {local} 越出 {order[rank]} 的 [0,{source_slots})"
+                    )
+    return problems
+
+
+def borrow_blend_remap_problems(ledger, indices_by_family, ranges, *, limit: int = 8) -> list:
+    """【t93】Blend 重定到新块之后的**两条硬判据**（空 = 通过）。
+
+    * **无未映射通道**：``ledger["unmapped"] > 0`` 意味着有通道既不落在本族注册槽、
+      也不在借用表里 ⇒ 索引保持旧值，运行期会查到**别人的槽**（几何跟着别人的骨骼跑）。
+      布局一旦带借用槽，旧编号就再也不是合法编号了，所以这条必须响，不能只警告。
+    * **无块外索引**：每个权重 > 0 的通道，索引必须落在**本族块**
+      ``[base, base + block_slots)`` 里 —— 注册槽在块头、借用槽在块尾；块外任何值
+      都是错的（哪怕它本身是别族的合法全局槽）。
+
+    ``indices_by_family``：``{family: 该族重定后仍被引用的索引}``。族不在 ``ranges`` 里
+    （普通路径 / 未参与合并）⇒ 不判 —— 那时索引本来就是局部编号。
+    """
+    problems: list = []
+    unmapped = int(dict(ledger or {}).get("unmapped", 0) or 0)
+    if unmapped > 0:
+        problems.append(
+            f"Blend 重定有 {unmapped} 个通道找不到目标槽（既不在本族注册范围、也不在"
+            "借用表里）⇒ 这些通道会查到别人的槽"
+        )
+    for family, values in dict(indices_by_family or {}).items():
+        info = dict(ranges.get(str(family)) or {})
+        if not info:
+            continue
+        base = int(info.get("base", 0) or 0)
+        own = int(info.get("slots", 0) or 0)
+        block = int(info.get("block_slots", own) or 0)
+        if block <= 0:
+            problems.append(
+                f"{family}: 布局里没有块（block_slots={block}）却有顶点引用它"
+            )
+            continue
+    # 块外判定只有一条口径（本族块 ∪ 借用槽），与 :func:`family_blend_scope_problems` 共用。
+    problems += family_blend_scope_problems(indices_by_family, ranges, limit=limit)
+    # 上面两段对「没有块」的族会各报一次，去重后返回。
+    unique: list = []
+    for item in problems:
+        if item not in unique:
+            unique.append(item)
+    return unique
 
 
 def attach_range_resource_name(family: str) -> str:
@@ -2779,6 +3814,7 @@ def attach_range_payload(
     placement=None,
     family_x=None,
     indices=None,
+    borrow_rows=None,
     version: int = ATTACH_RANGE_VERSION,
 ) -> bytes:
     """身份载荷 = 头部 ``(base, span, version, magic)`` + ``Q_f⁻¹``（``[1..3]``）+ ``X_f``（``[4..6]``）。
@@ -2793,9 +3829,17 @@ def attach_range_payload(
     * ``indices`` 给 ``(own_index, base_index)`` ⇒ 写进 ``[7]``（本族/宿主族在物体矩阵表里的
       序号，CS 运行期算 X 唯一需要的额外信息）；``None`` ⇒ 16 个 0 字节（旧行为）。
 
-    长度**恒为 ``ATTACH_RANGE_BYTES``（128）**：ini 侧是 typed Buffer（``format = R32G32B32A32_FLOAT``、
-    **无 ``array=``**），资源长度只能由文件字节数体现 ⇒ 「族数 × 128」是 ini/CS/解码三方共同的
-    同步点（见 :func:`verify_attach_range_files`）。
+    * ``borrow_rows`` 给一串 ``(target_slot, source_local, borrower_family_index)`` ⇒ 从
+      ``ATTACH_RANGE_BORROW_OFFSET``（128）起每行 16 B 追加，行数写进 ``[7].z``；``None``
+      ⇒ 不追加（长度回到 128 B，与旧产物逐字节相同）。
+
+      **t91 起发布路径恒传 ``None``**：借用关系改由每族一张 BorrowMap 承载
+      （:func:`borrow_map_payload`），身份载荷恒 128 B —— 与实机验证过的部署产物同形。
+      这个参数保留只为旧载荷形态的回归用例（见 :func:`borrow_rows_by_source_family`）。
+
+    长度 = ``ATTACH_RANGE_BYTES + 16 × len(borrow_rows)``：ini 侧是 typed Buffer（``format =
+    R32G32B32A32_FLOAT``、**无 ``array=``**），资源长度只能由文件字节数体现 ⇒ 三方同步点
+    （见 :func:`verify_attach_range_files`）。
 
     纯数据、无副作用：导出侧按 ``plan.family_ranges`` + 该族 palette 缓存 + vs-cb3 生成，
     测试与复算脚本直接读它比对（「产物级复算证据」的入口之一）。
@@ -2834,8 +3878,27 @@ def attach_range_payload(
                 f"族索引不接受负值（own={own_index}, base={base_index}）"
             )
         index_row = _struct.pack("<4I", own_index, base_index, 0, 0)
-    payload = header + blocks[0] + blocks[1] + index_row
-    assert len(payload) == ATTACH_RANGE_BYTES, len(payload)
+    borrow_block = b""
+    rows = list(borrow_rows or ())
+    if rows:
+        if indices is None:
+            raise HIMIResourceDeclError("借用表必须与族索引（[7]）一起发：行数就写在 [7].z")
+        packed = []
+        for row in rows:
+            target_slot, source_local, borrower_index = (int(v) for v in tuple(row)[:3])
+            if min(target_slot, source_local, borrower_index) < 0:
+                raise HIMIResourceDeclError(
+                    f"借用行不接受负值（target={target_slot}, local={source_local}, "
+                    f"family={borrower_index}）"
+                )
+            packed.append(_struct.pack("<4I", target_slot, source_local, borrower_index, 0))
+        index_row = _struct.pack(
+            "<4I", own_index, base_index, len(packed), 0
+        )
+        borrow_block = b"".join(packed)
+    payload = header + blocks[0] + blocks[1] + index_row + borrow_block
+    expected = ATTACH_RANGE_BYTES + ATTACH_RANGE_BORROW_BYTES * len(rows)
+    assert len(payload) == expected, (len(payload), expected)
     return payload
 
 
@@ -2852,7 +3915,8 @@ def decode_attach_range_payload(payload: bytes) -> dict:
     "has_family_x","family_x","own_index","base_index","has_indices"}``。
 
     兼容四种形态：v1 的 16 B（无 Q）、v2/v3 的 64 B（带 Q）、112 B（带 Q + ``X_f``）、
-    **128 B（带 Q + ``X_f`` + 族索引）**，以及其它长度（``ok=False``）。``has_placement`` 只在
+    **128 B（带 Q + ``X_f`` + 族索引）**，以及 128 B 之后再追加借用表的变长形态
+    （``128 + 16 × borrow_count``，t84）；其它长度 ⇒ ``ok=False``。``has_placement`` 只在
     ``version >= 2`` **且** Q 的 12 个数里至少有一个非零时为真（全零 = 生成侧没给摆放 ⇒
     语义等同 v1；方案 B 起 v2+ 的 ``[1..3]`` **恒为单位阵**，故恒为真）；
     ``placement_is_identity`` 是方案 B 的判据（12 个数与单位阵的偏差 ≤ 1e-6），
@@ -2871,8 +3935,12 @@ def decode_attach_range_payload(payload: bytes) -> dict:
         "placement_is_identity": False,
         "has_family_x": False, "family_x": [],
         "own_index": -1, "base_index": -1, "has_indices": False,
+        "borrow_count": 0, "borrow_rows": [], "has_borrow": False,
     }
-    if len(raw) not in (ATTACH_RANGE_HEADER_BYTES, 64, 112, ATTACH_RANGE_BYTES):
+    if len(raw) not in (ATTACH_RANGE_HEADER_BYTES, 64, 112, ATTACH_RANGE_BYTES) and not (
+        len(raw) >= ATTACH_RANGE_BORROW_OFFSET
+        and (len(raw) - ATTACH_RANGE_BORROW_OFFSET) % ATTACH_RANGE_BORROW_BYTES == 0
+    ):
         return empty
     values = [
         int.from_bytes(raw[index * 4 : index * 4 + 4], "little") for index in range(4)
@@ -2880,9 +3948,25 @@ def decode_attach_range_payload(payload: bytes) -> dict:
     placement = _decode_block(raw, ATTACH_RANGE_HEADER_BYTES)
     family_x = _decode_block(raw, ATTACH_RANGE_X_OFFSET)
     own_index, base_index = -1, -1
+    borrow_count = 0
     if len(raw) >= ATTACH_RANGE_INDICES_OFFSET + 16:
         own_index, base_index = _struct.unpack(
             "<2I", raw[ATTACH_RANGE_INDICES_OFFSET : ATTACH_RANGE_INDICES_OFFSET + 8]
+        )
+        (borrow_count,) = _struct.unpack(
+            "<1I", raw[ATTACH_RANGE_INDICES_OFFSET + 8 : ATTACH_RANGE_INDICES_OFFSET + 12]
+        )
+    borrow_rows: list = []
+    available = max(0, len(raw) - ATTACH_RANGE_BORROW_OFFSET) // ATTACH_RANGE_BORROW_BYTES
+    for index in range(min(int(borrow_count), available)):
+        offset = ATTACH_RANGE_BORROW_OFFSET + index * ATTACH_RANGE_BORROW_BYTES
+        target_slot, source_local, borrower_index = _struct.unpack("<3I", raw[offset : offset + 12])
+        borrow_rows.append(
+            {
+                "target_slot": int(target_slot),
+                "source_local": int(source_local),
+                "source_family_index": int(borrower_index),
+            }
         )
     return {
         "base": values[0],
@@ -2904,6 +3988,9 @@ def decode_attach_range_payload(payload: bytes) -> dict:
         # 全零的 [7] 与「族 0 / 宿主 0」在数值上不可分 ⇒ 判据只能是「有这一行 **且** 版本 >= 4」，
         # CS 侧同样用 version 门（asuint(attach_range.z) >= 4u）而不是看数值。
         "has_indices": bool(values[2] >= 4 and len(raw) >= ATTACH_RANGE_INDICES_OFFSET + 16),
+        "borrow_count": int(len(borrow_rows)),
+        "borrow_rows": borrow_rows,
+        "has_borrow": bool(borrow_rows),
     }
 
 
@@ -3073,7 +4160,8 @@ def attach_write_target(
        走同一条路；此前模型把 span=0 当「整族拒写」而 CS 当「不拦」—— 语义分歧已消除；
     1. 身份可用 ⇒ 它权威；冻结表认识这一族且与其不一致 ⇒ **拒写**（-1）；
     2. base 仍不可知 ⇒ 拒写；
-    3. ``bone_index >= source_slots`` ⇒ 拒写（不得读副本之外）；
+    3. ``bone_index >= source_slots`` ⇒ **本线程落在借用槽区**（t91）：本族槽这条路拒写（-1），
+       由 :func:`borrow_write_target` 接着判块尾的那几个槽；
     4. ``bone_index >= identity_span`` ⇒ 拒写（**截断**：副本维度大于本族 span 时
        绝不写进下一族的块 —— F5 的核心）；
     5. 目标槽越出骨架槽数 ⇒ 拒写。
@@ -3098,8 +4186,121 @@ def attach_write_target(
     return target
 
 
+def borrow_write_target(*, bone_index: int, source_slots: int, rows, skeleton_slots: int):
+    """**CS 借用分支的模型**（t91；返回 ``(行号, 目标槽)``，``None`` = 本线程不写）。
+
+    与 :func:`attach_write_target` 是同一件事的两半：那里的第 3 步（``bone_index >=
+    source_slots``）在 CS 里不再是「直接 return」，而是**转入借用分支** —— 于是模型这边也
+    必须给出「这一线程该写哪个槽」，否则「生成文本 vs 模型」就没有对齐点。
+
+    语义逐条对齐 CS（``merged_attach_hlsl_problems`` 钉住文本，这里钉住行为）：
+
+    1. 行号 = ``bone_index - source_slots``；越出表长 ⇒ 不写（dispatch 按块长向上取整，
+       尾部多出来的线程必然走到这里）；
+    2. 行首分量 ``0xFFFFFFFF`` 是空行哨兵 ⇒ 不写；
+    3. 目标槽越出骨架槽数（``dst + 2 >= skeleton_slots``）⇒ 不写（宁可少写，不写坏别人的槽）。
+    """
+    index = int(bone_index) - int(source_slots)
+    if index < 0:
+        return None
+    table = [tuple(int(part) for part in row) for row in (rows or ())]
+    if index >= len(table):
+        return None
+    row = table[index]
+    if not row:
+        return None
+    target = int(row[0])
+    if target < 0 or target == BORROW_MAP_EMPTY_SENTINEL:
+        return None
+    if target * 3 + 2 >= int(skeleton_slots) * 3:
+        return None
+    return index, target
+
+
+def borrow_rows_by_source_family(ranges) -> dict:
+    """``{源族: [(目标槽, 源族 palette 局部槽, 借用方族序号), ...]}``（**t84 旧机制，只剩对照/回归用途**）。
+
+    t91 起借用关系改由**每族一张 BorrowMap**（:func:`borrow_map_rows`）承载：借用槽由借用方
+    自己的 dispatch 写、来源族的 palette 以 ``cs-tN`` 副本绑进来。这个函数保留下来只为
+    「旧载荷形态的回归用例」和「历史产物对照」，**不再参与发布**
+    （:func:`publish_attach_ranges` 已不调用它，身份载荷恒 128 B）。
+
+    旧设计把借用表放在**源族**（= 拥有那根骨 palette 的族）的载荷里：只有它手里有
+    ``P``，而 ``X_借用方`` 能从物体矩阵表（``cs-u1``）运行期读出来算 ⇒ 不需要把 X 烘死。
+    它被换掉的原因是**写者缺席**：源族那一帧没有 attach run（或它的段被跳过）时，块尾的
+    借用槽就永远没人写 —— 借用方自己写才有「谁需要谁负责」的确定性。
+    """
+    fanout: dict = {}
+    for family, info in dict(ranges or {}).items():
+        info = dict(info or {})
+        for row in info.get("borrow") or ():
+            row = dict(row)
+            try:
+                source = str(row.get("source_family") or "")
+                packed = (
+                    int(row.get("target_slot", -1)),
+                    int(row.get("source_local", -1)),
+                    int(info.get("family_index", -1)),
+                )
+            except (TypeError, ValueError):
+                continue
+            if not source or min(packed) < 0:
+                continue
+            fanout.setdefault(source, []).append(packed)
+    for rows in fanout.values():
+        rows.sort()
+    return fanout
+
+
+def attach_range_layout_problems(ranges, *, skeleton_slots: int = 0) -> list:
+    """逐块核对身份资源的布局：``base >= 0``、``span > 0`` 的块两两不重叠、不越界。
+
+    ``compute_family_ranges`` 已在**计划层** fail-closed 判过同一组约束；这里是**发布层**的
+    第二道闸（``publish_attach_ranges`` 也被测试/诊断直接调用，不能只靠上游）。给
+    ``skeleton_slots > 0`` 时才判越界（不知道骨架槽数就不臆断）。
+
+    借用槽（t84）一并核对：块长取 ``block_slots``（借用槽落在块尾），每行的 ``target_slot``
+    必须真的落在**本族块尾**那一段里 —— 越界或落到自己 span 上就是排布算错了。
+    """
+    spans = []
+    problems_borrow: list = []
+    for family, info in dict(ranges or {}).items():
+        info = dict(info or {})
+        # 块长取 block_slots：借用槽落在本族块尾，同样由本族区间声明（t84）。
+        span = int(info.get("block_slots", info.get("slots", 0)) or 0)
+        if span <= 0:
+            continue  # 借位族没有自己的块
+        entry = (int(info.get("base", 0) or 0), span, str(family))
+        spans.append(entry)
+        own = int(info.get("slots", 0) or 0)
+        for row in info.get("borrow") or ():
+            target = int(dict(row).get("target_slot", -1))
+            if target < entry[0] + own or target >= entry[0] + span:
+                problems_borrow.append(
+                    f"{family}: 借用行的目标槽 {target} 不在块尾 [{entry[0] + own},{entry[0] + span})"
+                )
+    problems = list(problems_borrow)
+    for base, span, family in spans:
+        if base < 0:
+            problems.append(f"{family}: 块起点 {base} < 0")
+        if int(skeleton_slots or 0) > 0 and base + span > int(skeleton_slots):
+            problems.append(
+                f"{family}: 区间 [{base},{base + span}) 越出骨架槽位 [0,{int(skeleton_slots)})"
+            )
+    spans.sort()
+    for previous, current in zip(spans, spans[1:]):
+        previous_end = previous[0] + previous[1]
+        if current[0] < previous_end:
+            problems.append(
+                f"{current[2]}: 区间 [{current[0]},{current[0] + current[1]}) 与 "
+                f"{previous[2]}（结束于 {previous_end}）重叠 ⇒ 两个 attach 段会写同一批槽位"
+            )
+    return problems
+
+
 def publish_attach_ranges(
-    ranges, folder_path: str, *, placements=None, family_xs=None, indices=None
+    ranges, folder_path: str, *, placements=None, family_xs=None, indices=None,
+    skeleton_slots: int = 0,
 ) -> dict:
     """把每族的身份载荷写进 mod 缓冲目录（幂等；返回 ``{"ok","written","files","message"}``）。
 
@@ -3134,12 +4335,21 @@ def publish_attach_ranges(
     placements = dict(placements or {})
     family_xs = dict(family_xs or {})
     indices = dict(indices or {})
+    layout = attach_range_layout_problems(ranges, skeleton_slots=int(skeleton_slots or 0))
+    if layout:
+        return {"ok": False, "written": False, "files": [], "message": "；".join(layout)}
+    borrow_maps = borrow_map_rows_by_family(ranges)
+    borrow_problems = borrow_map_layout_problems(ranges, borrow_maps)
+    if borrow_problems:
+        return {"ok": False, "written": False, "files": [], "message": "；".join(borrow_problems)}
     try:
         os.makedirs(folder, exist_ok=True)
     except OSError as exc:
         return {"ok": False, "written": False, "files": [], "message": str(exc)}
     files: list = []
+    borrow_written: list = []
     written = 0
+    changed = 0
     try:
         for family, info in sorted(
             ranges.items(), key=lambda item: (int(dict(item[1]).get("base", 0)), str(item[0]))
@@ -3164,32 +4374,103 @@ def publish_attach_ranges(
             )
             path = os.path.join(folder, attach_range_basename(family))
             files.append(path)
-            unchanged = False
+            previous = None
             if os.path.isfile(path):
                 try:
                     with open(path, "rb") as handle:
-                        unchanged = handle.read() == payload
+                        previous = handle.read()
                 except OSError:
-                    unchanged = False
-            if unchanged:
-                continue
+                    previous = None
+            # 【t39-X 校准】每次都**无条件重写**：载荷是「本次 plan + 本次 X_f」的快照，
+            # 内容相同也刷新 mtime —— 旧实现内容一致就跳过写盘，产物里出现过
+            # 「AttachRange 的 mtime 停在上一次场景」的可观测证据（与顶点缓冲不同步）。
             with open(path, "wb") as handle:
                 handle.write(payload)
             written += 1
+            if previous != payload:
+                changed += 1
+        # 【t91 借用表】每族一张（借用方名下），与身份资源同目录、同节奏无条件重写。
+        # 空表写一行哨兵 ⇒ 文件永远存在 ⇒ ini 的 filename 不会指向不存在的路径。
+        for family in sorted(borrow_maps, key=lambda name: (int(dict(ranges.get(name) or {}).get("base", 0)), str(name))):
+            rows = borrow_maps[family]
+            payload = borrow_map_payload(rows)
+            path = os.path.join(folder, borrow_map_basename(family))
+            files.append(path)
+            previous = None
+            if os.path.isfile(path):
+                try:
+                    with open(path, "rb") as handle:
+                        previous = handle.read()
+                except OSError:
+                    previous = None
+            with open(path, "wb") as handle:
+                handle.write(payload)
+            written += 1
+            if previous != payload:
+                changed += 1
+            borrow_written.append({"family": family, "rows": len(rows), "file": path})
+        # 【t93 落盘核】借用表写完再**读回来**核对：字节必须与本次编码逐字节相同（长度因此
+        # 也必须是 16 B × 行数，空表 1 行哨兵）。写与读用同一对编解码器 ⇒ 读回来的不是同一串
+        # 字节，就说明文件被截断/被别的进程覆盖（真实产物里出现过 mtime 与顶点缓冲不同步）。
+        # 「投递成功」不等于「做了」：ini 的 array 是按行数声明的，落盘少一行 CS 侧就少一条。
+        for item in borrow_written:
+            expected = borrow_map_payload(borrow_maps[item["family"]])
+            try:
+                with open(item["file"], "rb") as handle:
+                    landed = handle.read()
+            except OSError as exc:
+                return {
+                    "ok": False,
+                    "written": False,
+                    "files": files,
+                    "message": f"借用表 {item['file']} 读回失败：{exc}",
+                }
+            if landed != expected:
+                return {
+                    "ok": False,
+                    "written": False,
+                    "files": files,
+                    "message": (
+                        f"{item['family']}: 借用表落盘字节与计划不一致"
+                        f"（期望 {len(expected)} B / 实际 {len(landed)} B，"
+                        f"行数应为 {max(1, int(item['rows']))}）"
+                    ),
+                }
     except OSError as exc:
         return {"ok": False, "written": False, "files": files, "message": str(exc)}
     calibrated = len([1 for family in placements if str(family) in ranges])
     matrixed = len([1 for family in family_xs if str(family) in ranges])
     indexed = len([1 for family in indices if str(family) in ranges])
+    # 【覆盖核对】每个骨架槽都必须有写方：``∑span == skeleton_slots`` 且首块从 0 起。
+    # 全量导出下 gap 非空 = 有槽没人写（顶点位置全零、且不报错）⇒ 必须在导出期就看得见；
+    # 过滤导出（只发部分族）合法留 gap，所以这里只如实回报，不 fail-closed。
+    gaps = []
+    covered = 0
+    if int(skeleton_slots or 0) > 0:
+        gaps = [[start, end] for start, end in uncovered_slot_ranges(ranges, int(skeleton_slots))]
+        covered = int(skeleton_slots) - sum(end - start for start, end in gaps)
     return {
         "ok": True,
         "written": written > 0,
+        "rewritten": changed,
         "files": files,
+        "borrow_maps": borrow_written,
+        "slot_gaps": gaps,
+        "slot_covered": covered,
         "message": (
-            f"已写出 {len(files)} 个家族身份资源（重写 {written} 个；"
-            f"分族摆放段恒为单位阵（方案 B：顶点侧不校准；{calibrated} 个显式给值）、"
-            f"{matrixed} 个带族级物体矩阵 X_f（兜底）、"
-            f"{indexed} 个带物体矩阵表索引 / {ATTACH_RANGE_BYTES} B）"
+            f"已写出 {len(files)} 个家族资源（每次导出都重写；本次内容变化 {changed} 个；"
+            f"身份载荷恒为 {ATTACH_RANGE_BYTES} B、分族摆放段恒为单位阵"
+            f"（方案 B：顶点侧不校准；{calibrated} 个显式给值）、"
+            f"{matrixed} 个带族级物体矩阵 X_f、"
+            f"{indexed} 个带物体矩阵表索引；借用表 {len(borrow_written)} 张、"
+            f"共 {sum(int(item['rows']) for item in borrow_written)} 行"
+            + (
+                f"；覆盖 {covered}/{int(skeleton_slots)} 槽"
+                + (f"，未覆盖 {len(gaps)} 段（过滤导出可接受）" if gaps else "，无空洞")
+                if int(skeleton_slots or 0) > 0
+                else ""
+            )
+            + ")"
         ),
     }
 
@@ -3227,7 +4508,10 @@ def verify_attach_range_files(
         if span <= 0:
             continue
         counted += 1
-        expected_bytes += ATTACH_RANGE_BYTES
+        # 载荷长度**恒为** ATTACH_RANGE_BYTES：借用槽**(t91)** 自 BorrowMap 起不再往载荷里塞行
+        # （借用方自己的 dispatch 按行号取表）⇒ 长度只要不是 128 B 就是旧产物或写坏了。
+        expected_length = ATTACH_RANGE_BYTES
+        expected_bytes += expected_length
         path = os.path.join(folder, attach_range_basename(family))
         if not os.path.isfile(path):
             problems.append(f"{family}: 身份资源文件不存在（{path}）")
@@ -3238,9 +4522,9 @@ def verify_attach_range_files(
         except OSError as exc:
             problems.append(f"{family}: 身份资源无法读取（{exc}）")
             continue
-        if len(raw) != ATTACH_RANGE_BYTES:
+        if len(raw) != expected_length:
             problems.append(
-                f"{family}: 载荷长度 {len(raw)} B ≠ {ATTACH_RANGE_BYTES} B"
+                f"{family}: 载荷长度 {len(raw)} B ≠ {expected_length} B"
                 "（8 个 float4：头部 + 单位阵 + X_f + 族索引）"
             )
             continue
@@ -3287,6 +4571,40 @@ def verify_attach_range_files(
                     f"(own={decoded.get('own_index')}, base={decoded.get('base_index')}) "
                     f"≠ 发布值 (own={want_own}, base={want_base})"
                 )
+        wanted_rows = sorted(
+            tuple(int(v) for v in row[:3]) for row in (borrow_map_rows(ranges, str(family)) or ())
+        )
+        map_path = os.path.join(folder, borrow_map_basename(family))
+        if not os.path.isfile(map_path):
+            problems.append(f"{family}: 借用表文件不存在（{map_path}）")
+        else:
+            try:
+                with open(map_path, "rb") as handle:
+                    map_raw = handle.read()
+            except OSError as exc:
+                problems.append(f"{family}: 借用表无法读取（{exc}）")
+                map_raw = b""
+            if map_raw:
+                want_length = BORROW_MAP_ROW_BYTES * max(1, len(wanted_rows))
+                if len(map_raw) != want_length:
+                    problems.append(
+                        f"{family}: 借用表长度 {len(map_raw)} B ≠ {want_length} B"
+                        f"（{max(1, len(wanted_rows))} 行 × {BORROW_MAP_ROW_BYTES} B）"
+                    )
+                else:
+                    got_rows = sorted(
+                        tuple(int(v) for v in row[:3])
+                        for row in decode_borrow_map_payload(map_raw)
+                    )
+                    if wanted_rows:
+                        if got_rows != wanted_rows:
+                            problems.append(
+                                f"{family}: 借用表 {got_rows} ≠ 排布算出的 {wanted_rows}"
+                            )
+                    elif got_rows != [(BORROW_MAP_EMPTY_SENTINEL, 0, 0)]:
+                        problems.append(
+                            f"{family}: 本族没有借用槽，但借用表不是一行空哨兵：{got_rows}"
+                        )
     total = 0
     for family, info in ranges.items():
         if int(dict(info or {}).get("slots", 0) or 0) <= 0:
@@ -3297,7 +4615,8 @@ def verify_attach_range_files(
             pass
     if total != expected_bytes:
         problems.append(
-            f"身份资源总字节数 {total} ≠ {counted} 族 × {ATTACH_RANGE_BYTES} B（= {expected_bytes}）"
+            f"身份资源总字节数 {total} ≠ 各族应有的总长 {expected_bytes}"
+            f"（{counted} 族 × {ATTACH_RANGE_BYTES} B）"
         )
     return problems
 

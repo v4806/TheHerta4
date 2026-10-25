@@ -1660,7 +1660,6 @@ class SSMTQuickExportSelected(_BackgroundExportMixin, bpy.types.Operator):
                 LOG.warning(f"   跳过 {skipped_count} 个已失效或非 Mesh 的选中对象")
             for obj in selected_meshes:
                 LOG.info(f"   - {self._safe_object_name(obj)}")
-
             temp_tree = self._build_temp_blueprint_tree(selected_meshes)
 
             round_plan = dict(QUICK_EXPORT_ROUND_PLAN)
@@ -1678,6 +1677,21 @@ class SSMTQuickExportSelected(_BackgroundExportMixin, bpy.types.Operator):
         except Exception as e:
             print(f"❌ 快速局部导出失败: {e}")
             LOG.exception(e)
+            # 失败栈落到 <插件根>/.dbg/last_export_error.txt：Blender 的信息面板只留一行，
+            # 用户贴回来的往往只有异常文案，没有调用链。`.dbg/` 是本地临时目录（.gitignore），
+            # 写盘失败不能盖掉原始错误，所以整段兜在 try 里。
+            try:
+                import traceback as _tb
+
+                _dump = os.path.join(
+                    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".dbg", "last_export_error.txt"
+                )
+                os.makedirs(os.path.dirname(_dump), exist_ok=True)
+                with open(_dump, "w", encoding="utf-8") as _handle:
+                    _handle.write(f"快速局部导出失败: {e!r}\n\n")
+                    _handle.write(_tb.format_exc())
+            except Exception:  # noqa: BLE001 - 诊断写盘失败不能盖掉原始错误
+                pass
             self.report({'ERROR'}, f"快速局部导出失败: {e}")
             return {'CANCELLED'}
         finally:

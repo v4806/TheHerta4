@@ -2022,15 +2022,22 @@ class HIMIExporterWiringTests(HIMIMergedRuntimeBase):
         self.assertEqual(verdicts["aaaa1111"]["verdict"], "global")
 
     def test_blend_namespace_local_blocks_the_rebind(self):
-        """mod 的 Blend 仍是局部编号 ⇒ 绝不能重绑 vs-t0（否则骨骼错位）。"""
+        """mod 的 Blend 仍是局部编号 ⇒ 绝不能重绑 vs-t0（否则骨骼错位）。
+
+        【t95】不重绑 **不等于** 不写槽：该族仍有专属块 ⇒ 本族 deform pass 必须照旧发
+        「捕获 palette → 捕获 cb3 → run attach」，否则骨架里那块槽恒零 ⇒ 索引到它的
+        顶点拿零矩阵（13:54 产物里 09c6e58a 的 165 个槽就是这样全空的）。
+        """
         self._workspace_with_two_parts()
         model = self._models(blend_rows="local")[0]
         exporter = self.make_exporter([model])
         builder = M_IniBuilder()
         exporter.add_unity_vs_texture_override_vb_sections(builder, model)
         text = "\n".join(_builder_lines(builder))
-        self.assertNotIn("vs-t0", text)
+        self.assertNotIn("vs-t0 = ", text, "判定 local ⇒ 不得重绑（重绑才叫错位）")
         self.assertIn("draw = 999, 0", text, "退回基类路径（保持与今天相同的渲染行为）")
+        self.assertIn("= copy vs-t0 unless_null", text, "本族 palette 捕获必须仍在")
+        self.assertIn("run = " + _runtime.attach_section_name("aaaa1111"), text)
         verdict = exporter.himi_blend_namespace_verdicts()["aaaa1111"]
         self.assertEqual(verdict["verdict"], "local")
         self.assertIn("局部", verdict["note"])
@@ -2062,6 +2069,11 @@ class HIMIExporterWiringTests(HIMIMergedRuntimeBase):
         )
 
     def test_vb_section_falls_back_on_blend_hash_mismatch(self):
+        """hash 与计划记录不一致 ⇒ 不重绑（风险落在「落到别的 pass」上），
+
+        但**该族块仍必须被写**：捕获行读的是这笔 pass 自己的 vs-t0，与重绑无关
+        （【t95】与 :meth:`ExportHIMI._himi_rebind_for` 解耦）。
+        """
         self._workspace_with_two_parts()
         model = self._models()[0]
         model.category_hash_dict["Blend"] = "deadbeef"
@@ -2069,8 +2081,10 @@ class HIMIExporterWiringTests(HIMIMergedRuntimeBase):
         builder = M_IniBuilder()
         exporter.add_unity_vs_texture_override_vb_sections(builder, model)
         text = "\n".join(_builder_lines(builder))
-        self.assertNotIn("vs-t0", text)
+        self.assertNotIn("vs-t0 = ", text)
         self.assertIn("draw = 999, 0", text, "hash 不一致必须退回基类的渲染 draw 数")
+        self.assertIn("= copy vs-t0 unless_null", text, "本族块仍要有人写")
+        self.assertIn("run = " + _runtime.attach_section_name("aaaa1111"), text)
 
     def test_vb_section_falls_back_when_family_incomplete(self):
         self._workspace_with_two_parts()
@@ -2167,18 +2181,49 @@ class HIMIExporterWiringTests(HIMIMergedRuntimeBase):
         # 声明与段的数量必须等于「有专属块的族数」（不多不少，也不给借位族发段）
         self.assertEqual(text.count("[ResourceHI3PaletteFam_"), len(wanted))
         self.assertEqual(text.count("[CustomShaderHI3MergedSkeletonAttach_"), len(wanted))
-        # 【t75】全部 `cs =` 指向同一个文件（防止回退成每族一份）
-        cs_values = sorted(
+        # 【t75】attach 段全部 `cs =` 指向同一个文件（防止回退成每族一份）；
+        # 【t94】蒙皮段是**另一个** CS（`himi_merged_skin.hlsl`，部署产物形态），
+        # 两族各用自己的、互不混用，也不得再出现逐族 `<fam>` 变体。
+        attach_cs_values = sorted(
             {
                 line.split("=", 1)[1].strip()
                 for line in lines
                 if re.match(r"^\s*cs\s*=", line)
+                and line.split("=", 1)[1].strip()
+                == _himi_exporter.MERGED_ATTACH_HLSL_PATH
             }
         )
         self.assertEqual(
-            cs_values,
+            attach_cs_values,
             [_himi_exporter.MERGED_ATTACH_HLSL_PATH],
-            "全部 `cs =` 必须唯一指向同一个 CS 文件",
+            "attach 段的 `cs =` 必须唯一指向 attach CS",
+        )
+        all_cs_values = {
+            line.split("=", 1)[1].strip()
+            for line in lines
+            if re.match(r"^\s*cs\s*=", line)
+        }
+        allowed_cs = {_himi_exporter.MERGED_ATTACH_HLSL_PATH}
+        skin_sections = [
+            name for name in wanted if f"[{_runtime.skin_section_name(name)}]" in text
+        ]
+        if skin_sections:
+            allowed_cs.add(_himi_exporter.MERGED_SKIN_HLSL_PATH)
+            for fam in skin_sections:
+                start = lines.index(f"[{_runtime.skin_section_name(fam)}]")
+                end = start + 1
+                while end < len(lines) and not lines[end].startswith("["):
+                    end += 1
+                skin = [line for line in lines[start:end] if re.match(r"^\s*cs\s*=", line)]
+                self.assertEqual(
+                    [line.split("=", 1)[1].strip() for line in skin],
+                    [_himi_exporter.MERGED_SKIN_HLSL_PATH],
+                    f"{fam}: 蒙皮段只能引用蒙皮 CS",
+                )
+        self.assertEqual(
+            all_cs_values,
+            allowed_cs,
+            "`cs =` 只允许 attach CS 与蒙皮 CS 两个文件，且不得出现逐族变体",
         )
         self.assertEqual(
             exporter.himi_attach_cs_paths(),
@@ -2294,6 +2339,36 @@ class HIMIExporterWiringTests(HIMIMergedRuntimeBase):
                 "run 必须紧贴在该笔 drawindexed **前一行**（幂等，且不得插到 if 之外）",
             )
         self.assertEqual(lines.count(attach), 4, "每笔 drawindexed 前各一次")
+
+    def test_ib_sections_never_inject_the_merged_skin_pass(self):
+        """【t100 回归】IB 段里**不得**出现带蒙皮的两行：``run = …MergedSkin_<fam>`` / ``vb0 = ResourceHI3SkinOut_<fam>``。
+
+        为什么（t100 实机事故，m01572）：``_himi_rebind_for`` 放行后 IB 段的 ``skin_entry``
+        变成非空 ⇒ 每笔 ``drawindexed`` 前多出「跑蒙皮 CS + 把 vb0 换成自建蒙皮输出」。
+        那条 CS（``Toolset/himi_merged_skin.hlsl``）编译失败会被 3DMigoto 静默跳过 ——
+        dispatch 照常记录、缓冲一个字节都不写 ⇒ 顶点塌到原点、物体消失且不报错
+        （t89 实机）。渲染侧唯一的职责是 ``cb3 捕获 + run attach``（t74 路线）。
+        """
+        self._workspace_with_two_parts()
+        model = self._models()[0]
+        model.submesh_ib_dict = {
+            str(submesh.unique_str): b"\x00\x00\x00\x00" for submesh in model.submesh_model_list
+        }
+        exporter = self.make_exporter([model])
+        helper = sys.modules[f"{PKG}.common.m_ini_helper"].M_IniHelper
+        original = helper.get_drawindexed_str_list
+        helper.get_drawindexed_str_list = lambda calls, obj_name_draw_offset_dict=None: [
+            "drawindexed = 30, 0, 0"
+        ]
+        self.addCleanup(setattr, helper, "get_drawindexed_str_list", original)
+        builder = M_IniBuilder()
+        exporter.add_unity_vs_texture_override_ib_sections(builder, model)
+        text = "\n".join(_builder_lines(builder))
+        family = str(model.draw_ib)
+        # 前提：本夹具确实走到了注入路径（attach 行存在），否则下面的断言恒真。
+        self.assertIn(f"run = CustomShaderHI3MergedSkeletonAttach_{family}", text)
+        self.assertNotIn("CustomShaderHI3MergedSkin_", text, "蒙皮 CS 不得被 run")
+        self.assertNotIn("ResourceHI3SkinOut_", text, "vb0 不得换成蒙皮输出")
 
     def test_ib_sections_are_untouched_without_rebind(self):
         """护栏（非恒真）：不通过 G1 的 DrawIB 的 IB 段**逐字**等于基类产物（不插 run）。"""
@@ -3854,7 +3929,7 @@ class HIMIMergedAttachCsTests(unittest.TestCase):
         good = _himi_exporter.merged_attach_hlsl_text()
         self.assertEqual(_himi_exporter.merged_attach_hlsl_problems(good), [])
         # 删掉基址表首行（程序化定位，不靠字面替换）
-        first_row = _himi_exporter.MERGED_ATTACH_BASE_TABLE_LINES[0]
+        first_row = _himi_exporter.MERGED_ATTACH_BASE_TABLE_SAMPLE_LINES[0]
         self.assertIn(first_row, good, "夹具前提：基址表首行必须逐字在文本里")
         dropped_row = good.replace(first_row + "\n", "", 1)
         self.assertNotEqual(dropped_row, good, "夹具前提：替换必须真的删掉一行")
@@ -4042,12 +4117,15 @@ class HIMIMergedAttachCsTests(unittest.TestCase):
                 self.assertEqual(len(references), 5, references)
                 self.assertTrue(all("ResourceHI3AttachRange_" in item for item in references))
 
-                # ---- B 态（反例①）：身份资源一个都还没落盘 ⇒ 5 条全报「不存在」----
+                # ---- B 态（反例①）：身份资源一个都还没落盘 ⇒ 每族 2 条全报「不存在」
+                # （【t91】每族除身份载荷外还有一份 BorrowMap，硬门两样都查 ⇒ 5 族 × 2 = 10）
                 problems = exporter._himi_enforce_attach_range_references(ini_path)
-                self.assertEqual(len(problems), 5, problems)
+                self.assertEqual(len(problems), 10, problems)
                 self.assertTrue(all("引用的文件不存在" in item for item in problems), problems)
                 self.assertTrue(
-                    all("AttachRange.buf" in item for item in problems),
+                    all(
+                        "AttachRange.buf" in item or "BorrowMap.buf" in item for item in problems
+                    ),
                     f"每条都必须指名缺哪个族的文件：{problems}",
                 )
                 # 【t73·兜底原则】不再是 Fatal ⇒ 降级为普通导出 + 大声警告。
@@ -4062,7 +4140,8 @@ class HIMIMergedAttachCsTests(unittest.TestCase):
                 clean = self._exporter_with_plan(root)
                 published = clean._himi_publish_attach_ranges(plan, "Meshes")
                 self.assertTrue(published["ok"], published)
-                self.assertEqual(len(published["files"]), 5, published)
+                # 每族 2 份：身份载荷 + BorrowMap（【t91】借用表与身份资源同目录同批写出）
+                self.assertEqual(len(published["files"]), 10, published)
                 self.assertEqual(clean._himi_enforce_attach_range_references(ini_path), [])
                 clean._himi_raise_for_attach_range_references(ini_path)
                 self.assertFalse(clean.himi_degraded_to_ordinary(), "正例不得降级")
@@ -4436,7 +4515,7 @@ class HIMIAttachRangeIdentityTests(unittest.TestCase):
         self.assertFalse([line for line in lines if line.startswith("stride")], lines)
 
     def test_publish_writes_every_own_block_family_and_is_idempotent(self):
-        """落盘必须**每族一份**、内容 = 本次 plan，且第二次不重写（幂等）。"""
+        """落盘必须**每族一份**、内容 = 本次 plan；第二次内容相同时**仍要重写**（刷 mtime）。"""
         ranges = {
             family: {"base": base, "slots": span, "own_block": True}
             for family, (base, span) in self.REAL_RANGES.items()
@@ -4445,19 +4524,40 @@ class HIMIAttachRangeIdentityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="himi_attach_range_") as folder:
             result = _runtime.publish_attach_ranges(ranges, folder)
             self.assertTrue(result["ok"], result)
-            self.assertEqual(len(result["files"]), len(self.REAL_RANGES))
+            # 每族 2 份：`-AttachRange.buf`（恒 128 B）+ `-BorrowMap.buf`（【t91】借用表，
+            # 没有借用槽的族写一行哨兵）——两者同批落盘，缺一样就是产物不自洽。
+            self.assertEqual(len(result["files"]), 2 * len(self.REAL_RANGES))
             self.assertEqual(
                 sorted(os.listdir(folder)),
-                sorted(_runtime.attach_range_basename(fam) for fam in self.REAL_RANGES),
-                "借位族（slots=0）不得发身份资源",
+                sorted(
+                    [(_runtime.attach_range_basename(fam)) for fam in self.REAL_RANGES]
+                    + [(_runtime.borrow_map_basename(fam)) for fam in self.REAL_RANGES]
+                ),
+                "借位族（slots=0）不得发身份资源，也不得发借用表",
             )
             for family, (base, span) in self.REAL_RANGES.items():
                 with io.open(os.path.join(folder, _runtime.attach_range_basename(family)), "rb") as handle:
                     decoded = _runtime.decode_attach_range_payload(handle.read())
                 self.assertEqual((decoded["base"], decoded["span"]), (base, span), family)
+            before_mtime = {
+                family: os.stat(os.path.join(folder, _runtime.attach_range_basename(family))).st_mtime_ns
+                for family in self.REAL_RANGES
+            }
             again = _runtime.publish_attach_ranges(ranges, folder)
             self.assertTrue(again["ok"])
-            self.assertFalse(again["written"], "内容一致时不得重写（幂等）")
+            # 【t39-X 校准】每次导出都**无条件重写**身份资源（旧实现内容一致就跳过写盘，
+            # 产物里出现过「AttachRange 的 mtime 停在上一次场景」的可观测证据）。
+            self.assertTrue(again["written"], "每次导出都要重写身份资源（不允许按内容相同跳过）")
+            self.assertEqual(again["rewritten"], 0, "内容一致 ⇒ rewritten 记 0（只是重刷，不是变了）")
+            for family, (base, span) in self.REAL_RANGES.items():
+                path = os.path.join(folder, _runtime.attach_range_basename(family))
+                with io.open(path, "rb") as handle:
+                    decoded = _runtime.decode_attach_range_payload(handle.read())
+                self.assertEqual((decoded["base"], decoded["span"]), (base, span), family)
+                self.assertGreaterEqual(
+                    os.stat(path).st_mtime_ns, before_mtime[family],
+                    "重写必须刷新 mtime（否则产物又可能比场景旧）",
+                )
 
     def test_span_bound_truncates_and_never_spills_into_the_next_block_TWO_STATE(self):
         """**两态**：副本维度大于/错配本族 span 时，新逻辑截断或拒写，旧逻辑溢出到下一族。
@@ -4557,7 +4657,12 @@ class HIMIAttachRangeIdentityTests(unittest.TestCase):
 
 
 class HIMIBaseTableGateTests(unittest.TestCase):
-    """【F6】冻结基址表 vs 动态 plan：**矛盾**必须 Fatal，其余必须大声诊断（不静默）。"""
+    """【F6】基址表 ← 本次 ``plan.family_ranges``（唯一权威来源）：矛盾必须 Fatal，其余大声诊断。
+
+    表不再是常量：``merged_attach_base_table_lines(ranges)`` 按 plan 生成，导出侧渲染的就是
+    这一份。于是这道门抓的是生成器层面的**结构性残余** —— 两个族的**源槽位数相同**（运行期
+    只按源槽位数查表 ⇒ 两族撞同一个槽块），以及 ∑span ≠ 槽位数这类诊断。
+    """
 
     REAL_RANGES = {
         "2c706fbd": {"base": 0, "slots": 184, "own_block": True},
@@ -4572,7 +4677,13 @@ class HIMIBaseTableGateTests(unittest.TestCase):
         self.assertEqual(
             sorted((slots, base) for slots, base, _family in rows),
             sorted((info["slots"], info["base"]) for info in self.REAL_RANGES.values()),
-            "冻结表必须逐行等于真实五族的 (span, base)",
+            "参考样例必须逐行等于参考角色的真实五族 (span, base)",
+        )
+        # 样本常量是**生成器算出来的**（不是手写）⇒ 与本角色真实排布生成的表逐字一致
+        self.assertEqual(
+            list(_himi_exporter.MERGED_ATTACH_BASE_TABLE_SAMPLE_LINES),
+            _himi_exporter.merged_attach_base_table_lines(self.REAL_RANGES),
+            "样本表必须与「按真实排布生成」逐字相同（注释里的族 ID 也是）",
         )
 
     def test_audit_is_clean_on_the_real_layout_and_matches_the_export_gate(self):
@@ -4588,49 +4699,114 @@ class HIMIBaseTableGateTests(unittest.TestCase):
         exporter.drawib_model_list = []
         exporter._himi_verify_base_table_against_plan(plan)  # 不抛 = 通过
 
-    def test_span_change_that_contradicts_the_table_must_be_fatal_TWO_STATE(self):
-        """**两态（F6 的硬门）**：同一 span 在表里映射到别的 base ⇒ 导出期 Fatal。"""
-        Fatal = sys.modules[f"{PKG}.utils.format_utils"].Fatal
-        plan = types.SimpleNamespace(
-            family_ranges=dict(self.REAL_RANGES), slot_count=343
+    def test_generated_table_carries_this_roles_layout_not_the_reference_one(self):
+        """**本任务的回归点**：本角色 ``077983c9`` 的 span 也是 51，但基址是 0。
+
+        表由 plan 生成 ⇒ 渲染出的是 ``51→0 / 165→51 / 1→216``，绝不是参考角色那份
+        （``51→292``，那会让运行期 ``base_slot != identity_base`` 整族拒写、导出期 F6 Fatal）。
+        """
+        ranges = {
+            "077983c9": {"base": 0, "slots": 51, "own_block": True},
+            "09c6e58a": {"base": 51, "slots": 165, "own_block": True},
+            "1b62725d": {"base": 216, "slots": 1, "own_block": True},
+        }
+        lines = _himi_exporter.merged_attach_base_table_lines(ranges)
+        self.assertEqual(
+            lines,
+            [
+                "    if (source_slots == 51u) { base_slot = 0u; }          // 077983c9",
+                "    else if (source_slots == 165u) { base_slot = 51u; }   // 09c6e58a",
+                "    else if (source_slots == 1u) { base_slot = 216u; }    // 1b62725d",
+            ],
         )
+        text = _himi_exporter.merged_attach_hlsl_text(ranges=ranges)
+        self.assertEqual(
+            _himi_exporter.merged_attach_base_table_lines_in_text(text), lines
+        )
+        self.assertEqual(_himi_exporter.merged_attach_hlsl_problems(text), [])
+        self.assertNotIn("292", "".join(lines), "不得残留参考角色的基址")
+
+    def test_borrowed_family_does_not_get_a_row(self):
+        """借位族（``own_block`` 假 / span 0）没有自己的槽块 ⇒ 不得进表。"""
+        ranges = dict(self.REAL_RANGES)
+        ranges["0000beef"] = {"base": 0, "slots": 0, "own_block": False}
+        lines = _himi_exporter.merged_attach_base_table_lines(ranges)
+        self.assertEqual(len(lines), 5)
+        self.assertFalse(any("0000beef" in line for line in lines))
+
+    def test_two_families_with_the_same_source_span_must_be_fatal_TWO_STATE(self):
+        """**两态**：两族源槽位数相同 ⇒ 运行期撞同一个槽块 ⇒ 导出期必须 Fatal。
+
+        这是表改由 plan 生成之后 F6 唯一还能抓到的**真矛盾**（同 span 不同 base 已经不可能
+        出现：那一行只有一个 base）。两族各写 51 个槽到同一段地址 ⇒ 后写的覆盖先写的。
+        """
+        Fatal = sys.modules[f"{PKG}.utils.format_utils"].Fatal
         blueprint_model = types.SimpleNamespace(
             keyname_mkey_dict={}, ordered_draw_obj_data_model_list=[]
         )
         exporter = ExportHIMI(blueprint_model)
         exporter.drawib_model_list = []
-        # A 态：真实排布 ⇒ 不抛（下面走的就是导出侧的真调用点，没有替身）
+        # A 态：真实排布 ⇒ 不抛（走导出侧真调用点，没有替身）
+        plan = types.SimpleNamespace(family_ranges=dict(self.REAL_RANGES), slot_count=343)
         exporter._himi_verify_base_table_against_plan(plan)
-        # B 态：工作空间重建后 18 槽那一族的基址变成 300（表仍写 184）⇒ 直接矛盾
-        shifted = {
-            family: dict(info) for family, info in self.REAL_RANGES.items()
+        # B 态：新角色里两族都恰好 64 槽 ⇒ 同 span 撞车
+        clashed = {
+            "aaaa0001": {"base": 0, "slots": 64, "own_block": True},
+            "aaaa0002": {"base": 64, "slots": 64, "own_block": True},
         }
-        shifted["694025c6"] = {"base": 300, "slots": 18, "own_block": True}
-        plan_b = types.SimpleNamespace(family_ranges=shifted, slot_count=343)
+        plan_b = types.SimpleNamespace(family_ranges=clashed, slot_count=128)
         with self.assertRaises(Fatal) as caught:
             exporter._himi_verify_base_table_against_plan(plan_b)
-        self.assertIn("直接矛盾", str(caught.exception))
-        self.assertIn("694025c6", str(caught.exception))
+        self.assertIn("重复的源槽位数 64", str(caught.exception))
         # 还原 ⇒ 又必须不抛（两态都能反复观测）
         exporter._himi_verify_base_table_against_plan(plan)
 
-    def test_new_span_is_a_loud_notice_not_a_fatal(self):
-        """**两态（F6 的第二态）**：plan 出现表里没有的 span ⇒ 诊断（不是 Fatal）。
+    def test_foreign_reference_table_against_this_role_is_fatal_TWO_STATE(self):
+        """审计一张**外来的**表（参考角色那份）对上本角色排布 ⇒ 真矛盾（这正是历史 bug）。
 
-        为什么不是 Fatal：t4/F5 起运行期的 base/span 来自身份资源（本次 plan 生成），
-        「表不认识这一族」不再等于「一根骨都不写」；把它当 Fatal 会让 HIMI 只对当前角色可用。
+        导出路径已经不可能产出这种组合（表由 plan 生成）；这条守的是审计函数本身：给它一张
+        陈旧表时它必须真判红（否则 F6 是恒真的摆设）。
+        """
+        stale = list(_himi_exporter.MERGED_ATTACH_BASE_TABLE_SAMPLE_LINES)
+        this_role = {
+            "077983c9": {"base": 0, "slots": 51, "own_block": True},
+            "09c6e58a": {"base": 51, "slots": 165, "own_block": True},
+            "1b62725d": {"base": 216, "slots": 1, "own_block": True},
+        }
+        audit = _himi_exporter.merged_attach_base_table_audit(
+            this_role, 219, table_lines=stale
+        )
+        self.assertTrue(audit["problems"], "外部陈旧表 vs 本族排布必须报矛盾")
+        self.assertTrue(
+            any("077983c9" in line and "292" in line for line in audit["problems"]),
+            audit["problems"],
+        )
+        # 同一张表对**参考排布**则必须干净（否则判据会把对的也判错）
+        self.assertEqual(
+            _himi_exporter.merged_attach_base_table_audit(
+                self.REAL_RANGES, 343, table_lines=stale
+            )["problems"],
+            [],
+        )
+
+    def test_new_span_is_a_loud_notice_not_a_fatal(self):
+        """**两态（F6 的第二态）**：外来表里没有 plan 的新 span ⇒ 诊断（不是 Fatal）。
+
+        为什么不是 Fatal：运行期的 base/span 来自身份资源（本次 plan 生成），「表不认识这一族」
+        不等于「一根骨都不写」；导出侧的表本来就是按 plan 生成的，换角色不会命中这条。
         """
         Fatal = sys.modules[f"{PKG}.utils.format_utils"].Fatal
-        ranges = {
-            family: dict(info) for family, info in self.REAL_RANGES.items()
-        }
+        ranges = {family: dict(info) for family, info in self.REAL_RANGES.items()}
         ranges["9999abcd"] = {"base": 343, "slots": 40, "own_block": True}
-        audit = _himi_exporter.merged_attach_base_table_audit(ranges, 383)
-        self.assertEqual(audit["problems"], [], "换角色的新 span 不得被当成矛盾")
+        audit = _himi_exporter.merged_attach_base_table_audit(
+            ranges, 383, table_lines=_himi_exporter.MERGED_ATTACH_BASE_TABLE_SAMPLE_LINES
+        )
+        self.assertEqual(audit["problems"], [], "换个角色不得被当成矛盾")
         self.assertTrue(
             any("9999abcd" in line for line in audit["notices"]),
             f"必须写出诊断（不得静默）：{audit['notices']}",
         )
+        # 导出侧：表按 plan 生成 ⇒ 这个新族**有**自己的一行，gate 不抛也不该报缺
         plan = types.SimpleNamespace(family_ranges=ranges, slot_count=383)
         blueprint_model = types.SimpleNamespace(
             keyname_mkey_dict={}, ordered_draw_obj_data_model_list=[]
@@ -6298,8 +6474,599 @@ class HIMINearestFamilyTieTests(unittest.TestCase):
             )
 
 
+class HIMIBorrowLayoutBaselineTests(unittest.TestCase):
+    """【t93】跨族借用骨骼的专用槽：**块尾追加**布局 + 借用表 + 身份资源 + 基址表的基准复算。
+
+    基准 = 已实机验证通过的那份手改产物（一个角色，3 族；原布局 219 槽 → 新布局 223 槽）：
+
+    ==== ===== ==== ==== ============
+    族    base  span 块长 块尾借用槽
+    ==== ===== ==== ==== ============
+    077…  0     51   55   51/52/53/54
+    09c…  55    165  166  220
+    1b6…  221   1    2    222
+    ==== ===== ==== ==== ============
+
+    这一组全部走**纯函数**（不抓帧、不读 K: 产物）：布局 → 借用行 → 借用表字节 →
+    身份载荷 → 基址表 → Blend 重映射表，逐项与实测值对齐。反向用例覆盖第 5 条校验钩子
+    （块重叠 / 目标槽越界 / 源局部槽越界 / 源族序号非法 / 未映射通道 / 块外索引）。
+    """
+
+    FAMILIES = ("077983c9", "09c6e58a", "1b62725d")
+    #: 原布局：（base, span）
+    OWN = {"077983c9": (0, 51), "09c6e58a": (51, 165), "1b62725d": (216, 1)}
+    #: 实测：每族顶点**实际引用**到的全局骨号（块外那些 = 借用）
+    REFS = {
+        "077983c9": tuple(range(0, 51)) + (51, 146, 147, 216),
+        "09c6e58a": tuple(range(51, 216)) + (0,),
+        "1b62725d": (216, 0),
+    }
+    #: 新布局：（base, span, block_slots）
+    NEW = {"077983c9": (0, 51, 55), "09c6e58a": (55, 165, 166), "1b62725d": (221, 1, 2)}
+    #: 实测借用行：（目标槽, 来源族序号 rank, 来源族**局部**槽）
+    BORROW_ROWS = {
+        "077983c9": [(51, 1, 0), (52, 1, 95), (53, 1, 96), (54, 2, 0)],
+        "09c6e58a": [(220, 0, 0)],
+        "1b62725d": [(222, 0, 0)],
+    }
+    TOTAL = 223
+
+    # -- 构造 -------------------------------------------------------------- #
+
+    @classmethod
+    def parts(cls):
+        return [
+            _runtime.HIMIRebindPart(
+                bare=f"{family}-1-0",
+                draw_ib=family,
+                slot_values=tuple(range(base, base + span)),
+                referenced_slots=cls.REFS[family],
+            )
+            for family, (base, span) in cls.OWN.items()
+        ]
+
+    def ranges(self):
+        return _runtime.compute_family_ranges(
+            self.parts(), 219, complete=False, borrowed_slots=self.REFS
+        )
+
+    # -- 布局 -------------------------------------------------------------- #
+
+    def test_layout_appends_borrow_slots_at_block_tail(self):
+        """块 = 自己的注册槽（原顺序）+ 块尾借用槽；总槽数由新布局决定。"""
+        ranges = self.ranges()
+        for family, (base, span, block) in self.NEW.items():
+            info = dict(ranges[family])
+            self.assertEqual(
+                (info["base"], info["slots"], info["block_slots"], info["own_base"]),
+                (base, span, block, self.OWN[family][0]),
+                f"{family}: 新块基址/自有 span/块长/原基址必须与实测一致",
+            )
+            self.assertTrue(info["own_block"], f"{family}: 有注册槽的族必须有专属块")
+            self.assertEqual(
+                len(info["borrow"]), block - span, f"{family}: 块尾槽数 = 借用行数"
+            )
+        self.assertEqual(_runtime.ranges_slot_count(ranges), self.TOTAL)
+        self.assertEqual(
+            _runtime.family_block_slots(ranges), set(range(self.TOTAL)),
+            "每槽恰有一个写方：块（含块尾借用槽）铺满整个新骨架",
+        )
+        self.assertEqual(
+            sum(int(dict(info)["block_slots"]) for info in ranges.values()),
+            self.TOTAL,
+            "各块首尾相接、铺满新骨架（借用槽不另开区间）",
+        )
+        self.assertEqual(
+            [dict(ranges[name])["family_index"] for name in self.FAMILIES], [0, 1, 2],
+            "rank = 族按 base 升序的序号",
+        )
+
+    def test_borrow_targets_ranks_and_source_local_slots(self):
+        """借用行：目标槽在块尾、rank 指向来源族、第三分量是来源族的**局部**槽。"""
+        rows_by_family = _runtime.borrow_map_rows_by_family(self.ranges())
+        self.assertEqual(
+            {family: list(rows) for family, rows in rows_by_family.items()},
+            self.BORROW_ROWS,
+            "目标槽 / rank / 源局部槽必须与实测借用表一致",
+        )
+
+    def test_borrow_map_payload_and_decl(self):
+        """借用表字节：每行 ``<4I`` = (目标槽, rank, 源局部槽, 0)；空表一行哨兵。"""
+        ranges = self.ranges()
+        for family, rows in self.BORROW_ROWS.items():
+            payload = _runtime.borrow_map_payload(rows)
+            self.assertEqual(len(payload), len(rows) * _runtime.BORROW_MAP_ROW_BYTES)
+            decoded = [
+                struct.unpack_from("<4I", payload, index * 16) for index in range(len(rows))
+            ]
+            self.assertEqual(decoded, [tuple(row) + (0,) for row in rows])
+            decl = _runtime.build_borrow_map_decl(family, len(rows))
+            self.assertEqual(decl.name, f"ResourceHI3BorrowMap_{family}")
+            self.assertEqual(int(decl.array), len(rows), f"{family}: ini array = 该族行数")
+            self.assertEqual(int(decl.stride), _runtime.BORROW_MAP_STRIDE)
+        empty = _runtime.borrow_map_payload(())
+        self.assertEqual(
+            struct.unpack("<4I", empty),
+            (_runtime.BORROW_MAP_EMPTY_SENTINEL, 0, 0, 0),
+            "没有借用的族必须写一行哨兵（文件永远存在，ini 的 filename 不会指空）",
+        )
+        self.assertEqual(ranges["1b62725d"]["slots"], 1, "1b6 只有 1 个自有槽")
+
+    def test_source_palette_binding_follows_base_order(self):
+        """rank → cs-tN + palette 别名：0→t2、1→t3、2→t5（t4 给借用表、t0 本族、t1 身份）。"""
+        ranges = self.ranges()
+        self.assertEqual(_runtime.borrow_palette_families(ranges), list(self.FAMILIES))
+        expected = [(0, "a", "t2"), (1, "b", "t3"), (2, "c", "t5")]
+        for rank, suffix, register in expected:
+            self.assertEqual(_runtime.borrow_palette_hlsl_name(rank), f"himi_borrow_palette_{suffix}")
+            self.assertEqual(_runtime.borrow_palette_register(rank), register)
+
+    def test_attach_range_payload_keeps_identity_encoding(self):
+        """身份载荷：``[0]`` 是 **uint 位** (base, span, version, magic)，``[7]`` 是物体矩阵表序号。"""
+        ranges = self.ranges()
+        for index, family in enumerate(self.FAMILIES):
+            info = dict(ranges[family])
+            payload = _runtime.attach_range_payload(
+                int(info["base"]), int(info["slots"]), indices=(index, index)
+            )
+            self.assertEqual(len(payload), _runtime.ATTACH_RANGE_BYTES)
+            self.assertEqual(
+                struct.unpack_from("<4I", payload, 0),
+                (
+                    int(info["base"]),
+                    int(info["slots"]),
+                    _runtime.ATTACH_RANGE_VERSION,
+                    _runtime.ATTACH_RANGE_MAGIC,
+                ),
+                f"{family}: 魔数必须是整型位（写成 float 会让 CS 的 identity 门整族拒写）",
+            )
+            self.assertEqual(
+                struct.unpack_from("<4I", payload, _runtime.ATTACH_RANGE_INDICES_OFFSET),
+                (index, index, 0, 0),
+                f"{family}: [7] = (本族序号, 宿主族序号) —— 是**表序号**，不是新基址",
+            )
+            self.assertEqual(
+                struct.unpack_from("<4f", payload, 16), (1.0, 0.0, 0.0, 0.0),
+                "[1..3] 方案 B 恒为单位阵",
+            )
+
+    def test_base_table_is_generated_from_the_new_layout(self):
+        """冻结基址表的键是**源族 span**、值是**新基址**（旧 0/51/216 必须全被替换）。"""
+        ranges = self.ranges()
+        lines = _himi_exporter.merged_attach_base_table_lines(ranges)
+        table = {}
+        for line in lines:
+            match = re.search(r"source_slots == (\d+)u\)[^{]*\{ base_slot = (\d+)u;", line)
+            if match:
+                table[int(match.group(1))] = int(match.group(2))
+        self.assertEqual(
+            table,
+            {51: 0, 165: 55, 1: 221},
+            "表行必须由这份布局生成（键 = 源族 span，值 = 新基址）",
+        )
+        self.assertEqual(
+            _himi_exporter.merged_attach_base_table_audit(ranges, self.TOTAL)["problems"], []
+        )
+
+    def test_blend_slot_map_points_borrows_at_the_block_tail(self):
+        """Blend 重映射：本族槽搬到新基址、跨族借用槽落到本族块尾。"""
+        table = _runtime.family_slot_map(self.ranges())
+        self.assertEqual(
+            {slot: table["077983c9"][slot] for slot in (0, 50, 51, 146, 147, 216)},
+            {0: 0, 50: 50, 51: 51, 146: 52, 147: 53, 216: 54},
+            "077：自有槽原位（base 0），借 09c 的 0/95/96 与 1b6 的 0 落在块尾",
+        )
+        self.assertEqual(
+            {slot: table["09c6e58a"][slot] for slot in (51, 215, 0)},
+            {51: 55, 215: 219, 0: 220},
+            "09c：自有块搬 55 起，借 077 的槽 0 落在块尾 220",
+        )
+        self.assertEqual(
+            table["1b62725d"], {216: 221, 0: 222}, "1b6：自有槽 216→221，借 077 的 0→222"
+        )
+
+    def test_layout_is_unchanged_without_borrows(self):
+        """没有借用时一个字段都不改（= 今天导出的非合并/无借用布局逐字节等价）。
+
+        注意槽数取 **217**：原布局 219 槽里有 2 个（217/218）不属于这三族 —— 那是 t91
+        时代「全骨架尾部借用区」的残留。无借用复算只关心「三族注册槽首尾相接」这一条，
+        所以这里按 217 起算；带借用那份的 223 槽是独立的（由 reference 集推出）。
+        """
+        plain = _runtime.compute_family_ranges(self.parts(), 217, complete=True)
+        self.assertEqual(
+            plain,
+            {
+                family: {"base": base, "slots": span, "own_block": True}
+                for family, (base, span) in self.OWN.items()
+            },
+            "无借用 ⇒ 区间 / 槽数 / 键集与旧排布完全一致（没有 block_slots/borrow 这些新键）",
+        )
+        self.assertEqual(_runtime.ranges_slot_count(plain), 217)
+        self.assertEqual(
+            _runtime.family_block_slots(plain), set(range(217)), "无借用的块 = 注册槽本身"
+        )
+        self.assertEqual(
+            {family: list(rows) for family, rows in _runtime.borrow_map_rows_by_family(plain).items()},
+            {family: [] for family in self.OWN},
+        )
+        self.assertEqual(
+            _himi_exporter.merged_attach_base_table_lines(plain),
+            _himi_exporter.merged_attach_base_table_lines(
+                _runtime.compute_family_ranges(self.parts(), 217, complete=True)
+            ),
+        )
+
+    # -- 校验钩子（第 5 条：导出期必须能失败得响） ------------------------- #
+
+    def test_borrow_map_gate_rejects_bad_rows(self):
+        """借用表判据：目标槽必须在块尾、rank 合法且非本族、源局部槽 < 源族 span。"""
+        ranges = self.ranges()
+        good = _runtime.borrow_map_rows_by_family(ranges)
+        self.assertEqual(_runtime.borrow_map_layout_problems(ranges, good), [])
+
+        inside_span = dict(good)
+        inside_span["077983c9"] = [(50, 1, 0)]           # 落在自己的 span 里 ⇒ 覆盖自有槽
+        self.assertTrue(_runtime.borrow_map_layout_problems(ranges, inside_span))
+
+        self_target = dict(good)
+        self_target["09c6e58a"] = [(223, 0, 0)]          # 目标槽 = 总槽数 ⇒ 越界
+        self.assertTrue(_runtime.borrow_map_layout_problems(ranges, self_target))
+
+        bad_local = dict(good)
+        bad_local["077983c9"] = [(51, 1, 165)]           # 09c 只有 165 个局部槽 [0,165)
+        self.assertTrue(_runtime.borrow_map_layout_problems(ranges, bad_local))
+
+        bad_rank = dict(good)
+        bad_rank["1b62725d"] = [(222, 3, 0)]             # 只有 3 个族
+        self.assertTrue(_runtime.borrow_map_layout_problems(ranges, bad_rank))
+
+        self_rank = dict(good)
+        self_rank["1b62725d"] = [(222, 2, 0)]            # 借自己
+        self.assertTrue(_runtime.borrow_map_layout_problems(ranges, self_rank))
+
+    def test_attach_range_gate_rejects_overlap_and_overflow(self):
+        """身份资源判据：块两两不重叠、不越出总槽数（借用槽算在块长里）。"""
+        ranges = self.ranges()
+        self.assertEqual(
+            _runtime.attach_range_layout_problems(ranges, skeleton_slots=self.TOTAL), []
+        )
+        self.assertTrue(
+            _runtime.attach_range_layout_problems(ranges, skeleton_slots=self.TOTAL - 1),
+            "少给一槽 ⇒ 最后一块越界必须判红",
+        )
+        overlap = {family: dict(info) for family, info in ranges.items()}
+        overlap["09c6e58a"]["base"] = 54                 # 与 077 的块尾 [51,55) 重叠
+        self.assertTrue(_runtime.attach_range_layout_problems(overlap, skeleton_slots=self.TOTAL))
+
+    def test_remap_gate_rejects_unmapped_and_out_of_block(self):
+        """重映射判据：未映射通道数必须为 0，且每个索引都落在本族块内。"""
+        ranges = self.ranges()
+        clean = {"077983c9": {0, 50, 51, 52, 53, 54}, "1b62725d": {221, 222}}
+        self.assertEqual(
+            _runtime.borrow_blend_remap_problems({"unmapped": 0}, clean, ranges), []
+        )
+        leftover = _runtime.borrow_blend_remap_problems({"unmapped": 3}, clean, ranges)
+        self.assertEqual(len(leftover), 1)
+        self.assertIn("3 个通道", leftover[0])
+        stray = _runtime.borrow_blend_remap_problems(
+            {"unmapped": 0}, {"077983c9": {0, 55, 220}}, ranges
+        )
+        self.assertEqual(len(stray), 1)
+        self.assertIn("本族块 [0,55)", stray[0])
+        self.assertIn("55", stray[0])
+
+    def test_publish_writes_one_borrow_map_per_family(self):
+        """落盘：每族一张借用表（空表 1 行哨兵）+ 128 B 身份资源；行数 = 该族借用槽数。"""
+        ranges = self.ranges()
+        with tempfile.TemporaryDirectory() as folder:
+            result = _runtime.publish_attach_ranges(
+                ranges, folder, skeleton_slots=self.TOTAL
+            )
+            self.assertTrue(result["ok"], result.get("message"))
+            self.assertEqual(
+                {item["family"]: item["rows"] for item in result["borrow_maps"]},
+                {family: len(rows) for family, rows in self.BORROW_ROWS.items()},
+                "每族行数 = 借用槽数（ini 的 array 就按这个数声明）",
+            )
+            for family, rows in self.BORROW_ROWS.items():
+                path = os.path.join(folder, _runtime.borrow_map_basename(family))
+                with open(path, "rb") as handle:
+                    blob = handle.read()
+                self.assertEqual(blob, _runtime.borrow_map_payload(rows), f"{family}: 字节必须可复现")
+                self.assertEqual(len(blob) // _runtime.BORROW_MAP_ROW_BYTES, len(rows))
+            for family in self.FAMILIES:
+                path = os.path.join(folder, _runtime.attach_range_basename(family))
+                self.assertEqual(os.path.getsize(path), _runtime.ATTACH_RANGE_BYTES)
+
+    def test_validation_hooks_have_no_false_positive_on_baseline(self):
+        """基准布局必须一次过全部门（否则导出期会 Fatal）。"""
+        ranges = self.ranges()
+        self.assertEqual(
+            _runtime.borrow_map_layout_problems(ranges, _runtime.borrow_map_rows_by_family(ranges)),
+            [],
+        )
+        self.assertEqual(
+            _runtime.attach_range_layout_problems(ranges, skeleton_slots=self.TOTAL), []
+        )
+        decl = _runtime.build_merged_skeleton_decl("role_06c391d0", self.TOTAL)
+        self.assertEqual(int(decl.array), self.TOTAL * 3, "合并骨架 array = 槽数 × 3")
+        self.assertEqual(int(decl.slots), self.TOTAL)
+
+
 def himi_runtime_skeleton_name_placeholder() -> str:
     """占位（避免在测试里硬编码骨架资源名）。"""
     return "uint dst = target_slot * 3u;"
 
 
+
+# --------------------------------------------------------------------------- #
+# 【t95】局部骨骼编号回基址：与借用布局解耦
+# --------------------------------------------------------------------------- #
+
+
+class HIMILocalIndexRebaseTests(HIMIMergedRuntimeBase):
+    """块基址 > 0 的族，Blend 里写的是**局部**编号时必须加回基址。
+
+    为什么单列一个类：这是 13:54 产物「模型爆炸」的主因 —— ``09c6e58a`` 的块基址是 51，
+    它的 Blend 里却写着局部 0..164（93.93% 的行），而合并骨架被宿主族绑上去之后，
+    这些顶点就按槽 0..164 查到了别人的骨。
+    """
+
+    def _two_family_workspace(self):
+        return _make_workspace(
+            self.workspace,
+            "RoleA",
+            [
+                {
+                    "bare": "aaaa1111-1-0",
+                    "draw_ib": "aaaa1111",
+                    "vg_count": 4,
+                    "original_vertex_count": 8,
+                    "family_members": ["aaaa1111-1-0"],
+                    "vg_map": {str(index): index for index in range(4)},
+                    "rows": 1,
+                    "local_indices": [[0, 1, 2, 3]],
+                },
+                {
+                    "bare": "bbbb2222-1-0",
+                    "draw_ib": "bbbb2222",
+                    "vg_count": 4,
+                    "original_vertex_count": 4,
+                    "family_members": ["bbbb2222-1-0"],
+                    "vg_map": {str(index): index + 4 for index in range(4)},
+                    "rows": 1,
+                    "local_indices": [[0, 1, 2, 3]],
+                },
+            ],
+            slot_count=SLOT_COUNT,
+        )
+
+    @staticmethod
+    def _numpy_blend(rows, *, all_weights: bool = False):
+        """Blend 记录：默认只让通道 0 有权重；``all_weights`` 时 4 个通道各 0.25。"""
+        import numpy
+        import struct
+
+        weights = (0.25, 0.25, 0.25, 0.25) if all_weights else (1.0, 0.0, 0.0, 0.0)
+        payload = bytearray()
+        for indices in rows:
+            payload += struct.pack("<4f", *weights)
+            payload += struct.pack("<4i", *list(indices)[:4])
+        return numpy.frombuffer(bytes(payload), dtype=numpy.uint8).copy()
+
+    def _pair(self, host_rows=None, second_rows=None):
+        """两族各一个模型（G1 要求本次导出覆盖全部已落盘部件，否则一律不重绑）。"""
+        host = _drawib_model(
+            "aaaa1111", [_submesh("aaaa1111-1-0", vg_count=4)], draw_number=1, blend_rows=None
+        )
+        second = _drawib_model(
+            "bbbb2222", [_submesh("bbbb2222-1-0", vg_count=4)], draw_number=1, blend_rows=None
+        )
+        host.category_buffer_dict = {"Blend": self._numpy_blend(host_rows or [[0, 1, 2, 3]])}
+        second.category_buffer_dict = {"Blend": self._numpy_blend(second_rows or [[0, 1, 2, 3]])}
+        return host, second
+
+    def test_rebased_without_any_borrow_and_rebind_unblocked(self):
+        self._two_family_workspace()
+        host, model = self._pair()
+
+        # 死锁的一半：局部编号的产物被判 local ⇒ 不重绑（此时合并骨架压根不会生效）
+        probe = self.make_exporter([host, model])
+        self.assertIsNone(probe._himi_rebind_for(model))
+        self.assertEqual(probe.himi_blend_namespace_verdicts()["bbbb2222"]["verdict"], "local")
+
+        model.category_buffer_dict = {
+            "Blend": self._numpy_blend([[0, 1, 2, 3]], all_weights=True)
+        }
+        exporter = self.make_exporter([host, model])
+        ranges = dict(exporter.himi_merged_runtime_plan().family_ranges)
+        info = dict(ranges["bbbb2222"])
+        self.assertEqual(int(info["base"]), 4, "第二族的块基址必须是 4")
+        self.assertFalse(list(info.get("borrow") or ()), "本夹具没有借用槽（旧 t93 门会直接早退）")
+
+        ledger = exporter._himi_remap_merged_blend_to_blocks()
+        self.assertFalse(ledger["skipped"], "没有借用表也必须跑（这是本次修的正是这一条）")
+        self.assertEqual(ledger["local_rebased"], 4, "4 个局部编号必须加回基址")
+        self.assertEqual(ledger["rewritten"], 1)
+        self.assertEqual(ledger["passthrough"], 0, "本族只写局部编号，没有跨族全局引用")
+
+        import struct
+
+        raw = model.category_buffer_dict["Blend"].tobytes()
+        self.assertEqual(struct.unpack_from("<4i", raw, 16), (4, 5, 6, 7))
+
+        # 死锁的另一半：字节修正后缓存的 local 判定必须作废 ⇒ vs-t0 重绑放行
+        rebind = exporter._himi_rebind_for(model)
+        self.assertIsInstance(rebind, dict, "修正后必须重绑（否则合并骨架压根不生效）")
+        self.assertEqual(
+            exporter.himi_blend_namespace_verdicts()["bbbb2222"]["verdict"], "indeterminate"
+        )
+
+    def test_cross_family_global_references_become_borrow_rows(self):
+        """【t98】导出 Blend 里的跨族全局槽必须变成**借用行**（块尾槽 + 源族 palette 副本）。
+
+        为什么：跨族引用只出现在**池化行**上（同一个 draw 里拼进来的别族几何），它们的骨号
+        是全局合并槽。旧行为（t95）把这类引用原样留着 ⇒ 运行期按借用方的对象矩阵摆位，
+        那正是实机上「错位/爆炸」的那一批顶点。t98 起由发现集驱动 compute_family_ranges
+        把它们排进借用方块尾，并让源族的 dispatch 写 X_借用方·P_源。
+        """
+        self._two_family_workspace()
+        # 宿主族 base=0、4 个注册槽；它引用 4/5/7（别族的合法全局槽）⇒ 3 个借用槽
+        model, second = self._pair(host_rows=[[0, 4, 5, 7]])
+        model.category_buffer_dict = {"Blend": self._numpy_blend([[0, 4, 5, 7]], all_weights=True)}
+        # 第二族自己已经写成全局槽（4..7 全在自己块内）⇒ 它一个借用都不需要
+        second.category_buffer_dict = {
+            "Blend": self._numpy_blend([[4, 5, 6, 7]], all_weights=True)
+        }
+        exporter = self.make_exporter([model, second])
+        plan = exporter.himi_merged_runtime_plan()
+        ranges = dict(plan.family_ranges)
+
+        host = dict(ranges["aaaa1111"])
+        self.assertEqual(int(host["base"]), 0)
+        self.assertEqual(int(host["slots"]), 4)
+        self.assertEqual(int(host["block_slots"]), 7, "4 个注册槽 + 3 个块尾借用槽")
+        borrow = list(host["borrow"])
+        self.assertEqual([int(row["target_slot"]) for row in borrow], [4, 5, 6], "借用槽在块尾连续")
+        self.assertEqual([str(row["source_family"]) for row in borrow], ["bbbb2222"] * 3)
+        self.assertEqual([int(row["source_local"]) for row in borrow], [0, 1, 3], "对应全局 4/5/7")
+
+        # 借用方族占了 [0,7)，源族跟着右移到 [7,11)：合并骨架 8 → 11 槽
+        self.assertEqual(int(dict(ranges["bbbb2222"])["base"]), 7)
+        self.assertEqual(int(plan.slot_count), 11)
+        self.assertEqual(int(plan.skeleton_extra_slots), 3)
+        self.assertFalse(
+            _runtime.borrow_map_layout_problems(
+                ranges, _runtime.borrow_map_rows_by_family(ranges)
+            ),
+            "借用表必须自洽（否则运行期读到别人的行）",
+        )
+        self.assertFalse(
+            _runtime.attach_range_layout_problems(ranges, skeleton_slots=int(plan.slot_count))
+        )
+
+        ledger = exporter._himi_remap_merged_blend_to_blocks()
+        self.assertFalse(ledger["skipped"])
+        self.assertEqual(ledger["local_rebased"], 0, "宿主族 base=0 ⇒ 恒等，局部编号不该被改")
+        self.assertEqual(ledger["borrowed"], 3, "3 个跨族引用必须落到块尾借用槽")
+        self.assertEqual(ledger["passthrough"], 0, "t98 起不再原样放行跨族引用")
+        self.assertEqual(ledger["unmapped"], 0)
+        self.assertEqual(ledger["rewritten"], 2, "两族块基址都变了（源族右移到 7）⇒ 两族都要重写")
+
+        import struct
+
+        raw = model.category_buffer_dict["Blend"].tobytes()
+        self.assertEqual(
+            struct.unpack_from("<4i", raw, 16), (0, 4, 5, 6), "4/5/7 ⇒ 块尾 4/5/6"
+        )
+        # 源族自己的槽 4..7 跟着块右移到 7..10（块基址 7）
+        self.assertEqual(
+            struct.unpack_from("<4i", second.category_buffer_dict["Blend"].tobytes(), 16),
+            (7, 8, 9, 10),
+        )
+
+    def test_orphan_slot_references_abort_export(self):
+        """【t98】引用「没有任何写方」的槽 ⇒ 导出 Fatal（零矩阵会把顶点拉向原点）。"""
+        self._two_family_workspace()
+        model, second = self._pair()
+        model.category_buffer_dict = {"Blend": self._numpy_blend([[0, 99, 99, 99]], all_weights=True)}
+        second.category_buffer_dict = {
+            "Blend": self._numpy_blend([[4, 5, 6, 7]], all_weights=True)
+        }
+        Fatal = sys.modules[f"{PKG}.utils.format_utils"].Fatal
+        exporter = self.make_exporter([model, second])
+        with self.assertRaises(Fatal) as caught:
+            exporter.himi_merged_runtime_plan()
+        message = str(caught.exception)
+        self.assertIn("aaaa1111", message, "报告必须指名引用方")
+        self.assertIn("99", message, "报告必须列出没有写方的槽")
+        self.assertIn("零矩阵", message, "报告必须说清运行期后果")
+        self.assertEqual(exporter._himi_borrow_orphans, {"aaaa1111": [99]})
+
+
+
+
+class HIMISharedSlotClaimTests(HIMIMergedRuntimeBase):
+    """【t99】同一槽被两个家族注册时由「先注册者」独占，骨架里不会出现无人写的槽。
+
+    为什么单列：t98 的 orphan 报告把「槽没有写方」当成可能的运行期灾难。实测这条路径
+    不可达 —— load_workspace_plan 的认领循环（resolve_borrow_slots，:3015）在导出集内给
+    每个注册槽只留一个拥有者，其余家族在该槽上的注册直接归零，因此每个被注册的槽都落在
+    某个家族的块里。真实工作空间的槽 217（6e0ccfd4-6030-0 与三个 bbbbf903-* 都注册）
+    因此有写方；此前的「owner(217)=None」是离线探针绕过了认领循环算出来的误判。
+    """
+
+    @staticmethod
+    def _silent_blend():
+        """权重全 0 的 Blend 记录：不产生任何加权索引，因此不干扰借用发现。"""
+        import numpy
+        import struct
+
+        payload = struct.pack("<4f", 0.0, 0.0, 0.0, 0.0) + struct.pack("<4i", 0, 0, 0, 0)
+        return numpy.frombuffer(payload, dtype=numpy.uint8).copy()
+
+    def test_shared_registration_is_claimed_by_first_family(self):
+        _make_workspace(
+            self.workspace,
+            "RoleA",
+            [
+                {
+                    "bare": "aaaa1111-1-0",
+                    "draw_ib": "aaaa1111",
+                    "vg_count": 2,
+                    "original_vertex_count": 4,
+                    "family_members": ["aaaa1111-1-0"],
+                    "vg_map": {"0": 0, "1": 1},
+                    "rows": 1,
+                    "local_indices": [[0, 1, 0, 0]],
+                },
+                {
+                    "bare": "bbbb2222-1-0",
+                    "draw_ib": "bbbb2222",
+                    "vg_count": 1,
+                    "original_vertex_count": 4,
+                    "family_members": ["bbbb2222-1-0"],
+                    "vg_map": {"0": 2},
+                    "rows": 1,
+                    "local_indices": [[0, 0, 0, 0]],
+                },
+                {
+                    "bare": "cccc3333-1-0",
+                    "draw_ib": "cccc3333",
+                    "vg_count": 1,
+                    "original_vertex_count": 4,
+                    "family_members": ["cccc3333-1-0"],
+                    "vg_map": {"0": 2},
+                    "rows": 1,
+                    "local_indices": [[0, 0, 0, 0]],
+                },
+            ],
+            slot_count=3,
+        )
+        models = [
+            _drawib_model("aaaa1111", [_submesh("aaaa1111-1-0", vg_count=2)], draw_number=1),
+            _drawib_model("bbbb2222", [_submesh("bbbb2222-1-0", vg_count=1)], draw_number=1),
+            _drawib_model("cccc3333", [_submesh("cccc3333-1-0", vg_count=1)], draw_number=1),
+        ]
+        for model in models:
+            model.category_buffer_dict = {"Blend": self._silent_blend()}
+        exporter = self.make_exporter(models)
+
+        plan = exporter.himi_merged_runtime_plan()
+        self.assertTrue(plan.ok, getattr(plan, "message", ""))
+        ranges = {name: dict(info or {}) for name, info in dict(plan.family_ranges).items()}
+        self.assertIn("bbbb2222", ranges, "先注册者（bbbb2222 < cccc3333）拿到槽 2")
+        self.assertEqual(int(ranges["bbbb2222"]["slots"]), 1)
+        self.assertFalse(
+            bool(ranges.get("cccc3333", {}).get("own_block", False)),
+            "后注册者在该槽上不再拥有块",
+        )
+        covered = set()
+        for info in ranges.values():
+            span = int(info.get("block_slots", info.get("slots", 0)) or 0)
+            base = int(info.get("base", 0) or 0)
+            covered.update(range(base, base + span))
+        self.assertTrue(
+            {0, 1, 2} <= covered,
+            "每个被注册的槽都必须落在某个家族的块里（否则运行期读零矩阵）",
+        )

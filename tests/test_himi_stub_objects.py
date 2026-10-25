@@ -108,6 +108,8 @@ _skeleton = _load_real_module(f"{PKG}.common.himi_skeleton", "common/himi_skelet
 _runtime = _load_real_module(
     f"{PKG}.common.himi_merged_runtime", "common/himi_merged_runtime.py"
 )
+# ui/universal/himi.py 会 import 这个模块（族级 X 解析）；假包不登记就 ImportError
+_load_real_module(f"{PKG}.common.himi_family_x", "common/himi_family_x.py")
 
 
 # ---- fake bpy（对象/网格注册表 + 顶点组） ---- #
@@ -788,6 +790,7 @@ class _StubCase(unittest.TestCase):
         exporter._himi_stub_draw_calls = []
         exporter._himi_stub_bares = set()
         exporter._himi_stub_decision = None
+        exporter._himi_stub_writer_slots = {}
         exporter.drawib_model_list = []
         exporter._himi_plan = None
         exporter._himi_plan_ready = False
@@ -844,13 +847,15 @@ class StubRuleTests(_StubCase):
         self.assertEqual(decision.families["aaaa"]["decision"], _skeleton.HIMI_STUB_REASON_ALREADY_PRESENT)
 
     def test_st2_absent_family_with_own_slot_referenced_gets_all_members(self):
-        """ST2：整个 DrawIB 缺席 ⇒ **逐组件**判定（方法名里的 "all_members" 是历史遗留）。
+        """ST2：整个 DrawIB 缺席且它是这些槽唯一的 palette 写方 ⇒ **全族**补站位。
 
-        口径（计划书 §7.7.3 规则② / §7.7.8 ST2 / §7.7.12.2，已同步为「逐组件」+「外来槽」）：
-        只有「有**外来槽**证据」的成员补站位；其余成员按**保守方向**不插桩并记入
-        ``skipped_members``（实现锚点：``common/himi_skeleton.py`` 的逐成员循环与
-        ``decide_stub_injection`` docstring）。**方法名保留不改**：它被
-        ``decide_stub_injection`` 的 docstring 按名字引用，改名会打断那条引用。
+        口径（t103，用户口径：「被合并进来的物体需要生成极限小的 3 个点的站位，就和其他的
+        骨骼合并的一样」）：整族缺席时，若「该族注册的槽 ∩ 被引用（``used``）」减去「在场家族
+        注册的槽」还非空 ⇒ 这些槽只有它能写 ⇒ 它的几何已被并进别人的 draw ⇒ **整个家族**
+        逐成员补 3 点站位（与 ZZMI 规则① 同款），不让任何一个成员的原版 draw 继续跑。
+        只有当它的槽由在场家族注册（借位 / canonical 共享）时才退回逐组件的「外来槽」判定，
+        见 ``StubForeignSlotTests``。**方法名保留不改**：它被 ``decide_stub_injection`` 的
+        docstring 按名字引用，改名会打断那条引用。
         """
         _write_workspace(
             self.workspace,
@@ -868,12 +873,14 @@ class StubRuleTests(_StubCase):
             scene_present_bares={"cccc-1-0"},
             used_group_ids={10},
         )
-        # 判据是**逐组件**的：只有「专属槽位被引用」的那一个补占位；
-        # bbbb-2-0 的专属槽位零引用 ⇒ 它单独走保守分支（不插桩）。
-        self.assertEqual(decision.stub_members, ["bbbb-1-0"])
-        self.assertEqual(decision.families["bbbb"]["decision"], _skeleton.HIMI_STUB_REASON_ABSORBED)
-        self.assertIn("bbbb-2-0", decision.skipped_members)
-        # 两者都有专属槽位（不是借位），所以这个用例证明的是「零引用」分支而非 ST3
+        # 载体只引用 bbbb-1-0 的槽 10，但 bbbb 整族缺席且没人替它写这些槽 ⇒
+        # 它是「唯一的 palette 写方」⇒ 两个成员都补站位（含只被自己注册的 20/21）。
+        self.assertEqual(decision.stub_members, ["bbbb-1-0", "bbbb-2-0"])
+        self.assertEqual(
+            decision.families["bbbb"]["decision"], _skeleton.HIMI_STUB_REASON_WRITERLESS
+        )
+        self.assertEqual(decision.skipped_members, [])
+        # 两者都有专属槽位（不是借位），所以这个用例证明的不是 ST3 的借位形态
         self.assertEqual(
             _skeleton.himi_exclusive_slots(
                 "bbbb-1-0", ["bbbb-1-0", "bbbb-2-0"], {"bbbb-1-0": {10, 11}, "bbbb-2-0": {20, 21}}
@@ -2346,7 +2353,8 @@ class StubNailIntegrityTests(unittest.TestCase):
         """
         defs = {rel: self._prod_def_lines(rel) for rel in self.PROD_ANCHOR_FILES}
         problems = []
-        for rel in self.PROD_ANCHOR_DOCS:
+        # reports/himi-merge/ 可能被裁剪掉：缺文件时跳过，仓内文档的校验不受影响。
+        for rel in [rel for rel in self.PROD_ANCHOR_DOCS if (REPO_ROOT / rel).exists()]:
             for index, line in enumerate(self._read(rel).splitlines(), 1):
                 for match in self._PROD_SYMBOL_REF.finditer(line):
                     target = match.group("path").replace("\\", "/")
@@ -2657,7 +2665,8 @@ class StubRule1Tests(_StubCase):
     def test_rule1_recognizes_merged_object_by_ib_identity(self):
         """F-A：合并对象身份带副本后缀（`..._copy`）⇒ 按 **IB 身份** 识别「家族部分在场」。
 
-        两态：同一份数据，场景对象换成别的 IB（`9f9f9f9f-1-0_copy`）⇒ 落到规则② ⇒ 零引用 ⇒ 不插桩。
+        两态：同一份数据，场景对象换成别的 IB（`9f9f9f9f-1-0_copy`）⇒ 落到规则②，但本族
+        仍是这些槽唯一的 palette 写方 ⇒ **全族**补站位（t103 口径）。
         """
         self._write_shared_family()
         merged = decide_stub_injection(
@@ -2681,7 +2690,14 @@ class StubRule1Tests(_StubCase):
             used_group_ids={0, 1},
         )
         self.assertEqual(other.families[self.FAMILY]["rule"], "2")
-        self.assertEqual(other.stub_members, [], "整族缺席 + 只被借位槽位引用 ⇒ 不插桩")
+        self.assertEqual(
+            sorted(other.stub_members),
+            sorted(self.MEMBERS),
+            "整族缺席 + 槽位被引用且没有在场家族写它们 ⇒ 全族补站位（t103 writerless 口径）",
+        )
+        self.assertEqual(
+            other.families[self.FAMILY]["decision"], _skeleton.HIMI_STUB_REASON_WRITERLESS
+        )
 
     def test_rule2_zero_reference_multi_member_still_not_stubbed(self):
         """② 反例：整族缺席 + **零引用** ⇒ 不插桩（保守方向未被规则① 的改动放松）。"""
@@ -2788,11 +2804,16 @@ class StubForeignSlotTests(_StubCase):
             "外来槽 0 落在两个成员的 own 里 ⇒ 逐组件补站位（这正是旧判据漏掉的重影形态）",
         )
         self.assertEqual(
-            decision.families["aaaa"]["decision"], _skeleton.HIMI_STUB_REASON_ABSORBED
+            decision.families["aaaa"]["decision"], _skeleton.HIMI_STUB_REASON_WRITERLESS
         )
 
     def test_st13_mutant_fail_closed_loses_detection(self):
-        """ST13 两态：把「声明命名空间」这条路掐掉（fail-closed）⇒ **检不出** ⇒ 不插桩。"""
+        """ST13 两态（t103）：判据已换成「唯一 palette 写方」⇒ 打掉声明命名空间仍检得出。
+
+        旧口径靠 `declared_by_present_slots`（外来槽）识别吸收；t103 起整族缺席的族只要它
+        注册的槽被引用、且没有任何在场家族注册这些槽，就判「唯一写方」⇒ 不依赖声明命名空间。
+        本用例把那条路打掉，结论必须不变（改名前的旧版本这里是「检不出 ⇒ 不插桩」）。
+        """
         self._absorbed_fixture()
         original = _skeleton.declared_by_present_slots
         _skeleton.declared_by_present_slots = lambda *args, **kwargs: None
@@ -2805,12 +2826,14 @@ class StubForeignSlotTests(_StubCase):
         finally:
             _skeleton.declared_by_present_slots = original
         self.assertEqual(
-            mutated.stub_members, [], "变异体（fail-closed）⇒ 检不出 ⇒ 本用例确实在区分两种口径"
+            sorted(mutated.stub_members),
+            ["aaaa-1-0", "aaaa-2-0"],
+            "判据不再读声明命名空间 ⇒ 变异体不影响结论（旧版本这里是 []）",
         )
         self.assertEqual(
-            mutated.families["aaaa"]["decision"], _skeleton.HIMI_STUB_REASON_NO_DECLARED
+            mutated.families["aaaa"]["decision"], _skeleton.HIMI_STUB_REASON_WRITERLESS
         )
-        # 还原后同一份数据仍能检出（证明上面那次变异是**唯一**差别）
+        # 还原后同一份数据结论相同（证明变异体已不再是判据的一部分）
         restored = decide_stub_injection(
             workspace_root=self.workspace,
             scene_present_bares={"bbbb-1-0"},
@@ -2890,7 +2913,12 @@ class StubForeignSlotTests(_StubCase):
     # -- ST14b：fail-closed（信息不足不猜） -------------------------------------- #
 
     def test_st14b_unavailable_namespace_fails_closed(self):
-        """ST14b：载体**未落盘**（`own` 不可判定）⇒ 规则② 不插桩；补齐后按 ST13 行为插桩。"""
+        """ST14b（t103）：载体**未落盘**（`own` 不可判定）⇒ 槽位没有已知写方 ⇒ 仍补站位。
+
+        旧口径在这里 fail-closed（不插桩）；规则④ 只看「被引用且没有在场家族注册」这一个
+        事实，载体 json 缺失只会让「有人写」这条路不可见 ⇒ 结论不变。② 段证明补齐载体后
+        结论一致，因此本用例不再有「两态」，只保留「不因信息缺失而放弃站位」这一条。
+        """
         # ① 载体在家族名单里但**没有 json** ⇒ own 不可判定 ⇒ fail-closed
         _write_workspace(
             self.workspace,
@@ -2902,9 +2930,13 @@ class StubForeignSlotTests(_StubCase):
             scene_present_bares={"bbbb-1-0"},
             used_group_ids={0},
         )
-        self.assertEqual(closed.stub_members, [], "声明命名空间不可得 ⇒ 不插桩（宁可不压）")
         self.assertEqual(
-            closed.families["aaaa"]["decision"], _skeleton.HIMI_STUB_REASON_NO_DECLARED
+            sorted(closed.stub_members),
+            ["aaaa-1-0"],
+            "槽 0 被引用且没有已知写方 ⇒ 补站位（信息缺失不再等于放弃压制）",
+        )
+        self.assertEqual(
+            closed.families["aaaa"]["decision"], _skeleton.HIMI_STUB_REASON_WRITERLESS
         )
         # ② 补齐载体的 own ⇒ 槽 0 成为外来槽 ⇒ 插桩（证明上一步不是恒真）
         self._absorbed_fixture()
@@ -2936,6 +2968,138 @@ class StubForeignSlotTests(_StubCase):
             "成员身份已知但 own 为空（未落盘）⇒ None",
         )
 
+
+class WriterlessFamilyStubTests(_StubCase):
+    """t103 规则④：整族缺席、但它注册的槽位没有别的写方 ⇒ 必须补站位。
+
+    为什么不能只靠规则②：规则② 要求「槽位被**现存对象**实际引用（外来槽）」才插桩。
+    palette 写方与「谁引用了它」是两件事 —— 那些槽没有它写就一直是零矩阵，而引用它们
+    的行来自运行期那笔 draw 的顶点池，导出期只认得本族局部编号（计划书 §13.22）。
+    所以规则④ 只看槽位归属：没有别的在场家族注册 ⇒ 它就是唯一写方 ⇒ 补站位。
+    """
+
+    def test_absent_family_owning_unclaimed_slots_is_stubbed(self):
+        _write_workspace(
+            self.workspace,
+            [
+                {"bare": "aaaa-1-0", "vg_map": {0: 0}},
+                {"bare": "bbbb-1-0", "vg_map": {0: 5}},
+            ],
+            {"aaaa": ["aaaa-1-0"], "bbbb": ["bbbb-1-0"]},
+        )
+        decision = decide_stub_injection(
+            workspace_root=self.workspace,
+            scene_present_bares={"aaaa-1-0"},
+            used_group_ids={0, 5},  # 槽 5 被引用、且只有 bbbb 会写 ⇒ 必须补站位
+        )
+        self.assertEqual(
+            decision.stub_members, ['bbbb-1-0'],
+            "槽 5 只有 bbbb 会写 ⇒ 即使没人引用也必须补站位（否则运行期零矩阵）",
+        )
+        self.assertEqual(
+            decision.families["bbbb"]["decision"], _skeleton.HIMI_STUB_REASON_WRITERLESS
+        )
+        self.assertEqual(decision.families["bbbb"]["rule"], "2")
+        self.assertTrue(
+            any("唯一的 palette 写方" in text for text in decision.diagnostics),
+            "诊断必须说清它是这些槽唯一的写方",
+        )
+
+    def test_slot_registered_by_present_family_is_not_stubbed(self):
+        """反例：缺席家族的槽已被在场家族注册 ⇒ 有写方 ⇒ 不插桩（规则④ 不得放大）。"""
+        _write_workspace(
+            self.workspace,
+            [
+                {"bare": "aaaa-1-0", "vg_map": {0: 0}},
+                {"bare": "cccc-1-0", "vg_map": {0: 0}},
+            ],
+            {"aaaa": ["aaaa-1-0"], "cccc": ["cccc-1-0"]},
+        )
+        decision = decide_stub_injection(
+            workspace_root=self.workspace,
+            scene_present_bares={"aaaa-1-0"},
+            used_group_ids={0},
+        )
+        self.assertEqual(decision.stub_members, [], "槽 0 由在场的 aaaa 写 ⇒ 不缺口写方")
+        self.assertNotEqual(
+            decision.families["cccc"]["decision"], _skeleton.HIMI_STUB_REASON_WRITERLESS
+        )
+
+
+class MissingWriterStubTests(_StubCase):
+    """t106：本次导出引用了「别族保管的槽」，而那族没进场景 ⇒ 自动补 3 点站位。
+
+    实机形态（User said m02054）：只选宿主 ``077983c9`` 做快速局部导出，宿主 Blend
+    引用槽 216，槽 216 由已被合并进宿主的 ``1b62725d-1740-0`` 注册 —— 它的几何已在
+    宿主顶点池里，但 palette 只有它会写，缺了就是运行期零矩阵。
+    """
+
+    def _exporter(self):
+        return self._make_exporter(ordered=[], inject=False)
+
+    def _write_families(self, *, keep_writer_in_family_map: bool = True):
+        _write_workspace(
+            self.workspace,
+            [
+                {"bare": "aaaa1111-1-0", "vg_map": {0: 0}},
+                {"bare": "bbbb2222-1-0", "vg_map": {0: 216}},
+            ],
+            (
+                {"aaaa1111": ["aaaa1111-1-0"], "bbbb2222": ["bbbb2222-1-0"]}
+                if keep_writer_in_family_map
+                else {"aaaa1111": ["aaaa1111-1-0"]}
+            ),
+        )
+
+    def _run(self, decision, *, present=("aaaa1111-1-0",), family_map=None):
+        self._write_families()
+        exporter = self._exporter()
+        added = exporter._himi_add_missing_writer_stubs(
+            decision,
+            workspace_root=self.workspace,
+            scene_present=set(present),
+            used_group_ids={0, 216},
+            family_map=(
+                {"aaaa1111": ["aaaa1111-1-0"], "bbbb2222": ["bbbb2222-1-0"]}
+                if family_map is None
+                else family_map
+            ),
+        )
+        return exporter, added
+
+    def test_absent_writer_family_gets_a_stub(self):
+        decision = _skeleton.HIMIStubDecision()
+        exporter, added = self._run(decision)
+        self.assertEqual(added, ["bbbb2222-1-0"])
+        self.assertEqual(decision.stub_members, ["bbbb2222-1-0"])
+        self.assertEqual(
+            exporter._himi_stub_writer_slots,
+            {"bbbb2222-1-0": [216]},
+            "站位只负责给这些槽写矩阵，槽号要留下来给后续诊断",
+        )
+
+    def test_writer_family_in_scene_is_not_stubbed(self):
+        decision = _skeleton.HIMIStubDecision()
+        _, added = self._run(decision, present=("aaaa1111-1-0", "bbbb2222-1-0"))
+        self.assertEqual(added, [], "写方自己在场景里 ⇒ 它自己的段就会写这些槽")
+        self.assertEqual(decision.stub_members, [])
+
+    def test_writer_family_without_component_data_is_not_guessed(self):
+        decision = _skeleton.HIMIStubDecision()
+        _, added = self._run(
+            decision,
+            family_map={"aaaa1111": ["aaaa1111-1-0"]},
+        )
+        self.assertEqual(added, [], "组件数据都没有 ⇒ 不猜，交给导出期的 orphan 门")
+        self.assertEqual(decision.stub_members, [])
+
+    def test_writer_family_skipped_by_rule_two_is_promoted_to_stub(self):
+        decision = _skeleton.HIMIStubDecision(skipped_members=["bbbb2222-1-0"])
+        exporter, added = self._run(decision)
+        self.assertEqual(added, ["bbbb2222-1-0"])
+        self.assertEqual(decision.stub_members, ["bbbb2222-1-0"])
+        self.assertEqual(decision.skipped_members, [], "已在跳过名单 ⇒ 必须移出")
+        self.assertEqual(exporter._himi_stub_writer_slots, {"bbbb2222-1-0": [216]})
 
 if __name__ == "__main__":
     unittest.main()

@@ -90,6 +90,7 @@ HIMI_STUB_REASON_NO_EXCLUSIVE = "no_exclusive"
 HIMI_STUB_REASON_NO_DECLARED = "no_declared_namespace"
 HIMI_STUB_REASON_NO_FAMILY_MAP = "no_family_map"
 HIMI_STUB_REASON_NO_USED = "no_used"
+HIMI_STUB_REASON_WRITERLESS = "writerless_family"
 
 DUMP_LINE_RE = re.compile(
     r"^(\d{6})\s+3DMigoto Dumping (?:Buffer|Texture2D) .*[\\/]([^\\/]+) -> .*[\\/]([^\\/]+)$"
@@ -1272,6 +1273,15 @@ def decide_stub_injection(
         None if declared_by_present is None else (used - set(declared_by_present))
     )
 
+    # 规则④（t103）的输入：**在场家族**注册过的槽位并集。缺席家族只在自己持有在场家族
+    # 都不持有的槽位时才是「palette 写方」——那些槽没有它就会读到零矩阵。
+    present_family_slots: set = set()
+    for _draw_ib, _members in family_map.items():
+        if str(_draw_ib) not in present_ibs:
+            continue
+        for _member in _members:
+            present_family_slots |= set(landed_values.get(str(_member)) or ())
+
     for draw_ib, members in sorted(family_map.items()):
         draw_ib = str(draw_ib)
         members = [str(member) for member in members]
@@ -1302,16 +1312,32 @@ def decide_stub_injection(
             absorbed = True
             reason = HIMI_STUB_REASON_ABSORBED
         else:
-            # 规则②：整个 DrawIB 缺席 ⇒ 看**外来槽**是否被现存对象实际引用（t41）。
-            absorbed = is_drawib_absorbed(
-                draw_ib,
-                family_members=members,
-                landed_values=landed_values,
-                used_group_ids=used,
-                declared_by_present=declared_by_present,
-            )
+            # 规则④（t103）：整个 DrawIB 缺席、它注册的槽位**没有任何在场家族注册**、
+            # 而且这些槽**确实被引用**（used）⇒ 它是它们唯一的 palette 写方。不补站位 ⇒
+            # 运行期读到零矩阵 ⇒ 顶点被拉向原点（用户实测的「模型爆炸」）。几何方面它是
+            # 安全的：HIMI 实测里这些族的顶点本来就整块躺在在场族那笔 draw 的顶点池里
+            # （t103：1b62725d 580/580、09c6e58a-57792-0 19264/19264 三角形都由在场 draw
+            # 画过），所以 3 顶点站位不会丢几何，只丢一笔重复 draw。
+            # 「被引用」这一条必须留着：没人引用的槽不需要写方，补站位只会白抑制原版 draw
+            # （规则② 对它们的保守方向仍然正确）。
+            family_slots: set = set()
+            for member in members:
+                family_slots |= set(landed_values.get(member) or ())
+            writerless = bool((family_slots & used) - present_family_slots)
+            if writerless:
+                absorbed = True
+                reason = HIMI_STUB_REASON_WRITERLESS
+            else:
+                # 规则②：整个 DrawIB 缺席 ⇒ 看**外来槽**是否被现存对象实际引用（t41）。
+                absorbed = is_drawib_absorbed(
+                    draw_ib,
+                    family_members=members,
+                    landed_values=landed_values,
+                    used_group_ids=used,
+                    declared_by_present=declared_by_present,
+                )
             if absorbed:
-                reason = HIMI_STUB_REASON_ABSORBED
+                reason = reason if writerless else HIMI_STUB_REASON_ABSORBED
             elif foreign_used is None:
                 # fail-closed：present 对象的声明命名空间不可判定 ⇒ 外来槽路径不参与。
                 reason = HIMI_STUB_REASON_NO_DECLARED
@@ -1353,6 +1379,10 @@ def decide_stub_injection(
                 )
                 skipped.append(member)
                 continue
+            if writerless:
+                # 规则④：这些槽没有别的写方 ⇒ 补站位（上面已过掉无反查数据与 dedup 两道）。
+                stubbed.append(member)
+                continue
             if foreign_used is None or not (values & foreign_used):
                 # 反例② / ST3、ST13 的反面：**无外来槽证据**（该成员的槽位都被现存
                 # 对象声明过 ⇒ 与「共享骨骼」不可区分）⇒ **不插桩**（保守方向）。
@@ -1382,6 +1412,11 @@ def decide_stub_injection(
                     f"站位：{draw_ib} 有部分组件在场景中（规则①，ZZMI 逐字口径：缺失组件"
                     f"直接补占位、不做 exclusive 门控）⇒ 缺失的 {len(stubbed)} 个组件"
                     "补占位小三角面（抑制原版 draw 防重影）"
+                )
+            elif reason == HIMI_STUB_REASON_WRITERLESS:
+                decision.diagnostics.append(
+                    f"站位：{draw_ib} 没有对象，但它注册的槽位没有任何在场家族注册"
+                    f"（它是这些槽唯一的 palette 写方），补占位 {len(stubbed)} 个组件"
                 )
             else:
                 decision.diagnostics.append(
@@ -1494,6 +1529,20 @@ def blender_purge_stale_stub_objects() -> set:
     return stale
 
 
+def _strip_duplicate_suffix(segment: str) -> str:
+    """去掉 Blender 给重名对象追加的 ``.001`` 后缀。
+
+    站位件的名字是 ``LOD0.<bare>``，``bare`` 的第三段是 ``first_index``；同名对象在
+    Blender 里被复制过一次，段尾就变成 ``0.001``。下游 ``int()`` 当场抛
+    ``invalid literal for int()``，一轮快速局部导出直接中止。
+    """
+    text = str(segment or "").strip()
+    head, separator, tail = text.rpartition(".")
+    if separator and head and len(tail) == 3 and tail.isdigit():
+        return head
+    return text
+
+
 def _himi_stub_name_parts(obj_name: str) -> dict:
     """把合成的 ``LOD0.<bare>`` 名拆成 ``DrawCallModel.match_*`` 的语义。
 
@@ -1506,6 +1555,8 @@ def _himi_stub_name_parts(obj_name: str) -> dict:
     """
     bare = bare_from_unique_str(str(obj_name or ""))
     segments = bare.split("-")
+    if segments:
+        segments[-1] = _strip_duplicate_suffix(segments[-1])
     return {
         "bare": bare,
         "draw_ib": segments[0] if len(segments) > 0 else "",
