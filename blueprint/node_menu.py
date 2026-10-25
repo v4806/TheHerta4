@@ -1061,7 +1061,10 @@ class SSMT_OT_ViewChain(bpy.types.Operator):
             self._restore_highlight(tree, tree_id)
             return {'FINISHED'}
 
-        selected_oi_nodes = [n for n in tree.nodes if n.select and n.bl_idname == 'SSMTNode_Object_Info']
+        selected_oi_nodes = [
+            n for n in tree.nodes
+            if n.select and n.bl_idname in {'SSMTNode_Object_Info', 'SSMTNode_Object_Info_Pro'}
+        ]
         if not selected_oi_nodes:
             self.report({'WARNING'}, "请先选择一个物体信息节点")
             return {'CANCELLED'}
@@ -1318,7 +1321,6 @@ class SSMT_MT_ObjectContextMenuSub(bpy.types.Menu):
         layout.operator("ssmt.quick_add_rename_rule", text="快速添加重命名规则", icon='FONT_DATA')
         layout.operator("ssmt.quick_add_vertex_group_match", text="快速添加顶点组匹配", icon='GROUP_VERTEX')
 
-
 class SSMT_MT_NodeMenu_ModOutput(bpy.types.Menu):
     bl_label = "模组输出"
 
@@ -1335,6 +1337,7 @@ class SSMT_MT_NodeMenu_ObjectBase(bpy.types.Menu):
     def draw(self, context):
         layout = self.layout
         _add_node_entry(layout, "物体信息", 'OBJECT_DATAMODE', "SSMTNode_Object_Info")
+        _add_node_entry(layout, "物体信息Pro", 'OBJECT_DATAMODE', "SSMTNode_Object_Info_Pro")
         _add_node_entry(layout, "物体组", 'GROUP', "SSMTNode_Object_Group")
         _add_node_entry(layout, "物体切换", 'ARROW_LEFTRIGHT', "SSMTNode_ObjectSwap")
 
@@ -1407,6 +1410,7 @@ class SSMT_MT_NodeMenu_PostProcess_Dynamic(bpy.types.Menu):
     def draw(self, context):
         layout = self.layout
         _add_node_entry(layout, "形态键配置", 'SHAPEKEY_DATA', "SSMTNode_PostProcess_ShapeKey")
+        _add_node_entry(layout, "形态键扩展配置", 'ACTION', "SSMTNode_PostProcess_ShapeKeyExt")
         _add_node_entry(layout, "UV偏移", 'DRIVER', "SSMTNode_PostProcess_UVOffset")
         _add_node_entry(layout, "多文件配置", 'FILE_FOLDER', "SSMTNode_PostProcess_MultiFile")
 
@@ -1430,6 +1434,7 @@ class SSMT_MT_NodeMenu_PostProcess_Panel(bpy.types.Menu):
         layout = self.layout
         _add_node_entry(layout, "UI面板注入", 'RESTRICT_VIEW_OFF', "SSMTNode_PostProcess_UIPanel")
         _add_node_entry(layout, "滑块面板", 'GRIP', "SSMTNode_PostProcess_SliderPanel")
+        _add_node_entry(layout, "切换＆滑块面板", 'SHADERFX', "SSMTNode_PostProcess_CombinedPanel")
 
 
 class SSMT_MT_NodeMenu_PostProcess_AnimDriver(bpy.types.Menu):
@@ -1447,8 +1452,6 @@ class SSMT_MT_NodeMenu_PostProcess_Creative(bpy.types.Menu):
     def draw(self, context):
         layout = self.layout
         _add_node_entry(layout, "血量检测", 'HEART', "SSMTNode_PostProcess_HealthDetection")
-        _add_node_entry(layout, "形态键扩展配置", 'ACTION', "SSMTNode_PostProcess_ShapeKeyExt")
-        _add_node_entry(layout, "物体切换面板", 'SHADERFX', "SSMTNode_PostProcess_SwapPanel")
         _add_node_entry(layout, "贴图切换 V5.1", 'TEXTURE', "SSMTNode_PostProcess_DiffuseSwitch")
         _add_node_entry(layout, "物体贴图替换与清理", 'TEXTURE', "SSMTNode_PostProcess_ObjectTextureAssign")
         _add_node_entry(layout, "RabbitFX贴图后处理", 'LIGHT', "SSMTNode_PostProcess_Glow")
