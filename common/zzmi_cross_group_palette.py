@@ -1113,11 +1113,27 @@ def plan_cross_group_palette(candidates: list[dict]) -> tuple[dict, list[str]]:
     return profile, warnings
 
 
+def _finite_int(value: object, fallback: int) -> int:
+    """把可能带 NaN/inf 的数值收成有限非负整数；收不出来就用 ``fallback``。
+
+    ``int()`` 遇到 NaN 直接 ValueError，而调用方把 ``ValueError`` 当「整池方案
+    算不出来」处理 —— 一个部件的脏数据会因此否决整只角色。所有来自部件数据的
+    数值都先过这里。
+    """
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return fallback
+    if not numpy.isfinite(number):
+        return fallback
+    return int(max(0.0, number))
+
+
 def _common_fields(candidate: dict) -> dict:
     return {
         "pose_vs": candidate.get("pose_vs", ""),
         "pose_order": int(candidate.get("pose_order", 0)),
-        "vertex_count": int(candidate.get("vertex_count", 0)),
+        "vertex_count": _finite_int(candidate.get("vertex_count", 0), 0),
         "palette_bone_count": int(len(candidate["palette"])),
     }
 
@@ -1133,6 +1149,15 @@ def plan_from_parts(parts: dict[str, dict]) -> tuple[dict, dict, dict, list[str]
         vertex_count  顶点数（只用来选根，缺省时退化成权重和）
         shape_keyed   形态键驱动的部件（不参与合并）
 
+    非有限值（NaN/inf）按**损坏数据**处理，不许流进判等与 ``int()``：骨骼表带
+    NaN 的部件不参与合并（骨骼矩阵就是它的身份，NaN 既认不出共有骨也无法换算），
+    只占池尾私有槽位；权重带 NaN 则该骨计数按 0 算（只影响挑锚点与选根）。
+    实测：脸部 1 骨部件 ``dbbf0aee`` 的 Blend 权重含 NaN，旧的
+    ``int(round(float(weighted.sum())))`` 直接抛 ValueError，整池方案当场算不出来，
+    于是整只角色回退历史分组，看上去就是「带脸部导入就退回非跨组合并」。
+    Blend 权重本来就可能是合成/损坏数据（历史分组路径 :2251 早有按 0 记账的
+    处理），跨组计划器不该是唯一没有防护的那条路。
+
     返回 ``(vg_maps, vg_offsets, profile, warnings)``：
     ``vg_maps[draw_ib]`` 是「本地骨号 -> **骨骼池槽位**」，就是导出侧要写进
     SubmeshJson 的 VGMap（运行期按池槽位索引调色板，没有第二层 remap）；
@@ -1147,6 +1172,14 @@ def plan_from_parts(parts: dict[str, dict]) -> tuple[dict, dict, dict, list[str]
             warnings.append(str(draw_ib) + " 缺少骨骼表或物体矩阵，没有参与骨骼合并。")
             continue
         rows = numpy.asarray(palette, dtype=numpy.float32).reshape(-1, 3, 4)
+        if not len(rows) or not numpy.isfinite(rows).all():
+            # 骨骼矩阵带 NaN/inf：既不能拿去认共有骨，也不能拿来换算，硬塞进池里
+            # 会把锚点链污染成 NaN 槽位。让它走池尾私有段。
+            warnings.append(
+                str(draw_ib) + " 的骨骼表含非有限值（NaN/inf），"
+                "没有纳入骨骼合并计算（在骨骼池末尾独占槽位）。"
+            )
+            continue
         weights = part.get("slot_weights")
         if weights is not None:
             weighted = numpy.asarray(weights, dtype=numpy.float64).reshape(-1)
@@ -1155,12 +1188,19 @@ def plan_from_parts(parts: dict[str, dict]) -> tuple[dict, dict, dict, list[str]
                     (weighted, numpy.zeros(len(rows) - len(weighted)))
                 )
             weighted = weighted[: len(rows)]
+            if not numpy.isfinite(weighted).all():
+                warnings.append(
+                    str(draw_ib) + " 的骨骼权重含非有限值（NaN/inf），"
+                    "这些骨的计数按 0 处理（不参与锚点挑选与选根）。"
+                )
+                weighted = numpy.nan_to_num(weighted, nan=0.0, posinf=0.0, neginf=0.0)
         else:
             weighted = numpy.ones(len(rows), dtype=numpy.float64)
         vertex_count = part.get("vertex_count")
         if vertex_count is None:
             # 没有顶点数时用「权重和」当尺子：越大的网格叠的骨骼影响越多。
-            vertex_count = int(round(float(weighted.sum())))
+            vertex_count = float(weighted.sum())
+        vertex_count = _finite_int(vertex_count, 0)
         matrix = numpy.asarray(transform, dtype=numpy.float64).reshape(4, 4)
         # `parse_object_transform` 给的是**行向量式** 4×4（平移在第 3 行、w 在 (3,3)），
         # 而换算链要的是**列向量式**（平移在第 3 列）；判形态后转置。

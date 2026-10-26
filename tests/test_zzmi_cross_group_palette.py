@@ -353,6 +353,38 @@ class PlanFromPartsTest(unittest.TestCase):
         vg_maps, _, _, _ = cgp.plan_from_parts(parts)
         self.assertEqual(len(vg_maps["11111111"]), 11)
 
+    def test_non_finite_weights_no_longer_veto_the_whole_plan(self):
+        # 实测现场：脸部那颗 1 骨部件（dbbf0aee）的 Blend 权重是 NaN，于是
+        # weighted.sum() 也是 NaN，int(round(NaN)) 抛 ValueError —— 整池方案当场
+        # 算不出来，整只角色退回历史分组，看上去就是「带脸部导入就退回非跨组合并」。
+        parts = self._parts()
+        parts["33333333"] = {
+            "palette": _skeleton(1, seed=9).reshape(-1, 12),
+            "transform": numpy.eye(4).reshape(16),
+            "slot_weights": [float("nan")],
+            "vertex_count": None,
+        }
+        vg_maps, _, profile, warnings = cgp.plan_from_parts(parts)
+        self.assertTrue(
+            any("33333333" in warning and "非有限值" in warning for warning in warnings)
+        )
+        # 计数按 0 算只影响挑锚点与选根，槽位照占：池尾那一段就是它。
+        self.assertEqual(list(vg_maps["33333333"].values()), [profile["pool_bones"] - 1])
+
+    def test_palette_with_non_finite_matrix_gets_private_block(self):
+        parts = self._parts()
+        broken = _skeleton(4, seed=11).reshape(-1, 12).astype(numpy.float32)
+        broken[0][3] = float("nan")
+        parts["44444444"] = {"palette": broken, "transform": numpy.eye(4).reshape(16)}
+        vg_maps, vg_offsets, profile, warnings = cgp.plan_from_parts(parts)
+        self.assertTrue(
+            any("44444444" in warning and "NaN" in warning for warning in warnings)
+        )
+        # 骨骼矩阵带 NaN 认不出身份，但也不许把整池否决：池尾私有段。
+        self.assertEqual(vg_offsets["44444444"], 19)
+        self.assertEqual(vg_maps["44444444"], {0: 19, 1: 20, 2: 21, 3: 22})
+        self.assertEqual(profile["pool_bones"], 23)
+
 
 if __name__ == "__main__":
     unittest.main()
