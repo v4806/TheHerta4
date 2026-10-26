@@ -11,6 +11,7 @@
    逐字节相同的文本**，在放宽窗口后必须能把 1.6 / -0.4 原样带过去。
 """
 
+import math
 import os
 import re
 import sys
@@ -207,6 +208,105 @@ class DragChainTest(unittest.TestCase):
 
         self.assertGreater(step(0.9, 1.0, 0.5), 1.0)
         self.assertLess(step(0.1, -1.0, 0.5), 0.0)
+
+
+class AnimWeightGateTest(unittest.TestCase):
+    """动画累加的门闸：负权重是反向位移，只有「恰好为 0」才允许跳过。
+
+    这里锁的是**符号**，不是数值：旧版生成端写的是 ``if (anim_weight_x > 1e-5)``，
+    于是 ini 里 ``$Freq_x = -0.4`` 整段累加被跳过、模型一动不动，表现成「只能设正值」。
+    """
+
+    GATE_FILES = (
+        "blueprint/shapekey_sparse_index.py",
+        "blueprint/node_postprocess_shapekey.py",
+    )
+
+    def test_every_weight_gate_takes_the_absolute_value(self):
+        for relative_path in self.GATE_FILES:
+            with self.subTest(generator=relative_path):
+                gates = [line.strip() for line in _read(relative_path).splitlines()
+                         if "if (" in line and "anim_weight_" in line]
+                self.assertTrue(gates, "没找到门闸行：判据失效，检查变量名")
+                for line in gates:
+                    self.assertIn("abs(", line, "门闸按符号判会把负权重整段吃掉")
+
+    def test_sparse_docstring_shows_the_same_gate_as_the_code(self):
+        # 模块 docstring 里那段示例是读代码的人唯一会照抄的地方
+        text = _read("blueprint/shapekey_sparse_index.py")
+        self.assertIn("if (abs(anim_weight_entry) > 1e-5)", text)
+        self.assertNotIn("if (anim_weight_entry > 1e-5)", text)
+
+
+class FrameTableProgressTest(unittest.TestCase):
+    """帧表采样：进度允许为负（单键组里它就是权重），越界线性外推而不是夹住。
+
+    与 ``SyncWeightSemanticsTest`` 同样的做法——把 hlsl 的判定按同一语义在 CPU 上
+    跑一遍，确认 ``-0.4`` 真的得到 ``-0.4 × 位移``，而不是被压成 0。
+    """
+
+    FRAME_KEYS = 1  # 单键组：帧表 = [零位移, delta]
+
+    def _bound(self):
+        text = _read("Toolset/shapekey_anim_frame_table.hlsl")
+        bound = _define_value(text, "FRAME_TABLE_EXTRAPOLATION_FRAMES")
+        self.assertIsNotNone(bound, "外推帧数上限的 define 不见了")
+        return text, bound
+
+    def test_sampler_no_longer_clips_the_progress(self):
+        text, _bound = self._bound()
+        self.assertNotIn("saturate(t)", text)
+        # 外推上限必须引用 define，不能在 clamp 里写死一个数字
+        self.assertIn("FRAME_TABLE_EXTRAPOLATION_FRAMES", text)
+        self.assertIn("scaled < 0.0", text)
+
+    def _sample(self, frames, key_count, t, bound):
+        """``frame_table_sample`` 的 CPU 移植（union_size = 1、local_index = 0）。"""
+        if key_count == 0:
+            return (0.0, 0.0, 0.0)
+        if t != t:  # NaN 守卫
+            t = 0.0
+        scaled = min(max(t * float(key_count), -bound), float(key_count) + bound)
+        if scaled < 0.0:
+            origin, first = frames[0], frames[1]
+            return tuple(origin[k] + (first[k] - origin[k]) * scaled for k in range(3))
+        frame_index = int(math.floor(scaled))
+        frac = scaled - float(frame_index)
+        if frame_index >= key_count:
+            frame_index = key_count - 1
+            frac = scaled - float(frame_index)
+        a = frames[frame_index]
+        if frac <= 0.0:
+            return a
+        b = frames[frame_index + 1]
+        return tuple(a[k] + (b[k] - a[k]) * frac for k in range(3))
+
+    def test_single_key_group_runs_backwards(self):
+        """单键组：进度就是权重，负值必须得到负位移。"""
+        _text, bound = self._bound()
+        frames = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.5)]
+        for t, expected in ((-0.4, (-0.4, 0.0, -0.2)), (0.0, (0.0, 0.0, 0.0)),
+                            (0.5, (0.5, 0.0, 0.25)), (1.0, (1.0, 0.0, 0.5)),
+                            (1.6, (1.6, 0.0, 0.8))):
+            with self.subTest(t=t):
+                self.assertEqual(self._sample(frames, 1, t, bound), expected)
+
+    def test_overshoot_is_bounded(self):
+        _text, bound = self._bound()
+        frames = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0)]
+        # 下界顶到 -上限；上界是「键数 + 上限」帧，界外不再线性放大
+        self.assertEqual(self._sample(frames, 1, -1e9, bound), (-bound, 0.0, 0.0))
+        self.assertEqual(self._sample(frames, 1, 1e9, bound), (1.0 + bound, 0.0, 0.0))
+
+    def test_multi_key_group_extrapolates_along_the_first_segment(self):
+        _text, bound = self._bound()
+        # 3 键：帧 0 = 零，帧 1 = 第一个键，帧 3 = 三个键全叠
+        frames = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (3.0, 0.0, 0.0), (6.0, 0.0, 0.0)]
+        self.assertEqual(self._sample(frames, 3, 0.5, bound), (2.0, 0.0, 0.0))
+        self.assertEqual(self._sample(frames, 3, 1.0, bound), (6.0, 0.0, 0.0))
+        self.assertEqual(self._sample(frames, 3, -0.5, bound), (-1.5, 0.0, 0.0))
+        # t = 2 → 帧 2 之后再加 4 段（每段 +3）
+        self.assertEqual(self._sample(frames, 3, 2.0, bound), (15.0, 0.0, 0.0))
 
 
 if __name__ == "__main__":

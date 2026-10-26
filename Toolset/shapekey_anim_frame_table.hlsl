@@ -17,6 +17,10 @@
 //
 // 同步模式的单键即 key_count = 1 的序列组（帧表 [0, delta]，进度 = 该键强度），
 // 因此所有键都能统一走本路径，无需双份逻辑。
+//
+// 进度允许为负（也允许暂时 > 1）：帧表是线性可插值的，越界就沿首/末段线性外推。
+// 单键组的进度就是该键权重，`$Freq_x = -0.4` 因此得到 -0.4 倍位移（反向）。
+// 硬边界 ±4 由权重同步 CS 保证，本文件另加一层帧数上限（见 frame_table_sample）。
 
 struct VertexAttributes {
     float3 position;
@@ -56,23 +60,50 @@ float3 frame_table_load(uint rec)
         f16tof32(w2 >> 16u));
 }
 
-// 组内按进度 t（0..1）取插值位移：帧 K 与 K+1 之间线性插值。
+// 越界外推的帧数上限：单键组（key_count = 1）时正好等于权重硬边界 ±4，
+// 多键组时最多沿首/末段外推 4 帧 —— 界外是线性外推，不设上限的话进度被写成
+// 3~4 就能把 30 键的组推到一百多帧之外，模型直接炸开。
+#define FRAME_TABLE_EXTRAPOLATION_FRAMES (4.0)
+
+// 组内按进度 t 取插值位移：帧 K 与 K+1 之间线性插值。
 // key_count = 该组形态键数；帧表记录数 = key_count + 1（第 0 条为零起点）。
 // local_index = 该顶点在组顶点并集中的局部下标（>= 0 才调用）。
+//
+// t 不夹到 0..1：负 t 沿首段反向、t > 1 沿末段正向线性外推。单键组的 t 就是
+// 该键权重，夹掉符号会让 `$Freq_x = -0.4` 完全不动（旧版 saturate 的行为）。
 float3 frame_table_sample(uint group_offset, uint union_size, uint key_count, uint local_index, float t)
 {
-    // NaN 防护：saturate(NaN) 的结果依赖实现。权重侧虽有 clamp，但本函数是公共入口。
+    // 空组兜底：下面的末帧回退会算出 key_count - 1，0 会绕成 0xFFFFFFFF。
+    if (key_count == 0u)
+    {
+        return float3(0.0, 0.0, 0.0);
+    }
+    // NaN 防护：NaN 在下面的比较与 uint 转换里结果是未定义的。权重侧虽有 clamp，
+    // 但本函数是公共入口。
     if (t != t)
     {
         t = 0.0;
     }
-    float scaled = saturate(t) * (float)key_count;
+    float scaled = clamp(t * (float)key_count,
+                         -FRAME_TABLE_EXTRAPOLATION_FRAMES,
+                         (float)key_count + FRAME_TABLE_EXTRAPOLATION_FRAMES);
+
+    // 帧 0 恒为零位移起点，所以负进度等价于沿首段反向外推：origin + (first - origin) * scaled。
+    if (scaled < 0.0)
+    {
+        float3 origin = frame_table_load(group_offset + local_index);
+        float3 first = frame_table_load(group_offset + union_size + local_index);
+        return origin + (first - origin) * scaled;
+    }
+
     uint frame_index = (uint)floor(scaled);
+    float frac = scaled - (float)frame_index;
     if (frame_index >= key_count)
     {
-        return frame_table_load(group_offset + key_count * union_size + local_index);
+        // 越过末帧：回到最后一段，用 frac >= 1 继续线性外推（单键组即 t * delta）。
+        frame_index = key_count - 1u;
+        frac = scaled - (float)frame_index;
     }
-    float frac = scaled - (float)frame_index;
     float3 a = frame_table_load(group_offset + frame_index * union_size + local_index);
     if (frac <= 0.0)
     {

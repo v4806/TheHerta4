@@ -432,7 +432,7 @@ class SparseLogicLinesTests(unittest.TestCase):
         )
         # 强度按条目里的形态键序号取；位移按下标取，-1 直接跳过
         self.assertIn("float anim_weight_entry = ShapeKeyWeight[vertex_entry_freq[sparse_entry]];", text)
-        self.assertIn("if (anim_weight_entry > 1e-5)", text)
+        self.assertIn("if (abs(anim_weight_entry) > 1e-5)", text)
         self.assertIn("int packed_index = vertex_entry_packed[sparse_entry];", text)
         self.assertIn("if (packed_index != -1)", text)
         # 累加行来自注入的渲染器（与旧模型共用同一套实现）
@@ -480,7 +480,7 @@ class SparseLogicLinesTests(unittest.TestCase):
         )
         self.assertIn("anim_weight_entry = ShapeKeyDrive[sk_slot_entry];", text)
         # 覆盖后仍走同一条位移读取路径
-        self.assertIn("if (anim_weight_entry > 1e-5)", text)
+        self.assertIn("if (abs(anim_weight_entry) > 1e-5)", text)
         self.assertIn("int packed_index = vertex_entry_packed[sparse_entry];", text)
 
     def test_drag_variant_keeps_the_same_entry_loop(self):

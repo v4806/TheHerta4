@@ -17,7 +17,7 @@ warp divergence 吃掉——一个 warp 的 32 个 lane 里只要有一个命中
     for (uint e = vertex_entry_start[i]; e < vertex_entry_start[i + 1]; ++e)
     {
         float anim_weight_entry = ShapeKeyWeight[vertex_entry_freq[e]];
-        if (anim_weight_entry > 1e-5)
+        if (abs(anim_weight_entry) > 1e-5)
         {
             int packed_index = vertex_entry_packed[e];
             if (packed_index != -1) { ...merged_shapekey_pos_deltas[packed_index]... }
@@ -29,7 +29,9 @@ warp divergence 吃掉——一个 warp 的 32 个 lane 里只要有一个命中
 * 索引数据：(顶点数 × 槽位数 × 4B) → (顶点数 + 1) × 4B + 命中数 × 8B；
 * 每顶点索引读取：num_slots 次 → 该顶点实际命中数（2~5）次；
 * 逻辑块行数与键数脱钩（不再逐槽位展开，几百行 → 一段有界循环）；
-* 权重为 0 的命中项直接跳过位移读取（随机访问内存是这里最贵的一步）。
+* 权重为 0 的命中项直接跳过位移读取（随机访问内存是这里最贵的一步）。判定
+  取**绝对值**：负权重是合法的反向位移（权重硬边界 ±4，见
+  ``common/shapekey_weight_range.py``），不能因为符号被当成「没权重」跳过。
 
 本模块只做纯计算与文件落盘，不依赖 bpy，可单独单元测试。
 """
@@ -227,7 +229,7 @@ def build_sparse_logic_lines(channel_names, accumulation_builder, indent="    ",
 
     lines.extend(
         [
-            f"{weight_level}if (anim_weight_entry > 1e-5)",
+            f"{weight_level}if (abs(anim_weight_entry) > 1e-5)",
             f"{weight_level}{{",
             f"{packed_level}int packed_index = vertex_entry_packed[sparse_entry];",
             f"{packed_level}if (packed_index != -1)",

@@ -2797,7 +2797,9 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                                     f"    {if_cmd} (i >= {start_def} && i <= {end_def}) {{ anim_weight_slot{slot_index} = {name_to_freq_def[name]}; }} // Name: {name}"
                                 )
                                 is_first_if = False
-                        logic_lines.append(f"    if (anim_weight_slot{slot_index} > 1e-5)")
+                        # 门闸取绝对值：负权重是**反向**位移（硬边界 ±4），只有恰好为 0
+                        # 才值得跳过这次随机读取；按符号判会把负值整段吃掉、表现成「只能设正值」。
+                        logic_lines.append(f"    if (abs(anim_weight_slot{slot_index}) > 1e-5)")
                         logic_lines.append("    {")
 
                     logic_lines.append(f"        int packed_index = merged_shapekey_indices[packed_idx_slot{slot_index}];")
@@ -2883,7 +2885,8 @@ class SSMTNode_PostProcess_ShapeKey(SSMTNode_PostProcess_Base):
                             logic_lines.append(f"    {if_cmd} (i >= {start_def} && i <= {end_def}) {{ anim_weight_slot{slot_index} = {name_to_freq_def[name]}; }} // Name: {name}")
                             is_first_if = False
 
-                    logic_lines.extend([f"    if (anim_weight_slot{slot_index} > 1e-5)", "    {"])
+                    # 同上：判绝对值，负权重要走反向外推。
+                    logic_lines.extend([f"    if (abs(anim_weight_slot{slot_index}) > 1e-5)", "    {"])
 
                     indent = "        "
                     read_idx = "i"
