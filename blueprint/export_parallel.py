@@ -420,6 +420,8 @@ class ParallelExportCoordinator:
 
     @classmethod
     def _run_single_job(cls, job: dict, blender_path: str, timeout_seconds: int, addon_name: str):
+        from ..utils.process_log import run_logged_process
+
         command = [
             blender_path,
             "--factory-startup",
@@ -439,20 +441,12 @@ class ParallelExportCoordinator:
         ]
 
         try:
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="ignore",
-                timeout=timeout_seconds,
-                check=False,
+            result = run_logged_process(
+                command, job["log_path"], timeout_seconds,
+                lambda text: LOG._write_stdout_text(text, flush=True),
             )
         except subprocess.TimeoutExpired as error:
-            cls._write_text(job["log_path"], (error.stdout or "") + "\n" + (error.stderr or ""))
             raise ParallelExportError(f"Job {job['index']:03d} 超时") from error
-
-        cls._write_text(job["log_path"], (result.stdout or "") + "\n" + (result.stderr or ""))
 
         if result.returncode != 0:
             raise ParallelExportError(f"Job {job['index']:03d} 启动失败，退出码 {result.returncode}")
@@ -512,6 +506,8 @@ def _clear_export_section_registry() -> None:
         print(f"⚠️ 清理导出段登记表失败（已忽略）: {error}")
 
 def _run_worker(manifest_path: str):
+    from ..utils.process_log import configure_worker_output, REDIRECTED_LOG_ENV
+
     with open(manifest_path, "r", encoding="utf-8") as file:
         manifest = json.load(file)
 
@@ -527,6 +523,7 @@ def _run_worker(manifest_path: str):
     }
 
     try:
+        configure_worker_output()
         LOG.start_collecting()
         GlobalConfig.read_from_main_json_ssmt4()
         
@@ -554,8 +551,9 @@ def _run_worker(manifest_path: str):
     finally:
         PreProcessCache.clear_override_cache_dir()
         
-        with open(manifest["log_path"], "w", encoding="utf-8") as file:
-            file.write(LOG.get_log_content(strip_ansi=True))
+        if os.environ.get(REDIRECTED_LOG_ENV) != "1":
+            with open(manifest["log_path"], "w", encoding="utf-8") as file:
+                file.write(LOG.get_log_content(strip_ansi=True))
 
         with open(manifest["result_path"], "w", encoding="utf-8") as file:
             json.dump(result, file, ensure_ascii=False, indent=2)

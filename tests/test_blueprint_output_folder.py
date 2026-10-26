@@ -141,11 +141,12 @@ _install_module(
     ParallelExportCoordinator=types.SimpleNamespace(),
     ParallelExportError=RuntimeError,
 )
-# 后台导出只用于 invoke 分流；本文件测同步链路，给空壳即可
+# 会话启动在用例中打桩；这里验证前台的目录作用域与配置表确认。
 _install_module(
     f"{PKG}.blueprint.export_background",
     BACKGROUND_BUSY_MESSAGE="已有后台导出在运行，请等它结束或按 ESC 取消",
     BackgroundExportSession=types.SimpleNamespace(),
+    NTMI_MODIMP_STAGE_STEPS=(),
     QUICK_EXPORT_ROUND_PLAN={
         "round_index": 1,
         "phase": "single",
@@ -159,11 +160,11 @@ _install_module(
     },
     build_quick_export_temp_tree=lambda _objects: None,
     clear_active_session=lambda _session=None: None,
-    clear_progress_header=lambda: None,
+    clear_progress_header=lambda *_args: None,
     format_progress_bar=lambda *_args, **_kwargs: "",
     format_percent_bar=lambda *_args, **_kwargs: "",
     get_active_session=lambda: None,
-    push_progress_header=lambda _text: None,
+    push_progress_header=lambda _text, *_args: None,
     safe_object_name=lambda obj: str(getattr(obj, "name", "") or ""),
 )
 _install_module(f"{PKG}.blueprint.sync", refresh_blueprint_sync_state=lambda **_kwargs: {"tree_count": 0, "updated_count": 0})
@@ -186,7 +187,6 @@ GlobalConfig = _global_config_module.GlobalConfig
 ui_func_export = _load_real_module(f"{PKG}.ui.ui_func_export", Path("ui") / "ui_func_export.py")
 
 _ORIGINAL_READ_MAIN_JSON = GlobalConfig.read_from_main_json_ssmt4
-_ORIGINAL_EXPORT_ROUND_EXECUTOR = ui_func_export.ExportRoundExecutor
 _ORIGINAL_FIND_CONFIG_TABLES = ui_func_export.find_config_table_files
 _ORIGINAL_GET_CURRENT_TREE = ui_func_export.BlueprintExportHelper.get_current_blueprint_tree
 
@@ -254,7 +254,6 @@ class BlueprintOutputFolderTests(unittest.TestCase):
     def tearDown(self):
         GlobalConfig.read_from_main_json_ssmt4 = _ORIGINAL_READ_MAIN_JSON
         GlobalConfig.clear_output_blueprint_tree()
-        ui_func_export.ExportRoundExecutor = _ORIGINAL_EXPORT_ROUND_EXECUTOR
         ui_func_export.find_config_table_files = _ORIGINAL_FIND_CONFIG_TABLES
         ui_func_export.BlueprintExportHelper.get_current_blueprint_tree = _ORIGINAL_GET_CURRENT_TREE
         _NODE_GROUPS.clear()
@@ -331,63 +330,25 @@ class BlueprintOutputFolderTests(unittest.TestCase):
         self.assertEqual(GlobalConfig.path_generate_mod_folder(), self.global_folder)
 
     def test_blueprint_export_then_quick_export_does_not_reuse_old_blueprint(self):
-        """端到端：真实 SSMTGenerateModBlueprint.execute 之后指针必须还原。
-
-        走真实的 execute（只有 ExportRoundExecutor 打桩），在导出流程内部记录
-        `path_generate_mod_folder()` 的取值，确认：
-        - 导出进行中 = 蓝图自己的目录；
-        - execute 返回后（含异常路径）= 非蓝图流程的路径，不再串到旧蓝图。
-        """
         tree = self._register(_BlueprintTree("蓝图A", use_specific=True, folder_path=self.blueprint_folder))
         ui_func_export.BlueprintExportHelper.get_current_blueprint_tree = lambda **_kwargs: tree
-
         seen_paths = []
-
-        def _fake_execute_round(**kwargs):
-            seen_paths.append(GlobalConfig.path_generate_mod_folder())
-            return {"blueprint_model": _FakeBlueprintModel(seen_paths), "buffer_size": 0}
-
-        ui_func_export.ExportRoundExecutor = types.SimpleNamespace(execute_round=_fake_execute_round)
-
         operator = ui_func_export.SSMTGenerateModBlueprint()
-        operator.reports = []
-        operator.report = types.MethodType(_BaseFakeOperator.report, operator)
-        operator.overwrite_config = "YES"
-
-        result = operator.execute(self._context())
-
-        self.assertEqual(result, {"FINISHED"})
-        self.assertEqual(
-            seen_paths, [self.blueprint_folder, ("postprocess", self.blueprint_folder)],
-            "导出流程内部必须记到蓝图自己的目录",
-        )
-        self.assertEqual(GlobalConfig.get_output_blueprint_tree_name(), "", "导出结束后指针必须还原为空")
-        self.assertEqual(GlobalConfig.path_generate_mod_folder(), self.global_folder, "导出结束后不得再命中旧蓝图")
-
-        # 「快速局部导出」用的就是同一个 path_generate_mod_folder()（export_parallel 里算 buffer 目录）
-        self.assertNotEqual(
-            os.path.join(GlobalConfig.path_generate_mod_folder(), "Meshes"),
-            os.path.join(self.blueprint_folder, "Meshes"),
-        )
+        operator._start_background_export = lambda context, tree: seen_paths.append(GlobalConfig.path_generate_mod_folder()) or {"RUNNING_MODAL"}
+        self.assertEqual(operator.execute(self._context()), {"RUNNING_MODAL"})
+        self.assertEqual(seen_paths, [self.blueprint_folder])
+        self.assertEqual(GlobalConfig.get_output_blueprint_tree_name(), "")
+        self.assertEqual(GlobalConfig.path_generate_mod_folder(), self.global_folder)
 
     def test_blueprint_export_exception_still_restores_pointer(self):
-        """导出过程中抛异常也必须还原指针（异常路径不得泄漏）。"""
         tree = self._register(_BlueprintTree("蓝图A", use_specific=True, folder_path=self.blueprint_folder))
         ui_func_export.BlueprintExportHelper.get_current_blueprint_tree = lambda **_kwargs: tree
-
-        def _explode(**_kwargs):
-            raise RuntimeError("boom")
-
-        ui_func_export.ExportRoundExecutor = types.SimpleNamespace(execute_round=_explode)
-
         operator = ui_func_export.SSMTGenerateModBlueprint()
-        operator.reports = []
-        operator.report = types.MethodType(_BaseFakeOperator.report, operator)
-        operator.overwrite_config = "YES"
-
-        result = operator.execute(self._context())
-
-        self.assertEqual(result, {"CANCELLED"})
+        operator.report = lambda *_args: None
+        def explode(_tree):
+            raise RuntimeError("background startup failed")
+        operator._create_background_session = explode
+        self.assertEqual(operator.execute(self._context()), {"CANCELLED"})
         self.assertEqual(GlobalConfig.get_output_blueprint_tree_name(), "")
         self.assertEqual(GlobalConfig.path_generate_mod_folder(), self.global_folder)
 

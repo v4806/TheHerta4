@@ -2,27 +2,21 @@ import bpy
 import os
 import time
 
-from ..utils.timer_utils import TimerUtils
 from ..utils.translate_utils import TR
 from ..utils.command_utils import CommandUtils
 from ..utils.log_utils import LOG
 
 from ..common.global_config import GlobalConfig
-from ..common.global_key_count_helper import GlobalKeyCountHelper
 from ..common.config_table_backup import (
     backup_config_tables,
     find_config_table_files,
     restore_config_tables,
 )
 
-from ..blueprint.model import BluePrintModel
 from ..blueprint.direct_export import (
-    execute_direct_export,
     has_direct_export_mode,
 )
 from ..blueprint.export_helper import BlueprintExportHelper
-from ..blueprint.preprocess import PreProcessHelper
-from ..blueprint.export_parallel import ExportRoundExecutor, ParallelExportCoordinator, ParallelExportError
 try:  # 共享步骤计划：拿不到时（精简加载 / 测试桩）退回旧预算
     from ..blueprint.export_step_plan import build_step_plan
 except Exception:  # pragma: no cover
@@ -30,6 +24,7 @@ except Exception:  # pragma: no cover
 from ..blueprint.export_background import (
     BACKGROUND_BUSY_MESSAGE,
     BackgroundExportSession,
+    NTMI_MODIMP_STAGE_STEPS,
     QUICK_EXPORT_ROUND_PLAN,
     build_quick_export_temp_tree,
     clear_active_session,
@@ -42,18 +37,6 @@ from ..blueprint.export_background import (
 from ..blueprint.sync import refresh_blueprint_sync_state
 from ..common.global_properties import GlobalProterties
 from ..common.logic_name import LogicName
-try:  # 纯文件装载的测试宿主可能没有贴图计划模块：退化为旧「先落盘再删除」流程
-    from ..common.texture_export_plan import TextureExportPlan
-except ImportError:  # pragma: no cover
-    TextureExportPlan = None
-
-
-def _raise_for_unknown_logic_name() -> None:
-    """当游戏预设未加载或不受支持时抛出异常"""
-    raise ValueError(
-        "当前游戏预设未加载或不受支持，未执行任何主导出逻辑。"
-        f" 当前 logic_name='{GlobalConfig.logic_name}'，请先确认全局设置中的游戏预设已正确加载。"
-    )
 
 
 #: 后台导出时蓝图节点的进度配色（RGB；Blender 5.x 的 node.color 是 3 分量，
@@ -768,6 +751,10 @@ class SSMTGenerateModBlueprint(_BackgroundExportMixin, bpy.types.Operator):
         options={'SKIP_SAVE'},
     ) # type: ignore
 
+    ntmi_output_node_name: bpy.props.StringProperty(
+        default="", options={'HIDDEN', 'SKIP_SAVE'},
+    )  # type: ignore
+
     def _resolve_target_tree(self, context):
         """解析目标蓝图节点树"""
         requested_tree_name = str(getattr(self, "blueprint_name", "") or "").strip()
@@ -787,30 +774,21 @@ class SSMTGenerateModBlueprint(_BackgroundExportMixin, bpy.types.Operator):
         # 这里绝不能改 runtime_blueprint_tree_name：它决定导出目标蓝图，
         # 一旦被写入就会被后续的蓝图解析当作回落目标，导致一直串到旧蓝图。
         # 该指针由调用方限定作用域：invoke/execute 都会在 finally 里还原，
-        # 见 _invoke_with_output_blueprint / _execute_export。
+        # 见 invoke / execute。
         if tree:
             GlobalConfig.set_output_blueprint_tree(tree)
 
         return tree
 
     def invoke(self, context, event):
-        """入口分流：勾选「后台导出」时走后台实例 + modal 轮询，否则走原有同步路径
-
-        _resolve_target_tree 会登记「本次导出使用的蓝图」（决定输出目录），
-        而走到 invoke 不代表一定会进入 execute（用户可以取消弹窗；后台导出也会
-        在 invoke 阶段就把输出目录算进任务清单），所以这里同样要用 try/finally
-        把这个指针还原，不能让它停在弹窗 / 后台启动阶段。
-        """
+        """所有界面与脚本入口统一启动后台导出。"""
         previous_output_tree_name = GlobalConfig.get_output_blueprint_tree_name()
         self._pending_background_export = False
         try:
-            if GlobalProterties.is_background_export_enabled():
-                # 防重入：已有后台导出在跑时不再起第二个后台实例
-                if get_active_session() is not None:
-                    self.report({'WARNING'}, BACKGROUND_BUSY_MESSAGE)
-                    return {'CANCELLED'}
-                return self._invoke_background_export(context, event)
-            return self._invoke_with_output_blueprint(context, event)
+            if get_active_session() is not None:
+                self.report({'WARNING'}, BACKGROUND_BUSY_MESSAGE)
+                return {'CANCELLED'}
+            return self._invoke_background_export(context, event)
         finally:
             GlobalConfig.restore_output_blueprint_tree(previous_output_tree_name)
 
@@ -823,12 +801,11 @@ class SSMTGenerateModBlueprint(_BackgroundExportMixin, bpy.types.Operator):
             self.report({'ERROR'}, "未找到当前蓝图，请在蓝图编辑器中点击 Generate Mod")
             return {'CANCELLED'}
 
-        # 后台实例支持普通导出与直出导出。NTEMI 有独立导出器，仍回落到原有入口。
-        if GlobalConfig.logic_name == LogicName.NTEMI:
-            self.report({'WARNING'}, "NTEMI 导出不支持后台导出，已回落到同步导出")
-            return self._invoke_with_output_blueprint(context, event)
+        if GlobalConfig.logic_name == LogicName.NTEMI and self._ntmi_output_node(tree) is None:
+            self.report({'ERROR'}, "当前蓝图中未找到 NTMI ModImp 输出节点。")
+            return {'CANCELLED'}
 
-        # 旧配置表：与同步导出同一套「覆盖 / 保留」确认弹窗。后台导出以前整段跳过，
+        # 旧配置表：沿用原有「覆盖 / 保留」确认弹窗。后台导出以前整段跳过，
         # 既不追问也不备份，旧配置表会被新产物直接盖掉。确认结果由 execute() 接着跑。
         dialog_result = self._invoke_config_table_dialog(context, tree)
         if dialog_result is not None:
@@ -880,12 +857,12 @@ class SSMTGenerateModBlueprint(_BackgroundExportMixin, bpy.types.Operator):
     def _invoke_config_table_dialog(self, context, tree):
         """导出目录里有旧配置表时弹确认框；返回 None 表示不需要确认。
 
-        同步导出与后台导出共用：两条链路都必须先问「覆盖 / 保留」再动旧配置表。
+        导出必须先问「覆盖 / 保留」再动旧配置表。
         """
         if not self._has_postprocess_nodes(tree):
             return None
 
-        mod_export_path = GlobalConfig.path_generate_mod_folder()
+        mod_export_path = self._export_output_dir(tree)
         if not mod_export_path or not os.path.exists(mod_export_path):
             return None
 
@@ -899,12 +876,12 @@ class SSMTGenerateModBlueprint(_BackgroundExportMixin, bpy.types.Operator):
         return context.window_manager.invoke_props_dialog(self, width=460)
 
     def _backup_config_tables_before_export(self):
-        """确认后把旧配置表改名并移入备份目录（同步 / 后台共用同一实现）。"""
+        """确认后把旧配置表改名并移入备份目录。"""
         self._backup_entries = []
         if not getattr(self, "_backup_pending", False):
             return
 
-        mod_export_path = GlobalConfig.path_generate_mod_folder()
+        mod_export_path = getattr(self, "_export_path", "") or GlobalConfig.path_generate_mod_folder()
         self._backup_entries = backup_config_tables(
             mod_export_path,
             getattr(self, "_config_table_paths", []) or [],
@@ -928,8 +905,35 @@ class SSMTGenerateModBlueprint(_BackgroundExportMixin, bpy.types.Operator):
         except Exception as error:
             LOG.warning(f"恢复旧配置表失败: {error}")
 
+    def _ntmi_output_node(self, tree):
+        if GlobalConfig.logic_name != LogicName.NTEMI:
+            return None
+        name = str(getattr(self, "ntmi_output_node_name", "") or "").strip()
+        node = tree.nodes.get(name) if name else self._find_ntmi_modimp_output_node(tree)
+        if node is not None and getattr(node, "bl_idname", "") == "SSMTNode_Result_Output_NTMIModImp":
+            return node
+        return None
+
+    def _export_output_dir(self, tree):
+        node = self._ntmi_output_node(tree)
+        if node is not None:
+            from ..blueprint.ntmi_export_modimp import resolve_ntmi_modimp_output_dir
+            return resolve_ntmi_modimp_output_dir(node)
+        return GlobalConfig.path_generate_mod_folder()
+
     def _create_background_session(self, tree):
-        """按当前蓝图准备会话参数（与同步导出同一套轮次计划计算）。"""
+        ntmi_node = self._ntmi_output_node(tree)
+        if ntmi_node is not None:
+            return BackgroundExportSession(
+                tree_name=tree.name,
+                output_dir=self._export_output_dir(tree),
+                round_plans=[],
+                logic_name=GlobalConfig.logic_name,
+                workspace_name=GlobalConfig.get_workspace_name(),
+                ntmi_output_node_name=ntmi_node.name,
+                total_steps=len(NTMI_MODIMP_STAGE_STEPS),
+            )
+        """按当前蓝图准备会话参数（沿用原有轮次计划计算）。"""
         has_shapekey_export = BlueprintExportHelper.has_shapekey_postprocess_node(tree)
         max_shapekey_slot = 0
         if has_shapekey_export:
@@ -1048,16 +1052,6 @@ class SSMTGenerateModBlueprint(_BackgroundExportMixin, bpy.types.Operator):
         except Exception:
             return []
 
-    def _invoke_with_output_blueprint(self, context, event):
-        tree = self._resolve_target_tree(context)
-        if not tree:
-            return self.execute(context)
-
-        dialog_result = self._invoke_config_table_dialog(context, tree)
-        if dialog_result is not None:
-            return dialog_result
-
-        return self.execute(context)
 
     def draw(self, context):
         """绘制确认对话框"""
@@ -1099,19 +1093,16 @@ class SSMTGenerateModBlueprint(_BackgroundExportMixin, bpy.types.Operator):
         return None
 
     def execute(self, context):
-        """导出入口：把「输出目录蓝图」指针的作用域严格限定在本次导出内。
-
-        以前只在 _resolve_target_tree 里 set、从不还原，指针会一直留到下一次导出：
-        非蓝图导出（快速局部导出 / NTMI ModImp）只要调用 path_generate_mod_folder()
-        就会命中上一个蓝图，输出目录串到旧蓝图（与「非蓝图导出流程不受影响」矛盾）。
-        这里用 try/finally 覆盖所有路径（含异常与提前 return）。
-        """
+        """EXEC_DEFAULT 也启动后台会话；确认弹窗只继续已经准备好的任务。"""
+        if not getattr(self, "_pending_background_export", False):
+            return self.invoke(context, None)
         previous_output_tree_name = GlobalConfig.get_output_blueprint_tree_name()
+        self._pending_background_export = False
         try:
-            if getattr(self, "_pending_background_export", False):
-                self._pending_background_export = False
-                return self._execute_background_export_after_dialog(context)
-            return self._execute_export(context)
+            if get_active_session() is not None:
+                self.report({'WARNING'}, BACKGROUND_BUSY_MESSAGE)
+                return {'CANCELLED'}
+            return self._execute_background_export_after_dialog(context)
         finally:
             GlobalConfig.restore_output_blueprint_tree(previous_output_tree_name)
 
@@ -1128,291 +1119,6 @@ class SSMTGenerateModBlueprint(_BackgroundExportMixin, bpy.types.Operator):
         )
         return self._start_background_export(context, tree)
 
-    def _execute_export(self, context):
-        GlobalConfig.read_from_main_json_ssmt4()
-        
-        TimerUtils.start_session("Mod导出")
-
-        TimerUtils.start_stage("蓝图验证")
-        tree = self._resolve_target_tree(context)
-        if not tree:
-            self.report({'ERROR'}, "未找到当前蓝图，请在蓝图编辑器中点击 Generate Mod")
-            return {'CANCELLED'}
-
-        if GlobalConfig.logic_name == LogicName.NTEMI:
-            ntmi_output_node = self._find_ntmi_modimp_output_node(tree)
-            if ntmi_output_node is not None:
-                self.report(
-                    {'ERROR'},
-                    "NTEMI 已停用普通导出链路，请改用蓝图中的“NTMI ModImp Output”节点按钮进行导出。"
-                )
-            else:
-                self.report(
-                    {'ERROR'},
-                    "NTEMI 已停用普通导出链路。请先从工作空间重新生成或添加“NTMI ModImp Output”节点后再导出。"
-                )
-            return {'CANCELLED'}
-
-        # 配置表备份：弹窗确认后，将旧配置表改名并移动至备份目录
-        self._backup_config_tables_before_export()
-
-        BlueprintExportHelper.set_runtime_blueprint_tree(tree)
-        BlueprintExportHelper.reset_direct_export_runtime_state(clear_postprocess_caches=True)
-        # 导出开始：清空上一次导出残留的 ini 段登记，条件后处理节点只应看到本次导出的段。
-        _clear_export_section_registry()
-        # 贴图计划：按本蓝图「资源合并」节点的开关初始化（导出期间跨轮次累积，
-        # 由资源合并节点 / 本流程收尾统一落盘）。
-        if TextureExportPlan is not None:
-            TextureExportPlan.configure_from_tree(tree, GlobalConfig.path_generate_mod_folder())
-        TimerUtils.end_stage("蓝图验证")
-
-        LOG.start_collecting()
-        BluePrintModel.clear_object_name_mapping()
-        GlobalKeyCountHelper.initialize()
-
-        LOG.info("=" * 60)
-        LOG.info("🚀 开始生成Mod")
-        LOG.info("=" * 60)
-
-        # 直出模式复用原有按钮入口，避免用户在标准导出和直出之间来回切换。
-        if has_direct_export_mode(tree):
-            LOG.info("⚡ 检测到直出模式，切换到直出导出流程")
-
-            export_success = False
-            error_message = None
-
-            try:
-                execute_direct_export(context=context, tree=tree)
-                self._validate_generated_ini_variables(GlobalConfig.path_generate_mod_folder())
-                export_success = True
-            except Exception as e:
-                error_message = f"直出失败: {str(e)}"
-                print(f"❌ 直出过程中发生错误: {e}")
-                LOG.exception(e)
-                PreProcessHelper.cleanup_copies(silent=True)
-
-            # 选择「否」时：导出完成后把备份的旧配置表覆盖回原位；「是」则保留新配置表
-            if self.overwrite_config == 'NO':
-                restore_config_tables(self._backup_entries)
-
-            LOG.info("")
-            LOG.info("📍 清理阶段")
-            LOG.info("-" * 40)
-            PreProcessHelper.cleanup_copies()
-
-            LOG.info("")
-            LOG.info("=" * 60)
-            if export_success:
-                LOG.info("✅ 直出完成!")
-                LOG.info("=" * 60)
-                self.report({'INFO'}, TR.translate("Generate Mod Success!"))
-                CommandUtils.OpenGeneratedModFolder()
-            else:
-                LOG.info(f"❌ Mod生成失败: {error_message}")
-                LOG.info("=" * 60)
-                self.report({'ERROR'}, error_message)
-
-            TimerUtils.print_summary()
-
-            LOG.stop_collecting()
-            log_name = LOG.save_to_text_editor()
-            if log_name:
-                print(f"📄 导出日志已保存至文本编辑器: {log_name}")
-
-            if export_success:
-                return {'FINISHED'}
-            return {'CANCELLED'}
-
-        TimerUtils.start_stage("导出前同步")
-        refresh_summary = refresh_blueprint_sync_state(
-            tree=tree,
-            context=context,
-            include_all_blueprints=True,
-        )
-        TimerUtils.end_stage("导出前同步")
-        LOG.info(
-            f"🔄 导出前刷新同步状态: {refresh_summary['tree_count']} 个蓝图, "
-            f"{refresh_summary['updated_count']} 处节点引用更新"
-        )
-
-        has_shapekey_export = BlueprintExportHelper.has_shapekey_postprocess_node(tree)
-        max_shapekey_slot = 0
-        if has_shapekey_export:
-            max_shapekey_slot = BlueprintExportHelper.calculate_max_shapekey_slot_count(tree)
-            if max_shapekey_slot == 0:
-                has_shapekey_export = False
-                LOG.info("   未检测到形态键，跳过形态键导出")
-
-        max_multi_file_count = BlueprintExportHelper.calculate_max_export_count(tree)
-        has_multi_file_export = BlueprintExportHelper.has_multi_file_export_nodes()
-
-        if has_shapekey_export:
-            LOG.info("")
-            LOG.info("🎭 形态键导出模式")
-            LOG.info("-" * 40)
-            LOG.info(f"   检测到形态键配置后处理节点")
-            LOG.info(f"   最大形态键槽位: {max_shapekey_slot}")
-            LOG.info(f"   形态键导出次数: {max_shapekey_slot + 1} 次 (基态 + {max_shapekey_slot} 个槽位)")
-
-        if has_multi_file_export:
-            LOG.info("")
-            LOG.info("📦 多文件导出模式")
-            LOG.info("-" * 40)
-            LOG.info(f"   检测到 {len(BlueprintExportHelper.multi_file_export_nodes)} 个多文件导出节点")
-            LOG.info(f"   多文件导出次数: {max_multi_file_count} 次")
-            for node in BlueprintExportHelper.multi_file_export_nodes:
-                obj_list = getattr(node, 'object_list', [])
-                LOG.info(f"   - 节点 '{node.name}': {len(obj_list)} 个物体")
-
-        LOG.info("")
-        LOG.info("📍 第一阶段：检测与准备")
-        LOG.info("-" * 40)
-
-        export_success = False
-        error_message = None
-        buffer_sizes = []
-        blueprint_model = None
-        export_plan = []
-
-        try:
-            export_plan = self._build_export_round_plan(
-                has_shapekey_export=has_shapekey_export,
-                max_shapekey_slot=max_shapekey_slot,
-                has_multi_file_export=has_multi_file_export,
-                max_multi_file_count=max_multi_file_count,
-            )
-            self._log_export_plan(export_plan)
-
-            if has_shapekey_export:
-                BlueprintExportHelper.collect_shapekey_objects(tree)
-                LOG.info(f"   收集到 {len(BlueprintExportHelper.shapekey_objects)} 个形态键物体")
-
-            if len(export_plan) == 1:
-                LOG.info("")
-                LOG.info("📍 第二阶段：单次导出")
-                LOG.info("-" * 40)
-
-                round_result = self._execute_main_round(tree, export_plan[0])
-                blueprint_model = round_result["blueprint_model"]
-                reference_size = round_result["buffer_size"]
-                buffer_sizes.append(reference_size)
-
-            else:
-                first_round = export_plan[0]
-                middle_rounds = export_plan[1:-1]
-                last_round = export_plan[-1]
-
-                LOG.info("")
-                LOG.info("📍 第二阶段：主线程首轮导出")
-                LOG.info("-" * 40)
-
-                first_result = self._execute_main_round(tree, first_round)
-                blueprint_model = first_result["blueprint_model"]
-                reference_size = first_result["buffer_size"]
-                buffer_sizes.append(reference_size)
-
-                if middle_rounds:
-                    if GlobalProterties.enable_parallel_export_rounds():
-                        LOG.info("")
-                        LOG.info("📍 第三阶段：并行中间轮次导出")
-                        LOG.info("-" * 40)
-                        middle_results = ParallelExportCoordinator.execute_middle_rounds(tree, middle_rounds)
-                        middle_results.sort(key=lambda item: item.get("round_index", 0))
-                        for result in middle_results:
-                            self._validate_buffer_size(reference_size, result["buffer_size"], result["round_index"], result["buffer_folder_name"])
-                            buffer_sizes.append(result["buffer_size"])
-                    else:
-                        LOG.info("")
-                        LOG.info("📍 第三阶段：串行中间轮次导出")
-                        LOG.info("-" * 40)
-                        for round_plan in middle_rounds:
-                            round_result = self._execute_main_round(tree, round_plan)
-                            self._validate_buffer_size(reference_size, round_result["buffer_size"], round_plan["round_index"], round_plan["buffer_folder_name"])
-                            buffer_sizes.append(round_result["buffer_size"])
-
-                LOG.info("")
-                LOG.info("📍 第四阶段：主线程尾轮导出")
-                LOG.info("-" * 40)
-                last_result = self._execute_main_round(tree, last_round)
-                blueprint_model = last_result["blueprint_model"]
-                self._validate_buffer_size(reference_size, last_result["buffer_size"], last_round["round_index"], last_round["buffer_folder_name"])
-                buffer_sizes.append(last_result["buffer_size"])
-
-            LOG.info("")
-            LOG.info("📍 第五阶段：后处理")
-            LOG.info("-" * 40)
-            TimerUtils.start_stage("后处理节点")
-            mod_export_path = GlobalConfig.path_generate_mod_folder()
-            if GlobalConfig.logic_name == LogicName.NTEMI:
-                from ..ui.ntmi_modimp.texture_slot_refresh import refresh_texture_slots_for_objects
-                refresh_texture_slots_for_objects(
-                    [
-                        obj
-                        for draw_call_model in getattr(blueprint_model, "ordered_draw_obj_data_model_list", []) or []
-                        for obj in [bpy.data.objects.get(draw_call_model.get_blender_obj_name())]
-                        if obj is not None and obj.type == "MESH"
-                    ]
-                )
-            blueprint_model.execute_postprocess_nodes(mod_export_path)
-            # 贴图计划兜底落盘：蓝图里没有「资源合并」节点（或它被禁用）时也要把贴图盘出来；
-            # 资源合并节点已在自身开头落盘，这里幂等，没有待落盘项时什么都不做。
-            if TextureExportPlan is not None:
-                TextureExportPlan.finalize(mod_export_path)
-            TimerUtils.end_stage("后处理节点")
-            self._validate_generated_ini_variables(mod_export_path)
-            export_success = True
-
-        except Exception as e:
-            error_message = f"导出失败: {str(e)}"
-            print(f"❌ 导出过程中发生错误: {e}")
-            LOG.exception(e)
-
-            PreProcessHelper.cleanup_copies(silent=True)
-
-        # 选择「否」时：导出完成后把备份的旧配置表覆盖回原位；「是」则保留新配置表
-        if self.overwrite_config == 'NO':
-            restore_config_tables(self._backup_entries)
-
-        LOG.info("")
-        LOG.info("📍 清理阶段")
-        LOG.info("-" * 40)
-
-        PreProcessHelper.cleanup_copies()
-
-        if has_shapekey_export:
-            BlueprintExportHelper.set_all_shapekey_values(0)
-            LOG.info("   所有形态键已归零")
-
-        LOG.info("")
-        LOG.info("=" * 60)
-        if export_success:
-            total_rounds = len(export_plan) if export_plan else 1
-            if has_shapekey_export and has_multi_file_export:
-                LOG.info(f"✅ 形态键+多文件导出完成! 共导出 {total_rounds} 轮")
-            elif has_shapekey_export:
-                LOG.info(f"✅ 形态键导出完成! 共导出 {total_rounds} 轮")
-            elif has_multi_file_export:
-                LOG.info(f"✅ 多文件导出完成! 共导出 {total_rounds} 轮")
-            else:
-                LOG.info("✅ Mod生成完成!")
-            LOG.info("=" * 60)
-            self.report({'INFO'},TR.translate("Generate Mod Success!"))
-            CommandUtils.OpenGeneratedModFolder()
-        else:
-            LOG.info(f"❌ Mod生成失败: {error_message}")
-            LOG.info("=" * 60)
-            self.report({'ERROR'}, error_message)
-
-        TimerUtils.print_summary()
-
-        LOG.stop_collecting()
-        log_name = LOG.save_to_text_editor()
-        if log_name:
-            print(f"📄 导出日志已保存至文本编辑器: {log_name}")
-
-        if export_success:
-            return {'FINISHED'}
-        return {'CANCELLED'}
 
     def _build_export_round_plan(self, has_shapekey_export: bool, max_shapekey_slot: int,
                                  has_multi_file_export: bool, max_multi_file_count: int) -> list:
@@ -1477,78 +1183,6 @@ class SSMTGenerateModBlueprint(_BackgroundExportMixin, bpy.types.Operator):
 
         return export_plan
 
-    def _validate_generated_ini_variables(self, mod_export_path):
-        """导出收尾自检：产物 ini 里"被引用但未声明"的变量 + 重复全局声明。
-
-        未声明的 ``$var`` 在 3DMigoto 里退化成段内局部变量（跨 run= 不传递），
-        表现为功能静默失效；历史事故（viewport_valid、形态键 Freq_xxx 分叉）
-        都属于这一类。这里只报告、不阻断导出。
-        """
-        try:
-            workspace_name = str(GlobalConfig.get_workspace_name() or "")
-        except Exception:
-            workspace_name = ""
-        # 延迟导入：自检是收尾增强，模块缺失（裁剪/测试桩环境）不得影响导出
-        try:
-            from ..common.ini_variable_validator import (
-                find_primary_ini,
-                format_findings,
-                validate_ini_file,
-            )
-        except ImportError as exc:  # pragma: no cover - 仅裁剪/测试桩环境命中
-            LOG.info(f"⚠️ [INI 校验] 跳过（校验模块不可用）: {exc}")
-            return
-        ini_path = find_primary_ini(mod_export_path, workspace_name)
-        if not ini_path:
-            return
-        try:
-            report = validate_ini_file(ini_path)
-        except Exception as exc:
-            LOG.info(f"⚠️ [INI 校验] 跳过（读取失败）: {exc}")
-            return
-        if report.get("missing"):
-            return
-        LOG.info("")
-        LOG.info("🔎 产物变量声明自检")
-        LOG.info("-" * 40)
-        for line in format_findings(report):
-            LOG.info(line)
-
-    def _log_export_plan(self, export_plan: list):
-        LOG.info("")
-        LOG.info("🗂️ 导出轮次计划")
-        LOG.info("-" * 40)
-        for round_plan in export_plan:
-            flags = []
-            if round_plan.get("generate_ini"):
-                flags.append("生成INI")
-            if round_plan.get("generate_classification_report"):
-                flags.append("分类报告")
-            if not flags:
-                flags.append("仅Buffer")
-            LOG.info(
-                f"   第 {round_plan['round_index']} 轮: {round_plan['description']} -> {round_plan['buffer_folder_name']} ({' / '.join(flags)})"
-            )
-
-    def _execute_main_round(self, tree, round_plan: dict) -> dict:
-        LOG.info("")
-        LOG.info(f"🔄 第 {round_plan['round_index']} 轮导出: {round_plan['description']}")
-        LOG.info(f"   Buffer 文件夹: {round_plan['buffer_folder_name']}")
-
-        result = ExportRoundExecutor.execute_round(
-            tree=tree,
-            round_plan=round_plan,
-            allow_parallel_preprocess=True,
-        )
-
-        LOG.info(f"   Buffer 文件夹大小: {result['buffer_size']} 字节")
-        return result
-
-    def _validate_buffer_size(self, reference_size: int, current_size: int, round_index: int, buffer_folder_name: str):
-        if reference_size != current_size:
-            raise ParallelExportError(
-                f"第 {round_index} 轮导出的 Buffer 文件夹 {buffer_folder_name} 大小 ({current_size} 字节) 与首轮 ({reference_size} 字节) 不一致"
-            )
 
 class SSMTQuickExportSelected(_BackgroundExportMixin, bpy.types.Operator):
     """快速局部导出选中的网格物体，无需复杂蓝图"""
@@ -1562,9 +1196,7 @@ class SSMTQuickExportSelected(_BackgroundExportMixin, bpy.types.Operator):
     )
 
     def invoke(self, context, event):
-        """入口分流：勾选「后台导出」时起后台实例 + modal 轮询，否则走原有同步路径。"""
-        if not GlobalProterties.is_background_export_enabled():
-            return self.execute(context)
+        """快速局部导出始终交给独立后台实例。"""
 
         # 防重入：已有后台导出在跑时不再起第二个后台实例
         if get_active_session() is not None:
@@ -1577,9 +1209,9 @@ class SSMTQuickExportSelected(_BackgroundExportMixin, bpy.types.Operator):
             return {'CANCELLED'}
 
         GlobalConfig.read_from_main_json_ssmt4()
-        # NTEMI 有独立导出器，快速导出不支持后台，回落到同步入口（与 Generate 一致）
         if GlobalConfig.logic_name == LogicName.NTEMI:
-            return self.execute(context)
+            self.report({'ERROR'}, self._NTEMI_QUICK_EXPORT_DISABLED_MESSAGE)
+            return {'CANCELLED'}
 
         # 立即反馈：会话启动里要先存工程快照（数秒）再起子进程，先把文本写上。
         push_progress_header("后台导出：正在保存工程快照…", context)
@@ -1644,91 +1276,8 @@ class SSMTQuickExportSelected(_BackgroundExportMixin, bpy.types.Operator):
         )
 
     def execute(self, context):
-        selected_meshes, skipped_count = self._collect_selected_meshes(context)
-        if not selected_meshes:
-            self.report({'WARNING'}, "请先选择至少一个网格物体")
-            return {'CANCELLED'}
-
-        GlobalConfig.read_from_main_json_ssmt4()
-        if GlobalConfig.logic_name == LogicName.NTEMI:
-            self.report({'ERROR'}, self._NTEMI_QUICK_EXPORT_DISABLED_MESSAGE)
-            return {'CANCELLED'}
-
-        temp_tree = None
-        previous_runtime_tree_name = BlueprintExportHelper.runtime_blueprint_tree_name
-        previous_export_index = BlueprintExportHelper.current_export_index
-        previous_buffer_folder_name = BlueprintExportHelper.get_current_buffer_folder_name()
-        export_success = False
-
-        try:
-            LOG.start_collecting()
-            TimerUtils.start_session("快速局部导出")
-            GlobalKeyCountHelper.initialize()
-
-            LOG.info("=" * 60)
-            LOG.info("🚀 开始快速局部导出")
-            LOG.info(f"📋 当前选择网格物体: {len(selected_meshes)} 个")
-            if skipped_count:
-                LOG.warning(f"   跳过 {skipped_count} 个已失效或非 Mesh 的选中对象")
-            for obj in selected_meshes:
-                LOG.info(f"   - {self._safe_object_name(obj)}")
-            temp_tree = self._build_temp_blueprint_tree(selected_meshes)
-            # 临时树只有 Object Info / Group / Output，不含后处理节点：贴图计划必定关闭。
-            # 仍然显式初始化一次，清掉上一次导出可能残留的计划状态。
-            if TextureExportPlan is not None:
-                TextureExportPlan.configure_from_tree(
-                    temp_tree, GlobalConfig.path_generate_mod_folder()
-                )
-
-            round_plan = dict(QUICK_EXPORT_ROUND_PLAN)
-
-            result = ExportRoundExecutor.execute_round(
-                tree=temp_tree,
-                round_plan=round_plan,
-                allow_parallel_preprocess=True,
-            )
-
-            export_success = True
-            self.report({'INFO'}, f"快速局部导出完成，共导出 {result['object_count']} 个物体")
-            CommandUtils.OpenGeneratedModFolder()
-            return {'FINISHED'}
-        except Exception as e:
-            print(f"❌ 快速局部导出失败: {e}")
-            LOG.exception(e)
-            # 【临时诊断】把完整调用栈落到工作区，便于离线定位（无 UI 可看时的唯一取证途径）。
-            try:
-                import traceback as _tb
-
-                _dump = os.path.join(
-                    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".dbg", "last_export_error.txt"
-                )
-                os.makedirs(os.path.dirname(_dump), exist_ok=True)
-                with open(_dump, "w", encoding="utf-8") as _handle:
-                    _handle.write(f"快速局部导出失败: {e!r}\n\n")
-                    _handle.write(_tb.format_exc())
-            except Exception:  # noqa: BLE001 - 诊断写盘失败不能盖掉原始错误
-                pass
-            self.report({'ERROR'}, f"快速局部导出失败: {e}")
-            return {'CANCELLED'}
-        finally:
-            BlueprintExportHelper.runtime_blueprint_tree_name = previous_runtime_tree_name
-            BlueprintExportHelper.set_current_export_index(previous_export_index)
-            BlueprintExportHelper.set_current_buffer_folder_name(previous_buffer_folder_name)
-
-            if temp_tree:
-                try:
-                    temp_tree_name = temp_tree.name
-                except (AttributeError, ReferenceError):
-                    temp_tree_name = ""
-                if temp_tree_name and bpy.data.node_groups.get(temp_tree_name):
-                    bpy.data.node_groups.remove(temp_tree, do_unlink=True)
-
-            TimerUtils.print_summary()
-
-            LOG.stop_collecting()
-            log_name = LOG.save_to_text_editor("快速局部导出日志")
-            if log_name:
-                print(f"📄 快速局部导出日志已保存至文本编辑器: {log_name}")
+        """脚本直接执行也使用后台导出，禁止在前台运行导出计算。"""
+        return self.invoke(context, None)
 
     @staticmethod
     def _safe_object_name(obj) -> str:
@@ -1764,7 +1313,7 @@ class SSMTQuickExportSelected(_BackgroundExportMixin, bpy.types.Operator):
         return selected_meshes, skipped_count
 
     def _build_temp_blueprint_tree(self, objects):
-        """建临时蓝图树（实现抽到 ``export_background``，同步路径与后台 worker 共用）。"""
+        """建临时蓝图树（实现抽到 ``export_background``，由后台 worker 使用）。"""
         return build_quick_export_temp_tree(objects)
 
 
