@@ -363,6 +363,12 @@ def _add_manual_skip_item(node, hash_text, index_count_text="", first_index_text
     if entry is None:
         return False, error
 
+    # 点击「添加」是安全上下文：先把旧列表并入统一列表，再去重/追加。
+    try:
+        _migrate_legacy_manual_hashes(node)
+    except Exception:
+        pass
+
     existing_entries, _invalid = _collect_node_manual_entries(node)
     if entry in existing_entries:
         # 重复点击不再弹警告（用户反馈：正常重复添加也应静默处理）。
@@ -1014,14 +1020,13 @@ class SSMTNode_PostProcess_Skip(SSMTNode_PostProcess_Base):
     def draw_buttons(self, context, layout):
         layout.label(text="删除 IB hash 所属的全部导出段，并追加跳过段", icon='HIDE_ON')
 
-        # 旧工程的手动哈希列表并入统一列表后再显示（只在真实节点上迁移）。
-        try:
-            _migrate_legacy_manual_hashes(self)
-        except Exception:
-            pass
+        # 注意：不能在 draw 阶段迁移旧列表（Blender 不允许在绘制时改数据）。
+        # 这里只展示旧条目；真正的迁移在点击按钮 / 导出时做。
+        legacy_items = list(getattr(self, "manual_hash_items", []) or [])
+        total_count = len(self.skip_objects) + len(legacy_items)
 
         box = layout.box()
-        box.label(text=f"跳过部件 ({len(self.skip_objects)})", icon='OBJECT_DATA')
+        box.label(text=f"跳过部件 ({total_count})", icon='OBJECT_DATA')
         if self.skip_objects:
             box.template_list(
                 "SSMT_UL_SKIP_OBJECTS", "",
@@ -1029,6 +1034,18 @@ class SSMTNode_PostProcess_Skip(SSMTNode_PostProcess_Base):
                 self, "active_skip_object",
                 rows=max(2, min(len(self.skip_objects), 8)),
             )
+        # 旧工程里未迁移的手动哈希：在同一个列表区域里显示，点击任意按钮后并入上面。
+        for index, item in enumerate(legacy_items):
+            entry, _error = _normalize_manual_hash_item(
+                getattr(item, "hash", ""),
+                getattr(item, "index_count", ""),
+                getattr(item, "first_index", ""),
+            )
+            row = box.row(align=True)
+            row.label(text=_manual_hash_item_label(item), icon='TEXT' if entry else 'ERROR')
+            op_remove = row.operator("ssmt.skip_manual_hash_remove", text="", icon='X')
+            op_remove.node_name = self.name
+            op_remove.index = index
 
         row = box.row(align=True)
         row.operator("ssmt.skip_parts_add_selected", text="添加选中物体", icon='ADD').node_name = self.name
@@ -1387,6 +1404,10 @@ class SSMT_OT_PostProcess_AddSkipObject(bpy.types.Operator):
             self.report({'WARNING'}, "请先选中要添加的网格物体")
             return {'CANCELLED'}
 
+        try:
+            _migrate_legacy_manual_hashes(node)
+        except Exception:
+            pass
         existing = {str(item.object_name or "") for item in node.skip_objects}
         added_count = 0
         for obj in objects:
@@ -1417,6 +1438,10 @@ class SSMT_OT_PostProcess_RemoveSkipObject(bpy.types.Operator):
             self.report({'ERROR'}, "请选择跳过节点")
             return {'CANCELLED'}
 
+        try:
+            _migrate_legacy_manual_hashes(node)
+        except Exception:
+            pass
         if 0 <= self.index < len(node.skip_objects):
             node.skip_objects.remove(self.index)
             node.active_skip_object = max(0, min(int(node.active_skip_object), len(node.skip_objects) - 1))
@@ -1440,8 +1465,20 @@ class SSMT_OT_PostProcess_ClearSkipObjects(bpy.types.Operator):
             self.report({'ERROR'}, "请选择跳过节点")
             return {'CANCELLED'}
 
+        try:
+            _migrate_legacy_manual_hashes(node)
+        except Exception:
+            pass
         while len(node.skip_objects) > 0:
             node.skip_objects.remove(len(node.skip_objects) - 1)
+        # 迁移失败时也兜底清空旧列表
+        legacy = getattr(node, "manual_hash_items", None)
+        if legacy is not None and hasattr(legacy, "remove"):
+            while len(legacy) > 0:
+                try:
+                    legacy.remove(0)
+                except (TypeError, ValueError):
+                    del legacy[0]
         node.active_skip_object = 0
         self.report({'INFO'}, "已清空跳过部件列表")
         return {'FINISHED'}
