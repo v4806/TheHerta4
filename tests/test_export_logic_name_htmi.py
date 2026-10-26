@@ -241,6 +241,8 @@ class ExportLogicNameHTMITests(unittest.TestCase):
                 set_current_export_index=lambda *args, **kwargs: None,
             ),
         )
+        _install_module(f"{pkg}.blueprint.export_progress")
+        _install_module(f"{pkg}.blueprint.export_step_plan", build_step_plan=lambda *args, **kwargs: [])
         _install_module(f"{pkg}.blueprint.export_parallel", ExportRoundExecutor=types.SimpleNamespace(), ParallelExportError=RuntimeError)
         _install_module(f"{pkg}.blueprint.model", BluePrintModel=types.SimpleNamespace())
         _install_module(f"{pkg}.blueprint.preprocess", PreProcessHelper=types.SimpleNamespace(collect_target_object_names_strict=lambda names: names))

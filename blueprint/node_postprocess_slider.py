@@ -6,7 +6,11 @@ import shutil
 from collections import OrderedDict
 
 from .node_postprocess_base import SSMTNode_PostProcess_Base
-from ..common.ui_image_color import mark_png_as_srgb
+try:
+    from ..common.ui_image_color import mark_png_as_srgb
+except (ImportError, ModuleNotFoundError):
+    def mark_png_as_srgb(path):
+        pass
 from ..common.shapekey_weight_range import (
     SLIDER_WINDOW_MIN,
     SLIDER_WINDOW_MAX,

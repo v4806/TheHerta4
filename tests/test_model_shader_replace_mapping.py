@@ -635,7 +635,7 @@ class SwapPanelSliderOrderTests(unittest.TestCase):
         )
 
     def test_swap_panel_before_slider_panel_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "物体切换面板节点必须排在.*形态键扩展"):
+        with self.assertRaisesRegex(ValueError, r"(?:切换＆滑块面板|物体切换).*必须排在.*形态键扩展"):
             model_module.validate_postprocess_node_constraints(
                 [_swap_panel_node(), _shapekey_ext_node(emit=True)]
             )
@@ -658,7 +658,7 @@ class SwapPanelSliderOrderTests(unittest.TestCase):
         model_module.validate_postprocess_node_constraints(
             [_shapekey_ext_node(emit=None), _swap_panel_node()]
         )
-        with self.assertRaisesRegex(ValueError, "物体切换面板节点必须排在.*形态键扩展"):
+        with self.assertRaisesRegex(ValueError, r"(?:切换＆滑块面板|物体切换).*必须排在.*形态键扩展"):
             model_module.validate_postprocess_node_constraints(
                 [_swap_panel_node(), _shapekey_ext_node(emit=None)]
             )

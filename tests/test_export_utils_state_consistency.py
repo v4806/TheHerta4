@@ -69,7 +69,7 @@ _install_module(f"{PKG}.common.logic_name", LogicName=types.SimpleNamespace(GF2=
 _install_module(f"{PKG}.common.global_properties", GlobalProterties=types.SimpleNamespace())
 _install_module(f"{PKG}.common.d3d11_gametype", D3D11GameType=object)
 _install_module(f"{PKG}.common.obj_buffer_helper", ObjBufferHelper=types.SimpleNamespace(
-    parse_elementname_data_dict=lambda mesh, d3d11_game_type, vertex_group_names=None: {"POSITION": mesh},
+    parse_elementname_data_dict=lambda mesh, d3d11_game_type, vertex_group_names=None, **kwargs: {"POSITION": mesh},
 ))
 _install_module(f"{PKG}.utils.timer_utils", TimerUtils=types.SimpleNamespace())
 _install_module(f"{PKG}.utils.obj_utils", ObjUtils=types.SimpleNamespace(

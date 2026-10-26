@@ -26,7 +26,11 @@ from collections import OrderedDict
 import bpy
 
 from .node_postprocess_base import SSMTNode_PostProcess_Base
-from ..common.ui_image_color import mark_png_as_srgb
+try:
+    from ..common.ui_image_color import mark_png_as_srgb
+except (ImportError, ModuleNotFoundError):
+    def mark_png_as_srgb(path):
+        pass
 
 try:
     from .node_swap_ini import SwapKeyINIGenerator
@@ -3572,6 +3576,13 @@ def _apply_swap_panel_implementation(cls):
     for name, value in vars(_SSMTNode_PostProcess_SwapPanelMixin).items():
         if name not in reserved and name not in cls.__dict__:
             setattr(cls, name, value)
+    for name, prop in _SSMTNode_PostProcess_SwapPanelMixin.__annotations__.items():
+        if name not in cls.__dict__:
+            keywords = getattr(prop, "keywords", None)
+            if keywords is None and isinstance(prop, tuple) and len(prop) == 2 and isinstance(prop[1], dict):
+                keywords = prop[1]
+            default_val = keywords.get("default", None) if isinstance(keywords, dict) else None
+            setattr(cls, name, default_val)
     return cls
 
 
@@ -4339,7 +4350,10 @@ def migrate_legacy_swap_panels():
                 print(f"[切换＆滑块面板] 迁移共用快捷键失败：{node.name}（{tree.name}）：{error}")
 
 
-@bpy.app.handlers.persistent
+_persistent = getattr(getattr(getattr(bpy, "app", None), "handlers", None), "persistent", lambda fn: fn)
+
+
+@_persistent
 def _combined_panel_load_post(_dummy):
     migrate_legacy_swap_panels()
 

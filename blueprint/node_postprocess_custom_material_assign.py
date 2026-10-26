@@ -22,8 +22,12 @@ from collections import OrderedDict
 from .node_postprocess_material import (
     MATERIAL_DETECT_PRESETS,
     SSMTNode_PostProcess_MaterialBase,
-    resolve_keyswap_key,
 )
+try:
+    from .node_postprocess_material import resolve_keyswap_key
+except ImportError:
+    def resolve_keyswap_key(sections, section_name, requested_key, log_prefix=""):
+        return requested_key
 try:  # pragma: no cover - 纯文件装载的测试宿主可能没有 common 包
     from ..common.texture_export_plan import TextureExportPlan
 except ImportError:  # pragma: no cover

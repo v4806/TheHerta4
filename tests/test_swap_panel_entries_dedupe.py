@@ -340,9 +340,9 @@ class ButtonListTests(EntriesDedupeTestCase):
             _swap_node(var="swapkey4", comment="帽子", hotkey="home"),
         ]
         buttons = self._build_buttons(nodes)
-        self.assertEqual(len(buttons), 1)
-        self.assertEqual(buttons[0]["var_names"], ["swapkey3", "swapkey4"])
-        self.assertEqual(buttons[0]["option_counts"], [2, 2])
+        self.assertEqual(len(buttons), 2, "同快捷键的不同注释部件在面板中保留独立按钮")
+        self.assertEqual(buttons[0]["var_names"], ["swapkey3"])
+        self.assertEqual(buttons[1]["var_names"], ["swapkey4"])
 
 
 if __name__ == "__main__":

@@ -1,4 +1,5 @@
 import importlib.util
+import sys
 from pathlib import Path
 import unittest
 from unittest import mock
@@ -33,7 +34,10 @@ def reference(offsets,groups,weights,loops,channels,normalize=True):
 
 class ExportGeometryNativeTests(unittest.TestCase):
     def setUp(self):
-        if native._library() is None:self.skipTest('Native export geometry library unavailable')
+        if sys.version_info < (3, 12):
+            self.skipTest('Native export geometry requires Python >= 3.12')
+        if native._library() is None:
+            self.skipTest('Native export geometry library unavailable')
 
     def test_blend_matches_reference_bytes_for_widths_and_threads(self):
         rng=np.random.default_rng(347)

@@ -1,4 +1,4 @@
-﻿# HIMI（崩坏3 / HI3）骨骼合并计划书
+# HIMI（崩坏3 / HI3）骨骼合并计划书
 
 > 状态：**已实现并交付（数据层 + 导入侧接线 + 导出/运行时合并骨架资源生成 + 独立验证 + 审查 + 集成收口全部完成）**；实机验证项未做（见 §11） · 最后更新：2026-09-23（T10 定稿）
 > 目标：参照 ZZMI 合并骨架（`common/zzmi_skeleton.py` / `ui/universal/zzmi.py` / `Toolset/zzmi_merged_*.hlsl`），为 HIMI（崩坏3 / HI3，游戏目录 `K:\SSMT-Package-master\3Dmigoto\HI3`）实现骨骼合并。
@@ -591,7 +591,7 @@ float4 r2 = palette[bone * 3u + 2u];
 1. **`family_members()` 只遍历「工作空间里已落盘」的组件**（`common/himi_skeleton.py:466-477`），因此**看不到「从未落盘的家族成员」**——此时会判该家族 `safe=True`。这是**有意边界且方向安全**：放行的前提是「本次导出集合覆盖了工作空间里该家族的全部已落盘成员」，即导出侧自己不会切掉同家族兄弟。门控**不能**覆盖「工作空间外部的缺失」（那种缺失对 dump 侧同样不可见）。
 2. **家族级拒绝时 `DeformGateBlockedPasses` 仍会记录该 pass**：它只是**诊断明细**，`reason` 仍按「家族自身是否 safe」正确选择（家族级 vs pass 级），**不改变任何写回内容**。
 
-**G1 的导出侧重算入口**：`HIMISkeletonMergeHelper.prepare(target_bares=...)`（T6 偏离 ③）——`target_bares` 覆盖「合并目标集合」，导入侧缺省 = 全部已落盘组件，导出侧传入**本次实际要导出的组件**，因此「本次不导出同家族兄弟」会被正确判为不完整。导出侧经 `prepare_gate_oracle`（`common/himi_merged_runtime.py:2427`）消费该结论，`gate_source=prepare`；dump 不可用时退化为 `gate_source=cache-only`（见 §7.4 D3）。
+**G1 的导出侧重算入口**：`HIMISkeletonMergeHelper.prepare(target_bares=...)`（T6 偏离 ③）——`target_bares` 覆盖「合并目标集合」，导入侧缺省 = 全部已落盘组件，导出侧传入**本次实际要导出的组件**，因此「本次不导出同家族兄弟」会被正确判为不完整。导出侧经 `prepare_gate_oracle`（`common/himi_merged_runtime.py:2430`）消费该结论，`gate_source=prepare`；dump 不可用时退化为 `gate_source=cache-only`（见 §7.4 D3）。
 
 **VB 段形态（在 Blend 类别的 `TextureOverride` 内，对照 `ui/universal/unity.py:58-61`）**：
 
@@ -608,11 +608,11 @@ draw = <deform pass 的 Draw(VertexCount)>, 0   ; ← 注意：不是 draw_numbe
 
 1. **`draw` 的顶点数 = 该 deform pass 的 `Draw(VertexCount)` 的家族分片之和**（T7 偏离 ②），**不是** `drawib_model.draw_number`（渲染用）。实测两者不同（例 135739/`000035`：deform `VertexCount = 3377`，组件 `Blend.buf` 也是 3377 行；而渲染 `draw_number` 是该组件的导出顶点数）。同一 IB 家族的多个 bare 共享同一 SO 输出（分片区间首尾相接），因此该 pass 的行数 = **家族内各分片 `OriginalVertexCount` 之和**。**写错 ⇒ SO 只写前 N 行，其余行保留上一帧/未初始化内容 ⇒ 模型残缺。**
    > ⚠️ **t48/t49 更正（2026-09-25；**这正是本轮实机 blocker 的成因**）**：上述「家族分片之和」口径**已被实机推翻**，且它本身就是 blocker。真机 dump 实测：每家族**只有 1 个** deform pass（`StartVertexLocation: 0`），游戏真实 deform draw = **单个分片/LOD** 的数量（`2c706fbd` = **19895**、`694025c6` = 3363、`70a4da3e` = 3789、`b35cfc6c` = 1816、`def0c0ae` = 1496），而**同族每个成员的 `OriginalVertexCount` 完全相同**（它们是分片/LOD 变体：`5×19895`、`3×3363`、`2×1496`）⇒ 求和**必然**给出 N 倍。**新口径（已落地，t48）**：`draw` 的**唯一权威 = 模组自己这次上传的顶点数**（= `drawib_model.draw_number` = 产物 `override_vertex_count` = `Position.buf` 行数）；家族 Σ **只用于诊断打印**，且**只报警、不夹取**（静默夹取会让离线护栏永远看不到越界值）。旧口径下五族写出 `99475 / 10089 / 3789 / 1816 / 2992`，对上传行数 `31066 / 9 / 3 / 3 / 6` 越界 **3.2× / 1121× / 1263× / 605× / 499×**（其中 4 个家族只有站位几何）。**但注意：量纲修好 ≠ 实机修好**（见 §13.11「被推翻的假设①」）。
-   **~~安全夹取~~ ⇒ 导出顶点数无条件权威（t48 反转）**：`resolve_deform_draw_count()`（`common/himi_merged_runtime.py:2165`）**已反转方向** —— `exported > 0` **无条件采用**（`source = "exported"`），家族 Σ 只进 `note`；仅当 `exported == 0`（不可得）才退回 Σ（`family-sum-fallback`）。**原「取较大值」方向是错的**：越界写会把**角色级 SO 池**写爆（t47 实测多写 68409 行），而「少写」只会让尾行保留上一帧 —— 两害相权，**上传行数才是那个物理量**。实测数据上两者相等（`04` §1：34/34 组件 `vertex_count_blend == vertex_count_deform`）⇒ 旧口径在**取证数据**上是空操作，**只在真实导出上炸**。
+   **~~安全夹取~~ ⇒ 导出顶点数无条件权威（t48 反转）**：`resolve_deform_draw_count()`（`common/himi_merged_runtime.py:2168`）**已反转方向** —— `exported > 0` **无条件采用**（`source = "exported"`），家族 Σ 只进 `note`；仅当 `exported == 0`（不可得）才退回 Σ（`family-sum-fallback`）。**原「取较大值」方向是错的**：越界写会把**角色级 SO 池**写爆（t47 实测多写 68409 行），而「少写」只会让尾行保留上一帧 —— 两害相权，**上传行数才是那个物理量**。实测数据上两者相等（`04` §1：34/34 组件 `vertex_count_blend == vertex_count_deform`）⇒ 旧口径在**取证数据**上是空操作，**只在真实导出上炸**。
 2. **`vs-t0` 重绑必须在同一个 VB 段内**（与 `vb1` 一起），保证重绑与 draw 之间没有别的 pass 插进来。
 3. **非合并路径必须保留 `handling = skip` + `draw = <draw_number>, 0`**（对照 `zzmi.py:4083-4094` 的回归教训）——即：`draw` 的值在合并/非合并两条路径下**不同**，实现时必须分支。
 
-**D3 —— dump 不可用时的门控退化（T7 偏离 ③）**：`load_workspace_plan`（`common/himi_merged_runtime.py:2924`）在 dump 缺失时走 `gate_source=cache-only`，**不做家族/pass 重算**（重算需要 dump）；仅当「本次导出覆盖了**全部**已落盘带数据部件」时沿用缓存判定，否则**保守地全部不重绑**（不替别人换骨架）。带 `target_bares` 的请求**必须拒绝 cache-only**（`gate_source='cache-only-unavailable'`）——否则「权威可用但放行 0 个」会被导出侧当成判定，使保守退路静默失效。
+**D3 —— dump 不可用时的门控退化（T7 偏离 ③）**：`load_workspace_plan`（`common/himi_merged_runtime.py:2927`）在 dump 缺失时走 `gate_source=cache-only`，**不做家族/pass 重算**（重算需要 dump）；仅当「本次导出覆盖了**全部**已落盘带数据部件」时沿用缓存判定，否则**保守地全部不重绑**（不替别人换骨架）。带 `target_bares` 的请求**必须拒绝 cache-only**（`gate_source='cache-only-unavailable'`）——否则「权威可用但放行 0 个」会被导出侧当成判定，使保守退路静默失效。
 
 > **未验证项（R3）**：`vb1` 覆盖 + `vs-t0` 重绑在 **非索引 `Draw`** 上的实际行为未经实机验证（ZZMI 的先例是同形态：`zzmi_merged_skeleton_attach.hlsl` 就是给 deform pass 用的）。验收标准 §9 的第 6 条要求游戏内实测。
 
@@ -1496,7 +1496,7 @@ ZZMI 的门控（`zzmi_skeleton.py:656-667`）触发条件是「命中对任一�
 | # | 计划书原口径 | 最终口径 | 理由 | 落地位置（T30 复核） |
 |---|---|---|---|---|
 | E1 | §5.1「`VGCount` = 被引用槽数、`VGMap` 键集 = 被引用槽集合」 | **`VGCount = max(被引用局部槽下标) + 1`；`VGMap` 完整覆盖 `0..VGCount-1`**（被引用槽 → 全局槽位；**空洞槽 → `槽位数 + 局部下标`**） | 导入侧硬校验：`common/submesh_json.py:53` 的 `set(normalized) == set(range(vg_count))` 不成立 ⇒ 元数据判无效；`common/mesh_create_helper.py:451-457` 的 `actual_keys != expected_keys` ⇒ `Fatal`；`:527` 的 `component.vg_map[int(i)]` 缺失 ⇒ `Fatal`。**照原口径实现，首个 HIMI 组件导入即崩** | `common/himi_skeleton.py:879-901`（槽位分配循环）；`tests/test_himi_skeleton.py::test_real_referenced_slot_totals_are_pinned` |
-| E2 | §4.2「palette 原始字节 = 该组件 palette 被引用槽按 48 B/骨切片后的字节」 | **「按引用序压缩的槽表」**：行 `j` = 第 `j` 小的被引用局部槽；`BoneMatrixSlotCount` = 被引用槽数 | 池含未引用槽 ⇒ 「池镜像」会把行号错位；导出侧必须用同一「引用序」解析并与角色骨架**逐字节**核对 | `common/himi_skeleton.py:796`（`slots = sorted({…})`）；`common/himi_merged_runtime.py:2669`（`read_palette_cache` 逐字写明「按引用序压缩的槽表」）与 `:1931`（对回全局槽位）；`common/himi_merged_runtime.py:2693`（`verify_palette_cache_against_skeleton`） |
+| E2 | §4.2「palette 原始字节 = 该组件 palette 被引用槽按 48 B/骨切片后的字节」 | **「按引用序压缩的槽表」**：行 `j` = 第 `j` 小的被引用局部槽；`BoneMatrixSlotCount` = 被引用槽数 | 池含未引用槽 ⇒ 「池镜像」会把行号错位；导出侧必须用同一「引用序」解析并与角色骨架**逐字节**核对 | `common/himi_skeleton.py:796`（`slots = sorted({…})`）；`common/himi_merged_runtime.py:2672`（`read_palette_cache` 逐字写明「按引用序压缩的槽表」）与 `:1931`（对回全局槽位）；`common/himi_merged_runtime.py:2696`（`verify_palette_cache_against_skeleton`） |
 | E3 | §5.1 `BoneMatrixSlotCount` 语义写「= 去重前池内**被引用槽数**，用于大小校验」+ §9.4 C4 只写「`VGMap` 写回后 `_merged_skeleton_metadata_valid` 为真」 | 语义同上，但**校验判据必须真的调用该函数**：`_merged_skeleton_metadata_valid(payload) is True`，并补三个负例 | 原 C4 的测试只断言 payload 键值、**从未调用校验函数** ⇒ 无法证伪原口径（T9 F6） | `tests/test_himi_skeleton.py` 的 `_load_merged_skeleton_validator()` + 2 条用例 |
 
 ### 13.2 计划书未写、实现补上（5 条）
@@ -2171,7 +2171,7 @@ cd E:\代码\TheHerta4 ; .\.venv\Scripts\python.exe -m pytest -q
 
 **修法**
 
-- `ui/universal/himi.py:5206` `add_unity_vs_texture_override_ib_sections` 删掉 `skin_entry` /
+- `ui/universal/himi.py:5292` `add_unity_vs_texture_override_ib_sections` 删掉 `skin_entry` /
   `skin_lines` 的构建与 `out.extend(skin_lines)`，只保留 `out.extend(capture_lines)`
   （即「cb3 捕获 → run attach」）。全仓 `skin_entry|skin_lines` 引用数为 0。
 - `himi_skin_sections()` 的段与资源发射**保持不变**（与 t97 产物一致：段存在但无人引用 ⇒
@@ -2233,7 +2233,7 @@ Blend 权重和恒 1.0 ⇒ 不是数据坏，是同一份几何被画了多次�
 **修法 B（回退 t99 的自动补家族）**：`ui/ui_func_export.py` 删掉 `_collect_export_meshes` / `_expand_merged_skeleton_families` 整段
 （1891 → 1763 行），两个入口回到 `_collect_selected_meshes`（`ui/ui_func_export.py:1562` 与 `ui/ui_func_export.py:1635`）；
 `common/himi_merged_runtime.py` 删掉无调用方的 `merge_family_bare` / `missing_family_bares`（现 5392 行），保留 `workspace_slot_owners`
-（`common/himi_merged_runtime.py:2839`）与 `describe_ownerless_slots`（`common/himi_merged_runtime.py:2862`，仍供 orphan 消息使用）；
+（`common/himi_merged_runtime.py:2839`）与 `describe_ownerless_slots`（`common/himi_merged_runtime.py:2865`，仍供 orphan 消息使用）；
 `tests/test_himi_merged_runtime.py` 删掉 `HIMIFamilyNameTests`（现 7072 行）。
 
 **修法 C（部署 mod 的站位形态，t104）**：`虚构游戏.ini` 备份 `虚构游戏.ini.bak_t104_20261025_165240`（451 行）→ **463 行**，
