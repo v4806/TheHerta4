@@ -313,6 +313,34 @@ class BlueprintExportHelper:
         return ""
 
     @staticmethod
+    def get_blueprint_name_after_delete(ordered_names, deleted_name):
+        """删除蓝图后下拉框应顺序选中的下一项（与「当前打开的蓝图」解耦）。
+
+        ``ordered_names`` 是删除前的下拉列表顺序（即 ``get_all_blueprint_trees()``
+        的名字顺序）。规则：
+
+        - 删除中间项 -> 选它后面的那一项；
+        - 删除末项 -> 选它前面的那一项；
+        - 只删剩 0 项 -> 返回空串（调用方写 ``__NONE__``）；
+        - 删除的目标不在列表里（陈旧/外部修改）-> 选剩余第一项。
+
+        旧实现删除后调用 ``get_preferred_blueprint_name()``，会优先返回当前打开
+        的蓝图，表现为「删掉别的选项后下拉框又跳回当前蓝图」。
+        """
+        names = [str(name) for name in (ordered_names or [])]
+        deleted = str(deleted_name or "")
+        remaining = [name for name in names if name != deleted]
+        if not remaining:
+            return ""
+        try:
+            index = names.index(deleted)
+        except ValueError:
+            return remaining[0]
+        if index < len(remaining):
+            return remaining[index]
+        return remaining[-1]
+
+    @staticmethod
     def _blueprint_enum_item_number(index: int) -> int:
         """蓝图枚举项声明的序号 = **该项在 items 列表里的下标**。
 

@@ -296,6 +296,39 @@ class BlueprintIdentifierNormalizationTests(unittest.TestCase):
 
         self.assertIsNone(tree)
 
+    def test_after_delete_selects_next_item_in_dropdown_order(self):
+        """删除后应按列表顺序选下一项，而不是跳回当前打开的蓝图"""
+        helper = export_helper.BlueprintExportHelper
+        order = ["Alpha", "Beta", "Gamma"]
+
+        self.assertEqual(helper.get_blueprint_name_after_delete(order, "Alpha"), "Beta")
+        self.assertEqual(helper.get_blueprint_name_after_delete(order, "Beta"), "Gamma")
+
+    def test_after_delete_last_item_selects_previous_item(self):
+        """删除末项时选前一项，保持选择落在列表内"""
+        helper = export_helper.BlueprintExportHelper
+
+        self.assertEqual(
+            helper.get_blueprint_name_after_delete(["Alpha", "Beta", "Gamma"], "Gamma"),
+            "Beta",
+        )
+
+    def test_after_delete_only_item_returns_empty(self):
+        """删到只剩 0 项时返回空串（由调用方写 __NONE__）"""
+        helper = export_helper.BlueprintExportHelper
+
+        self.assertEqual(helper.get_blueprint_name_after_delete(["Alpha"], "Alpha"), "")
+        self.assertEqual(helper.get_blueprint_name_after_delete([], "Alpha"), "")
+
+    def test_after_delete_unknown_target_falls_back_to_first_remaining(self):
+        """删除目标在列表里找不到（陈旧值）时，回退到剩余第一项而不是空串"""
+        helper = export_helper.BlueprintExportHelper
+
+        self.assertEqual(
+            helper.get_blueprint_name_after_delete(["Alpha", "Beta"], "Missing"),
+            "Alpha",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
