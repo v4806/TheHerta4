@@ -782,58 +782,6 @@ def _panel_runtime_parse_resources(ini_text):
     return mapping
 
 
-def _panel_runtime_source_ini(node, slider_node):
-    """找一份可作临时导出底稿的 mod ini（面板段落已存在）。"""
-    candidates = []
-
-    def add(path):
-        path = (path or "").strip()
-        if path and os.path.isfile(path) and path not in candidates:
-            candidates.append(path)
-
-    add(getattr(node, "last_mod_ini_path", ""))
-    add(getattr(slider_node, "last_mod_ini_path", ""))
-    try:
-        from ..common.global_config import GlobalConfig
-
-        generate_dir = (GlobalConfig.path_generate_mod_folder() or "").strip()
-        root = os.path.dirname(os.path.normpath(generate_dir)) if generate_dir else ""
-        if root and os.path.isdir(root):
-            found = []
-            for current, dirs, files in os.walk(root):
-                depth = current[len(root):].count(os.sep)
-                if depth >= 2:
-                    dirs[:] = []
-                for name in files:
-                    if name.lower().endswith(".ini"):
-                        found.append(os.path.join(current, name))
-            found.sort(key=lambda item: os.path.getmtime(item), reverse=True)
-            for path in found:
-                add(path)
-    except Exception:
-        pass
-
-    namespace = ""
-    try:
-        namespace = str(node._ensure_namespace() or "")
-    except Exception:
-        namespace = str(getattr(node, "namespace", "") or "")
-
-    preferred = []
-    fallback = []
-    for path in candidates:
-        try:
-            with open(path, "r", encoding="utf-8", errors="replace") as handle:
-                text = handle.read()
-        except OSError:
-            continue
-        if namespace and f"${namespace}_btn_w1" in text:
-            preferred.append(path)
-        elif "SSMTSwapPanel" in text or "SLIDER PANEL CUSTOM LOGIC" in text:
-            fallback.append(path)
-    return (preferred or fallback or candidates or [None])[0]
-
-
 def _panel_runtime_button_ns(ini_text):
     match = re.search(r"^\s*global\s+\$(\w+)_btn_w1\s*=", ini_text, re.MULTILINE)
     return match.group(1) if match else ""
@@ -1028,17 +976,15 @@ def _render_panel_runtime_image(node, ini_path, res_dir):
 
 
 def _combined_panel_preview_runtime(node):
-    """按 Mod 运行时数据生成预览：临时目录里真实跑一遍面板导出，再按 shader 绘制顺序合成。"""
+    """直接读当前工程节点数据生成预览：临时目录跑一遍内置导出，再按 shader 顺序合成。
+
+    不需要历史导出的 mod ini：临时目录里只放一个最小的 ``[Constants]`` / ``[Present]``
+    底稿，避免旧 mod 的 ``[KeySwap_*]`` 备注/变量把当前按钮错误合并。
+    """
     if not PIL_AVAILABLE or node.panel_mode not in {"INTEGRATED_TOP", "INTEGRATED_BOTTOM"}:
         return None
     slider_node = node._find_shape_ext_node()
     if slider_node is None or not bool(getattr(node, "slider_use_slider_panel", False)):
-        return None
-    source_ini = _panel_runtime_source_ini(node, slider_node)
-    if not source_ini:
-        return None
-    source_res = os.path.join(os.path.dirname(source_ini), "res")
-    if not os.path.isdir(source_res):
         return None
 
     saved_paths = []
@@ -1046,15 +992,17 @@ def _combined_panel_preview_runtime(node):
         saved_paths.append((target, getattr(target, "last_mod_ini_path", "")))
     temp_root = tempfile.mkdtemp(prefix="ssmt_panel_runtime_preview_")
     try:
-        temp_ini = os.path.join(temp_root, os.path.basename(source_ini))
-        shutil.copy2(source_ini, temp_ini)
-        shutil.copytree(source_res, os.path.join(temp_root, "res"))
+        temp_ini = os.path.join(temp_root, "preview.ini")
+        with open(temp_ini, "w", encoding="utf-8") as handle:
+            handle.write("[Constants]\n\n[Present]\n")
+        res_dir = os.path.join(temp_root, "res")
+        os.makedirs(res_dir, exist_ok=True)
         slider_node._sync_combined_slider_config()
         if not slider_node.execute_postprocess(temp_root, _in_place=True, _ini_path=temp_ini, _skip_backup=True):
             return None
         if not node.execute_postprocess(temp_root, _in_place=True, _ini_path=temp_ini, _skip_backup=True):
             return None
-        image = _render_panel_runtime_image(node, temp_ini, os.path.join(temp_root, "res"))
+        image = _render_panel_runtime_image(node, temp_ini, res_dir)
         if image is None:
             return None
         output = os.path.join(tempfile.gettempdir(), "ssmt_combined_panel_preview.png")
