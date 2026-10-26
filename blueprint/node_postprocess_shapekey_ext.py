@@ -2875,7 +2875,8 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
         # 滑块宽度 = 滑块高度 × 滑块柄图片宽高比（与物体切换面板按钮一致，保持图片比例）
         slider_w = self._measure_image_aspect(dest_res_dir, "1.png") * slider_h * SCREEN_RATIO_CORRECTION
 
-        child_height = slider_h
+        # A row contains both the handle and its play/label button.
+        child_height = max(slider_h, btn_h_fixed)
         top_bottom_padding = 0.03
         spacing = 0.02
         total_slider_height = num_sliders * child_height
@@ -2887,7 +2888,7 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
         integrated_switch_width = 0.0
         integrated_switch_hitboxes = []
 
-        combined = self._find_combined_slider_panel() if auto_crop else None
+        combined = self._find_combined_slider_panel()
         if (combined is not None
                 and getattr(combined, "panel_mode", "") in {"INTEGRATED_TOP", "INTEGRATED_BOTTOM"}):
             switch_entries = list(getattr(combined, "swap_panel_entries", []) or [])
@@ -3001,11 +3002,11 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
         # 背景图按滑块、播放按钮及集成切换按钮的实际占用范围裁切。
         # 裁切发生在 mod 输出副本上，原始用户图片不受影响。
         bg_aspect = self._measure_image_aspect(dest_res_dir, "0.png")
+        min_slider_width = max(
+            button_width + 0.05 + max(slider_w * 2.5, 0.10)
+            for button_width in btn_w_list
+        ) if btn_w_list else 0.15
         if auto_crop:
-            min_slider_width = max(
-                (button_width + 0.02 + slider_w * 2.5) / 0.95
-                for button_width in btn_w_list
-            ) if btn_w_list else slider_w * 2.5
             content_width = max(min_slider_width, integrated_switch_width)
             target_aspect = content_width / max(parent_height * SCREEN_RATIO_CORRECTION, 1e-6)
             if self._crop_background_to_aspect(
@@ -3020,7 +3021,10 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
                 )
 
         # 背景尺寸：宽 = 背景比例 × 面板高度 × 屏幕校正。
-        panel_bg_width_auto = parent_height * bg_aspect * SCREEN_RATIO_CORRECTION
+        minimum_width = max(min_slider_width, integrated_switch_width)
+        if not auto_crop and bg_aspect > 0:
+            parent_height = max(parent_height, minimum_width / (bg_aspect * SCREEN_RATIO_CORRECTION))
+        panel_bg_width_auto = max(parent_height * bg_aspect * SCREEN_RATIO_CORRECTION, minimum_width)
 
         # 生成/处理面板背景（圆角+边框）：无论是否自定义背景图都生效
         bg_custom = (self.background_image or "").strip()
@@ -3048,6 +3052,7 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
             "; --- UI 几何与位置配置 (由滑块面板-自定义生成) ---",
             f"global $base_width0 = {panel_bg_width_auto:.4f}",
             f"global $base_height0 = {parent_height:.4f}",
+            "global $slider_side_padding = 0.0200", "global $slider_label_gap = 0.0100",
             "global $set_x0 = 0.5", "global $set_y0 = 0.5",
         ])
         for i in range(1, num_sliders + 1):
@@ -3059,6 +3064,8 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
                 f"global $base_height{i} = {slider_h:.4f}",
                 f"global $set_rel_x{i} = 0.5",
                 f"global $fixed_rel_y{i} = {relative_y:.4f}",
+                f"global $btn_base_width{i} = {btn_w_i:.4f}",
+                f"global $btn_base_height{i} = {btn_h_fixed:.4f}",
                 f"global $btn_width{i} = {btn_w_i:.4f}",
                 f"global $btn_height{i} = {btn_h_fixed:.4f}",
                 f"global $btn_x{i}", f"global $btn_y{i}", f"global $btn_pressed{i} = 0",
@@ -3162,13 +3169,15 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
         present_additions.append("    $norm_width0 = $base_width0 * $zoom0")
         present_additions.append("    $norm_height0 = $base_height0 * $zoom0")
         for i in range(1, num_sliders + 1):
-            present_additions.append(f"    $norm_width{i} = $base_width{i} * $zoom{i}")
-            present_additions.append(f"    $norm_height{i} = $base_height{i} * $zoom{i}")
+            present_additions.append(f"    $norm_width{i} = $base_width{i} * $zoom0")
+            present_additions.append(f"    $norm_height{i} = $base_height{i} * $zoom0")
+            present_additions.append(f"    $btn_width{i} = $btn_base_width{i} * $zoom0")
+            present_additions.append(f"    $btn_height{i} = $btn_base_height{i} * $zoom0")
 
         present_additions.append("\n    ; --- 2. 计算子级的拖拽边界 ---")
         for i in range(1, num_sliders + 1):
-            present_additions.append(f"    $min_rel_x{i} = $btn_width{i} + 0.02")
-            present_additions.append(f"    $max_rel_x{i} = ($norm_width0 * 0.95) - $norm_width{i}")
+            present_additions.append(f"    $min_rel_x{i} = $btn_width{i} + ($slider_side_padding + $slider_label_gap) * $zoom0")
+            present_additions.append(f"    $max_rel_x{i} = $norm_width0 - $slider_side_padding * $zoom0 - $norm_width{i}")
             present_additions.append(f"    $range_x{i} = $max_rel_x{i} - $min_rel_x{i}")
 
         present_additions.append("\n    ; --- 3. 位置初始化 ---")
@@ -3203,7 +3212,7 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
             present_additions.append(f"    $rel_y{i} = ($fixed_rel_y{i} * $norm_height0) - ($norm_height{i} / 2)")
             present_additions.append(f"    $img{i}_x = $img0_x + $rel_x{i}")
             present_additions.append(f"    $img{i}_y = $img0_y + $rel_y{i}")
-            present_additions.append(f"    $btn_x{i} = $img0_x + $min_rel_x{i} - $btn_width{i} - 0.01")
+            present_additions.append(f"    $btn_x{i} = $img0_x + $min_rel_x{i} - $btn_width{i} - $slider_label_gap * $zoom0")
             present_additions.append(f"    $btn_y{i} = $img{i}_y + ($norm_height{i} - $btn_height{i}) * 0.5")
 
         present_additions.append("\n    ; --- 5. 按钮按下/弹起检测（仅自动播放分组可点击）---")
@@ -3302,7 +3311,7 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
             present_additions.append(f"    $right_bar{i}_height = $left_bar{i}_height")
             present_additions.append(f"    $right_bar{i}_y = $left_bar{i}_y")
             present_additions.append(f"    $right_bar{i}_x = $slider{i}_center_x")
-            present_additions.append(f"    $right_bar{i}_width = ($img0_x + $norm_width0 * 0.95) - $right_bar{i}_x")
+            present_additions.append(f"    $right_bar{i}_width = ($img0_x + $norm_width0 - $slider_side_padding * $zoom0) - $right_bar{i}_x")
 
         present_additions.append("\n    ; --- 8. 计算映射参数并链接到形态键强度或播放速度百分比 ---")
         present_additions.append("    $dragged_slider = 0")
