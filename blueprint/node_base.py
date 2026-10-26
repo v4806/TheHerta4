@@ -319,9 +319,9 @@ class THEHERTA3_OT_OpenPersistentBlueprint(bpy.types.Operator):
 
         BlueprintExportHelper.set_runtime_blueprint_tree(tree)
 
-        global_properties = getattr(getattr(context, "scene", None), "global_properties", None)
-        if global_properties and getattr(global_properties, "selected_blueprint_name", "") != tree.name:
-            global_properties.selected_blueprint_name = tree.name
+        # 不在这里写 selected_blueprint_name：下拉框的「选择」和「当前打开的蓝图」
+        # 是两件事——用户要求从这里只打开选定的蓝图，但打开的蓝图不能反过来
+        # 改变下拉框的选择。选择只由用户在面板下拉框里显式修改。
 
         target_window = None
         for window in context.window_manager.windows:
@@ -433,17 +433,23 @@ class THEHERTA3_OT_DeletePersistentBlueprint(bpy.types.Operator):
             BlueprintExportHelper.runtime_blueprint_tree_name = ""
 
         deleted_blueprint_name = target_tree.name
+        # 先记录删除前的下拉列表顺序：删除后按顺序选下一项，而不是跳回当前打开的蓝图。
+        ordered_blueprint_names = [
+            tree.name for tree in BlueprintExportHelper.get_all_blueprint_trees()
+        ]
         global_properties = getattr(getattr(context, "scene", None), "global_properties", None)
         bpy.data.node_groups.remove(target_tree)
 
-        # 删除后原枚举序号必然失效：立刻写回一个仍然存在的蓝图（一个都不剩时写
-        # __NONE__）。否则下拉框会留成空白并持续刷 RNA 警告，删除/重命名也会再次
-        # 失去目标。
-        preferred_blueprint_name = BlueprintExportHelper.get_preferred_blueprint_name(context=context)
+        next_blueprint_name = BlueprintExportHelper.get_blueprint_name_after_delete(
+            ordered_blueprint_names, deleted_blueprint_name
+        )
+        # 删除后原枚举序号必然失效：写回顺序上的下一项（一个都不剩时写 __NONE__）。
+        # 不调用 get_preferred_blueprint_name：它优先返回当前打开的蓝图，会让下拉框
+        # 在删掉其他选项后自动跳回当前蓝图（用户反馈的选择被“绑定”问题）。
         if global_properties:
             try:
                 global_properties.selected_blueprint_name = (
-                    preferred_blueprint_name or BlueprintExportHelper.BLUEPRINT_NONE_IDENTIFIER
+                    next_blueprint_name or BlueprintExportHelper.BLUEPRINT_NONE_IDENTIFIER
                 )
             except Exception:
                 BlueprintExportHelper.ensure_valid_selected_blueprint_name(context=context)
