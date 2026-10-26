@@ -19,6 +19,7 @@ import sys
 import os
 import shutil
 import tempfile
+import time
 import traceback
 
 repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -335,13 +336,29 @@ def run_tests():
         gp.path_generate_mod_folder = export_dir
         gp.workspace_source_mode = "CUSTOM"
         gp.custom_workspace_folder_path = ws_dir
-        gp.background_export_enabled = False  # Synchronous export for testing
         gp.enable_export_cache = True         # PR #54 export cache enabled
         gp.selected_blueprint_name = tree_main.name
 
         print("Triggering bpy.ops.ssmt.generate_mod_blueprint...")
         res = bpy.ops.ssmt.generate_mod_blueprint(blueprint_name=tree_main.name)
-        log_result("Operator ssmt.generate_mod_blueprint returned FINISHED", res == {'FINISHED'}, str(res))
+        log_result("Operator ssmt.generate_mod_blueprint started", res in ({'FINISHED'}, {'RUNNING_MODAL'}), str(res))
+
+        # 导出固定走后台子进程，这里等子进程自己跑完再检查产物：脚本环境里
+        # Blender 的 modal 定时器不会转，等它轮询结束等于等到超时。
+        from TheHerta4.blueprint.export_background import get_active_session
+
+        session = get_active_session()
+        deadline = time.time() + 1800
+        while session is not None and session.process is not None:
+            if session.process.poll() is not None or time.time() > deadline:
+                break
+            time.sleep(0.5)
+        worker_exited = session is not None and session.process is not None and session.process.poll() is not None
+        log_result(
+            "Background export worker exited",
+            worker_exited,
+            (session.error or f"exit={session.process.poll() if session.process else '?'}") if session is not None else "后台导出会话未建立",
+        )
 
         # =====================================================================
         # Inspect Output Artifacts
