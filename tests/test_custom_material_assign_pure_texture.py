@@ -11,11 +11,19 @@
 3. 登记过的纯贴图段不会被 ``_pure_texture_conflict_with_export`` 误判成
    「该 IB 在导出链上有网格段」：同一进程里第二次生成仍然重建段，不会删旧段后
    不再生成。
-4. 同一 IB 的多个物体各自生成独立段（``_7fbbcf0d`` / ``_7fbbcf0d_2``），全部登记。
-5. 开「使用全局指定」后照样生成纯贴图段：主路径只看 ini 里已有的 mesh 段，导出链外的
+4. 每个物体写成**独立 ini 片段** ``<hash>-<indexCount>-<firstIndex>_PureTexture.ini``，
+   不写主 ini；同 IB 的多个物体各自一个片段，段名不能撞（``_7fbbcf0d`` /
+   ``_7fbbcf0d_2``），只有槽位段登记进段登记表（哈希段不属于任何 DrawIB）。重跑会先
+   删掉上一次的片段，不会残留。
+5. 开「使用全局指定」后照样生成：主路径只看 ini 里已有的 mesh 段，导出链外的
    物体只能靠这条路径补段，不能在全局模式下被整体关掉。
 6. 这些物体的贴图切换组取自它们自己的 ``target_items[].switch_groups``：全局模式下
    ``global_switch_groups`` 是链路部件的扫描结果，和导出链外的物体不是同一批。
+7. 写法跟贴图标记走：``MarkType == "Hash"`` 的贴图写 ``[TextureOverride_<贴图hash>]``
+   （``hash`` / ``match_priority`` / ``this = Resource_Texture_<贴图hash>``，对齐
+   ``M_IniHelper.generate_hash_style_texture_ini`` 与 SSMT4 的 Hash 风格模板）；``Slot``
+   / ``SharedSlot`` / 没有标记的仍走槽位写法。``MarkHash`` 缺失时退回槽位写法。
+8. 哈希段名与导出目录里已有段重复时跳过并告警（重复段在 3Dmigoto 里是后者覆盖前者）。
 
 装载沿用 ``tests/test_custom_material_assign_clear_textures.py`` 的 fake-package 范式。
 """
@@ -178,6 +186,23 @@ class _StubMaterialBase:
     def _prepare_material_group_switch_map(self, mapping):
         mapping.clear()
 
+    def create_resource_entry(
+        self,
+        material,
+        param_name,
+        texture_folder,
+        all_sections,
+        resource_name_override=None,
+        workspace_source_path=None,
+        dedup_group=None,
+    ):
+        """哈希风格用 ``param_name="this"``；槽位风格的真实实现另有分支。"""
+        resource_name = resource_name_override or f"Resource_{material.name}"
+        all_sections[f"[{resource_name}]"] = [
+            f"filename = Textures/{material.name}.dds"
+        ]
+        return f"{param_name} = {resource_name}"
+
     def _max_ui_switch_number(self):
         return 0
 
@@ -268,6 +293,7 @@ class _FakeNode(module.SSMTNode_PostProcess_CustomMaterialAssign):
         global_mode=False,
         item_groups=None,
         global_groups=None,
+        marks=None,
     ):
         item_groups = list(item_groups or [])
         self.target_items = []
@@ -283,6 +309,11 @@ class _FakeNode(module.SSMTNode_PostProcess_CustomMaterialAssign):
         self.use_global_assign = bool(global_mode)
         self.clear_non_target_textures = False
         self.material_switch_var = "$swapkey"
+        self._marks_by_object = dict(marks or {})
+
+    def _pure_texture_marks(self, obj_name, cache):
+        """贴图标记用假数据（真实实现要读工作空间 SubmeshJson）。"""
+        return dict(self._marks_by_object.get(obj_name) or {})
 
     @staticmethod
     def _pure_texture_slot_layout():
@@ -318,6 +349,17 @@ def _switch_group(variable, bindings, key="N", enabled=True, comment="", object_
     )
 
 
+def _mark(name, mark_type="Hash", mark_hash="18fa939b", slot="ps-t0", filename=""):
+    """一个贴图标记（真实实现读工作空间 SubmeshJson 的 TextureMarkUpInfoList）。"""
+    return types.SimpleNamespace(
+        mark_name=name,
+        mark_type=mark_type,
+        mark_hash=mark_hash,
+        mark_slot=slot,
+        mark_filename=filename or f"16420b5e-3180-2238-{name}.dds",
+    )
+
+
 class PureTextureSectionTests(unittest.TestCase):
     def setUp(self):
         _REGISTRY_ENTRIES.clear()
@@ -336,50 +378,72 @@ class PureTextureSectionTests(unittest.TestCase):
         with open(self.ini_path, "r", encoding="utf-8") as handle:
             return handle.read()
 
-    def test_generates_null_fallbacks_and_registers_section(self):
+    def _fragment_files(self):
+        return sorted(
+            name
+            for name in os.listdir(self.root)
+            if name.endswith(module._MATERIAL_PURE_TEXTURE_FRAGMENT_SUFFIX)
+        )
+
+    def _fragment_text(self, name="7fbbcf0d-7116-0_PureTexture.ini"):
+        with open(os.path.join(self.root, name), "r", encoding="utf-8") as handle:
+            return handle.read()
+
+    def _registry_view(self):
+        return [
+            {
+                "name": entry["name"],
+                "type": entry["type"],
+                "draw_ib": entry["draw_ib"],
+                "ini_path": entry["ini_path"],
+            }
+            for entry in _REGISTRY_ENTRIES
+        ]
+
+    def test_generates_null_fallbacks_into_its_own_fragment(self):
         count = self._run(["LOD0.7fbbcf0d-7116-0.脸"])
 
         self.assertEqual(1, count)
-        content = self._content()
-        self.assertIn("[TextureOverride_MaterialPureTexture_7fbbcf0d]", content)
-        self.assertIn("hash = 7fbbcf0d", content)
-        self.assertIn("Resource\\ZZMI\\Diffuse = null", content)
-        self.assertIn("run = CommandList\\ZZMI\\SetTextures", content)
+        self.assertEqual(["7fbbcf0d-7116-0_PureTexture.ini"], self._fragment_files())
+        fragment = self._fragment_text()
+        self.assertIn("[TextureOverride_MaterialPureTexture_7fbbcf0d]", fragment)
+        self.assertIn("hash = 7fbbcf0d", fragment)
+        self.assertIn("Resource\\ZZMI\\Diffuse = null", fragment)
+        self.assertIn("run = CommandList\\ZZMI\\SetTextures", fragment)
         # null 兜底必须在 ref 之前
         self.assertLess(
-            content.index("Resource\\ZZMI\\Diffuse = null"),
-            content.index("Resource\\ZZMI\\Diffuse = ref Resource_A"),
+            fragment.index("Resource\\ZZMI\\Diffuse = null"),
+            fragment.index("Resource\\ZZMI\\Diffuse = ref Resource_A"),
         )
-        # 段必须登记（否则条件判断节点反查不到、无法门控）
+        # 没有 KeySwap 的话主 ini 一个字都不该动
+        self.assertEqual(BASE_INI, self._content())
+        # 段仍要登记（条件判断等后处理节点按 DrawIB 反查），指向片段自己
         self.assertEqual(
             [
                 {
                     "name": "TextureOverride_MaterialPureTexture_7fbbcf0d",
                     "type": "TextureOverrideMaterialPureTexture",
                     "draw_ib": "7fbbcf0d",
-                    "ini_path": self.ini_path,
+                    "ini_path": os.path.join(
+                        self.root, "7fbbcf0d-7116-0_PureTexture.ini"
+                    ),
                 }
             ],
-            [
-                {
-                    "name": entry["name"],
-                    "type": entry["type"],
-                    "draw_ib": entry["draw_ib"],
-                    "ini_path": entry["ini_path"],
-                }
-                for entry in _REGISTRY_ENTRIES
-            ],
+            self._registry_view(),
         )
 
     def test_second_run_regenerates_and_does_not_duplicate(self):
         self._run(["LOD0.7fbbcf0d-7116-0.脸"])
         self._run(["LOD0.7fbbcf0d-7116-0.脸"])
 
-        content = self._content()
         # 登记过的纯贴图段不能被当成「导出链上的网格段」而跳过重新生成
-        self.assertEqual(1, content.count("[TextureOverride_MaterialPureTexture_7fbbcf0d]"))
-        self.assertIn("hash = 7fbbcf0d", content)
-        self.assertIn("Resource\\ZZMI\\Diffuse = ref Resource_A", content)
+        self.assertEqual(["7fbbcf0d-7116-0_PureTexture.ini"], self._fragment_files())
+        fragment = self._fragment_text()
+        self.assertEqual(
+            1, fragment.count("[TextureOverride_MaterialPureTexture_7fbbcf0d]")
+        )
+        self.assertIn("hash = 7fbbcf0d", fragment)
+        self.assertIn("Resource\\ZZMI\\Diffuse = ref Resource_A", fragment)
 
     def test_two_objects_same_ib_get_separate_sections_all_registered(self):
         count = self._run(
@@ -387,17 +451,38 @@ class PureTextureSectionTests(unittest.TestCase):
         )
 
         self.assertEqual(2, count)
-        content = self._content()
-        self.assertIn("[TextureOverride_MaterialPureTexture_7fbbcf0d]", content)
-        self.assertIn("[TextureOverride_MaterialPureTexture_7fbbcf0d_2]", content)
-        names = sorted(entry["name"] for entry in _REGISTRY_ENTRIES)
+        self.assertEqual(
+            [
+                "7fbbcf0d-1260-9402_PureTexture.ini",
+                "7fbbcf0d-7116-0_PureTexture.ini",
+            ],
+            self._fragment_files(),
+        )
+        # 两个物体各自一个片段，段名不能撞（撞了 3Dmigoto 里后一个会把前一个顶掉）
+        self.assertIn(
+            "[TextureOverride_MaterialPureTexture_7fbbcf0d]",
+            self._fragment_text("7fbbcf0d-7116-0_PureTexture.ini"),
+        )
+        self.assertIn(
+            "[TextureOverride_MaterialPureTexture_7fbbcf0d_2]",
+            self._fragment_text("7fbbcf0d-1260-9402_PureTexture.ini"),
+        )
         self.assertEqual(
             [
                 "TextureOverride_MaterialPureTexture_7fbbcf0d",
                 "TextureOverride_MaterialPureTexture_7fbbcf0d_2",
             ],
-            names,
+            sorted(entry["name"] for entry in _REGISTRY_ENTRIES),
         )
+
+    def test_stale_fragments_are_cleared_on_regenerate(self):
+        stale = os.path.join(self.root, "abcdef12-1-2_PureTexture.ini")
+        with open(stale, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write("[TextureOverride_MaterialPureTexture_abcdef12]\nhash = abcdef12\n")
+
+        self._run(["LOD0.7fbbcf0d-7116-0.脸"])
+
+        self.assertEqual(["7fbbcf0d-7116-0_PureTexture.ini"], self._fragment_files())
 
     def test_registered_pure_section_is_not_export_conflict(self):
         _register_section(
@@ -440,17 +525,34 @@ class GlobalModePureTextureTests(unittest.TestCase):
         with open(self.ini_path, "r", encoding="utf-8") as handle:
             return handle.read()
 
+    def _fragment_files(self):
+        return sorted(
+            name
+            for name in os.listdir(self.root)
+            if name.endswith(module._MATERIAL_PURE_TEXTURE_FRAGMENT_SUFFIX)
+        )
+
+    def _fragment_text(self):
+        with open(
+            os.path.join(self.root, "7fbbcf0d-7116-0_PureTexture.ini"),
+            "r",
+            encoding="utf-8",
+        ) as handle:
+            return handle.read()
+
     def test_global_mode_still_generates_sections(self):
         count = self._run(["LOD0.7fbbcf0d-7116-0.脸"], global_mode=True)
 
         self.assertEqual(1, count)
-        content = self._content()
-        self.assertIn("[TextureOverride_MaterialPureTexture_7fbbcf0d]", content)
-        self.assertIn("Resource\\ZZMI\\Diffuse = ref Resource_A", content)
+        self.assertEqual(["7fbbcf0d-7116-0_PureTexture.ini"], self._fragment_files())
+        fragment = self._fragment_text()
+        self.assertIn("[TextureOverride_MaterialPureTexture_7fbbcf0d]", fragment)
+        self.assertIn("Resource\\ZZMI\\Diffuse = ref Resource_A", fragment)
 
     def test_global_mode_without_extra_objects_does_nothing(self):
         self.assertEqual(0, self._run([], global_mode=True))
         self.assertEqual(BASE_INI, self._content())
+        self.assertEqual([], self._fragment_files())
 
     def test_global_mode_skips_objects_that_are_exported(self):
         # 该 IB 已经有网格段（主路径处理），纯贴图段必须让出去
@@ -458,6 +560,7 @@ class GlobalModePureTextureTests(unittest.TestCase):
 
         self.assertEqual(0, self._run(["LOD0.7fbbcf0d-7116-0.脸"], global_mode=True))
         self.assertNotIn("MaterialPureTexture", self._content())
+        self.assertEqual([], self._fragment_files())
 
     def test_global_mode_takes_switch_groups_from_the_object_itself(self):
         module.resolve_keyswap_key = lambda *args, **kwargs: "N"
@@ -504,6 +607,74 @@ class GlobalModePureTextureTests(unittest.TestCase):
             ["DiffuseMap_A"],
             node._material_group_order[("DiffuseMap_A",)],
         )
+
+
+class HashStylePureTextureTests(unittest.TestCase):
+    """贴图标记是 Hash 的走哈希写法，其余（Slot / 无标记）走插槽写法。"""
+
+    OBJ = "LOD0.7fbbcf0d-7116-0.脸"
+    FRAGMENT = "7fbbcf0d-7116-0_PureTexture.ini"
+
+    def setUp(self):
+        _REGISTRY_ENTRIES.clear()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = self._tmp.name
+        self.ini_path = os.path.join(self.root, "mod.ini")
+        with open(self.ini_path, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(BASE_INI)
+
+    def _run(self, marks):
+        node = _FakeNode([self.OBJ], marks={self.OBJ: marks})
+        return node._apply_pure_texture_sections(self.root)
+
+    def _fragment_text(self):
+        with open(os.path.join(self.root, self.FRAGMENT), "r", encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_hash_mark_writes_hash_style_section(self):
+        count = self._run({"DiffuseMap": _mark("DiffuseMap", "Hash", "18fa939b")})
+
+        self.assertEqual(1, count)
+        fragment = self._fragment_text()
+        self.assertIn("[TextureOverride_18fa939b]", fragment)
+        self.assertIn("hash = 18fa939b", fragment)
+        self.assertIn("match_priority = 0", fragment)
+        self.assertIn("this = Resource_Texture_18fa939b", fragment)
+        self.assertIn("[Resource_Texture_18fa939b]", fragment)
+        self.assertIn("filename = Textures/DiffuseMap_A.dds", fragment)
+        # 哈希写法不需要槽位段（也不需要 run CommandList）
+        self.assertNotIn("[TextureOverride_MaterialPureTexture_7fbbcf0d]", fragment)
+        self.assertNotIn("run = CommandList", fragment)
+        self.assertEqual(BASE_INI, self._content())
+
+    def test_slot_mark_keeps_slot_style(self):
+        self._run({"DiffuseMap": _mark("DiffuseMap", "Slot", "18fa939b")})
+
+        fragment = self._fragment_text()
+        self.assertIn("[TextureOverride_MaterialPureTexture_7fbbcf0d]", fragment)
+        self.assertIn("Resource\\ZZMI\\Diffuse = ref Resource_A", fragment)
+        self.assertNotIn("[TextureOverride_18fa939b]", fragment)
+
+    def test_hash_mark_without_hash_falls_back_to_slot_style(self):
+        self._run({"DiffuseMap": _mark("DiffuseMap", "Hash", "")})
+
+        fragment = self._fragment_text()
+        self.assertIn("[TextureOverride_MaterialPureTexture_7fbbcf0d]", fragment)
+        self.assertNotIn("this = ", fragment)
+
+    def test_hash_section_already_in_directory_is_skipped(self):
+        with open(self.ini_path, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(BASE_INI + "\n[TextureOverride_18fa939b]\nhash = 18fa939b\n")
+
+        self.assertEqual(
+            0, self._run({"DiffuseMap": _mark("DiffuseMap", "Hash", "18fa939b")})
+        )
+        self.assertFalse(os.path.exists(os.path.join(self.root, self.FRAGMENT)))
+
+    def _content(self):
+        with open(self.ini_path, "r", encoding="utf-8") as handle:
+            return handle.read()
 
 
 if __name__ == "__main__":
