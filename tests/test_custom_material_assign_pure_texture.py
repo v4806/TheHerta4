@@ -12,11 +12,16 @@
    「该 IB 在导出链上有网格段」：同一进程里第二次生成仍然重建段，不会删旧段后
    不再生成。
 4. 同一 IB 的多个物体各自生成独立段（``_7fbbcf0d`` / ``_7fbbcf0d_2``），全部登记。
+5. 开「使用全局指定」后照样生成纯贴图段：主路径只看 ini 里已有的 mesh 段，导出链外的
+   物体只能靠这条路径补段，不能在全局模式下被整体关掉。
+6. 这些物体的贴图切换组取自它们自己的 ``target_items[].switch_groups``：全局模式下
+   ``global_switch_groups`` 是链路部件的扫描结果，和导出链外的物体不是同一批。
 
 装载沿用 ``tests/test_custom_material_assign_clear_textures.py`` 的 fake-package 范式。
 """
 
 import importlib.util
+import json
 import os
 import sys
 import tempfile
@@ -257,15 +262,25 @@ module._parse_switch_var_base = lambda _node: ("$swapkey", 150)
 class _FakeNode(module.SSMTNode_PostProcess_CustomMaterialAssign):
     """借真实类的方法，只替换 bpy 收集来的部件列表与槽位表。"""
 
-    def __init__(self, target_names):
-        self.target_items = [
-            types.SimpleNamespace(
-                target_object=types.SimpleNamespace(name=name, type="MESH"),
-                switch_groups=[],
+    def __init__(
+        self,
+        target_names,
+        global_mode=False,
+        item_groups=None,
+        global_groups=None,
+    ):
+        item_groups = list(item_groups or [])
+        self.target_items = []
+        for index, name in enumerate(target_names):
+            groups = item_groups[index] if index < len(item_groups) else []
+            self.target_items.append(
+                types.SimpleNamespace(
+                    target_object=types.SimpleNamespace(name=name, type="MESH"),
+                    switch_groups=list(groups or []),
+                )
             )
-            for name in target_names
-        ]
-        self.use_global_assign = False
+        self.global_switch_groups = list(global_groups or [])
+        self.use_global_assign = bool(global_mode)
         self.clear_non_target_textures = False
         self.material_switch_var = "$swapkey"
 
@@ -288,6 +303,21 @@ class _FakeNode(module.SSMTNode_PostProcess_CustomMaterialAssign):
 BASE_INI = "[Constants]\nglobal persist $mod_enabled = 1\n"
 
 
+def _switch_group(variable, bindings, key="N", enabled=True, comment="", object_name=""):
+    """造一个切换组（``bindings`` 在真实节点上存的是 JSON 字符串）。"""
+    names = [list(binding) for binding in bindings]
+    return types.SimpleNamespace(
+        switch_variable=variable,
+        bindings=json.dumps(names, ensure_ascii=False),
+        key=key,
+        enabled=enabled,
+        state_count=max(len(binding) for binding in names),
+        comment=comment,
+        object_name=object_name,
+        merge_group_id=variable,
+    )
+
+
 class PureTextureSectionTests(unittest.TestCase):
     def setUp(self):
         _REGISTRY_ENTRIES.clear()
@@ -298,8 +328,8 @@ class PureTextureSectionTests(unittest.TestCase):
         with open(self.ini_path, "w", encoding="utf-8", newline="\n") as handle:
             handle.write(BASE_INI)
 
-    def _run(self, target_names):
-        node = _FakeNode(list(target_names))
+    def _run(self, target_names, **kwargs):
+        node = _FakeNode(list(target_names), **kwargs)
         return node._apply_pure_texture_sections(self.root)
 
     def _content(self):
@@ -387,6 +417,92 @@ class PureTextureSectionTests(unittest.TestCase):
             module.SSMTNode_PostProcess_CustomMaterialAssign._pure_texture_conflict_with_export(
                 {}, "7fbbcf0d"
             )
+        )
+
+
+class GlobalModePureTextureTests(unittest.TestCase):
+    """「使用全局指定」打开后，导出链外的物体照样要出贴图替换段。"""
+
+    def setUp(self):
+        _REGISTRY_ENTRIES.clear()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = self._tmp.name
+        self.ini_path = os.path.join(self.root, "mod.ini")
+        with open(self.ini_path, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(BASE_INI)
+
+    def _run(self, target_names, **kwargs):
+        node = _FakeNode(list(target_names), **kwargs)
+        return node._apply_pure_texture_sections(self.root)
+
+    def _content(self):
+        with open(self.ini_path, "r", encoding="utf-8") as handle:
+            return handle.read()
+
+    def test_global_mode_still_generates_sections(self):
+        count = self._run(["LOD0.7fbbcf0d-7116-0.脸"], global_mode=True)
+
+        self.assertEqual(1, count)
+        content = self._content()
+        self.assertIn("[TextureOverride_MaterialPureTexture_7fbbcf0d]", content)
+        self.assertIn("Resource\\ZZMI\\Diffuse = ref Resource_A", content)
+
+    def test_global_mode_without_extra_objects_does_nothing(self):
+        self.assertEqual(0, self._run([], global_mode=True))
+        self.assertEqual(BASE_INI, self._content())
+
+    def test_global_mode_skips_objects_that_are_exported(self):
+        # 该 IB 已经有网格段（主路径处理），纯贴图段必须让出去
+        _register_section("TextureOverride_IB_7fbbcf0d", draw_ib="7fbbcf0d")
+
+        self.assertEqual(0, self._run(["LOD0.7fbbcf0d-7116-0.脸"], global_mode=True))
+        self.assertNotIn("MaterialPureTexture", self._content())
+
+    def test_global_mode_takes_switch_groups_from_the_object_itself(self):
+        module.resolve_keyswap_key = lambda *args, **kwargs: "N"
+        self.addCleanup(setattr, module, "resolve_keyswap_key", lambda *a, **k: "")
+        item_group = _switch_group(
+            "$swapkey150", [["DiffuseMap_A"], ["DiffuseMap_B"]]
+        )
+        chain_group = _switch_group(
+            "$swapkey160", [["BodyMap_C"], ["BodyMap_D"]], key="M"
+        )
+
+        count = self._run(
+            ["LOD0.7fbbcf0d-7116-0.脸"],
+            global_mode=True,
+            item_groups=[[item_group]],
+            global_groups=[chain_group],
+        )
+
+        self.assertEqual(1, count)
+        content = self._content()
+        self.assertIn("[KeySwap_Diffuse_swapkey150]", content)
+        self.assertNotIn("[KeySwap_Diffuse_swapkey160]", content)
+
+    def test_merged_switch_map_separates_global_and_object_groups(self):
+        node = _FakeNode(
+            ["LOD0.7fbbcf0d-7116-0.脸"],
+            global_mode=True,
+            item_groups=[
+                [_switch_group("$swapkey150", [["DiffuseMap_A"], ["DiffuseMap_B"]])]
+            ],
+            global_groups=[
+                [_switch_group("$swapkey160", [["BodyMap_C"], ["BodyMap_D"]])]
+            ][0],
+        )
+        mapping = {}
+        node._prepare_material_group_switch_map(mapping)
+        self.assertEqual("$swapkey160", mapping[("BodyMap_C",)])
+
+        node._merge_object_switch_groups(node.target_items[0], mapping)
+
+        self.assertEqual("$swapkey150", mapping[("DiffuseMap_A",)])
+        # 档位顺序跟着物体自己的组走，否则第 N 档会和面板上的第 N 档错开
+        self.assertEqual(
+            ["DiffuseMap_A"],
+            node._material_group_order[("DiffuseMap_A",)],
         )
 
 

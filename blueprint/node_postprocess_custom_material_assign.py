@@ -2306,39 +2306,79 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
     def _iter_switch_group_defs(self):
         global_mode = bool(getattr(self, "use_global_assign", False))
         if global_mode:
-            collections = [self.global_switch_groups]
-        else:
-            collections = [item.switch_groups for item in self.target_items]
-        for collection in collections:
-            for group in collection:
-                variable = str(getattr(group, "switch_variable", "") or "").strip()
-                if not variable:
+            yield from self._iter_switch_specs(self.global_switch_groups)
+            return
+        for item in self.target_items:
+            yield from self._iter_switch_specs(item.switch_groups)
+
+    @staticmethod
+    def _iter_switch_specs(collection):
+        """把一个切换组集合展开成导出用的定义（``collection`` 可为空/None）。"""
+        for group in collection or []:
+            variable = str(getattr(group, "switch_variable", "") or "").strip()
+            if not variable:
+                continue
+            try:
+                bindings = json.loads(
+                    str(getattr(group, "bindings", "") or "") or "[]"
+                )
+            except Exception:
+                bindings = []
+            if not isinstance(bindings, list):
+                bindings = []
+            yield {
+                "item": None,
+                "group": group,
+                "enabled": bool(getattr(group, "enabled", True)),
+                "variable": variable,
+                "comment": str(getattr(group, "comment", "") or "").strip(),
+                "key": str(getattr(group, "key", "") or "").strip(),
+                "state_count": max(
+                    2,
+                    int(getattr(group, "state_count", 2) or 2),
+                ),
+                "bindings": [
+                    tuple(names)
+                    for names in bindings
+                    if isinstance(names, (list, tuple))
+                ],
+            }
+
+    def _iter_pure_texture_switch_specs(self):
+        """纯贴图段可用的切换组：全局组的 + 各附加物体自己的组。
+
+        全局模式下主路径只认 ``global_switch_groups``（它们来自导出链上的部件
+        扫描），而纯贴图段覆盖的恰恰是导出链外的物体 —— 那些物体的切换组只存在
+        ``target_items`` 自己身上。两处都收，交给下面的 ``used_swap_keys`` 过滤；
+        变量名冲突时先到先得（全局组先出），不会把同一套材质写两遍。
+        """
+        yield from self._iter_switch_group_defs()
+        if not bool(getattr(self, "use_global_assign", False)):
+            return
+        for item in getattr(self, "target_items", []) or []:
+            yield from self._iter_switch_specs(
+                getattr(item, "switch_groups", []) or []
+            )
+
+    def _merge_object_switch_groups(self, item, material_group_to_swapkey):
+        """把该物体自己的切换组叠进本次纯贴图生成的映射表（已有键不覆盖）。
+
+        ``generate_material_lines`` 用「材质名集合」在映射表里查切换变量，所以
+        每个物体带自己的组进来，就不会和别的物体的变量串套；顺便把档位顺序记进
+        ``_material_group_order``，否则第 N 档的材质会和面板上的第 N 档错开。
+        """
+        order = dict(getattr(self, "_material_group_order", None) or {})
+        for spec in self._iter_switch_specs(
+            getattr(item, "switch_groups", []) or []
+        ):
+            for binding in spec["bindings"]:
+                if not binding:
                     continue
-                try:
-                    bindings = json.loads(
-                        str(getattr(group, "bindings", "") or "") or "[]"
-                    )
-                except Exception:
-                    bindings = []
-                if not isinstance(bindings, list):
-                    bindings = []
-                yield {
-                    "item": None,
-                    "group": group,
-                    "enabled": bool(getattr(group, "enabled", True)),
-                    "variable": variable,
-                    "comment": str(getattr(group, "comment", "") or "").strip(),
-                    "key": str(getattr(group, "key", "") or "").strip(),
-                    "state_count": max(
-                        2,
-                        int(getattr(group, "state_count", 2) or 2),
-                    ),
-                    "bindings": [
-                        tuple(names)
-                        for names in bindings
-                        if isinstance(names, (list, tuple))
-                    ],
-                }
+                key = tuple(binding)
+                material_group_to_swapkey.setdefault(key, spec["variable"])
+                order.setdefault(key, list(binding))
+                order.setdefault(tuple(sorted(binding)), list(binding))
+        self._material_group_order = order
 
     def _prepare_material_group_switch_map(self, material_group_to_swapkey):
         # 同时记录每个切换组的档位顺序（扫描时的 bindings 顺序）：导出生成 if 档位时
@@ -3337,22 +3377,41 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
                 icon="INFO",
             )
 
-    def _draw_target_input_panel(self, context, layout):
-        """非全局模式：显示目标部件输入框。"""
+    def _draw_target_input_panel(self, context, layout, as_extra_objects=False):
+        """目标部件输入框；全局模式下同一张表退化为「附加物体列表」。"""
         title = layout.box()
-        title.label(text="目标部件（仅这些部件会按材质生成）", icon="OBJECT_DATA")
-        title.label(
-            text="未在此列表中的部件保持默认配置，不会修改",
-            icon="INFO",
-        )
+        if as_extra_objects:
+            title.label(
+                text="附加物体（只在导出链外时出手：补贴图替换段）",
+                icon="OBJECT_DATA",
+            )
+            title.label(
+                text="在导出链上的照常按全局逻辑处理；不在导出链的只生成贴图替换段（无网格修改）",
+                icon="INFO",
+            )
+        else:
+            title.label(text="目标部件（仅这些部件会按材质生成）", icon="OBJECT_DATA")
+            title.label(
+                text="未在此列表中的部件保持默认配置，不会修改",
+                icon="INFO",
+            )
 
         rows = layout.box()
         header = rows.row(align=True)
-        header.label(text=f"部件输入框（{len(self.target_items)} 个）")
-        scan = header.operator(
-            "ssmt.custom_material_assign_scan_objects", text="扫描蓝图物体", icon="VIEWZOOM"
+        header.label(
+            text=(
+                f"附加物体（{len(self.target_items)} 个）"
+                if as_extra_objects
+                else f"部件输入框（{len(self.target_items)} 个）"
+            )
         )
-        scan.node_name = self.name
+        if not as_extra_objects:
+            scan = header.operator(
+                "ssmt.custom_material_assign_scan_objects",
+                text="扫描蓝图物体",
+                icon="VIEWZOOM",
+            )
+            scan.node_name = self.name
         add = header.operator(
             "ssmt.custom_material_assign_add_selected",
             text="添加选中",
@@ -3488,7 +3547,7 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
         layout.prop(self, "use_global_assign", text="使用全局指定")
         if self.use_global_assign:
             layout.label(
-                text="已开启：将忽略下方目标列表，按材质转资源逻辑处理所有部件",
+                text="已开启：所有部件按材质转资源逻辑处理（附加物体里导出链外的补贴图替换段）",
                 icon="INFO",
             )
         else:
@@ -3521,6 +3580,7 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
 
         if self.use_global_assign:
             self._draw_global_switch_panel(context, layout)
+            self._draw_target_input_panel(context, layout, as_extra_objects=True)
         else:
             self._draw_target_input_panel(context, layout)
 
@@ -4108,15 +4168,19 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
         return lines, next_swap_key_num, matched_types
 
     def _apply_pure_texture_sections(self, mod_export_path):
-        """对「不在导出链」的目标物体生成纯贴图段；返回生成的段数。"""
-        if bool(getattr(self, "use_global_assign", False)):
-            return 0
-        objects = [
-            item.target_object
-            for item in getattr(self, "target_items", []) or []
+        """对「不在导出链」的物体生成纯贴图段；返回生成的段数。
+
+        全局模式下主路径（基类 ``execute_postprocess``）只处理 ini 里已有的 mesh
+        段，没导出的物体永远不会被它看见；这里补上这一块：物体仍然取自
+        ``target_items``（全局模式下它们是「附加物体」，不再当白名单用），生成前
+        先用 ``_pure_texture_conflict_with_export`` 把真正在导出链上的物体让出去。
+        """
+        items = [
+            item
+            for item in (getattr(self, "target_items", []) or [])
             if getattr(item, "target_object", None) is not None
         ]
-        if not objects:
+        if not items:
             return 0
         slot_map, set_textures_line = self._pure_texture_slot_layout()
         if slot_map is None:
@@ -4156,7 +4220,8 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
         handled_names = []
         warnings = []
 
-        for obj in objects:
+        for item in items:
+            obj = item.target_object
             ib = _parse_part_draw_name(obj.name)
             if ib is None:
                 warning = f"{obj.name}：解析不出 DrawIB（应形如 LOD0.7fbbcf0d-7116-0.部件名）"
@@ -4166,6 +4231,8 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
             if self._pure_texture_conflict_with_export(sections, ib_hash):
                 # 该物体在导出链上：网格段由常规路径处理，这里不重复生成
                 continue
+            # 该物体自己的贴图切换组（全局模式下也是从它身上读）
+            self._merge_object_switch_groups(item, material_group_to_swapkey)
             lines, next_swap_key_num, matched_types = self._build_pure_texture_lines(
                 obj,
                 sections,
@@ -4231,7 +4298,7 @@ class SSMTNode_PostProcess_CustomMaterialAssign(SSMTNode_PostProcess_MaterialBas
         if generated_sections and used_swap_keys:
             self.define_swapkeys_in_sections(sections, used_swap_keys)
             chosen = OrderedDict()
-            for spec in self._iter_switch_group_defs():
+            for spec in self._iter_pure_texture_switch_specs():
                 if not spec["enabled"] or not spec["key"]:
                     continue
                 if spec["variable"] not in used_swap_keys:
