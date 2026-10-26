@@ -2171,7 +2171,7 @@ cd E:\代码\TheHerta4 ; .\.venv\Scripts\python.exe -m pytest -q
 
 **修法**
 
-- `ui/universal/himi.py:5292` `add_unity_vs_texture_override_ib_sections` 删掉 `skin_entry` /
+- `ui/universal/himi.py:5317` `add_unity_vs_texture_override_ib_sections` 删掉 `skin_entry` /
   `skin_lines` 的构建与 `out.extend(skin_lines)`，只保留 `out.extend(capture_lines)`
   （即「cb3 捕获 → run attach」）。全仓 `skin_entry|skin_lines` 引用数为 0。
 - `himi_skin_sections()` 的段与资源发射**保持不变**（与 t97 产物一致：段存在但无人引用 ⇒
@@ -2387,3 +2387,96 @@ t106 落地后用户在 Blender 里点「快速局部导出」仍然撞到 orpha
 * 死蒙皮段 `[CustomShaderHI3MergedSkin_<fam>]` 仍指向不存在的 `res/himi_merged_skin.hlsl`，每次 reload 刷 `Shader not found` 噪声，待删；
 * 产物 ini 诊断块「基址表 span 之和 343 ≠ 559」「out_of_range_refs = 70%」仍是审计没减 base 的老 bug（假警报），待修；
 * 本角色的 559 槽里 216 个来自借用（79% 权重），宿主挑选口径（「Position 缓冲最长」）会让「19 根骨的族」当宿主 —— 是否要改成「palette 骨数最多者」需要单独决策。
+
+
+## 13.29 t117 · 「第一个模组错、第二个模组对」：`sizes` 从未被带回 ⇒ 全合并判据恒成立（2026-10-26；代码已修，待实机复验）
+
+### 13.29.1 现象
+
+用户在 Blender 里连续导出两个工作空间，肉眼看到 **`嗨♪爱愿妖精♥` 的合并骨架整块错位**，而
+**`虚构游戏` 正确**，并质问「是不是有什么写死了，按道理一切都该按工作空间实时算」。
+两个产物目录的 ini / buf 时间戳是 `2026-10-26 11:05` 与 `11:06` —— 同一次会话、同一个插件，
+所以不是「旧产物没重导」这类外部原因。
+
+### 13.29.2 决定性证据：两份产物的「站位族」根本不是一回事
+
+按 `<draw_ib>-Position.buf` 字节数 / 44 反算顶点数，并与 ini 里各 LOD 段的 `drawindexed` 对照：
+
+| 产物 | 族 | Position | 顶点 | 自己那笔 draw | 判定 |
+| --- | --- | --- | --- | --- | --- |
+| 嗨♪爱愿妖精♥ | `2c706fbd` | 1040468 B | 23647 | 23647 | 宿主（真几何） |
+| 同上 | `694025c6` | 152592 B | 3468 | 3468 | **真几何，自成一笔** |
+| 同上 | `70a4da3e` | 174108 B | 3957 | 3957 | **真几何，自成一笔** |
+| 同上 | `b35cfc6c` | 132 B | 3 | 3 | 站位股（零面积） |
+| 同上 | `def0c0ae` | 264 B | 6 | 6 | 站位股（零面积） |
+| 虚构游戏 | `077983c9` | 132 B | 3 | 3 | 站位股 |
+| 同上 | `09c6e58a` | 最大 | — | 19512 | 宿主（真几何） |
+| 同上 | `1b62725d` | 264 B | 6 | 6 | 站位股 |
+
+⇒ 「真几何的族」与「只剩站位的族」**可以同时出现在同一份产物里**。这是本次事故的全部前提。
+
+### 13.29.3 真因：判据拿不到尺寸，退化成「全是站位」
+
+`ui/universal/himi.py:_himi_family_index_map()` 决定每族 `[7] = (own, base)`（运行期 CS 靠
+`base` 决定读表里哪一段当 `M_base`）。`0c3823e`（2026-10-26 06:54）引入的判据是：
+
+```python
+sizes = dict((host or {}).get("sizes") or {})          # ← 但 _himi_host_family 从不返回这个键
+stubs = [f for f in families if f != host_family and sizes.get(family, 0) <= 512]
+if stubs and len(stubs) == len(families) - 1:          # ← 空字典 ⇒ 恒成立
+    return {family: (index, host_index) for index, family in enumerate(families)}   # 全体对齐宿主
+```
+
+`_himi_host_family()` 只返回 `{ok, family, size, source, note}`，`sizes` 是它内部的局部变量。
+于是 `sizes` 恒为空 ⇒ 每一族都被判成 ≤512 B 的站位族 ⇒ **全合并分支恒成立** ⇒ 五族的
+`base` 全部指向宿主 `2c706fbd`。
+
+运行期后果（`merged_attach_hlsl_text` 的分支 (b)）：`own_index != base_index` ⇒ CS 每帧算
+`X = M_base⁻¹·M_own` 再左乘 keyframe：
+
+```
+S = M_2c⁻¹ · M_694 · P_694
+```
+
+而 694 那笔 draw 那一刻喂进 `vs-cb3` 的本来就是 `M_694` ⇒ 净效果 `M_694 · M_2c⁻¹ · M_694 · P`，
+**多乘了一整层 `M_2c⁻¹·M_694`**。载荷里烘着的那份 X 实测就是这个量级：`694025c6` 偏
+**160.56°** / 平移 0.32，`70a4da3e` 偏 **26.67°**，`b35cfc6c` 179°、`def0c0ae` 162.5° —— 整块歪掉、
+错位，正是肉眼看到的「出错」。
+
+### 13.29.4 为什么第二个模组恰好是对的
+
+`虚构游戏` 的两族 `077983c9`（132 B / 3 v）与 `1b62725d`（264 B / 6 v）**真的**是站位股，
+几何整块并进了宿主 `09c6e58a` 那一笔 draw ⇒ 「全体对齐宿主」在这一份产物上**恰好就是正确答案**。
+同一条错误判据，命中了两份几何结构相反的产物：一份全站位（对），一份真假并存（错）。
+这与「运行期算 X 的机制坏了」无关 —— X 一直是每帧现算的。
+
+### 13.29.5 修法（两处，缺一不可）
+
+1. `_himi_host_family()` 的返回里补上 `"sizes": {family: bytes}`（判定宿主时它本来就算过，
+   只是没带回来）。
+2. `_himi_family_index_map()` 改成**逐族**判定，而不是「全体一起判」：
+   * 站位族（`sizes[f] <= 512`）⇒ `base = 宿主`（几何烘在宿主物体空间里，槽只被宿主那笔读）；
+   * 其余族 ⇒ `base = own` ⇒ CS 走分支 (a)，`X` 恒为单位阵，`S = P_f`，逐帧零校正成本；
+   * 尺寸**未知**的族一律按 `own`：判错的代价是少一层校正，而把有效几何判成站位会多乘一层
+     `M_宿主⁻¹·M_族` —— 后者才是肉眼看得见的错位。
+   * 顺带去掉 `len(families) > 1` 以外的退化路径：`sizes` 空时不再有任何「全体对齐宿主」的分支。
+
+### 13.29.6 验收读数
+
+* `pytest tests/test_himi_family_x.py -q` ⇒ **72 passed**（含 4 条新钉子：真实 M1 形状的逐族
+  期望、无站位族全 own、未知尺寸不当站位、`_himi_host_family` 必须带回 `sizes`）。
+* `pytest tests -k himi -q` ⇒ **459 passed / 3 failed**，三条都不是本次回归：
+  `test_real_dump_missing_target_none_is_not_authoritative` 与 `test_real_role_end_to_end`
+  在 HEAD 上同样失败（本机 `Config/FrameAnalysisPath.json` 指向的抓帧不存在、缓存不可重建）；
+  `test_production_anchor_references_resolve` 是本次改了 `himi.py` 行数导致的锚点漂移，
+  已把 §13.23 的 `ui/universal/himi.py:5292` 更新为 `:5317`。
+
+### 13.29.7 待办 / 遗留
+
+* **待实机复验**：重导 `嗨♪爱愿妖精♥` 后，`694025c6` / `70a4da3e` 应不再二次变换；`b35cfc6c` /
+  `def0c0ae` 的 3 / 6 顶点站位股在自己那笔 draw 里会落到别处（零面积，不可见），这才是站位股
+  本来的设计口径（§7.7）。
+* 判据仍依赖 `Position` 字节数（`≤512 B` 阈值、宿主 = 最大者）。§13.28.6 里那条「是否改成
+  `palette` 骨数最多者当宿主」的决策仍未做：本修法只保证「判错宿主」不再放大成「全体二次变换」。
+* `_himi_family_index_map` 的 `except Exception: pass` 兜底仍会把任何异常静默降级成「全体 own」
+  —— 比旧的「全体宿主」安全，但仍应改成告警，留待后续。

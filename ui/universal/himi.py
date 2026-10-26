@@ -3672,11 +3672,15 @@ class ExportHIMI(ExportUnity):
         导出侧写载荷 ``[7] = (own, base)`` 与运行期 CS 读它必须是同一套，否则每族会拿别族的
         M 去算 X。
 
-        **``base`` 恒等于 ``own``（t92）**：每族的骨只由它自己的那笔 draw 消耗，游戏那一刻
+        **``base`` 默认恒等于 ``own``（t92）**：每族的骨只由它自己的那笔 draw 消耗，游戏那一刻
         用的就是本族的对象矩阵 ⇒ ``X = M_own⁻¹·M_own = 单位阵``，本族槽写 ``P_f`` 即可。
         跨族只在**借用槽**上出现，而那些槽在本族块尾、由本族的 dispatch 写
         ``X_源 = M_本族⁻¹·M_源``（来源族由 ``BorrowMap`` 指明）—— 所以「宿主族」这个概念
         从写槽路径里彻底退出了。
+
+        唯一的例外是**这族整块几何真的并进了宿主那一笔 draw**（只剩 ≤512 B 的站位股，自己那笔
+        draw 只画零面积小三角）：那时它的槽只被宿主那笔读，``base = 宿主`` 才对。这个例外是
+        **逐族**的 —— 同一份产物里「真几何的族」与「只剩站位的族」可以并存。
 
         之前按「Position 缓冲最大者」定宿主、让所有族都 ``base = 宿主``，等于给每个自成
         一 draw 的族乘了一次 ``M_宿主⁻¹·M_族``：实测 ``077983c9``（头发）被宿主
@@ -3691,13 +3695,30 @@ class ExportHIMI(ExportUnity):
         try:
             host = self._himi_host_family(plan)
             host_family = str(host.get("family") or "") if isinstance(host, dict) and host.get("ok") else ""
-            if host_family in families:
+            if host_family in families and len(families) > 1:
                 host_index = families.index(host_family)
+                # 【2026-10-26 事故】`sizes` 缺失时**绝不当成「全是站位」**：空字典会让每一族都被
+                # 判成 ≤512 B 的站位族 ⇒ 仍在自族那笔 draw 里画几何的族（实例：嗨♪爱愿妖精♥ 的
+                # 694025c6 / 70a4da3e）被乘两遍 M_宿主⁻¹·M_族，整块错位。
                 sizes = dict((host or {}).get("sizes") or {})
-                stubs = [family for family in families if family != host_family and sizes.get(family, 0) <= 512]
-                if stubs and len(stubs) == len(families) - 1:
-                    # 单 Draw 全合并模式：所有部件几何合并入宿主，base_index 全部对齐到宿主
-                    return {family: (index, host_index) for index, family in enumerate(families)}
+                if sizes:
+                    # 逐族判定，**不是**「全体一起判」：站位与真几何可以同时存在于同一份产物
+                    # （实例：嗨♪爱愿妖精♥ —— 694025c6 / 70a4da3e 自己那笔 draw 里画真几何，
+                    # 而 b35cfc6c / def0c0ae 只留下 3 / 6 个零面积站位顶点）。
+                    #   · 站位族（Position ≤ 512 B，实测 132 B = 3 顶点）⇒ 它的骨只被**宿主的**
+                    #     那一笔 draw 读（几何已烘进宿主物体空间）⇒ base = 宿主。
+                    #   · 其余族 ⇒ 自己那笔 draw 用本族对象矩阵读自己的槽 ⇒ base = 自己（= 单位阵）。
+                    # 尺寸**未知**的族一律按「自己那笔」处理：判错的代价是少一层校正，
+                    # 而把有效几何判成站位会多乘一层 M_宿主⁻¹·M_族 —— 后者才是肉眼看得到的错位。
+                    return {
+                        family: (
+                            index,
+                            host_index
+                            if (family != host_family and family in sizes and sizes[family] <= 512)
+                            else index,
+                        )
+                        for index, family in enumerate(families)
+                    }
         except Exception:
             pass
         return {family: (index, index) for index, family in enumerate(families)}
@@ -3922,9 +3943,13 @@ class ExportHIMI(ExportUnity):
         if not picked.get("ok"):
             return {"ok": False, "family": "", "size": 0, "source": source,
                     "note": picked.get("note") or "没有任何族的 Position 缓冲可用于判定宿主族"}
+        # 【2026-10-26】``sizes`` 必须随判定结果一起返回：``_himi_family_index_map`` 要用它区分
+        # 「几何真的并进宿主一笔 draw」（其余族只剩 ≤512 B 站位股）与「各族自己还有真几何」。
+        # 少了这个键，那条判据会退化成「全是站位」⇒ 每个自成 draw 的族都被乘两遍族级 X。
         return {"ok": True, "family": str(picked.get("family") or ""),
                 "size": int(sizes.get(str(picked.get("family") or ""), 0) or 0), "source": source,
-                "note": picked.get("note") or ""}
+                "note": picked.get("note") or "",
+                "sizes": {str(key): int(value or 0) for key, value in sizes.items()}}
 
     def _himi_family_x_none(self, reason: str) -> dict:
         """【t39-X】「一个族都没有 X_f」= 第三态：**不校准 + 大声警告**，绝不中止。

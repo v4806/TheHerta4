@@ -946,6 +946,120 @@ class FamilyXPureTests(unittest.TestCase):
         self.assertEqual(picked["size"], 4096)
         self.assertIn("Meshes", picked["source"])
 
+class FamilyBaseIndexTests(unittest.TestCase):
+    """【2026-10-26 事故】载荷 ``[7] = (own, base)`` 的 ``base`` 必须跟着「谁画这族的几何」走。
+
+    实例 A（错）：``嗨♪爱愿妖精♥`` 五族里只有 b35cfc6c（132 B / 3 顶点）与 def0c0ae（264 B /
+    6 顶点）是站位股，694025c6（152592 B / 3468 顶点）与 70a4da3e（174108 B / 3957 顶点）**仍在
+    自己那笔 draw 里画真几何**。把它们的 ``base`` 写成宿主 ⇒ 槽里存 ``M_2c⁻¹·M_694·P_694``，
+    而那一刻游戏喂的 ``vs-cb3`` 已经是 ``M_694`` ⇒ 二次变换（实测 694 偏 160.56°、70a 偏 26.67°）。
+
+    实例 B（对）：``虚构游戏`` 两族都是 3 / 6 顶点的站位股，几何整块并进宿主 09c6e58a 一笔 draw
+    ⇒ 那时 ``base = 宿主`` 才是对的，也是唯一允许偏离 ``base == own`` 的情形。
+
+    退化路径：``_himi_host_family`` 一旦没把 ``sizes`` 带回来，旧写法会把**每一族**都判成
+    ≤512 B 的站位族（``sizes.get(f, 0) == 0``）⇒ 全合并分支恒成立 ⇒ 实例 A 那种工作空间必然错位。
+    """
+
+    HOST = "2c706fbd"
+
+    def _exporter(self, families, sizes, host=None):
+        class _Fake:
+            def himi_family_range_items(self):
+                return [(family, {"base": 0, "slots": 1}) for family in families]
+
+            def himi_merged_runtime_plan(self):
+                return types.SimpleNamespace()
+
+            def _himi_host_family(self, plan):
+                payload = {"ok": True, "family": self.host, "size": 1, "source": "stub", "note": ""}
+                if self.sizes is not None:
+                    payload["sizes"] = dict(self.sizes)
+                return payload
+
+        fake = _Fake()
+        fake.host = host or self.HOST
+        fake.sizes = sizes
+        return fake
+
+    def test_host_family_reports_per_family_sizes(self):
+        class _Model:
+            def __init__(self, draw_ib, payload):
+                self.draw_ib = draw_ib
+                self.category_buffer_dict = {"Position": payload}
+
+        stub = types.SimpleNamespace(
+            drawib_model_list=[
+                _Model("2c706fbd", bytes(4400)),
+                _Model("694025c6", bytes(880)),
+            ],
+            himi_family_range_items=lambda: [
+                ("2c706fbd", {"base": 0, "slots": 1}),
+                ("694025c6", {"base": 1, "slots": 1}),
+            ],
+        )
+        picked = ExportHIMI._himi_host_family(stub, types.SimpleNamespace(has_rebinds=True))
+        self.assertTrue(picked["ok"])
+        self.assertEqual(picked["family"], "2c706fbd")
+        self.assertEqual(picked["sizes"], {"2c706fbd": 4400, "694025c6": 880})
+
+    def test_own_draw_families_keep_their_own_base(self):
+        # 实例 A 的真实形状：真几何与站位并存 ⇒ 逐族判定（站位 b35/def 跟宿主，其余跟自己）
+        families = ["2c706fbd", "694025c6", "70a4da3e", "b35cfc6c", "def0c0ae"]
+        sizes = {
+            "2c706fbd": 1040468,
+            "694025c6": 152592,
+            "70a4da3e": 174108,
+            "b35cfc6c": 132,
+            "def0c0ae": 264,
+        }
+        got = ExportHIMI._himi_family_index_map(self._exporter(families, sizes), None)
+        self.assertEqual(
+            got,
+            {
+                "2c706fbd": (0, 0),
+                "694025c6": (1, 1),
+                "70a4da3e": (2, 2),
+                "b35cfc6c": (3, 0),
+                "def0c0ae": (4, 0),
+            },
+            "自成 draw 的族被对齐到宿主族 ⇒ 骨架里会多乘一次 M_宿主⁻¹·M_族；"
+            "站位族跟着自己 ⇒ 并进宿主的那几个零面积顶点会少一层校正",
+        )
+
+    def test_no_stub_families_means_every_family_is_its_own_base(self):
+        families = ["2c706fbd", "694025c6", "70a4da3e"]
+        sizes = {"2c706fbd": 1040468, "694025c6": 152592, "70a4da3e": 174108}
+        got = ExportHIMI._himi_family_index_map(self._exporter(families, sizes), None)
+        self.assertEqual(got, {family: (index, index) for index, family in enumerate(families)})
+
+    def test_unknown_size_family_is_not_treated_as_stub(self):
+        # 尺寸未知 ⇒ 当作「自己那笔 draw」，绝不猜成站位（猜错会多乘一层 M_宿主⁻¹·M_族）
+        families = ["2c706fbd", "694025c6", "70a4da3e"]
+        sizes = {"2c706fbd": 1040468, "694025c6": 132}
+        got = ExportHIMI._himi_family_index_map(self._exporter(families, sizes), None)
+        self.assertEqual(got, {"2c706fbd": (0, 0), "694025c6": (1, 0), "70a4da3e": (2, 2)})
+
+    def test_full_merge_aligns_every_family_to_the_host(self):
+        families = ["077983c9", "09c6e58a", "1b62725d"]
+        sizes = {"077983c9": 132, "09c6e58a": 1040468, "1b62725d": 264}
+        got = ExportHIMI._himi_family_index_map(
+            self._exporter(families, sizes, host="09c6e58a"), None
+        )
+        self.assertEqual(got, {family: (index, 1) for index, family in enumerate(families)})
+
+    def test_missing_sizes_never_degrades_to_full_merge(self):
+        families = ["2c706fbd", "694025c6", "70a4da3e"]
+        got = ExportHIMI._himi_family_index_map(self._exporter(families, None), None)
+        self.assertEqual(got, {family: (index, index) for index, family in enumerate(families)})
+
+    def test_single_family_has_no_host_shift(self):
+        got = ExportHIMI._himi_family_index_map(
+            self._exporter(["deadbeef"], {"deadbeef": 1024}, host="deadbeef"), None
+        )
+        self.assertEqual(got, {"deadbeef": (0, 0)})
+
+
 class AttachRangeExportGateTests(unittest.TestCase):
     """t39-X 硬门：发布路径（`_himi_publish_attach_ranges`）必须在写盘后用**同一组**输入复核。
 
