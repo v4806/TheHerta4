@@ -5,6 +5,7 @@ import sys
 import tempfile
 import types
 import unittest
+from concurrent.futures import Future
 from pathlib import Path
 from unittest import mock
 
@@ -146,6 +147,106 @@ def _fake_texconv_run(command, gama=None, srgb=False, **_kwargs):
 
 
 class DDSToPNGTests(unittest.TestCase):
+    def test_submission_error_finishes_job_instead_of_leaving_busy_state(self):
+        _fake_bpy.context.scene.texture_tools_props.dds_auto_convert_png_after_import = True
+        _fake_bpy.data.images = [FakeImage(self._make_dds())]
+        executor = mock.Mock()
+        executor.submit.side_effect = RuntimeError("worker unavailable")
+        with mock.patch.object(dds_to_png, "_create_png_executor", return_value=executor):
+            self.assertTrue(dds_to_png.schedule_auto_convert())
+            dds_to_png._auto_tick()
+            self.assertIsNone(dds_to_png._auto_tick())
+        self.assertEqual(dds_to_png._AUTO_JOB["failed"], 1)
+        self.assertFalse(dds_to_png._AUTO_JOB["active"])
+
+    def test_stopping_auto_conversion_releases_queue_without_waiting_for_workers(self):
+        executor = mock.Mock()
+        dds_to_png._AUTO_JOB.update(images=[object()], active=True, executor=executor,
+                                    groups={"a": object()}, ready=[object()], seen_images={1})
+        dds_to_png.stop_auto_convert()
+        executor.shutdown.assert_called_once_with(wait=False, cancel_futures=True)
+        self.assertIsNone(dds_to_png._AUTO_JOB["images"])
+        self.assertFalse(dds_to_png._AUTO_JOB["active"])
+        self.assertEqual(dds_to_png._AUTO_JOB["groups"], {})
+
+    def test_shared_source_is_converted_once_and_all_references_keep_display_settings(self):
+        _fake_bpy.context.scene.texture_tools_props.dds_auto_convert_png_after_import = True
+        path = self._make_dds()
+        images = [FakeImage(path, colorspace="sRGB", alpha_mode="STRAIGHT"),
+                  FakeImage(path, colorspace="Non-Color", alpha_mode="CHANNEL_PACKED")]
+        _fake_bpy.data.images = images
+        self.assertTrue(dds_to_png.schedule_auto_convert())
+        with mock.patch.object(dds_to_png.subprocess, "run", side_effect=_fake_texconv_run) as run:
+            dds_to_png._auto_tick()
+            self.assertIsNone(dds_to_png._auto_tick())
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(dds_to_png._AUTO_JOB["converted"], 1)
+        self.assertEqual(dds_to_png._AUTO_JOB["skipped"], 1)
+        self.assertEqual([image.filepath for image in images], [dds_to_png.png_path_for(path)] * 2)
+        self.assertEqual([image.colorspace_settings.name for image in images], ["sRGB", "Non-Color"])
+        self.assertEqual([image.alpha_mode for image in images], ["STRAIGHT", "CHANNEL_PACKED"])
+
+    def test_pending_file_future_never_blocks_timer(self):
+        _fake_bpy.context.scene.texture_tools_props.dds_auto_convert_png_after_import = True
+        path = self._make_dds()
+        _fake_bpy.data.images = [FakeImage(path)]
+        pending = Future()
+        executor = mock.Mock()
+        executor.submit.return_value = pending
+        with mock.patch.object(dds_to_png, "_create_png_executor", return_value=executor):
+            self.assertTrue(dds_to_png.schedule_auto_convert())
+            self.assertEqual(dds_to_png._auto_tick(), dds_to_png._AUTO_INTERVAL)
+            self.assertEqual(dds_to_png._AUTO_JOB["processed"], 0)
+            self.assertFalse(pending.done())
+            png = dds_to_png.png_path_for(path)
+            _write_png(png)
+            pending.set_result(("converted", png))
+            dds_to_png._auto_tick()
+            self.assertEqual(dds_to_png._AUTO_JOB["processed"], 1)
+            self.assertIsNone(dds_to_png._auto_tick())
+        executor.shutdown.assert_called_once_with(wait=False)
+
+    def test_new_workspace_references_join_when_existing_batch_finishes(self):
+        _fake_bpy.context.scene.texture_tools_props.dds_auto_convert_png_after_import = True
+        first = FakeImage(self._make_dds("A.dds"))
+        _fake_bpy.data.images = [first]
+        with mock.patch.object(dds_to_png.subprocess, "run", side_effect=_fake_texconv_run) as run:
+            self.assertTrue(dds_to_png.schedule_auto_convert())
+            dds_to_png._auto_tick()
+            second = FakeImage(self._make_dds("B.dds"))
+            _fake_bpy.data.images.append(second)
+            self.assertFalse(dds_to_png.schedule_auto_convert())
+            dds_to_png._auto_tick()
+            self.assertEqual(dds_to_png._AUTO_JOB["processed"], 2)
+            self.assertIsNone(dds_to_png._auto_tick())
+        self.assertEqual(run.call_count, 2)
+        self.assertTrue(second.filepath.endswith(".png"))
+
+    def test_jpeg_with_dds_filename_uses_actual_container_without_texconv(self):
+        from PIL import Image
+        path = os.path.join(self.temp_dir, "masked.dds")
+        Image.new("RGB", (7, 5), (70, 130, 190)).save(path, format="JPEG")
+        original = Path(path).read_bytes()
+        with Image.open(path) as decoded:
+            expected = decoded.convert("RGB").tobytes()
+        image = FakeImage(path)
+        with mock.patch.object(dds_to_png, "find_texconv", return_value=None), mock.patch.object(dds_to_png.subprocess, "run") as run:
+            status, png = dds_to_png.process_one(image, path)
+        self.assertEqual(status, "converted")
+        run.assert_not_called()
+        with Image.open(png) as decoded:
+            self.assertEqual(decoded.convert("RGB").tobytes(), expected)
+        self.assertEqual(Path(path).read_bytes(), original)
+
+    def test_png_with_dds_filename_is_copied_byte_for_byte(self):
+        path = os.path.join(self.temp_dir, "masked.dds")
+        _write_png(path, bit_depth=16)
+        original = Path(path).read_bytes()
+        with mock.patch.object(dds_to_png.subprocess, "run") as run:
+            png = dds_to_png.convert_dds_to_png(None, path)
+        run.assert_not_called()
+        self.assertEqual(Path(png).read_bytes(), original)
+
     """DDS 引用转 PNG：色彩空间、保留原文件、重连显示配置、自动调度。"""
 
     def setUp(self):
@@ -173,6 +274,20 @@ class DDSToPNGTests(unittest.TestCase):
         patcher = mock.patch.object(dds_to_png, "find_texconv", return_value="texconv.exe")
         self.addCleanup(patcher.stop)
         patcher.start()
+        class ImmediateExecutor:
+            def submit(self, function, *args):
+                future = Future()
+                try:
+                    future.set_result(function(*args))
+                except Exception as exc:
+                    future.set_exception(exc)
+                return future
+
+            def shutdown(self, wait=False):
+                pass
+        executor = mock.patch.object(dds_to_png, "_create_png_executor", side_effect=ImmediateExecutor)
+        self.addCleanup(executor.stop)
+        executor.start()
 
     def _make_dds(self, name="X-LightMap.dds", dxgi_format=None, legacy_d3dfmt=None):
         path = os.path.join(self.temp_dir, name)
@@ -351,8 +466,8 @@ class DDSToPNGTests(unittest.TestCase):
         self.assertFalse(dds_to_png.schedule_auto_convert())
         self.assertEqual([], _registered_timers)
 
-    def test_auto_tick_processes_one_image_per_frame_then_finishes(self):
-        """自动流程每帧只处理一张，避免长耗时卡住界面；队列清空后返回 None 注销 timer"""
+    def test_auto_tick_relinks_ready_images_then_finishes(self):
+        """转换交给文件任务，主线程每帧只做有界重连，完成后注销 timer。"""
         _fake_bpy.context.scene.texture_tools_props = types.SimpleNamespace(
             dds_auto_convert_png_after_import=True
         )
@@ -364,8 +479,7 @@ class DDSToPNGTests(unittest.TestCase):
         _tick, _interval = _registered_timers[0]
 
         with mock.patch.object(dds_to_png.subprocess, "run", side_effect=_fake_texconv_run) as run_mock:
-            for _ in range(3):
-                self.assertEqual(dds_to_png._AUTO_INTERVAL, _tick())
+            self.assertEqual(dds_to_png._AUTO_INTERVAL, _tick())
             self.assertIsNone(_tick())
 
         self.assertEqual(3, run_mock.call_count)
@@ -418,13 +532,12 @@ class DDSToPNGTests(unittest.TestCase):
         expected_names = {os.path.basename(p) for p in paths}
 
         with mock.patch.object(dds_to_png.subprocess, "run", side_effect=_fake_texconv_run):
-            for step in range(1, 4):
-                self.assertEqual(dds_to_png._AUTO_INTERVAL, tick())
-                snapshot = dds_to_png.progress_snapshot()
-                self.assertTrue(snapshot["active"])
-                self.assertEqual(3, snapshot["total"])
-                self.assertEqual(step, snapshot["processed"])
-                self.assertIn(snapshot["current"], expected_names)
+            self.assertEqual(dds_to_png._AUTO_INTERVAL, tick())
+            snapshot = dds_to_png.progress_snapshot()
+            self.assertTrue(snapshot["active"])
+            self.assertEqual(3, snapshot["total"])
+            self.assertEqual(3, snapshot["processed"])
+            self.assertIn(snapshot["current"], expected_names)
             self.assertIsNone(tick())
 
         snapshot = dds_to_png.progress_snapshot()
