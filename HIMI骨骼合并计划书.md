@@ -2231,7 +2231,8 @@ Blend 权重和恒 1.0 ⇒ 不是数据坏，是同一份几何被画了多次�
 - 为什么这条判据安全：槽没人引用时补站位只是白抑制原版 draw（规则② 的保守方向仍正确）⇒ 判据是 `(family_slots & used) - present_family_slots`，不是「整族缺席就补」。
 
 **修法 B（回退 t99 的自动补家族）**：`ui/ui_func_export.py` 删掉 `_collect_export_meshes` / `_expand_merged_skeleton_families` 整段
-（1891 → 1763 行），两个入口回到 `_collect_selected_meshes`（`ui/ui_func_export.py:1562` 与 `ui/ui_func_export.py:1635`）；
+（1891 → 1763 行），导出入口回到 `_collect_selected_meshes`（现于 `ui/ui_func_export.py:1287`；导出统一收进后台路径后，
+只剩快速导出入口还在调用它）；
 `common/himi_merged_runtime.py` 删掉无调用方的 `merge_family_bare` / `missing_family_bares`（现 5392 行），保留 `workspace_slot_owners`
 （`common/himi_merged_runtime.py:2839`）与 `describe_ownerless_slots`（`common/himi_merged_runtime.py:2865`，仍供 orphan 消息使用）；
 `tests/test_himi_merged_runtime.py` 删掉 `HIMIFamilyNameTests`（现 7072 行）。
