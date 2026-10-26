@@ -510,7 +510,6 @@ class TestZZMISkeletonMergeHelper(unittest.TestCase):
         self.assertTrue(ok, message)
         self.assertIn("15 个子网格", message)
 
-
 class TestBlendChannelValidation(unittest.TestCase):
     """P2 回归：BLENDINDICES 无效通道（哨兵/零权重）不能算成真实骨骼。"""
 
@@ -1934,6 +1933,37 @@ class ZZMIMergedMetadataGateTests(unittest.TestCase):
             )
             self.assertIsInstance(payload.get("ChannelPlan"), dict)
         self.assertFalse(self._missing())
+
+    def test_cross_toggle_rejects_group_numbered_cache(self):
+        """开关开着时，历史分组编号的缓存不算「已合并」。
+
+        两种编号域的 VGMap 长得一样（VGMap/VGCount/Hash 字段全在），只看
+        「有没有 VGMap」会把历史编号当成合并成果跳过重建：导入侧再按跨组池
+        消费，每个部件就落在自己的局部空间里（现场：带脸部件一起导入后
+        「和没开跨组合并一样」）。口径由 ``SkeletonMergeMode`` 自证。
+        """
+        ok, message = ZZMISkeletonMergeHelper.ensure_skeleton_data(
+            workspace_root=str(self.ws), unique_str_list=self.unique_strs
+        )
+        self.assertTrue(ok, message)
+        # 这套合成提取源没有锚点骨可锚 ⇒ 本次写的是历史分组编号
+        unique_str, json_path, payload = _list_submesh_jsons(str(self.ws))[0]
+        self.assertEqual(payload.get("SkeletonMergeMode"), "group")
+        self.assertTrue(
+            ZZMISkeletonMergeHelper._zzmi_cache_intact(payload, json_path, unique_str)
+        )
+        self.assertFalse(
+            ZZMISkeletonMergeHelper._zzmi_cache_intact(
+                payload, json_path, unique_str, expect_cross=True
+            ),
+            "开着跨组合并时，历史分组编号必须判成需要重建",
+        )
+        payload["SkeletonMergeMode"] = "cross_group"
+        self.assertTrue(
+            ZZMISkeletonMergeHelper._zzmi_cache_intact(
+                payload, json_path, unique_str, expect_cross=True
+            )
+        )
 
 
 if __name__ == "__main__":

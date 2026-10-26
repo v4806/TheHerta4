@@ -686,6 +686,25 @@ def ImprotFromWorkSpaceFull(self, context):
             )
             print(f"[ZZMI骨骼合并] {message}")
             merged_vgmap_ready = bool(ok)
+            if merged_vgmap_ready and zzmi_merged_consumption:
+                # ok 只说「骨骼数据在/写下去了」；开着跨组合并时还要确认这份数据
+                # 就是**骨骼池编号**。骨骼池方案没算出来时会退回历史分组编号
+                # （每个部件各一段基址，看起来也有 VGMap），那种数据不能按跨组
+                # 池消费——否则每个部件都落在自己的局部空间里（现场：带脸部件
+                # 导入后「和没开跨组合并一样」）。
+                try:
+                    ready_cross = ZZMISkeletonMergeHelper.count_ready_merged_metadata(
+                        GlobalConfig.path_workspace_folder(), import_keys
+                    )
+                except Exception:
+                    ready_cross = 0
+                if ready_cross == 0:
+                    merged_vgmap_ready = False
+                    self.report(
+                        {'WARNING'},
+                        "跨组合并本次未生效（骨骼池方案没算出来，编号退回历史分组），"
+                        "本次按普通顶点组导入",
+                    )
             if ok:
                 if zzmi_merged_consumption:
                     self.report({'INFO'}, message)

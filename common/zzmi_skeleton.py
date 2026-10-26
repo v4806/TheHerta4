@@ -81,6 +81,12 @@ _BONE_MATRIX_FLOATS = 12
 _ZZMI_VG_MAP_ALGORITHM_VERSION = 5
 # 导出侧也需要知道当前缓存口径，不能只依赖导入阶段的幂等门控。
 ZZMI_VG_MAP_ALGORITHM_VERSION = _ZZMI_VG_MAP_ALGORITHM_VERSION
+# 缓存里的 VGMap 是哪个编号域：跨组骨骼池槽位，还是历史分组编号。
+# `_zzmi_cache_intact` 原本只看「有没有 VGMap」⇒ 历史编号的缓存会被当成合并成果
+# 幂等跳过；导入侧按跨组消费，拿到的却是各部件自己的局部编号 —— 现象就是「每个
+# 部件仍各在各的局部空间」。开跨组合并时宁可重建，也不能拿错口径的 VGMap 顶上。
+_ZZMI_MERGE_MODE_CROSS = "cross_group"
+_ZZMI_MERGE_MODE_GROUP = "group"
 
 
 class ZZMILogParser:
@@ -1149,7 +1155,11 @@ class ZZMISkeletonMergeHelper:
 
     @classmethod
     def _zzmi_cache_intact(
-        cls, submesh_json: dict, json_path: str, unique_str: str
+        cls,
+        submesh_json: dict,
+        json_path: str,
+        unique_str: str,
+        expect_cross: bool = False,
     ) -> bool:
         """ZZMI 缓存快路径完整性校验（schema + 算法版本 + 映射覆盖 + 缓存文件）。
 
@@ -1157,6 +1167,9 @@ class ZZMISkeletonMergeHelper:
         搬迁漏掉 ModImpRuntime 时，绝不允许带着半成品 VGMap 永久幂等跳过。校验项：
         - SkeletonGroup / DeformDrawIndex / OriginalVertexCount 是非负整数；
         - VGMapAlgorithmVersion == 当前算法版本；
+        - `expect_cross` 时 `SkeletonMergeMode` 必须是 `cross_group`：历史分组编号
+          与跨组池槽位是两个编号域，拿错口径的缓存顶上就是「每个部件各在各的
+          局部空间」；
         - VGCount / VGOffset 存在且非负；
         - VGMap 键完整覆盖 0..VGCount-1、len(VGMap) == VGCount、全局槽位非负
           （缺键或规范化重复键会让导入/导出映射口径不一致）；
@@ -1175,6 +1188,10 @@ class ZZMISkeletonMergeHelper:
         except (TypeError, ValueError):
             cache_version = 0
         if cache_version != _ZZMI_VG_MAP_ALGORITHM_VERSION:
+            return False
+        if expect_cross and (
+            submesh_json.get("SkeletonMergeMode") != _ZZMI_MERGE_MODE_CROSS
+        ):
             return False
         try:
             metadata_values = (
@@ -1322,9 +1339,13 @@ class ZZMISkeletonMergeHelper:
         刻意**不做**提取源指纹（log.txt 全量哈希）比对：那会让每次导入都哈希整个
         log；换用新提取文件请重新选择提取源并重新导入（或清缓存后重导入）。
         只检查请求集内可解析的 json；``GPU-PreSkinning`` 为 False 的 json 不参与判定。
+
+        口径随开关走：开着跨组合并时，历史分组编号的缓存也算「需要处理」——
+        两种编号域的 VGMap 长得一样，只有 ``SkeletonMergeMode`` 分得清。
         """
         if not workspace_root or not unique_str_list:
             return False
+        expect_cross = cls._cross_numbering_expected(workspace_root)
         for unique_str in unique_str_list:
             json_path = cls._resolve_submesh_json_path(workspace_root, unique_str)
             if not json_path:
@@ -1339,7 +1360,9 @@ class ZZMISkeletonMergeHelper:
                 continue
             if not payload.get("VGMap") or not payload.get("VGMapAlgorithmVersion"):
                 return True
-            if not cls._zzmi_cache_intact(payload, json_path, unique_str):
+            if not cls._zzmi_cache_intact(
+                payload, json_path, unique_str, expect_cross=expect_cross
+            ):
                 return True
         return False
 
@@ -1358,9 +1381,12 @@ class ZZMISkeletonMergeHelper:
 
         判定口径与 ``missing_merged_metadata_exist`` 逐件完全一致（同一份
         ``_zzmi_cache_intact``）：把一个「有没有缺失」的问题换成「有多少件就绪」。
+        切换开关时口径同样随开关走——开着跨组却只有历史分组编号的缓存不算就绪，
+        否则导入侧会把「各在各的局部空间」当成合并部分生效。
         """
         if not workspace_root or not unique_str_list:
             return 0
+        expect_cross = cls._cross_numbering_expected(workspace_root)
         ready = 0
         for unique_str in unique_str_list:
             json_path = cls._resolve_submesh_json_path(workspace_root, unique_str)
@@ -1376,10 +1402,29 @@ class ZZMISkeletonMergeHelper:
                 continue
             if not payload.get("VGMap") or not payload.get("VGMapAlgorithmVersion"):
                 continue
-            if not cls._zzmi_cache_intact(payload, json_path, unique_str):
+            if not cls._zzmi_cache_intact(
+                payload, json_path, unique_str, expect_cross=expect_cross
+            ):
                 continue
             ready += 1
         return ready
+
+    @classmethod
+    def _cross_numbering_expected(cls, workspace_root: str) -> bool:
+        """本工作空间是否应按**骨骼池编号**判定缓存是否可用。
+
+        开关开着、并且池方案文件就在盘上时才成立：没有方案文件时历史分组编号
+        才是这个工作空间的正常态（提取源没有锚点骨可锚），不能因此把它常年判成
+        「缺件」反复重建。
+        """
+        if not cls.cross_group_merged_enabled():
+            return False
+        try:
+            from .zzmi_cross_group_palette import get_profile_path
+
+            return os.path.isfile(get_profile_path(workspace_root))
+        except Exception:  # pragma: no cover - 磁盘异常
+            return False
 
     @staticmethod
     def cross_group_merged_enabled() -> bool:
@@ -1576,6 +1621,23 @@ class ZZMISkeletonMergeHelper:
         # 不能让部分完成被报告成完整成功）
         unresolved_targets: list[str] = []
         seen_members: set[str] = set()
+        # 快路径必须按**本次要的口径**校验：开跨组合并时，缓存里的 VGMap 必须是
+        # 池槽位，并且池方案文件得在盘上（两者缺一就无法确认编号域，而「看起来
+        # 有 VGMap」正是把历史分组编号当成合并成果的入口）。
+        expect_cross = bool(cls.cross_group_merged_enabled())
+        pool_profile_ready = False
+        if expect_cross:
+            try:
+                from .zzmi_cross_group_palette import get_profile_path
+
+                pool_profile_ready = os.path.isfile(
+                    get_profile_path(workspace_root)
+                )
+            except Exception:  # pragma: no cover - 磁盘异常
+                pool_profile_ready = False
+        # 编号域校验只在池方案在盘上时才有意义：没有方案文件时历史分组编号就是
+        # 本工作空间的正常态，判据由下面的「池方案不在 ⇒ 强制重建」承担。
+        cross_mode_ready = expect_cross and pool_profile_ready
 
         for unique_str in unique_str_list:
             if unique_str in seen_members:
@@ -1629,7 +1691,7 @@ class ZZMISkeletonMergeHelper:
                 group["dedup_excluded"] = True
 
             cache_intact = cls._zzmi_cache_intact(
-                submesh_json, json_path, unique_str
+                submesh_json, json_path, unique_str, expect_cross=cross_mode_ready
             )
             if (
                 cache_intact
@@ -1646,6 +1708,17 @@ class ZZMISkeletonMergeHelper:
             ):
                 # dump 尚在时自动迁移旧版/缺件来源缓存，避免本次幂等跳过后
                 # 用户清 VGMap、删 dump 才发现 CB1 不可复现。
+                cache_intact = False
+            if (
+                cache_intact
+                and expect_cross
+                and not pool_profile_ready
+                and submesh_json.get("SkeletonMergeMode") != _ZZMI_MERGE_MODE_GROUP
+            ):
+                # 池方案文件不在、缓存却自称池编号（或根本没有口径字段）：无从
+                # 确认这份 VGMap 是池槽位还是历史分组编号，重建一次把口径落定。
+                # 已写明 group 的是上次方案失败后的历史编号——那是本工作空间的
+                # 正常态，不必每次导入都重算一遍。
                 cache_intact = False
             if not force and cache_intact:
                 continue  # 该子网格缓存完整（临时计数，见下）
@@ -2225,6 +2298,11 @@ class ZZMISkeletonMergeHelper:
                 base += group_slots[group_index]
             total_slots = base
 
+        merge_mode = (
+            _ZZMI_MERGE_MODE_CROSS
+            if cls.cross_group_profile is not None
+            else _ZZMI_MERGE_MODE_GROUP
+        )
         vg_maps: dict[str, dict] = {}
         vg_offsets: dict[str, int] = {}
         slot_weights_by_draw_ib: dict[str, dict[int, int]] = {}
@@ -2296,6 +2374,9 @@ class ZZMISkeletonMergeHelper:
                 submesh_json["VGMap"] = {str(k): int(v) for k, v in sorted(vg_map.items())}
                 # 算法版本：快路径幂等判定依据；策略变更时递增版本使旧缓存自动失效
                 submesh_json["VGMapAlgorithmVersion"] = _ZZMI_VG_MAP_ALGORITHM_VERSION
+                # 编号域：cross_group = 骨骼池槽位；group = 历史分组编号。快路径靠它
+                # 区分两种 VGMap——只看「有 VGMap」会把历史编号当成合并成果。
+                submesh_json["SkeletonMergeMode"] = merge_mode
                 # t75 通道计划：唯一判定口径的产物 + 复核素材。缺失/版本不符时
                 # `_zzmi_cache_intact` 拒绝复用（显式重建，不静默退化）。
                 submesh_json["ChannelPlanVersion"] = ZZMI_CHANNEL_PLAN_VERSION

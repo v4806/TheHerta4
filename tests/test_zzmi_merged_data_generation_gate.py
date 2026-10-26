@@ -144,9 +144,15 @@ class SwitchIndependenceTests(unittest.TestCase):
             "ZZMISkeletonMergeHelper 必须提供元数据缺失/不完整判据（导入侧自愈门控）",
         )
         self.assertIn(
-            "_zzmi_cache_intact(payload, json_path, unique_str)",
+            "_zzmi_cache_intact(",
             source,
             "自愈判据必须包含快路径完整性检查，否则旧算法版本/缺字段不会自愈",
+        )
+        self.assertIn(
+            "expect_cross=expect_cross",
+            source,
+            "自愈判据必须同时校验编号域：开着跨组合并时，历史分组编号的 VGMap"
+            "看起来齐全却是各部件局部槽位，不校验就会被当成合并成果跳过",
         )
 
 
