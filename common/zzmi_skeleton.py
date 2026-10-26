@@ -1407,6 +1407,10 @@ class ZZMISkeletonMergeHelper:
         绝不让它把导入搞崩：跨组没有共享骨可锚、骨骼表/物体矩阵读不到、部件之间
         互相矛盾时 `plan_from_parts` 会抛 `ZZMICrossGroupPaletteError` —— 这里吞掉
         并打印原因，调用方走历史分组 + 组基址编号（跨组骨骼不合并，行为同旧版）。
+
+        单个部件的脏数据不在这条路上：骨骼表带 NaN/inf 的部件由 `plan_from_parts`
+        排除出合并计算（仍在池尾独占槽位），权重带 NaN 的按 0 计数 —— 一个部件
+        的坏数据不许否决整只角色的骨骼池。
         """
         try:
             from .zzmi_cross_group_palette import plan_from_parts
