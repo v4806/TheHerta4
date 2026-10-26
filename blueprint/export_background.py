@@ -54,6 +54,8 @@ SNAPSHOT_FILE_NAME = "snapshot.blend"
 KILL_GRACE_SECONDS = 2.0
 #: cancel() 里轮询 terminate 是否生效的间隔（秒）
 TERMINATE_POLL_INTERVAL = 0.05
+#: cancel() 在 UI 线程上运行（ESC 取消导出），只肯等这么久就升级到 kill
+TERMINATE_UI_WAIT_SECONDS = 0.3
 
 #: 已有后台导出在运行时，各导出入口的统一提示
 BACKGROUND_BUSY_MESSAGE = "已有后台导出在运行，请等它结束或按 ESC 取消"
@@ -1669,7 +1671,9 @@ class BackgroundExportSession:
             except Exception:
                 pass
 
-            deadline = time.monotonic() + KILL_GRACE_SECONDS
+            # cancel() 跑在 UI 线程上（ESC 取消导出）：等 terminate 生效的时间必须短，
+            # 否则 modal 定时器卡满整个 grace，界面就是整整冻住好几秒。等不到就强杀。
+            deadline = time.monotonic() + min(KILL_GRACE_SECONDS, TERMINATE_UI_WAIT_SECONDS)
             while time.monotonic() < deadline:
                 if process.poll() is not None:
                     break
@@ -1680,7 +1684,7 @@ class BackgroundExportSession:
                 except Exception:
                     pass
                 try:
-                    process.wait(timeout=KILL_GRACE_SECONDS)
+                    process.wait(timeout=TERMINATE_UI_WAIT_SECONDS)
                 except Exception:
                     pass
 
