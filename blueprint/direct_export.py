@@ -875,7 +875,12 @@ class SSMT_OT_GenerateDirectModBlueprint(bpy.types.Operator):
         if tree is None:
             self.report({'ERROR'}, "未找到当前蓝图树，请先在蓝图编辑器中选中目标蓝图。")
             return {'CANCELLED'}
-        result = bpy.ops.ssmt.generate_mod_blueprint('INVOKE_DEFAULT', blueprint_name=tree.name)
+        # 走统一后台入口，但声明只要直出流程：不能让它落进 NTMI ModImp 分支。
+        result = bpy.ops.ssmt.generate_mod_blueprint(
+            'INVOKE_DEFAULT',
+            blueprint_name=tree.name,
+            direct_export_only=True,
+        )
         return {'FINISHED'} if result == {'RUNNING_MODAL'} else result
 
 

@@ -755,6 +755,13 @@ class SSMTGenerateModBlueprint(_BackgroundExportMixin, bpy.types.Operator):
         default="", options={'HIDDEN', 'SKIP_SAVE'},
     )  # type: ignore
 
+    direct_export_only: bpy.props.BoolProperty(
+        name="直出导出",
+        description="忽略 NTMI ModImp 输出节点，只跑直出（形态键 / 多文件）流程",
+        default=False,
+        options={'HIDDEN', 'SKIP_SAVE'},
+    )  # type: ignore
+
     def _resolve_target_tree(self, context):
         """解析目标蓝图节点树"""
         requested_tree_name = str(getattr(self, "blueprint_name", "") or "").strip()
@@ -906,6 +913,10 @@ class SSMTGenerateModBlueprint(_BackgroundExportMixin, bpy.types.Operator):
             LOG.warning(f"恢复旧配置表失败: {error}")
 
     def _ntmi_output_node(self, tree):
+        # 直出入口显式声明了只跑直出流程：绝区零工程里也必须绕过 NTMI ModImp，
+        # 否则「直出」按钮会被解析成一次 NTMI 导出（PR #62 统一后台入口后的回归）。
+        if getattr(self, "direct_export_only", False):
+            return None
         if GlobalConfig.logic_name != LogicName.NTEMI:
             return None
         name = str(getattr(self, "ntmi_output_node_name", "") or "").strip()
