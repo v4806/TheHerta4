@@ -62,6 +62,7 @@ def _load(submodule):
 
 
 _load("tt_dds_conversion")
+native_png = _load("_dds_png_native")
 dds_to_png = _load("tt_dds_to_png")
 
 
@@ -401,6 +402,30 @@ class DDSToPNGTests(unittest.TestCase):
 
         self.assertEqual("failed", status)
         self.assertIn("texconv", detail)
+
+    def test_native_engine_converts_without_texconv_and_preserves_settings(self):
+        dds_path = self._make_dds(dxgi_format=95)
+        image = FakeImage(dds_path, colorspace="Non-Color", alpha_mode="CHANNEL_PACKED")
+        def native_convert(source, destination):
+            _write_png(destination, bit_depth=16)
+            return dict(depth=16, read_ms=1, decode_ms=2, filter_ms=3, compress_ms=4, write_ms=5)
+        with mock.patch.object(dds_to_png, "find_texconv", return_value=None), \
+             mock.patch.object(native_png, "convert", side_effect=native_convert), \
+             mock.patch.object(dds_to_png.subprocess, "run") as external:
+            status, _detail = dds_to_png.process_one(image, dds_path)
+        self.assertEqual(status, "converted")
+        external.assert_not_called()
+        self.assertEqual(image.colorspace_settings.name, "Non-Color")
+        self.assertEqual(image.alpha_mode, "CHANNEL_PACKED")
+        self.assertTrue(os.path.isfile(dds_path))
+
+    def test_native_error_falls_back_to_existing_texconv_rules(self):
+        dds_path = self._make_dds(dxgi_format=95)
+        with mock.patch.object(native_png, "convert", side_effect=RuntimeError("native encode failed")), \
+             mock.patch.object(dds_to_png.subprocess, "run", side_effect=_fake_texconv_run) as external:
+            dds_to_png.convert_dds_to_png("texconv.exe", dds_path)
+        self.assertIn("R16G16B16A16_UNORM", external.call_args.args[0])
+        self.assertEqual(dds_to_png.png_bit_depth(dds_to_png.png_path_for(dds_path)), 16)
 
     def test_iter_only_returns_file_images_with_dds_extension(self):
         """只挑 source=FILE 且路径以 .dds 结尾的图片"""

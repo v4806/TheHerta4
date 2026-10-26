@@ -7,7 +7,8 @@ PNG 后 Blender 能正常读，控制台也不再刷这些警告。
 
 三条实测得出的设计约束（数字见 tests/test_dds_to_png.py）：
 
-1. **色彩空间交给 texconv 自己判断**：普通（整型）源只给 ``-ft png``，*不给* ``-f``，
+1. **原生引擎保留源色彩语义**：8bit 整型、16bit HDR 直接写 PNG。texconv 回退时
+   普通（整型）源只给 ``-ft png``，*不给* ``-f``，
    texconv 会保留输入的 sRGB 语义（``BC7_UNORM_SRGB`` -> ``R8G8B8A8_UNORM_SRGB``，
    ``BC7_UNORM`` -> ``R8G8B8A8_UNORM``）。实测这与手工按格式指定输出逐像素完全一致
    （mean_abs_diff = 0.0）；而手工指定一旦写错，就会让 sRGB 贴图被线性解码一次，
@@ -33,6 +34,7 @@ from concurrent.futures import ThreadPoolExecutor
 import bpy
 
 from .tt_dds_conversion import find_texconv
+from . import _dds_png_native
 
 
 _AUTO_INTERVAL = 0.005
@@ -333,7 +335,7 @@ def iter_dds_images():
 
 
 def convert_dds_to_png(texconv, dds_path):
-    """按属性检测结果选命令，用 texconv 在 dds 同目录生成同名 .png，返回 png 绝对路径。
+    """优先专用 C 流水线，未支持的格式回退 texconv，返回同目录 PNG 绝对路径。
 
     命令由 :func:`probe_dds` + :data:`_PNG_COMMAND_TABLE` 决定；``-y`` 覆盖同名旧文件。
     转换前后各打一行日志（属性 / 命中规则 / 产物色彩元数据），便于直接核对。
@@ -353,6 +355,18 @@ def convert_dds_to_png(texconv, dds_path):
         with Image.open(dds_path) as image:
             image.convert("RGB").save(png_path, format="PNG")
         print(f"{_LOG_PREFIX} {os.path.basename(dds_path)} 实际为 JPEG，按真实格式转为 PNG。")
+        return png_path
+    png_path = png_path_for(dds_path)
+    try:
+        native_stats = _dds_png_native.convert(dds_path, png_path)
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"{_LOG_PREFIX} {os.path.basename(dds_path)} C 引擎失败，回退 texconv: {exc}")
+        native_stats = None
+    if native_stats is not None:
+        print("%s %s: C 引擎 -> %sbit PNG，读取 %.1f / 解码 %.1f / 滤波 %.1f / 压缩 %.1f / 落盘 %.1f ms" % (
+            _LOG_PREFIX, os.path.basename(dds_path), native_stats["depth"],
+            native_stats["read_ms"], native_stats["decode_ms"], native_stats["filter_ms"],
+            native_stats["compress_ms"], native_stats["write_ms"]))
         return png_path
     if not texconv:
         raise RuntimeError("未找到 texconv.exe")
@@ -526,10 +540,6 @@ def convert_all(force=False, reporter=None):
     if not targets:
         emit("INFO", "工程里没有指向 .dds 的图片引用。")
         return {"total": 0, "converted": 0, "skipped": 0, "failed": 0}
-
-    if not find_texconv():
-        emit("ERROR", "未找到 texconv.exe。请将其放入插件目录的 Toolset 子文件夹，或手动指定路径。")
-        return {"total": len(targets), "converted": 0, "skipped": 0, "failed": len(targets)}
 
     stats = {"total": len(targets), "converted": 0, "skipped": 0, "failed": 0}
     for image, dds_path in targets:
