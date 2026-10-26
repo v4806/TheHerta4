@@ -871,30 +871,12 @@ class SSMT_OT_GenerateDirectModBlueprint(bpy.types.Operator):
         return tree
 
     def execute(self, context):
-        LOG.start_collecting()
-        GlobalConfig.read_from_main_json_ssmt4()
-
-        TimerUtils.start_session("Mod直出")
-
-        try:
-            tree = self._resolve_target_tree(context)
-            if not tree:
-                self.report({'ERROR'}, "未找到当前蓝图树，请先在蓝图编辑器中选中目标蓝图。")
-                return {'CANCELLED'}
-
-            execute_direct_export(context=context, tree=tree)
-
-            self.report({'INFO'}, "直导出生成成功。")
-            return {'FINISHED'}
-        except Exception as exc:
-            LOG.error(f"直出失败: {exc}")
-            import traceback
-            traceback.print_exc()
-            self.report({'ERROR'}, str(exc))
+        tree = self._resolve_target_tree(context)
+        if tree is None:
+            self.report({'ERROR'}, "未找到当前蓝图树，请先在蓝图编辑器中选中目标蓝图。")
             return {'CANCELLED'}
-        finally:
-            TimerUtils.print_summary()
-            LOG.stop_collecting()
+        result = bpy.ops.ssmt.generate_mod_blueprint('INVOKE_DEFAULT', blueprint_name=tree.name)
+        return {'FINISHED'} if result == {'RUNNING_MODAL'} else result
 
 
 def execute_direct_export(context, tree):

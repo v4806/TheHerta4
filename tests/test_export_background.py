@@ -6,8 +6,8 @@
 2. stage.json 三种状态解析（running / success / error）与进度文本；
 3. ``BackgroundExportSession`` 用 fake Popen 测 start / poll 状态机 / cancel / cleanup；
 4. worker 侧 ``_run_worker`` 的轮次串行、后处理、result.json 成功与失败；
-5. ``common/global_properties.py`` 的开关声明默认 False；
-6. ``SSMTGenerateModBlueprint.invoke`` 开关关闭时走原 execute、开关开启时进 modal。
+5. 移除模式开关，旧工程中的关闭值也不能走前台计算；
+6. invoke / execute 两种入口统一启动后台会话。
 
 装载方式沿用 ``tests/test_blueprint_output_folder.py`` 的 fake-package 范式：
 被测的是**真实**的 ``export_background.py``、``ui_func_export.py``、``global_properties.py``，
@@ -434,6 +434,11 @@ export_step_plan = _load_real_module(
     f"{PKG}.blueprint.export_step_plan", Path("blueprint") / "export_step_plan.py"
 )
 # 真实模块：后台导出
+process_log = _load_real_module(
+    f"{PKG}.utils.process_log", Path("utils") / "process_log.py"
+)
+
+
 export_background = _load_real_module(
     f"{PKG}.blueprint.export_background", Path("blueprint") / "export_background.py"
 )
@@ -762,6 +767,62 @@ class ManifestTests(_BackgroundTestBase):
 
 
 class BackgroundSessionTests(_BackgroundTestBase):
+    def test_worker_log_reaches_console_and_text_block_without_replaying(self):
+        class TextBlock:
+            content = "old export"
+
+            def clear(self):
+                self.content = ""
+
+            @property
+            def lines(self):
+                return [types.SimpleNamespace(body=line) for line in self.content.split("\n")]
+
+            def cursor_set(self, line, character=0):
+                self.at_end = (line, character) == (len(self.lines) - 1, len(self.lines[-1].body))
+
+            def write(self, text):
+                assert self.at_end
+                self.content += text
+
+        block = TextBlock()
+        session = self.make_session()
+        self.assertTrue(session.start())
+        with mock.patch.object(_FAKE_BPY.data, "texts", {"导出流程日志": block}), mock.patch("builtins.print") as output:
+            data = "\x1b[33m中文警告\x1b[0m\n".encode("utf-8")
+            with open(session.log_path, "ab") as log:
+                log.write(data)
+            self.assertEqual(session.poll(), "running")
+            self.assertEqual(block.content, "中文警告\n")
+            session.poll()
+            self.assertEqual(output.call_count, 1)
+            with open(session.log_path, "ab") as log:
+                log.write("Traceback: 最后异常".encode("utf-8"))
+            _FakeProcess.instances[0].returncode = 1
+            self.assertEqual(session.poll(), "error")
+            session.cleanup()
+            self.assertEqual(block.content, "中文警告\nTraceback: 最后异常")
+            self.assertEqual(output.call_count, 2)
+            self.assertEqual(Path(session.log_path).read_bytes(), data + "Traceback: 最后异常".encode("utf-8"))
+
+    def test_cancel_drains_output_not_yet_seen_by_poll(self):
+        session = self.make_session()
+        self.assertTrue(session.start())
+        Path(session.log_path).write_bytes("取消前最后一条错误".encode("utf-8"))
+        with mock.patch("builtins.print") as output:
+            session.cancel()
+            session.cleanup()
+        output.assert_called_once_with("取消前最后一条错误", end="", flush=True)
+
+    def test_worker_environment_enables_unbuffered_utf8_output(self):
+        session = self.make_session()
+        self.assertTrue(session.start())
+        environment = _FakeProcess.instances[0].kwargs["env"]
+        self.assertEqual(environment["PYTHONUNBUFFERED"], "1")
+        self.assertEqual(environment["PYTHONIOENCODING"], "utf-8")
+        self.assertEqual(environment["HERTA_WORKER_LOG_REDIRECTED"], "1")
+        session.cleanup()
+
     def test_start_launches_detached_process_and_writes_manifest(self):
         session = self.make_session()
 
@@ -1082,6 +1143,40 @@ class _FakeBlueprintModel:
 
 
 class WorkerTests(_BackgroundTestBase):
+    def test_ntmi_worker_uses_selected_output_node_and_foreground_resolved_directory(self):
+        session_dir = os.path.join(self.temp_dir, "ntmi_worker")
+        os.makedirs(session_dir)
+        output_dir = os.path.join(self.temp_dir, "ntmi_output")
+        manifest = self._write_manifest(session_dir, [], output_dir)
+        manifest["ntmi_output_node_name"] = "指定输出"
+        export_background._write_json(manifest["manifest_path"], manifest)
+        node = types.SimpleNamespace(name="指定输出", bl_idname="SSMTNode_Result_Output_NTMIModImp",
+                                     use_custom_export_dir=False, export_dir="//relative")
+        tree = types.SimpleNamespace(name="测试蓝图", nodes={node.name: node})
+        engine = types.ModuleType(f"{PKG}.blueprint.ntmi_export_modimp")
+        engine.execute_ntmi_modimp_export = mock.Mock()
+        with mock.patch.dict(sys.modules, {engine.__name__: engine}), mock.patch.object(_FAKE_BPY.data.node_groups, "get", return_value=tree):
+            export_background._run_worker(manifest["manifest_path"])
+        result = export_background._read_json(manifest["result_path"])
+        self.assertEqual(result["status"], "success")
+        engine.execute_ntmi_modimp_export.assert_called_once_with(context=_FAKE_BPY.context, tree=tree, node=node)
+        self.assertTrue(node.use_custom_export_dir)
+        self.assertEqual(node.export_dir, output_dir)
+        stage = export_background._read_json(manifest["stage_path"])
+        self.assertEqual(stage["done"], len(export_background.NTMI_MODIMP_STAGE_STEPS))
+        self.assertEqual(stage["total"], stage["done"])
+
+    def test_redirected_worker_preserves_native_output_instead_of_rewriting_log(self):
+        session_dir = os.path.join(self.temp_dir, "native_output")
+        os.makedirs(session_dir)
+        manifest = self._write_manifest(session_dir, [], os.path.join(self.temp_dir, "out"))
+        original = b"Blender startup\nnative engine output\n"
+        Path(manifest["log_path"]).write_bytes(original)
+        with mock.patch.dict(os.environ, {"HERTA_WORKER_LOG_REDIRECTED": "1"}), mock.patch.object(export_background.traceback, "print_exc"):
+            export_background._run_worker(manifest["manifest_path"])
+        self.assertEqual(Path(manifest["log_path"]).read_bytes(), original)
+        self.assertTrue(Path(manifest["result_path"]).is_file())
+
     def _write_manifest(self, session_dir, round_plans, output_dir):
         return export_background.build_manifest(
             session_dir=session_dir,
@@ -1513,19 +1608,10 @@ class WorkerTests(_BackgroundTestBase):
 
 
 class BackgroundToggleTests(_BackgroundTestBase):
-    def test_property_defaults_to_true(self):
-        """后台导出默认开启（用户要求：点导出就不阻塞界面；取消勾选才走同步导出）。"""
-        declaration = global_properties_module.GlobalProterties.__annotations__[
-            "background_export_enabled"
-        ]
-        self.assertIs(declaration["default"], True)
-        self.assertEqual(declaration["name"], "后台导出")
-
-        # 读取入口按场景属性返回真假
-        self.scene_properties.background_export_enabled = False
-        self.assertFalse(global_properties_module.GlobalProterties.is_background_export_enabled())
-        self.scene_properties.background_export_enabled = True
-        self.assertTrue(global_properties_module.GlobalProterties.is_background_export_enabled())
+    def test_background_mode_has_no_setting_or_sync_export_method(self):
+        self.assertNotIn("background_export_enabled", global_properties_module.GlobalProterties.__annotations__)
+        self.assertFalse(hasattr(global_properties_module.GlobalProterties, "is_background_export_enabled"))
+        self.assertFalse(hasattr(ui_func_export.SSMTGenerateModBlueprint, "_execute_export"))
 
 
 class _RecordingSession:
@@ -1592,6 +1678,43 @@ class _FakeExportTree:
 
 
 class OperatorInvokeTests(_BackgroundTestBase):
+    def test_execute_default_starts_background_session(self):
+        context = self._make_context()
+        operator = self._make_operator(context)
+        self.assertEqual(operator.execute(context), {'RUNNING_MODAL'})
+        self.assertTrue(_RecordingSession.instances[0].started)
+        self.assertEqual(_FAKE_WINDOW_MANAGER.modal_handlers, [operator])
+
+    def test_quick_execute_default_starts_background_session(self):
+        context = self._make_context([self._make_mesh("M1")])
+        operator = self._make_quick_operator()
+        self.assertEqual(operator.execute(context), {'RUNNING_MODAL'})
+        self.assertTrue(_RecordingSession.instances[0].kwargs["quick_export"])
+        self.assertEqual(_FAKE_WINDOW_MANAGER.modal_handlers, [operator])
+
+    def test_execute_default_preserves_busy_guard(self):
+        context = self._make_context()
+        operator = self._make_operator(context)
+        export_background.set_active_session(object())
+        self.assertEqual(operator.execute(context), {'CANCELLED'})
+        self.assertFalse(_RecordingSession.instances)
+
+    def test_ntmi_session_keeps_selected_node_and_custom_directory(self):
+        _FakeGlobalConfig.logic_name = "NTEMI"
+        node = types.SimpleNamespace(name="自定义输出", bl_idname="SSMTNode_Result_Output_NTMIModImp")
+        tree = types.SimpleNamespace(name="测试蓝图", nodes={node.name: node})
+        operator = self._make_operator(self._make_context())
+        operator.ntmi_output_node_name = node.name
+        output_dir = os.path.join(self.temp_dir, "custom_ntmi_output")
+        engine = types.ModuleType(f"{PKG}.blueprint.ntmi_export_modimp")
+        engine.resolve_ntmi_modimp_output_dir = mock.Mock(return_value=output_dir)
+        with mock.patch.dict(sys.modules, {engine.__name__: engine}):
+            session = operator._create_background_session(tree)
+        self.assertEqual(session.kwargs["output_dir"], output_dir)
+        self.assertEqual(session.kwargs["ntmi_output_node_name"], node.name)
+        self.assertEqual(session.kwargs["round_plans"], [])
+        self.assertEqual(session.kwargs["total_steps"], len(export_background.NTMI_MODIMP_STAGE_STEPS))
+
     def setUp(self):
         super().setUp()
         _RecordingSession.instances = []
@@ -1764,32 +1887,21 @@ class OperatorInvokeTests(_BackgroundTestBase):
         self.assertFalse(operator._restore_config_tables_after_export)
         self.addCleanup(setattr, ui_func_export, "restore_config_tables", original_restore)
 
-    def test_invoke_with_toggle_off_runs_original_execute(self):
+    def test_legacy_disabled_setting_cannot_enable_foreground_export(self):
         self.scene_properties.background_export_enabled = False
-        operator = self._make_operator(None)
-        executed = []
-        operator.execute = lambda context: executed.append(context) or {'FINISHED'}
+        context = self._make_context()
+        operator = self._make_operator(context)
+        self.assertEqual(operator.invoke(context, None), {'RUNNING_MODAL'})
+        self.assertTrue(_RecordingSession.instances[0].started)
+        self.assertEqual(_FAKE_WINDOW_MANAGER.modal_handlers, [operator])
 
-        result = operator.invoke(None, None)
-
-        self.assertEqual(result, {'FINISHED'})
-        self.assertEqual(executed, [None])
-        self.assertEqual(_RecordingSession.instances, [])
-        self.assertEqual(_FAKE_WINDOW_MANAGER.timers, [])
-        self.assertEqual(_FAKE_WINDOW_MANAGER.modal_handlers, [])
-
-    def test_quick_invoke_with_toggle_off_runs_sync_execute(self):
+    def test_quick_export_ignores_legacy_disabled_setting(self):
         self.scene_properties.background_export_enabled = False
+        context = self._make_context([self._make_mesh("M1")])
         operator = self._make_quick_operator()
-        executed = []
-        operator.execute = lambda context: executed.append(context) or {'FINISHED'}
-
-        result = operator.invoke(None, None)
-
-        self.assertEqual(result, {'FINISHED'})
-        self.assertEqual(executed, [None])
-        self.assertEqual(_RecordingSession.instances, [])
-        self.assertEqual(_FAKE_WINDOW_MANAGER.timers, [])
+        self.assertEqual(operator.invoke(context, None), {'RUNNING_MODAL'})
+        self.assertTrue(_RecordingSession.instances[0].started)
+        self.assertTrue(_RecordingSession.instances[0].kwargs["quick_export"])
 
     def test_quick_invoke_with_toggle_on_starts_background_session(self):
         self.scene_properties.background_export_enabled = True

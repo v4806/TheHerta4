@@ -34,6 +34,7 @@ try:  # 纯文件装载的测试宿主可能没有贴图计划模块：退化为
 except ImportError:  # pragma: no cover
     TextureExportPlan = None
 from ..utils.log_utils import LOG
+from ..utils.process_log import configure_worker_output, FileLogRelay, REDIRECTED_LOG_ENV, worker_log_environment
 from ..utils.shapekey_utils import ShapeKeyUtils
 from . import export_progress
 from .export_parallel import ExportRoundExecutor
@@ -56,6 +57,12 @@ TERMINATE_POLL_INTERVAL = 0.05
 
 #: 已有后台导出在运行时，各导出入口的统一提示
 BACKGROUND_BUSY_MESSAGE = "已有后台导出在运行，请等它结束或按 ESC 取消"
+
+NTMI_MODIMP_STAGE_STEPS = (
+    "NTMI-ModImp-CollectObjects", "NTMI-ModImp-Preprocess",
+    "NTMI-ModImp-BlueprintModel", "NTMI-ModImp-Export",
+    "NTMI-ModImp-Postprocess", "收尾",
+)
 
 #: 快速局部导出的单轮轮次计划（同步路径与后台 worker 共用，口径完全一致）
 QUICK_EXPORT_ROUND_PLAN = {
@@ -442,11 +449,13 @@ def build_manifest(
     quick_export: bool = False,
     object_names: list = None,
     preprocess_cache_dir: str = "",
+    ntmi_output_node_name: str = "",
 ) -> dict:
     """写 ``manifest.json`` 并返回清单内容。
 
     清单是主进程 → worker 的唯一任务输入：worker 不重新算轮次计划、不重新解析
     输出目录，一切都以主进程（能看到当前蓝图 / 全局设置）算好的值为准。
+    ``ntmi_output_node_name`` 非空时执行指定 NTMI ModImp 输出节点。
     ``direct_export`` 为真时 worker 走直出导出（``execute_direct_export``），
     不使用 ``round_plans``。
     ``quick_export`` 为真时 worker 按 ``object_names`` 在快照里重建临时蓝图树，
@@ -477,6 +486,7 @@ def build_manifest(
         "quick_export": bool(quick_export),
         "object_names": [str(name) for name in (object_names or []) if str(name)],
         "preprocess_cache_dir": str(preprocess_cache_dir or ""),
+        "ntmi_output_node_name": str(ntmi_output_node_name or ""),
         "stage_path": stage_path,
         "result_path": result_path,
         "log_path": log_path,
@@ -749,6 +759,7 @@ def _run_worker(manifest_path: str) -> None:
     done_steps = 0
 
     try:
+        configure_worker_output()
         LOG.start_collecting()
         GlobalConfig.read_from_main_json_ssmt4()
         _apply_manifest_environment(manifest)
@@ -794,6 +805,8 @@ def _run_worker(manifest_path: str) -> None:
             )
         except Exception:
             step_plan = []
+        if manifest.get("ntmi_output_node_name"):
+            step_plan = list(NTMI_MODIMP_STAGE_STEPS)
         if step_plan:
             total_steps = len(step_plan)
 
@@ -881,6 +894,29 @@ def _run_worker(manifest_path: str) -> None:
                 export_progress.step_total(),
                 "后台快速局部导出完成",
             )
+        elif manifest.get("ntmi_output_node_name"):
+            from .ntmi_export_modimp import execute_ntmi_modimp_export
+            from ..utils.timer_utils import TimerUtils
+
+            node_name = str(manifest["ntmi_output_node_name"])
+            node = tree.nodes.get(node_name)
+            if node is None or getattr(node, "bl_idname", "") != "SSMTNode_Result_Output_NTMIModImp":
+                raise RuntimeError(f"未找到 NTMI ModImp 输出节点: {node_name}")
+            # 相对目录在前台工程中解析；快照只使用清单固定的绝对目录。
+            node.use_custom_export_dir = True
+            node.export_dir = output_dir
+            TimerUtils.start_session("NTMI ModImp 导出")
+            try:
+                execute_ntmi_modimp_export(context=bpy.context, tree=tree, node=node)
+            finally:
+                TimerUtils.print_summary()
+            if TextureExportPlan is not None:
+                TextureExportPlan.finalize(output_dir)
+            result.update(status="success", error="", rounds=1,
+                          warnings=_collect_ini_variable_warnings(output_dir))
+            done_steps = export_progress.finish_steps()
+            _write_stage(stage_path, "完成", done_steps,
+                         export_progress.step_total(), "NTMI ModImp 后台导出完成")
         elif bool(manifest.get("direct_export")):
             # 直出模式：与同步导出走同一个 execute_direct_export 入口（headless 可用，
             # 经验库 `theherta4-plugin-headless-direct-export` 已实证），它内部含后处理。
@@ -1000,8 +1036,10 @@ def _run_worker(manifest_path: str) -> None:
             pass
 
         try:
-            log_content = LOG.get_log_content(strip_ansi=True)
-            if log_path:
+            # stdout/stderr 已由父进程直接落盘时，不能用 Python 日志重写：
+            # 否则 Blender/C 引擎输出丢失，前台增量读取的偏移也会失效。
+            if log_path and os.environ.get(REDIRECTED_LOG_ENV) != "1":
+                log_content = LOG.get_log_content(strip_ansi=True)
                 with open(log_path, "w", encoding="utf-8") as file:
                     file.write(log_content)
         except Exception:
@@ -1258,6 +1296,7 @@ class BackgroundExportSession:
         quick_export: bool = False,
         object_names: list = None,
         preprocess_cache_dir: str = "",
+        ntmi_output_node_name: str = "",
     ):
         self.tree_name = str(tree_name or "")
         self.output_dir = str(output_dir or "")
@@ -1279,6 +1318,7 @@ class BackgroundExportSession:
         self.object_names = [str(name) for name in (object_names or []) if str(name)]
         #: 前处理缓存目录由主进程算，worker 不能自己推（快照路径会指向临时目录）
         self.preprocess_cache_dir = str(preprocess_cache_dir or "")
+        self.ntmi_output_node_name = str(ntmi_output_node_name or "")
 
         self.snapshot_path = ""
         self.manifest_path = ""
@@ -1310,6 +1350,8 @@ class BackgroundExportSession:
         self.cleaned = False
 
         self._log_handle = None
+        self._log_relay = None
+        self._log_text_initialized = False
 
     # -- 启动 ---------------------------------------------------------------
 
@@ -1344,6 +1386,7 @@ class BackgroundExportSession:
                 quick_export=self.quick_export,
                 object_names=self.object_names,
                 preprocess_cache_dir=self.preprocess_cache_dir,
+                ntmi_output_node_name=self.ntmi_output_node_name,
             )
 
             self.manifest_path = str(self.manifest.get("manifest_path") or "")
@@ -1374,11 +1417,13 @@ class BackgroundExportSession:
 
             # 子进程输出直接落到日志文件：主进程不读管道，poll 永远不会被管道阻塞
             self._log_handle = open(self.log_path, "ab")
+            self._log_relay = FileLogRelay(self.log_path)
             self.process = subprocess.Popen(
                 command,
                 stdout=self._log_handle,
                 stderr=subprocess.STDOUT,
                 stdin=subprocess.DEVNULL,
+                env=worker_log_environment(),
             )
             self.status = "running"
             # 本次导出总用时从「后台实例真正启动」起算；计时异常绝不能影响导出
@@ -1399,6 +1444,7 @@ class BackgroundExportSession:
 
     def poll(self) -> str:
         """返回 ``"running"`` / ``"success"`` / ``"error"``（取消后固定为 error 侧）。"""
+        self._relay_worker_log()
         if self.status in ("success", "error", "cancelled"):
             return self.status
 
@@ -1415,6 +1461,7 @@ class BackgroundExportSession:
             return self.status
 
         self._close_log_handle()
+        self._relay_worker_log(final=True)
         self.result = _read_json(self.result_path) or {}
         self._refresh_stage()
 
@@ -1428,6 +1475,39 @@ class BackgroundExportSession:
                 or f"后台导出进程异常退出（退出码 {exit_code}）"
             )
         return self.status
+
+    def _relay_worker_log(self, *, final=False):
+        """只在前台 modal 主线程更新文本块；每次轮询限量读取以保持 UI 响应。"""
+        if self._log_relay is None:
+            return
+        text = self._log_relay.read(final=final)
+        if not text:
+            return
+        try:
+            print(text, end="", flush=True)
+        except Exception:
+            # 无系统控制台时仍然把日志交给前台文本编辑器。
+            pass
+        try:
+            import re
+            text = re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', text)
+            text = text.replace("\r\n", "\n")
+            block = bpy.data.texts.get("导出流程日志")
+            if block is None:
+                block = bpy.data.texts.new("导出流程日志")
+            if not self._log_text_initialized:
+                block.clear()
+                self._log_text_initialized = True
+            # write() 从光标处插入；用户可能正查看旧行，始终移到末尾再追加。
+            block.cursor_set(len(block.lines) - 1, character=len(block.lines[-1].body))
+            block.write(text)
+            for window in bpy.context.window_manager.windows:
+                for area in window.screen.areas:
+                    if area.type == 'TEXT_EDITOR':
+                        area.tag_redraw()
+        except Exception:
+            # 日志展示失败不能中止正在进行的导出；磁盘原始日志继续保留。
+            pass
 
     def _refresh_stage(self) -> None:
         stage = _read_json(self.stage_path)
@@ -1605,6 +1685,7 @@ class BackgroundExportSession:
                     pass
 
         self._close_log_handle()
+        self._relay_worker_log(final=True)
         self.status = "cancelled"
         return True
 
@@ -1615,6 +1696,7 @@ class BackgroundExportSession:
         避免每个会话都在临时目录里留一份大文件。
         """
         self._close_log_handle()
+        self._relay_worker_log(final=True)
 
         targets = [self.manifest_path]
         if self.snapshot_path:

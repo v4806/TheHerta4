@@ -5,6 +5,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -123,11 +124,12 @@ _install_module(
     ParallelExportCoordinator=types.SimpleNamespace(),
     ParallelExportError=RuntimeError,
 )
-# 后台导出只用于 invoke 分流；本文件测同步链路，给空壳即可
+# 会话启动在用例中打桩；这里验证前台的目录作用域与配置表确认。
 _install_module(
     f"{PKG}.blueprint.export_background",
     BACKGROUND_BUSY_MESSAGE="已有后台导出在运行，请等它结束或按 ESC 取消",
     BackgroundExportSession=types.SimpleNamespace(),
+    NTMI_MODIMP_STAGE_STEPS=(),
     QUICK_EXPORT_ROUND_PLAN={
         "round_index": 1,
         "phase": "single",
@@ -178,22 +180,15 @@ class _BaseFakeOperator:
 
 
 class NtemiStandardExportBlockingTests(unittest.TestCase):
-    def test_generate_mod_blocks_ntemi_and_points_to_modimp_output(self):
+    def test_generate_mod_starts_modimp_in_background(self):
+        ui_func_export.GlobalConfig.logic_name = "NTEMI"
         tree = _FakeTree(include_ntmi_output=True)
-        ui_func_export.BlueprintExportHelper.get_current_blueprint_tree = lambda **_kwargs: tree
-        start_collecting_calls = []
-        ui_func_export.LOG.start_collecting = lambda *_args, **_kwargs: start_collecting_calls.append(True)
-
-        operator = ui_func_export.SSMTGenerateModBlueprint()
-        operator.reports = []
-        operator.report = types.MethodType(_BaseFakeOperator.report, operator)
-
-        result = operator.execute(types.SimpleNamespace(scene=types.SimpleNamespace(global_properties=types.SimpleNamespace(selected_blueprint_name=""))))
-
-        self.assertEqual(result, {'CANCELLED'})
-        self.assertTrue(operator.reports)
-        self.assertIn("NTMI ModImp Output", operator.reports[-1][1])
-        self.assertEqual(start_collecting_calls, [])
+        with mock.patch.object(ui_func_export.BlueprintExportHelper, "get_current_blueprint_tree", lambda **kwargs: tree):
+            operator = ui_func_export.SSMTGenerateModBlueprint()
+            started = []
+            operator._start_background_export = lambda context, target: started.append(target) or {'RUNNING_MODAL'}
+            self.assertEqual(operator.execute(None), {'RUNNING_MODAL'})
+            self.assertEqual(started, [tree])
 
     def test_quick_export_blocks_ntemi_before_building_temp_tree(self):
         operator = ui_func_export.SSMTQuickExportSelected()
@@ -231,186 +226,67 @@ _ORIGINAL_RESTORE_CONFIG_TABLES = ui_func_export.restore_config_tables
 _ORIGINAL_GET_CURRENT_TREE = ui_func_export.BlueprintExportHelper.get_current_blueprint_tree
 _ORIGINAL_FIND_CONFIG_TABLES = ui_func_export.find_config_table_files
 _ORIGINAL_PATH_GENERATE_MOD_FOLDER = ui_func_export.GlobalConfig.path_generate_mod_folder
-_ORIGINAL_EXECUTE_ROUND = ui_func_export.ExportRoundExecutor.execute_round
 
 
 class ConfigTableBackupDecisionTests(unittest.TestCase):
-    """弹窗「是/否」选择驱动的备份/恢复决策（回归：选择「是」不得恢复旧配置表）。
-
-    走主导出流程（直出桩关闭，ExportRoundExecutor 桩必然失败）：
-    - 弹窗确认（_backup_pending=True）后应先备份；
-    - 仅当 overwrite_config == 'NO' 时才在导出完成后恢复旧配置表。
-
-    C2 补强（原用例只数调用次数 → 备份/恢复出错也测不出来）：
-    - 断言 backup 收到的**实参形状** `(mod_export_path, config_table_paths)`；
-    - 断言 restore 收到的 entries **就是** backup 的返回值；
-    - 用事件序列断言**先后顺序** `backup → 导出尝试 → restore`；
-    - 覆盖 `ui_func_export.invoke()` 弹窗链（有配置表才弹窗并挂状态 / 无配置表直接 execute）。
-    """
+    """配置表确认仍先备份；恢复发生在后台任务完成后。"""
 
     def setUp(self):
-        self.operator = ui_func_export.SSMTGenerateModBlueprint()
-        self.operator.reports = []
-        self.operator.report = types.MethodType(_BaseFakeOperator.report, self.operator)
-        # 模拟 RNA 默认值（真实 Blender 中 EnumProperty 默认 'YES'）
-        self.operator.overwrite_config = 'YES'
-        # 绕过 NTEMI 阻断，进入实际导出流程
-        ui_func_export.GlobalConfig.logic_name = "OTHER"
-
-        # 真实存在的导出目录 + 一份"旧配置表"（invoke() 用 os.path.exists 门控）
-        self.config_dir = tempfile.mkdtemp(prefix="ntemi_cfg_")
+        self.config_dir = tempfile.mkdtemp(prefix="background_cfg_")
         self.addCleanup(shutil.rmtree, self.config_dir, True)
         self.ini_path = os.path.join(self.config_dir, "角色.ini")
         Path(self.ini_path).write_text("[old]", encoding="utf-8")
-
-        ui_func_export.GlobalConfig.path_generate_mod_folder = lambda: self.config_dir
-        ui_func_export.find_config_table_files = lambda _path: [self.ini_path]
-        ui_func_export.BlueprintExportHelper.get_current_blueprint_tree = (
-            lambda **_kwargs: _FakeTree(include_ntmi_output=False)
-        )
-
+        self.operator = ui_func_export.SSMTGenerateModBlueprint()
+        self.operator.overwrite_config = 'YES'
         self.events = []
-        self.backup_calls = []
-        self.restore_calls = []
-        self.backup_entries = [(
-            self.ini_path,
-            os.path.join(
-                self.config_dir, ".config_table_backup", "20260101_000000_000000",
-                "角色.ini.bak",
-            ),
-        )]
+        self.entries = [(self.ini_path, self.ini_path + '.bak')]
+        self.addCleanup(mock.patch.stopall)
+        mock.patch.object(ui_func_export.GlobalConfig, "logic_name", "OTHER").start()
+        mock.patch.object(ui_func_export.GlobalConfig, "path_generate_mod_folder", lambda: self.config_dir).start()
+        mock.patch.object(ui_func_export.BlueprintExportHelper, "get_current_blueprint_tree", lambda **kwargs: _FakeTreeWithPostprocess()).start()
+        mock.patch.object(ui_func_export, "find_config_table_files", return_value=[self.ini_path]).start()
+        mock.patch.object(ui_func_export, "backup_config_tables", self._backup).start()
+        mock.patch.object(ui_func_export, "restore_config_tables", lambda entries: self.events.append(('restore', entries))).start()
+        self.operator._start_background_export = lambda context, tree: self.events.append(('start', tree.name)) or {'RUNNING_MODAL'}
 
-        def _fake_backup(*args, **kwargs):
-            self.events.append("backup")
-            self.backup_calls.append({"args": args, "kwargs": kwargs})
-            return list(self.backup_entries)
+    def _backup(self, path, files):
+        self.assertEqual((path, files), (self.config_dir, [self.ini_path]))
+        self.events.append(('backup', files))
+        return self.entries
 
-        def _fake_restore(*args, **kwargs):
-            self.events.append("restore")
-            self.restore_calls.append({"args": args, "kwargs": kwargs})
-
-        def _fake_execute_round(**kwargs):
-            self.events.append("export_attempt")
-            return _ORIGINAL_EXECUTE_ROUND(**kwargs)   # 原桩必然抛 AssertionError
-
-        ui_func_export.backup_config_tables = _fake_backup
-        ui_func_export.restore_config_tables = _fake_restore
-        ui_func_export.ExportRoundExecutor.execute_round = _fake_execute_round
-
-    def tearDown(self):
-        ui_func_export.GlobalConfig.logic_name = "NTEMI"
-        ui_func_export.backup_config_tables = _ORIGINAL_BACKUP_CONFIG_TABLES
-        ui_func_export.restore_config_tables = _ORIGINAL_RESTORE_CONFIG_TABLES
-        ui_func_export.BlueprintExportHelper.get_current_blueprint_tree = _ORIGINAL_GET_CURRENT_TREE
-        ui_func_export.find_config_table_files = _ORIGINAL_FIND_CONFIG_TABLES
-        ui_func_export.GlobalConfig.path_generate_mod_folder = _ORIGINAL_PATH_GENERATE_MOD_FOLDER
-        ui_func_export.ExportRoundExecutor.execute_round = _ORIGINAL_EXECUTE_ROUND
-
-    def _context(self, with_dialog=False):
-        window_manager = None
-        self.dialog_calls = []
-        if with_dialog:
-            def _invoke_props_dialog(operator, **kwargs):
-                self.dialog_calls.append({"operator": operator, "kwargs": kwargs})
-                return {'RUNNING_MODAL'}
-
-            window_manager = types.SimpleNamespace(invoke_props_dialog=_invoke_props_dialog)
-        return types.SimpleNamespace(
-            scene=types.SimpleNamespace(
-                global_properties=types.SimpleNamespace(selected_blueprint_name="")
-            ),
-            window_manager=window_manager,
-        )
-
-    def _run_export(self, **operator_attrs):
-        for key, value in operator_attrs.items():
-            setattr(self.operator, key, value)
-        return self.operator.execute(self._context())
-
-    def _assert_backup_args(self):
-        self.assertEqual(len(self.backup_calls), 1, "弹窗确认后应先备份旧配置表")
-        call = self.backup_calls[0]
-        self.assertEqual(
-            call["args"], (self.config_dir, [self.ini_path]),
-            "backup 实参必须是 (导出目录, 配置表路径列表)",
-        )
-        self.assertEqual(call["kwargs"], {}, "backup 不应收到额外 kwargs")
+    def _confirm(self, overwrite):
+        self.operator._pending_background_export = True
+        self.operator._backup_pending = True
+        self.operator._export_path = self.config_dir
+        self.operator._config_table_paths = [self.ini_path]
+        self.operator.overwrite_config = overwrite
+        self.assertEqual(self.operator.execute(None), {'RUNNING_MODAL'})
+        self.assertEqual([event[0] for event in self.events], ['backup', 'start'])
+        self.operator._restore_config_tables_if_needed()
 
     def test_overwrite_yes_keeps_new_config_and_skips_restore(self):
-        result = self._run_export(
-            _backup_pending=True,
-            _config_table_paths=[self.ini_path],
-            overwrite_config='YES',
-        )
+        self._confirm('YES')
+        self.assertEqual([event[0] for event in self.events], ['backup', 'start'])
 
-        self.assertEqual(result, {'CANCELLED'})
-        self._assert_backup_args()
-        self.assertEqual(self.restore_calls, [], "选择「是」时不得把旧配置表覆盖回原位")
-        self.assertEqual(
-            self.events, ["backup", "export_attempt"],
-            "顺序必须是「备份 → 导出尝试」，且不得恢复",
-        )
+    def test_overwrite_no_restores_only_after_background_completion(self):
+        self._confirm('NO')
+        self.assertEqual([event[0] for event in self.events], ['backup', 'start', 'restore'])
+        self.assertEqual(self.events[-1][1], self.entries)
+        self.operator._restore_config_tables_if_needed()
+        self.assertEqual(len(self.events), 3)
 
-    def test_overwrite_no_restores_old_config_after_export(self):
-        result = self._run_export(
-            _backup_pending=True,
-            _config_table_paths=[self.ini_path],
-            overwrite_config='NO',
-        )
+    def test_invoke_dialog_opens_before_background_start(self):
+        dialog = mock.Mock(return_value={'RUNNING_MODAL'})
+        context = types.SimpleNamespace(window_manager=types.SimpleNamespace(invoke_props_dialog=dialog))
+        self.assertEqual(self.operator.invoke(context, None), {'RUNNING_MODAL'})
+        dialog.assert_called_once_with(self.operator, width=460)
+        self.assertTrue(self.operator._pending_background_export)
+        self.assertEqual(self.events, [])
 
-        self.assertEqual(result, {'CANCELLED'})
-        self._assert_backup_args()
-        self.assertEqual(len(self.restore_calls), 1, "选择「否」时导出完成后应恢复旧配置表")
-        self.assertEqual(
-            self.restore_calls[0]["args"], (self.backup_entries,),
-            "restore 必须收到 backup 返回的 entries（原路径/备份路径对）",
-        )
-        self.assertEqual(self.restore_calls[0]["kwargs"], {}, "restore 不应收到额外 kwargs")
-        self.assertEqual(
-            self.events, ["backup", "export_attempt", "restore"],
-            "restore 必须在导出尝试**之后**才发生",
-        )
-
-    def test_without_dialog_no_backup_no_restore(self):
-        result = self._run_export()
-
-        self.assertEqual(result, {'CANCELLED'})
-        self.assertEqual(self.backup_calls, [], "未弹窗确认时不应备份")
-        self.assertEqual(self.restore_calls, [], "未弹窗确认时不应恢复")
-        self.assertEqual(self.events, ["export_attempt"])
-
-    def test_invoke_dialog_opens_with_config_tables_and_sets_state(self):
-        """invoke()：有后处理节点 + 导出目录已存在 *.ini → 弹窗并挂上备份状态。"""
-        ui_func_export.BlueprintExportHelper.get_current_blueprint_tree = (
-            lambda **_kwargs: _FakeTreeWithPostprocess()
-        )
-        context = self._context(with_dialog=True)
-
-        result = self.operator.invoke(context, types.SimpleNamespace())
-
-        self.assertEqual(result, {'RUNNING_MODAL'})
-        self.assertEqual(len(self.dialog_calls), 1, "应且只应弹出一次确认对话框")
-        self.assertIs(self.dialog_calls[0]["operator"], self.operator)
-        self.assertEqual(self.dialog_calls[0]["kwargs"], {"width": 460})
-        self.assertTrue(getattr(self.operator, "_backup_pending", False))
-        self.assertEqual(self.operator._config_table_paths, [self.ini_path])
-        self.assertEqual(self.operator._export_path, self.config_dir)
-
-    def test_invoke_without_config_tables_executes_directly(self):
-        """invoke()：目录无配置表 → 不弹窗、不置 _backup_pending，直接走 execute。"""
-        ui_func_export.BlueprintExportHelper.get_current_blueprint_tree = (
-            lambda **_kwargs: _FakeTreeWithPostprocess()
-        )
-        ui_func_export.find_config_table_files = lambda _path: []
-        context = self._context(with_dialog=True)
-
-        result = self.operator.invoke(context, types.SimpleNamespace())
-
-        self.assertEqual(result, {'CANCELLED'})
-        self.assertEqual(self.dialog_calls, [], "无配置表时不得弹窗")
-        self.assertFalse(getattr(self.operator, "_backup_pending", False))
-        self.assertEqual(self.events, ["export_attempt"])
-        self.assertEqual(self.backup_calls, [])
+    def test_invoke_without_config_tables_starts_background_directly(self):
+        with mock.patch.object(ui_func_export, "find_config_table_files", return_value=[]):
+            self.assertEqual(self.operator.invoke(None, None), {'RUNNING_MODAL'})
+        self.assertEqual([event[0] for event in self.events], ['start'])
 
 
 _REAL_CONFIG_NS = "_ntemi_real_config_table_backup_pkg"

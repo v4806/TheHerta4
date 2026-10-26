@@ -405,6 +405,8 @@ class ParallelPreprocessCoordinator:
 
     @classmethod
     def _run_single_job(cls, job: dict, config: dict):
+        from ..utils.process_log import run_logged_process
+
         addon_name = __package__.split('.')[0]
         command = [
             config["blender_path"],
@@ -425,20 +427,12 @@ class ParallelPreprocessCoordinator:
         ]
 
         try:
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="ignore",
-                timeout=config["timeout_seconds"],
-                check=False,
+            result = run_logged_process(
+                command, job["log_path"], config["timeout_seconds"],
+                lambda text: LOG._write_stdout_text(text, flush=True),
             )
         except subprocess.TimeoutExpired as exc:
-            cls._write_text(job["log_path"], (exc.stdout or "") + "\n" + (exc.stderr or ""))
             raise ParallelPreprocessError(f"Job {job['index']:03d} 超时") from exc
-
-        cls._write_text(job["log_path"], (result.stdout or "") + "\n" + (result.stderr or ""))
 
         if result.returncode != 0:
             raise ParallelPreprocessError(f"Job {job['index']:03d} 启动失败，退出码 {result.returncode}")
@@ -550,6 +544,8 @@ def _parse_manifest_argument(argv: list[str]) -> str:
 
 
 def _run_worker(manifest_path: str):
+    from ..utils.process_log import configure_worker_output, REDIRECTED_LOG_ENV
+
     with open(manifest_path, "r", encoding="utf-8") as file:
         manifest = json.load(file)
 
@@ -564,6 +560,7 @@ def _run_worker(manifest_path: str):
         result["shapekey_records_path"] = shapekey_records_path
 
     try:
+        configure_worker_output()
         LOG.start_collecting()
 
         object_names = manifest.get("object_names", [])
@@ -626,9 +623,10 @@ def _run_worker(manifest_path: str):
         result["error"] = str(exc)
         traceback.print_exc()
     finally:
-        log_content = LOG.get_log_content(strip_ansi=True)
-        with open(manifest["log_path"], "w", encoding="utf-8") as file:
-            file.write(log_content)
+        if os.environ.get(REDIRECTED_LOG_ENV) != "1":
+            log_content = LOG.get_log_content(strip_ansi=True)
+            with open(manifest["log_path"], "w", encoding="utf-8") as file:
+                file.write(log_content)
 
         with open(manifest["result_path"], "w", encoding="utf-8") as file:
             json.dump(result, file, ensure_ascii=False, indent=2)

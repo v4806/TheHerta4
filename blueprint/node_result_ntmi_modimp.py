@@ -1,12 +1,8 @@
 from __future__ import annotations
 
-import os
 
 import bpy
 
-from ..common.global_properties import GlobalProterties
-from ..utils.log_utils import LOG
-from ..utils.timer_utils import TimerUtils
 from .export_helper import BlueprintExportHelper
 from .node_base import SSMTNodeBase
 
@@ -43,38 +39,14 @@ class SSMT_OT_GenerateNTMIModImpBlueprint(bpy.types.Operator):
         return tree, node
 
     def execute(self, context):
-        from .ntmi_export_modimp import (
-            execute_ntmi_modimp_export,
-            resolve_ntmi_modimp_output_dir,
+        tree, node = self._resolve_tree_and_node(context)
+        if tree is None or node is None:
+            self.report({'ERROR'}, "当前蓝图中未找到 NTMI ModImp 输出节点。")
+            return {'CANCELLED'}
+        result = bpy.ops.ssmt.generate_mod_blueprint(
+            'INVOKE_DEFAULT', blueprint_name=tree.name, ntmi_output_node_name=node.name,
         )
-
-        LOG.start_collecting()
-        TimerUtils.start_session("NTMI ModImp Export")
-        previous_runtime_tree_name = BlueprintExportHelper.runtime_blueprint_tree_name
-
-        try:
-            tree, node = self._resolve_tree_and_node(context)
-            if tree is None or node is None:
-                self.report({"ERROR"}, "当前蓝图中未找到 NTMI ModImp 输出节点。")
-                return {"CANCELLED"}
-
-            BlueprintExportHelper.set_runtime_blueprint_tree(tree)
-            execute_ntmi_modimp_export(context=context, tree=tree, node=node)
-
-            self.report({"INFO"}, "NTMI ModImp 导出成功。")
-            if GlobalProterties.open_mod_folder_after_generate_mod():
-                output_dir = resolve_ntmi_modimp_output_dir(node)
-                os.startfile(output_dir)
-            return {"FINISHED"}
-        except Exception as exc:
-            LOG.exception(exc)
-            self.report({"ERROR"}, str(exc))
-            return {"CANCELLED"}
-        finally:
-            BlueprintExportHelper.runtime_blueprint_tree_name = previous_runtime_tree_name
-            TimerUtils.print_summary()
-            LOG.stop_collecting()
-            LOG.save_to_text_editor("NTMI_ModImp_Export_Log")
+        return {'FINISHED'} if result == {'RUNNING_MODAL'} else result
 
 
 class SSMT_OT_CheckNTMIModImpDependency(bpy.types.Operator):
