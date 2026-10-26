@@ -32,6 +32,7 @@ _fake_bpy = types.SimpleNamespace(
     props=types.SimpleNamespace(
         StringProperty=lambda **_kwargs: None,
         EnumProperty=lambda **_kwargs: None,
+        BoolProperty=lambda **_kwargs: None,
     ),
     data=types.SimpleNamespace(node_groups=types.SimpleNamespace(get=lambda _name: None)),
 )
@@ -53,7 +54,6 @@ _install_module(
     LOG=types.SimpleNamespace(
         start_collecting=lambda *_args, **_kwargs: None,
         stop_collecting=lambda *_args, **_kwargs: None,
-        save_to_text_editor=lambda *_args, **_kwargs: None,
         info=lambda *_args, **_kwargs: None,
         warning=lambda *_args, **_kwargs: None,
         exception=lambda *_args, **_kwargs: None,
@@ -75,8 +75,6 @@ _install_module(
 )
 _install_module(f"{PKG}.common.global_key_count_helper", GlobalKeyCountHelper=types.SimpleNamespace(initialize=lambda: None))
 _install_module(f"{PKG}.common.global_properties", GlobalProterties=types.SimpleNamespace(
-    # 后台导出开关：本文件测同步链路，固定关闭
-    is_background_export_enabled=lambda: False,
 ))
 _install_module(
     f"{PKG}.common.logic_name",

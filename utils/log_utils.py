@@ -192,24 +192,6 @@ class LOG:
         cls._print_line("\033[32m" + "-" * 110 + "\033[0m")
 
     @classmethod
-    def save_to_text_editor(cls, text_name: str = "导出流程日志"):
-        import bpy
-
-        log_content = cls.get_log_content(strip_ansi=True)
-        if not log_content:
-            return
-
-        if text_name in bpy.data.texts:
-            text_block = bpy.data.texts[text_name]
-            text_block.clear()
-        else:
-            text_block = bpy.data.texts.new(text_name)
-
-        text_block.write(log_content)
-
-        return text_name
-
-    @classmethod
     def _strip_ansi_codes(cls, text: str) -> str:
         import re
         ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')

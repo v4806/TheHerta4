@@ -1,4 +1,5 @@
 import importlib.util
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -92,16 +93,60 @@ class PreviewTests(unittest.TestCase):
             def _find_shape_ext_node(self):
                 return self.slider
 
+            def execute_postprocess(self, root, **kwargs):
+                with open(kwargs['_ini_path'], 'a') as stream:
+                    stream.write(f'\npanel={self.setting}\n')
+                return True
+
         shared = Slider()
         first, second = Panel(shared, 11), Panel(shared, 22)
         for source in (second, first, second):
             with tempfile.TemporaryDirectory() as root:
                 _proxy, ini, _res = preview.export_preview(source, root)
-                self.assertIn(f'selected={source.setting}', Path(ini).read_text())
+                text = Path(ini).read_text()
+                self.assertIn(f'selected={source.setting}', text)
+                self.assertIn(f'panel={source.setting}', text)
         self.assertEqual(shared.setting, 7)
         self.assertEqual(shared.last_mod_ini_path, 'real-slider.ini')
         self.assertEqual(first.last_mod_ini_path, 'real-panel.ini')
         self.assertEqual(second.last_mod_ini_path, 'real-panel.ini')
+
+    def test_preview_restores_the_intervals_an_export_filled_in(self):
+        class Intervals(list):
+            def add(self):
+                self.append(SimpleNamespace(start=0.0))
+                return self[-1]
+
+            def remove(self, index):
+                del self[index]
+
+        setting = SimpleNamespace(speed_intervals=Intervals())
+        source = SimpleNamespace(play_group_settings=[setting])
+        state = preview.collect_overlay_state(source)
+        # The exporter defaults a missing interval on the existing setting and
+        # creates a setting for a group that had none.
+        setting.speed_intervals.add()
+        source.play_group_settings.append(SimpleNamespace(speed_intervals=Intervals()))
+        preview.restore_overlay_state(source, state)
+        self.assertEqual(len(source.play_group_settings), 1)
+        self.assertEqual(len(setting.speed_intervals), 0)
+
+    def test_preview_images_stay_one_per_panel(self):
+        node = SimpleNamespace(_find_shape_ext_node=lambda: None)
+        proxy = SimpleNamespace(_ensure_namespace=lambda: 'ns/one')
+        original = (preview.export_preview, preview.render_panel_runtime_image)
+        preview.export_preview = lambda source, root: (
+            proxy, os.path.join(root, 'preview.ini'), root)
+        preview.render_panel_runtime_image = lambda *args: Image.new('RGBA', (2, 2))
+        try:
+            first = preview.generate_preview(node)
+            second = preview.generate_preview(node)
+        finally:
+            preview.export_preview, preview.render_panel_runtime_image = original
+        self.assertEqual(first, second)
+        self.assertEqual(Path(first).name, 'ns_one.png')
+        self.assertEqual(Path(first).parent, Path(tempfile.gettempdir()) / 'ssmt_panel_previews')
+        self.assertTrue(Path(first).is_file())
 
 
 if __name__ == '__main__':

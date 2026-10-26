@@ -7,6 +7,11 @@ import types
 
 from PIL import Image
 
+# Nested exporter collections that fill in their own defaults while an export runs.
+# A preview must leave the node exactly as it found it, so every size recorded by
+# collect_overlay_state() is restored once the image has been rendered.
+_OVERLAY_COLLECTIONS = ("play_group_settings",)
+
 
 class PreviewNode:
     """Bind exporter methods to an isolated settings overlay over a Blender node."""
@@ -40,21 +45,48 @@ class PreviewNode:
         self._props[key] = value
 
 
-def _entry_buttons(node):
-    buttons = []
-    for entry in node.swap_panel_entries:
-        names = [name.strip() for name in (entry.variables or entry.variable_name).split("|")
-                 if name.strip()]
-        if not names:
+def _trim_collection(collection, keep):
+    while keep < len(collection):
+        index = len(collection) - 1
+        if hasattr(collection, "bl_rna"):
+            # bpy_prop_collection.remove() takes a position, unlike list.remove().
+            collection.remove(index)
+        else:
+            del collection[index]
+
+
+def collect_overlay_state(source):
+    """Record the collection sizes an export is allowed to grow, then undo it."""
+    state = []
+    for name in _OVERLAY_COLLECTIONS:
+        collection = getattr(source, name, None)
+        if collection is None:
             continue
-        buttons.append({
-            "var_name": names[0], "var_names": names,
-            "option_count": entry.option_count,
-            "option_counts": [entry.option_count] * len(names),
-            "comment": entry.comment, "hotkey": entry.hotkey,
-            "image_path": node._button_image_for_source(entry.hotkey, names[0]),
-        })
-    return buttons
+        nested = []
+        for index in range(len(collection)):
+            intervals = getattr(collection[index], "speed_intervals", None)
+            if intervals is not None:
+                nested.append((index, len(intervals)))
+        state.append((name, len(collection), nested))
+    return state
+
+
+def restore_overlay_state(source, state):
+    """Drop the default entries the export filled in, nested collections first."""
+    for name, keep, nested in state:
+        collection = getattr(source, name, None)
+        if collection is None:
+            continue
+        for index, intervals_keep in nested:
+            if index < len(collection):
+                try:
+                    _trim_collection(collection[index].speed_intervals, intervals_keep)
+                except Exception:
+                    pass
+        try:
+            _trim_collection(collection, keep)
+        except Exception:
+            pass
 
 
 def export_preview(source, root):
@@ -62,7 +94,6 @@ def export_preview(source, root):
     node = PreviewNode(source)
     node.ini_file_path = ""
     node.last_mod_ini_path = ""
-    node._build_button_list = lambda _path: _entry_buttons(node)
     slider_source = source._find_shape_ext_node()
     slider = PreviewNode(slider_source) if slider_source is not None else None
     node._find_shape_ext_node = lambda: slider
@@ -77,12 +108,17 @@ def export_preview(source, root):
     if slider is not None and node.slider_use_slider_panel:
         emitted_slider[0] = bool(slider.execute_postprocess(
             root, _in_place=True, _ini_path=ini_path, _skip_backup=True))
-    if _entry_buttons(node):
-        if not node.execute_postprocess(root, _in_place=True, _ini_path=ini_path, _skip_backup=True):
-            raise RuntimeError("当前节点的切换按钮未能生成，请检查控制台日志")
-    elif not emitted_slider[0]:
-        raise RuntimeError("当前面板没有可预览的按钮或滑块，请先刷新按钮列表并检查形态键分组")
+    if not node.execute_postprocess(root, _in_place=True, _ini_path=ini_path, _skip_backup=True):
+        if not emitted_slider[0]:
+            raise RuntimeError("当前面板没有可预览的按钮或滑块，请检查切换节点与形态键分组")
     return node, ini_path, os.path.join(root, "res")
+
+
+def _numeric(values, key, default=0.0):
+    try:
+        return float(values[key])
+    except (KeyError, TypeError, ValueError):
+        return default
 
 
 def collect_draws(node, values, slider_params):
@@ -106,10 +142,10 @@ def collect_draws(node, values, slider_params):
         add(f"ResourceImageToRender0_{ns}", 0.0, 0.0, width, height)
         index = 1
         while f"{ns}_btn_width{index}" in values:
-            bw = values[f"{ns}_btn_width{index}"] * zoom
-            bh = values[f"{ns}_btn_height{index}"] * zoom
-            bx = values[f"{ns}_fixed_rel_x{index}"] * width
-            by = values[f"{ns}_fixed_rel_y{index}"] * height - bh * 0.5
+            bw = _numeric(values, f"{ns}_btn_width{index}") * zoom
+            bh = _numeric(values, f"{ns}_btn_height{index}") * zoom
+            bx = _numeric(values, f"{ns}_fixed_rel_x{index}") * width
+            by = _numeric(values, f"{ns}_fixed_rel_y{index}") * height - bh * 0.5
             add(f"ResourceSwapButton{index}_{ns}", bx, by, bw, bh)
             index += 1
         slider_x = width + 0.03
@@ -153,8 +189,8 @@ def collect_draws(node, values, slider_params):
     widths, heights = [], []
     while f"{ns}_btn_w{len(widths) + 1}" in values:
         i = len(widths) + 1
-        widths.append(values[f"{ns}_btn_w{i}"])
-        heights.append(values[f"{ns}_btn_h{i}"])
+        widths.append(_numeric(values, f"{ns}_btn_w{i}"))
+        heights.append(_numeric(values, f"{ns}_btn_h{i}"))
     if widths:
         attached = node.panel_mode == "ATTACHED_LEFT"
         per_row = max(1, min(int(node.buttons_per_row or 1), len(widths)))
@@ -209,27 +245,47 @@ def render_panel_runtime_image(node, ini_path, res_dir):
     margin = 24
     canvas = Image.new("RGBA", (max(1, math.ceil(span_x * density)) + margin * 2,
                                  max(1, math.ceil(span_y * density)) + margin * 2), (30, 30, 30, 255))
+    missing = set()
     for resource, (x, y, width, height) in draws:
         filename = resources.get(resource, "")
         path = filename if os.path.isabs(filename) else os.path.join(res_dir, filename)
         if not filename or not os.path.isfile(path):
+            if resource not in missing:
+                missing.add(resource)
+                print(f"[面板预览] 缺少资源 {resource}（{path or '未在 ini 中登记'}），该元素不出现在预览图里")
             continue
         with Image.open(path) as source:
             image = source.convert("RGBA")
         size = (max(1, round(width * sx)), max(1, round(height * sy)))
-        image = image.resize(size, Image.Resampling.LANCZOS)
+        # Enlarged UI textures get bilinear sampling like the game's draw call does;
+        # Lanczos ringing on a two-pixel outline reads as a preview artifact.
+        filter_kind = (Image.Resampling.LANCZOS if size[0] <= image.width and size[1] <= image.height
+                       else Image.Resampling.BILINEAR)
+        image = image.resize(size, filter_kind)
         paste_clipped(canvas, image, margin + round((x - xmin) * sx), margin + round((y - ymin) * sy))
     return canvas
 
 
+def _preview_directory():
+    directory = os.path.join(tempfile.gettempdir(), "ssmt_panel_previews")
+    os.makedirs(directory, exist_ok=True)
+    return directory
+
+
 def generate_preview(node):
-    with tempfile.TemporaryDirectory(prefix="ssmt_panel_runtime_preview_") as root:
-        proxy, ini_path, res_dir = export_preview(node, root)
-        image = render_panel_runtime_image(proxy, ini_path, res_dir)
-    # Separate paths prevent sibling previews and image viewers from overwriting
-    # or caching another node's result.
-    descriptor, output = tempfile.mkstemp(
-        prefix=f"ssmt_panel_preview_{proxy._ensure_namespace()}_", suffix=".png")
-    os.close(descriptor)
+    slider_source = node._find_shape_ext_node()
+    sources = [node] if slider_source is None else [node, slider_source]
+    states = [(source, collect_overlay_state(source)) for source in sources]
+    try:
+        with tempfile.TemporaryDirectory(prefix="ssmt_panel_runtime_preview_") as root:
+            proxy, ini_path, res_dir = export_preview(node, root)
+            image = render_panel_runtime_image(proxy, ini_path, res_dir)
+    finally:
+        for source, state in states:
+            restore_overlay_state(source, state)
+    # One stable file per panel: sibling panels keep their own preview, and a repeat
+    # preview overwrites its own image instead of filling the temp directory.
+    name = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in (proxy._ensure_namespace() or "panel"))
+    output = os.path.join(_preview_directory(), f"{name}.png")
     image.convert("RGB").save(output)
     return output

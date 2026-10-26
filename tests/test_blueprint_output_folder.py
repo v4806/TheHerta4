@@ -58,6 +58,7 @@ _install_module(
     props=types.SimpleNamespace(
         StringProperty=lambda **_kwargs: None,
         EnumProperty=lambda **_kwargs: None,
+        BoolProperty=lambda **_kwargs: None,
     ),
     data=types.SimpleNamespace(
         node_groups=types.SimpleNamespace(get=lambda name: _NODE_GROUPS.get(name)),
@@ -82,7 +83,6 @@ _install_module(
     LOG=types.SimpleNamespace(
         start_collecting=lambda *_args, **_kwargs: None,
         stop_collecting=lambda *_args, **_kwargs: None,
-        save_to_text_editor=lambda *_args, **_kwargs: None,
         info=lambda *_args, **_kwargs: None,
         warning=lambda *_args, **_kwargs: None,
         exception=lambda *_args, **_kwargs: None,
@@ -94,8 +94,6 @@ _FAKE_GLOBAL_PROTERTIES = types.SimpleNamespace(
     workspace_source_mode=lambda: "",
     use_specific_generate_mod_folder_path=lambda: False,
     generate_mod_folder_path=lambda: "",
-    # 后台导出开关：本文件只测同步链路，固定关闭
-    is_background_export_enabled=lambda: False,
 )
 _install_module(f"{PKG}.common.global_properties", GlobalProterties=_FAKE_GLOBAL_PROTERTIES)
 _install_module(f"{PKG}.common.global_key_count_helper", GlobalKeyCountHelper=types.SimpleNamespace(initialize=lambda: None))

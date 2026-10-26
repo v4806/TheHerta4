@@ -3090,7 +3090,7 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
             ])
         for i in range(1, num_sliders + 1):
             constants_additions.extend([
-                f"global persist $rel_x{i} = 0", f"global persist $zoom{i} = 1.0",
+                f"global persist $rel_x{i} = 0",
                 f"global $norm_width{i}", f"global $norm_height{i}",
                 f"global $img{i}_x", f"global $img{i}_y", f"global $rel_y{i}",
                 f"global $param{i}",
@@ -3123,9 +3123,11 @@ class SSMTNode_PostProcess_ShapeKeyExt(SSMTNode_PostProcess_Base):
 
         reset_lines = ["$img0_x = 0", "$img0_y = 0", f"$zoom0 = {self.panel_default_scale:.2f}"]
         for i in range(1, num_sliders + 1):
-            reset_lines.extend([f"$rel_x{i} = 0", f"$zoom{i} = 1.0"])
-        zoom_in_lines = ["$zoom0 = $zoom0 + 0.05"] + [f"$zoom{i} = $zoom{i} + 0.05" for i in range(1, num_sliders + 1)]
-        zoom_out_lines = ["$zoom0 = $zoom0 - 0.05"] + [f"$zoom{i} = $zoom{i} - 0.05" for i in range(1, num_sliders + 1)]
+            reset_lines.append(f"$rel_x{i} = 0")
+        # Every slider scales with the panel zoom ($zoom0); per-slider zoom state would
+        # be written and never read.
+        zoom_in_lines = ["$zoom0 = $zoom0 + 0.05"]
+        zoom_out_lines = ["$zoom0 = $zoom0 - 0.05"]
 
         other_sections["[KeyHelp]"] = [
             f"condition = $ui_active == 1", f"key = {help_key}", "type = cycle", "$help = 0,1"

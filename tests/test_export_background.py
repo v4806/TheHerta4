@@ -194,9 +194,6 @@ class _FakeLog:
     def debug(self, message):
         self.messages.append(str(message))
 
-    def save_to_text_editor(self, *_args, **_kwargs):
-        return ""
-
     def print_summary(self, *_args, **_kwargs):
         pass
 
@@ -574,7 +571,6 @@ class _BackgroundTestBase(unittest.TestCase):
         _FakeGlobalConfig.output_dir = ""
 
         fake_scene_props = types.SimpleNamespace(
-            background_export_enabled=False,
             open_mod_folder_after_generate_mod=False,
         )
         _FAKE_BPY.context.scene = types.SimpleNamespace(global_properties=fake_scene_props)
@@ -1787,7 +1783,6 @@ class OperatorInvokeTests(_BackgroundTestBase):
 
     def _start_background_operator(self):
         """起一个真正走到 modal 的后台导出操作符（Generate 入口）。"""
-        self.scene_properties.background_export_enabled = True
         context = self._make_context()
         operator = self._make_operator(context)
         operator.execute = lambda _context: (_ for _ in ()).throw(
@@ -1820,7 +1815,6 @@ class OperatorInvokeTests(_BackgroundTestBase):
 
     def test_background_invoke_asks_before_overwriting_old_config_tables(self):
         """后台导出与同步导出一样先问「覆盖 / 保留」：确认前不备份、不起会话。"""
-        self.scene_properties.background_export_enabled = True
         context = self._make_context()
         operator = self._make_operator(context)
         output_dir = _FakeGlobalConfig.output_dir
@@ -1839,7 +1833,6 @@ class OperatorInvokeTests(_BackgroundTestBase):
 
     def test_background_confirm_backs_up_then_starts_session(self):
         """弹窗点确定（execute）后先备份旧配置表，再起后台会话。"""
-        self.scene_properties.background_export_enabled = True
         context = self._make_context()
         operator = self._make_operator(context)
         output_dir = _FakeGlobalConfig.output_dir
@@ -1859,7 +1852,6 @@ class OperatorInvokeTests(_BackgroundTestBase):
 
     def test_background_finish_restores_old_config_tables_when_user_keeps_them(self):
         """选了「否」：后台导出收尾把备份的旧配置表覆盖回原位，且只做一次。"""
-        self.scene_properties.background_export_enabled = True
         context = self._make_context()
         operator = self._make_operator(context)
         output_dir = _FakeGlobalConfig.output_dir
@@ -1888,7 +1880,6 @@ class OperatorInvokeTests(_BackgroundTestBase):
         self.addCleanup(setattr, ui_func_export, "restore_config_tables", original_restore)
 
     def test_legacy_disabled_setting_cannot_enable_foreground_export(self):
-        self.scene_properties.background_export_enabled = False
         context = self._make_context()
         operator = self._make_operator(context)
         self.assertEqual(operator.invoke(context, None), {'RUNNING_MODAL'})
@@ -1896,7 +1887,6 @@ class OperatorInvokeTests(_BackgroundTestBase):
         self.assertEqual(_FAKE_WINDOW_MANAGER.modal_handlers, [operator])
 
     def test_quick_export_ignores_legacy_disabled_setting(self):
-        self.scene_properties.background_export_enabled = False
         context = self._make_context([self._make_mesh("M1")])
         operator = self._make_quick_operator()
         self.assertEqual(operator.invoke(context, None), {'RUNNING_MODAL'})
@@ -1904,7 +1894,6 @@ class OperatorInvokeTests(_BackgroundTestBase):
         self.assertTrue(_RecordingSession.instances[0].kwargs["quick_export"])
 
     def test_quick_invoke_with_toggle_on_starts_background_session(self):
-        self.scene_properties.background_export_enabled = True
         context = self._make_context([self._make_mesh("M1")])
         operator = self._make_quick_operator()
         operator.execute = lambda _context: (_ for _ in ()).throw(
@@ -1928,7 +1917,6 @@ class OperatorInvokeTests(_BackgroundTestBase):
 
     def test_quick_modal_uses_same_navigation_dispatch(self):
         """快速局部导出与 Generate 共用同一套事件分派：普通移动吞掉、中键拖动放行。"""
-        self.scene_properties.background_export_enabled = True
         context = self._make_context([self._make_mesh("M1")])
         operator = self._make_quick_operator()
         operator.execute = lambda _context: (_ for _ in ()).throw(
@@ -1954,7 +1942,6 @@ class OperatorInvokeTests(_BackgroundTestBase):
 
     def test_invoke_is_blocked_while_background_session_active(self):
         """防重入：已有活动会话时两个导出入口都返回 CANCELLED，且不新建会话。"""
-        self.scene_properties.background_export_enabled = True
         export_background.set_active_session(object())
         context = self._make_context([self._make_mesh("M1")])
 
@@ -1986,7 +1973,6 @@ class OperatorInvokeTests(_BackgroundTestBase):
         self.assertIn("缺失变量: $x", summary)
 
     def test_invoke_with_toggle_on_starts_session_and_runs_modal(self):
-        self.scene_properties.background_export_enabled = True
         context = self._make_context()
         operator = self._make_operator(context)
         operator.execute = lambda _context: (_ for _ in ()).throw(
@@ -2038,7 +2024,6 @@ class OperatorInvokeTests(_BackgroundTestBase):
 
     def test_modal_failure_updates_header_without_error_report(self):
         """失败收尾不再弹 Blender 原生 Report：header 留摘要，report 不出现 ERROR。"""
-        self.scene_properties.background_export_enabled = True
         context = self._make_context()
         operator = self._make_operator(context)
         operator.invoke(context, None)
@@ -2054,7 +2039,6 @@ class OperatorInvokeTests(_BackgroundTestBase):
         self.assertIn("worker.log", _FAKE_AREAS[0].header)
 
     def test_modal_escape_cancels_session(self):
-        self.scene_properties.background_export_enabled = True
         context = self._make_context()
         operator = self._make_operator(context)
         operator.invoke(context, None)
@@ -2307,7 +2291,6 @@ class OperatorInvokeTests(_BackgroundTestBase):
     # -- 步骤进度条（window_manager.progress_*） ---------------------------
 
     def test_modal_drives_native_progress_bar(self):
-        self.scene_properties.background_export_enabled = True
         context = self._make_context()
         operator = self._make_operator(context)
         operator.invoke(context, None)
@@ -2335,7 +2318,6 @@ class OperatorInvokeTests(_BackgroundTestBase):
 
     def test_modal_places_progress_bar_before_step_text(self):
         """状态栏布局：``后台导出：`` + 进度条 + 空格 + ``done/total 阶段｜节点``。"""
-        self.scene_properties.background_export_enabled = True
         context = self._make_context()
         operator = self._make_operator(context)
         operator.invoke(context, None)
@@ -2358,7 +2340,6 @@ class OperatorInvokeTests(_BackgroundTestBase):
 
     def test_modal_keeps_text_when_progress_bar_empty(self):
         """进度条为空（准备 / 加载 / 完成等阶段）时状态栏文本保持原样。"""
-        self.scene_properties.background_export_enabled = True
         context = self._make_context()
         operator = self._make_operator(context)
         operator.invoke(context, None)
@@ -2374,7 +2355,6 @@ class OperatorInvokeTests(_BackgroundTestBase):
 
     def test_modal_progress_api_failure_falls_back_to_header_bar(self):
         """progress_* 抛异常时静默，并在 header 上退回文本进度条。"""
-        self.scene_properties.background_export_enabled = True
         _FAKE_WINDOW_MANAGER.progress_fail = True
         context = self._make_context()
         operator = self._make_operator(context)
@@ -2393,7 +2373,6 @@ class OperatorInvokeTests(_BackgroundTestBase):
 
     def test_modal_progress_update_throttled_when_done_unchanged(self):
         """done 不变时不再调 progress_update（指针在「进度/繁忙」间高频跳动的根因）。"""
-        self.scene_properties.background_export_enabled = True
         context = self._make_context()
         operator = self._make_operator(context)
         operator.invoke(context, None)
@@ -2415,7 +2394,6 @@ class OperatorInvokeTests(_BackgroundTestBase):
 
     def test_modal_progress_update_fires_once_per_done_change(self):
         """done 每次变化只调一次 progress_update；重复的 done 被跳过。"""
-        self.scene_properties.background_export_enabled = True
         context = self._make_context()
         operator = self._make_operator(context)
         operator.invoke(context, None)
@@ -2435,7 +2413,6 @@ class OperatorInvokeTests(_BackgroundTestBase):
 
     def test_modal_progress_begin_called_only_once(self):
         """progress_begin 只在第一次 tick 调一次，之后无论 done 怎么变都不再 begin。"""
-        self.scene_properties.background_export_enabled = True
         context = self._make_context()
         operator = self._make_operator(context)
         operator.invoke(context, None)
